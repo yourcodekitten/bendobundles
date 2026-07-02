@@ -29,6 +29,14 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
             s(serde_json::to_string(g).expect("game serializes")),
         ),
     ]);
+    item.insert(
+        "status".into(),
+        s(serde_json::to_value(g.status)
+            .expect("status serializes")
+            .as_str()
+            .expect("status is a string")
+            .to_string()),
+    );
     if g.is_listable() {
         item.insert("gsi1pk".into(), s("LISTABLE"));
         item.insert(
@@ -40,14 +48,30 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
 }
 
 pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
-    HashMap::from([
+    let mut item = HashMap::from([
         ("pk".into(), s(link_pk(&l.token))),
         ("sk".into(), s("META")),
         (
             "body".into(),
             s(serde_json::to_string(l).expect("link serializes")),
         ),
-    ])
+        (
+            "claims_allowed".into(),
+            AttributeValue::N(l.claims_allowed.to_string()),
+        ),
+        (
+            "claims_used".into(),
+            AttributeValue::N(l.claims_used.to_string()),
+        ),
+        ("revoked".into(), AttributeValue::Bool(l.revoked)),
+    ]);
+    if let Some(exp) = l.expires_at {
+        let ts = exp
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+        item.insert("expires_at".into(), s(ts));
+    }
+    item
 }
 
 pub fn claim_item(c: &Claim) -> HashMap<String, AttributeValue> {

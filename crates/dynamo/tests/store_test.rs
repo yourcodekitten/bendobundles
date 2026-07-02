@@ -1,5 +1,5 @@
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
-use dynamo::Store;
+use dynamo::{ClaimTxError, Store};
 use time::macros::datetime;
 
 async fn store_or_skip(test: &str) -> Option<Store> {
@@ -90,4 +90,88 @@ async fn link_and_claim_roundtrip() {
     store.put_claim(&claim).await.unwrap();
     assert_eq!(store.get_claim("tok1", "c1").await.unwrap().unwrap(), claim);
     assert_eq!(store.claims_for_link("tok1").await.unwrap(), vec![claim]);
+}
+
+#[tokio::test]
+async fn claim_happy_path_then_race_loses() {
+    let Some(store) = store_or_skip("claim-race").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.put_link(&link("tok1")).await.unwrap(); // claims_allowed = 1
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+
+    // game is now pending + off the listable index; link slot consumed
+    assert_eq!(store.list_listable_games().await.unwrap(), vec![]);
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::Pending);
+    assert_eq!(g.claim_id.as_deref(), Some("c1"));
+
+    // second claim on the same game: game already pending → unavailable
+    store.put_link(&link("tok2")).await.unwrap();
+    let err = store.claim_game("tok2", &gid, "c2", now).await.unwrap_err();
+    assert!(matches!(err, ClaimTxError::GameUnavailable));
+
+    // exhausted link: tok1 had exactly 1 claim
+    store.put_game(&game(3, true)).await.unwrap();
+    let err = store
+        .claim_game("tok1", &game_id("gk3", "mn"), "c3", now)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ClaimTxError::LinkNotClaimable));
+}
+
+#[tokio::test]
+async fn fulfill_writes_gift_url_then_flips_game() {
+    let Some(store) = store_or_skip("fulfill").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.put_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+
+    store
+        .fulfill_claim(
+            "tok1",
+            "c1",
+            &gid,
+            "https://www.humblebundle.com/gift?key=x",
+        )
+        .await
+        .unwrap();
+
+    let c = store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Fulfilled);
+    assert_eq!(
+        c.gift_url.as_deref(),
+        Some("https://www.humblebundle.com/gift?key=x")
+    );
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::Gifted);
+}
+
+#[tokio::test]
+async fn compensate_returns_everything() {
+    let Some(store) = store_or_skip("compensate").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.put_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+
+    store.compensate_claim("tok1", "c1", &gid).await.unwrap();
+
+    // game listable again, link slot returned, claim marked compensated
+    assert_eq!(store.list_listable_games().await.unwrap().len(), 1);
+    let l = store.get_link("tok1").await.unwrap().unwrap();
+    assert_eq!(l.claims_used, 0);
+    let c = store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Compensated);
 }

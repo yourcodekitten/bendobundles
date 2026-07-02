@@ -6,8 +6,9 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
     ProjectionType, ScalarAttributeType,
 };
-use domain::{Claim, Game, Link};
+use domain::{Claim, ClaimState, Game, GameStatus, Link};
 use schema::{claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body};
+use time::OffsetDateTime;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -15,6 +16,18 @@ pub enum StoreError {
     Aws(String),
     #[error("corrupt item: {0}")]
     Corrupt(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClaimTxError {
+    #[error("game is not available")]
+    GameUnavailable,
+    #[error("link cannot claim (revoked/expired/exhausted)")]
+    LinkNotClaimable,
+    #[error("duplicate claim id")]
+    DuplicateClaim,
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 impl<E: std::fmt::Debug, R: std::fmt::Debug> From<aws_sdk_dynamodb::error::SdkError<E, R>>
@@ -146,6 +159,193 @@ impl Store {
             .send()
             .await?;
         out.item.map(|i| parse_body(&i)).transpose()
+    }
+
+    /// Atomic claim intake. Three-item transaction: GAME available→pending (removes listable GSI
+    /// attrs), LINK counter increment (conditions: not revoked, not expired, not exhausted),
+    /// CLAIM put (condition: attribute_not_exists = dedup).
+    /// Cancellation reasons map positionally to the three writes.
+    pub async fn claim_game(
+        &self,
+        link_token: &str,
+        game_id: &str,
+        claim_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), ClaimTxError> {
+        // read current bodies so the updated `body` JSON stays in sync with top-level attrs
+        let game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(ClaimTxError::GameUnavailable)?;
+        let link = self
+            .get_link(link_token)
+            .await?
+            .ok_or(ClaimTxError::LinkNotClaimable)?;
+
+        let mut pending = game.clone();
+        pending.status = GameStatus::Pending;
+        pending.claim_id = Some(claim_id.to_string());
+        let mut bumped = link.clone();
+        bumped.claims_used += 1;
+        let claim = domain::Claim {
+            id: claim_id.to_string(),
+            link_token: link_token.to_string(),
+            game_id: game_id.to_string(),
+            state: ClaimState::Pending,
+            gift_url: None,
+            created_at: now,
+        };
+        let now_ts = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+
+        let av_s = |v: &str| aws_sdk_dynamodb::types::AttributeValue::S(v.to_string());
+
+        let game_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", av_s(&game_pk(game_id)))
+            .key("sk", av_s("META"))
+            .update_expression("SET body = :b, #st = :pending REMOVE gsi1pk, gsi1sk")
+            .condition_expression("#st = :available")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(
+                ":b",
+                av_s(&serde_json::to_string(&pending).expect("game")),
+            )
+            .expression_attribute_values(":pending", av_s("pending"))
+            .expression_attribute_values(":available", av_s("available"))
+            .build()
+            .expect("game_update");
+        let link_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", av_s(&link_pk(link_token)))
+            .key("sk", av_s("META"))
+            .update_expression("SET body = :b ADD claims_used :one")
+            .condition_expression(
+                "revoked = :f AND claims_used < claims_allowed \
+                 AND (attribute_not_exists(expires_at) OR expires_at > :now)",
+            )
+            .expression_attribute_values(":b", av_s(&serde_json::to_string(&bumped).expect("link")))
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .expression_attribute_values(":f", aws_sdk_dynamodb::types::AttributeValue::Bool(false))
+            .expression_attribute_values(":now", av_s(&now_ts))
+            .build()
+            .expect("link_update");
+        let claim_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(schema::claim_item(&claim)))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .expect("claim_put");
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(game_update)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(link_update)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(claim_put)
+                    .build(),
+            )
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                // Capture debug string before borrowing sdk_err via as_service_error()
+                let err_str = format!("{sdk_err:?}");
+                // In aws-sdk-dynamodb 1.116.0 there is no as_transaction_canceled_exception();
+                // pattern-match directly on the public enum variant instead.
+                if let Some(
+                    aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(tce),
+                ) = sdk_err.as_service_error()
+                {
+                    let reasons = tce.cancellation_reasons();
+                    let failed = |i: usize| {
+                        reasons
+                            .get(i)
+                            .and_then(|r| r.code())
+                            .is_some_and(|c| c == "ConditionalCheckFailed")
+                    };
+                    if failed(0) {
+                        return Err(ClaimTxError::GameUnavailable);
+                    }
+                    if failed(1) {
+                        return Err(ClaimTxError::LinkNotClaimable);
+                    }
+                    if failed(2) {
+                        return Err(ClaimTxError::DuplicateClaim);
+                    }
+                }
+                Err(ClaimTxError::Store(StoreError::Aws(err_str)))
+            }
+        }
+    }
+
+    /// Spec invariant: gift URL becomes durable BEFORE the game flips to gifted.
+    pub async fn fulfill_claim(
+        &self,
+        link_token: &str,
+        claim_id: &str,
+        game_id: &str,
+        gift_url: &str,
+    ) -> Result<(), StoreError> {
+        let mut claim = self
+            .get_claim(link_token, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("fulfill: claim missing"))?;
+        claim.state = ClaimState::Fulfilled;
+        claim.gift_url = Some(gift_url.to_string());
+        self.put_claim(&claim).await?; // write 1: URL durable (claim_item drops pending-GSI attrs)
+
+        let mut game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(StoreError::Corrupt("fulfill: game missing"))?;
+        game.status = GameStatus::Gifted;
+        self.put_game(&game).await // write 2: game flips
+    }
+
+    pub async fn compensate_claim(
+        &self,
+        link_token: &str,
+        claim_id: &str,
+        game_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut claim = self
+            .get_claim(link_token, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("compensate: claim missing"))?;
+        claim.state = ClaimState::Compensated;
+        self.put_claim(&claim).await?;
+
+        let mut game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(StoreError::Corrupt("compensate: game missing"))?;
+        game.status = GameStatus::Available;
+        game.claim_id = None;
+        self.put_game(&game).await?; // put_game re-adds listable GSI attrs via game_item
+
+        let mut link = self
+            .get_link(link_token)
+            .await?
+            .ok_or(StoreError::Corrupt("compensate: link missing"))?;
+        link.claims_used = link.claims_used.saturating_sub(1);
+        self.put_link(&link).await
     }
 
     /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).
