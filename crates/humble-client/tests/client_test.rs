@@ -42,6 +42,7 @@ async fn parses_order_key_states() {
 
     let order = client(&server).await.order("AAAAbbbbCCCC").await.unwrap();
     assert_eq!(order.bundle_name, "Humble Indie Bundle 99");
+    assert_eq!(order.gamekey, "AAAAbbbbCCCC");
     assert_eq!(order.keys.len(), 3);
 
     let fresh = &order.keys[0];
@@ -60,6 +61,32 @@ async fn dead_cookie_is_unauthorized() {
     Mock::given(method("GET"))
         .and(path("/api/v1/user/order"))
         .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).await.gamekeys().await.unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Unauthorized));
+}
+
+#[tokio::test]
+async fn forbidden_is_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).await.gamekeys().await.unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Unauthorized));
+}
+
+#[tokio::test]
+async fn login_redirect_is_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(302).append_header("location", "/login"))
         .mount(&server)
         .await;
 
