@@ -76,7 +76,7 @@ async fn link_and_claim_roundtrip() {
     let Some(store) = store_or_skip("link-claim").await else {
         return;
     };
-    store.put_link(&link("tok1")).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
     assert_eq!(store.get_link("tok1").await.unwrap().unwrap(), link("tok1"));
 
     let claim = Claim {
@@ -98,7 +98,7 @@ async fn claim_happy_path_then_race_loses() {
         return;
     };
     store.put_game(&game(1, true)).await.unwrap();
-    store.put_link(&link("tok1")).await.unwrap(); // claims_allowed = 1
+    store.create_link(&link("tok1")).await.unwrap(); // claims_allowed = 1
     let now = datetime!(2026-07-02 12:00 UTC);
     let gid = game_id("gk1", "mn");
 
@@ -111,7 +111,7 @@ async fn claim_happy_path_then_race_loses() {
     assert_eq!(g.claim_id.as_deref(), Some("c1"));
 
     // second claim on the same game: game already pending → unavailable
-    store.put_link(&link("tok2")).await.unwrap();
+    store.create_link(&link("tok2")).await.unwrap();
     let err = store.claim_game("tok2", &gid, "c2", now).await.unwrap_err();
     assert!(matches!(err, ClaimTxError::GameUnavailable));
 
@@ -130,7 +130,7 @@ async fn fulfill_writes_gift_url_then_flips_game() {
         return;
     };
     store.put_game(&game(1, true)).await.unwrap();
-    store.put_link(&link("tok1")).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
     let now = datetime!(2026-07-02 12:00 UTC);
     let gid = game_id("gk1", "mn");
     store.claim_game("tok1", &gid, "c1", now).await.unwrap();
@@ -161,7 +161,7 @@ async fn compensate_returns_everything() {
         return;
     };
     store.put_game(&game(1, true)).await.unwrap();
-    store.put_link(&link("tok1")).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
     let now = datetime!(2026-07-02 12:00 UTC);
     let gid = game_id("gk1", "mn");
     store.claim_game("tok1", &gid, "c1", now).await.unwrap();
@@ -186,7 +186,7 @@ async fn hidden_game_is_unclaimable() {
     let mut g = game(1, true);
     g.hidden = true;
     store.put_game(&g).await.unwrap();
-    store.put_link(&link("tok1")).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
     let now = datetime!(2026-07-02 12:00 UTC);
 
     let err = store
@@ -205,7 +205,7 @@ async fn compensate_is_idempotent() {
     // counter: claim A (used=1), claim B (used=2), compensate A (used=1), compensate A again → 1.
     let mut lnk = link("tok1");
     lnk.claims_allowed = 2;
-    store.put_link(&lnk).await.unwrap();
+    store.create_link(&lnk).await.unwrap();
     store.put_game(&game(1, true)).await.unwrap(); // A
     store.put_game(&game(2, true)).await.unwrap(); // B
     let now = datetime!(2026-07-02 12:00 UTC);
@@ -241,6 +241,92 @@ async fn compensate_is_idempotent() {
 }
 
 #[tokio::test]
+async fn expired_link_rejected_numerically() {
+    let Some(store) = store_or_skip("expired-link").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    // expires_at in the past, stored as epoch-seconds N; claim_game's numeric `expires_at > :now`
+    // gate must reject it (the old lexicographic RFC3339 compare was the bug this guards).
+    let mut lnk = link("tok1");
+    lnk.expires_at = Some(datetime!(2020-01-01 00:00 UTC));
+    store.create_link(&lnk).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+
+    let err = store
+        .claim_game("tok1", &game_id("gk1", "mn"), "c1", now)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ClaimTxError::LinkNotClaimable));
+}
+
+#[tokio::test]
+async fn fulfill_flip_requires_ownership() {
+    let Some(store) = store_or_skip("fulfill-ownership").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+
+    // compensate returns the game to the pool: available, claim_id cleared, listable again.
+    store.compensate_claim("tok1", "c1", &gid).await.unwrap();
+    assert_eq!(store.list_listable_games().await.unwrap().len(), 1);
+
+    // a stale fulfill for the now-compensated claim must NOT flip the re-listed game to gifted.
+    let res = store
+        .fulfill_claim(
+            "tok1",
+            "c1",
+            &gid,
+            "https://www.humblebundle.com/gift?key=x",
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "stale fulfill after compensate must take the loud path, not silently flip: {res:?}"
+    );
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        g.status,
+        GameStatus::Available,
+        "re-listed game must stay available, never gifted"
+    );
+    assert_eq!(g.claim_id, None);
+}
+
+#[tokio::test]
+async fn compensate_transaction_is_atomic_idempotent() {
+    let Some(store) = store_or_skip("compensate-atomic").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap(); // claims_allowed = 1
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+    assert_eq!(
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        1
+    );
+
+    // compensate, then compensate again: both Ok, counter decremented EXACTLY once, game listable
+    // EXACTLY once — the all-or-nothing transaction makes the retry a clean idempotent no-op.
+    store.compensate_claim("tok1", "c1", &gid).await.unwrap();
+    store.compensate_claim("tok1", "c1", &gid).await.unwrap();
+
+    let l = store.get_link("tok1").await.unwrap().unwrap();
+    assert_eq!(l.claims_used, 0, "counter decremented exactly once");
+    let listable = store.list_listable_games().await.unwrap();
+    assert_eq!(listable.len(), 1, "game listable exactly once");
+    assert_eq!(listable[0].id, gid);
+    let c = store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Compensated);
+}
+
+#[tokio::test]
 async fn claim_concurrent_counter_is_authoritative() {
     let Some(store) = store_or_skip("claim-concurrent").await else {
         return;
@@ -249,7 +335,7 @@ async fn claim_concurrent_counter_is_authoritative() {
     // Link with 2 slots; two available games.
     let mut lnk = link("tok-cc");
     lnk.claims_allowed = 2;
-    store.put_link(&lnk).await.unwrap();
+    store.create_link(&lnk).await.unwrap();
     store.put_game(&game(20, true)).await.unwrap();
     store.put_game(&game(21, true)).await.unwrap();
 

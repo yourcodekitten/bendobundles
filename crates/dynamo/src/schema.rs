@@ -2,6 +2,7 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use domain::{Claim, ClaimState, Game, Link};
 use std::collections::HashMap;
+use time::OffsetDateTime;
 
 pub const GSI_LISTABLE: &str = "listable";
 pub const GSI_PENDING: &str = "pending-claims";
@@ -16,8 +17,26 @@ pub fn claim_sk(claim_id: &str) -> String {
     format!("CLAIM#{claim_id}")
 }
 
-fn s(v: impl Into<String>) -> AttributeValue {
+pub(crate) fn s(v: impl Into<String>) -> AttributeValue {
     AttributeValue::S(v.into())
+}
+
+/// Encode a timestamp as a numeric (epoch **seconds**) AttributeValue. Use this everywhere a time
+/// enters a top-level attribute or a condition compare, so expiry math is numeric — never a
+/// fractional-second-width-sensitive, offset-sensitive lexicographic string compare. (The claim's
+/// `gsi2sk` is the one deliberate exception — ordering only; see `claim_item`.)
+pub(crate) fn epoch_s(t: OffsetDateTime) -> AttributeValue {
+    AttributeValue::N(t.unix_timestamp().to_string())
+}
+
+/// Build the (pk, sk) primary-key AttributeValues for a single-item get/update. The key *names*
+/// are always the literals `"pk"`/`"sk"`; this just kills the repeated `AttributeValue::S(..)` at
+/// call sites.
+pub(crate) fn key_pair(
+    pk: impl Into<String>,
+    sk: impl Into<String>,
+) -> (AttributeValue, AttributeValue) {
+    (s(pk), s(sk))
 }
 
 pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
@@ -37,6 +56,11 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
             .expect("status is a string")
             .to_string()),
     );
+    // Top-level `claim_id` mirrors the body so fulfill's flip can condition on ownership
+    // (`claim_id = :cid`). Omitted when None so compensate's re-list transparently clears it.
+    if let Some(cid) = &g.claim_id {
+        item.insert("claim_id".into(), s(cid));
+    }
     if g.is_listable() {
         item.insert("gsi1pk".into(), s("LISTABLE"));
         item.insert(
@@ -69,11 +93,10 @@ pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
         ),
         ("revoked".into(), AttributeValue::Bool(l.revoked)),
     ]);
+    // expires_at is numeric (epoch seconds), so claim_game's expiry gate is a numeric compare.
+    // Omitted when None (never-expires); update_link_meta REMOVEs it to match.
     if let Some(exp) = l.expires_at {
-        let ts = exp
-            .format(&time::format_description::well_known::Rfc3339)
-            .expect("rfc3339");
-        item.insert("expires_at".into(), s(ts));
+        item.insert("expires_at".into(), epoch_s(exp));
     }
     item
 }
@@ -89,6 +112,8 @@ pub fn claim_item(c: &Claim) -> HashMap<String, AttributeValue> {
     ]);
     if c.state == ClaimState::Pending {
         item.insert("gsi2pk".into(), s("PENDINGCLAIM"));
+        // gsi2sk stays RFC3339: it only ORDERS pending claims in the index, it is never an
+        // expiry/enforcer compare — so the string form is fine here (unlike link expires_at).
         let ts = c
             .created_at
             .format(&time::format_description::well_known::Rfc3339)
