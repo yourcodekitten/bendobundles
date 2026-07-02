@@ -10,18 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     services:
       dynamodb:
-        image: amazon/dynamodb-local:latest
+        image: amazon/dynamodb-local:2.5.2
         ports: ["8000:8000"]
     env:
       DYNAMODB_LOCAL_URL: http://localhost:8000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace

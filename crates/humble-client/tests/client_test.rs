@@ -107,6 +107,7 @@ async fn redeems_as_gift() {
         .and(path("/humbler/redeemkey"))
         .and(body_string_contains("keytype=stardew_valley_steam"))
         .and(body_string_contains("key=AAAAbbbbCCCC"))
+        .and(body_string_contains("keyindex=0"))
         .and(body_string_contains("gift=true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true,
@@ -140,4 +141,25 @@ async fn already_redeemed_is_typed() {
         .await
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::AlreadyRedeemed));
+}
+
+#[tokio::test]
+async fn ambiguous_redeem_is_typed() {
+    // success=true but NO giftkey: humble claims it worked yet handed back nothing. The key may
+    // have burned server-side — this must be its own typed outcome, never AlreadyRedeemed.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "stardew_valley_steam")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::AmbiguousRedeem));
 }

@@ -26,6 +26,10 @@ pub enum HumbleError {
     RateLimited,
     #[error("key already redeemed on humble")]
     AlreadyRedeemed,
+    #[error(
+        "humble reported success but returned no gift key — outcome ambiguous, do not retry blindly"
+    )]
+    AmbiguousRedeem,
     #[error("humble returned status {0}")]
     Api(u16),
     #[error("network error talking to humble: {0}")]
@@ -156,7 +160,12 @@ impl HumbleClient {
                     (true, Some(token)) => Ok(GiftUrl(format!(
                         "https://www.humblebundle.com/gift?key={token}"
                     ))),
-                    _ => Err(HumbleError::AlreadyRedeemed),
+                    // AmbiguousRedeem: possible API drift where humble claims success but hands
+                    // back no key — the key MAY have already burned server-side. Callers must
+                    // PARK and reconcile, never compensate: compensating would re-list a key that
+                    // could be spent, double-gifting it. Distinct from AlreadyRedeemed on purpose.
+                    (true, None) => Err(HumbleError::AmbiguousRedeem),
+                    (false, _) => Err(HumbleError::AlreadyRedeemed),
                 }
             }
             401 | 403 | 302 => Err(HumbleError::Unauthorized),

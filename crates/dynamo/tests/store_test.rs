@@ -177,6 +177,70 @@ async fn compensate_returns_everything() {
 }
 
 #[tokio::test]
+async fn hidden_game_is_unclaimable() {
+    let Some(store) = store_or_skip("claim-hidden").await else {
+        return;
+    };
+    // Available + giftable but hidden → is_listable() false → no sparse gsi1pk marker, even though
+    // status is still "available". The race-free listability gate must reject the claim.
+    let mut g = game(1, true);
+    g.hidden = true;
+    store.put_game(&g).await.unwrap();
+    store.put_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+
+    let err = store
+        .claim_game("tok1", &game_id("gk1", "mn"), "c1", now)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ClaimTxError::GameUnavailable));
+}
+
+#[tokio::test]
+async fn compensate_is_idempotent() {
+    let Some(store) = store_or_skip("compensate-idem").await else {
+        return;
+    };
+    // Link with 2 slots so a single compensate vs a double compensate is distinguishable in the
+    // counter: claim A (used=1), claim B (used=2), compensate A (used=1), compensate A again → 1.
+    let mut lnk = link("tok1");
+    lnk.claims_allowed = 2;
+    store.put_link(&lnk).await.unwrap();
+    store.put_game(&game(1, true)).await.unwrap(); // A
+    store.put_game(&game(2, true)).await.unwrap(); // B
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let a = game_id("gk1", "mn");
+    let b = game_id("gk2", "mn");
+
+    store.claim_game("tok1", &a, "cA", now).await.unwrap();
+    store.claim_game("tok1", &b, "cB", now).await.unwrap();
+    assert_eq!(
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        2
+    );
+
+    // first compensate: counter 2 → 1, game A re-listed
+    store.compensate_claim("tok1", "cA", &a).await.unwrap();
+    assert_eq!(
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        1
+    );
+
+    // second compensate on the SAME claim: Ok, but must NOT decrement again (retry-after-success)
+    store.compensate_claim("tok1", "cA", &a).await.unwrap();
+    assert_eq!(
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        1,
+        "second compensate must not double-decrement the link counter"
+    );
+
+    // game A is listable again exactly once; B is still pending (not listable)
+    let listable = store.list_listable_games().await.unwrap();
+    assert_eq!(listable.len(), 1, "game A re-listed exactly once");
+    assert_eq!(listable[0].id, a);
+}
+
+#[tokio::test]
 async fn claim_concurrent_counter_is_authoritative() {
     let Some(store) = store_or_skip("claim-concurrent").await else {
         return;
