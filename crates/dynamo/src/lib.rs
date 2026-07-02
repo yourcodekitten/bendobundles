@@ -370,24 +370,27 @@ impl Store {
         match put_res {
             Ok(_) => {}
             Err(sdk_err) => {
-                if let Some(
-                    aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(_),
-                ) = sdk_err.as_service_error()
-                {
-                    let current = self
-                        .get_claim(link_token, claim_id)
-                        .await?
-                        .ok_or(StoreError::Corrupt("fulfill: claim missing on recheck"))?;
-                    if current.state != ClaimState::Fulfilled {
-                        return Err(StoreError::Corrupt(
-                            "fulfill lost to compensate — gift URL needs manual/reconcile recovery",
-                        ));
-                    }
-                    // idempotent retry: URL already durable. Fall through to re-attempt the
-                    // (idempotent) game flip — a transient write-2 failure on the prior attempt
-                    // may have left the game stranded in pending.
+                let lost_condition = matches!(
+                    sdk_err.as_service_error(),
+                    Some(
+                        aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(_)
+                    )
+                );
+                if !lost_condition {
+                    return Err(StoreError::Aws(format!("{sdk_err:?}")));
                 }
-                return Err(StoreError::Aws(format!("{sdk_err:?}")));
+                let current = self
+                    .get_claim(link_token, claim_id)
+                    .await?
+                    .ok_or(StoreError::Corrupt("fulfill: claim missing on recheck"))?;
+                if current.state != ClaimState::Fulfilled {
+                    return Err(StoreError::Corrupt(
+                        "fulfill lost to compensate — gift URL needs manual/reconcile recovery",
+                    ));
+                }
+                // idempotent retry: URL already durable. Fall through to re-attempt the
+                // (idempotent) game flip — a transient write-2 failure on the prior attempt
+                // may have left the game stranded in pending.
             }
         }
 
