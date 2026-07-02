@@ -378,14 +378,14 @@ impl Store {
                         .get_claim(link_token, claim_id)
                         .await?
                         .ok_or(StoreError::Corrupt("fulfill: claim missing on recheck"))?;
-                    if current.state == ClaimState::Fulfilled {
-                        // idempotent retry: URL already durable. Skip the flip — it already
-                        // happened, or the winning fulfill's own retry path will complete it.
-                        return Ok(());
+                    if current.state != ClaimState::Fulfilled {
+                        return Err(StoreError::Corrupt(
+                            "fulfill lost to compensate — gift URL needs manual/reconcile recovery",
+                        ));
                     }
-                    return Err(StoreError::Corrupt(
-                        "fulfill lost to compensate — gift URL needs manual/reconcile recovery",
-                    ));
+                    // idempotent retry: URL already durable. Fall through to re-attempt the
+                    // (idempotent) game flip — a transient write-2 failure on the prior attempt
+                    // may have left the game stranded in pending.
                 }
                 return Err(StoreError::Aws(format!("{sdk_err:?}")));
             }
