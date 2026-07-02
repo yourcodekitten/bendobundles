@@ -130,7 +130,8 @@ async fn already_redeemed_is_typed() {
     Mock::given(method("POST"))
         .and(path("/humbler/redeemkey"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": false
+            "success": false,
+            "errormsg": "This key has already been redeemed."
         })))
         .mount(&server)
         .await;
@@ -141,6 +142,65 @@ async fn already_redeemed_is_typed() {
         .await
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::AlreadyRedeemed));
+}
+
+#[tokio::test]
+async fn refused_redeem_is_typed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "errormsg": "Gifting is disabled for this product."
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        humble_client::HumbleError::RedeemRefused(ref msg) if msg == "Gifting is disabled for this product."
+    ));
+}
+
+#[tokio::test]
+async fn malformed_redeem_is_parse_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "giftkey": "x"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Parse(_)));
+}
+
+#[tokio::test]
+async fn html_200_is_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<!DOCTYPE html><html>login</html>")
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client(&server).await.gamekeys().await.unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Unauthorized));
 }
 
 #[tokio::test]

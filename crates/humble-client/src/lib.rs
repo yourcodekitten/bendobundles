@@ -26,6 +26,13 @@ pub enum HumbleError {
     RateLimited,
     #[error("key already redeemed on humble")]
     AlreadyRedeemed,
+    /// Humble returned success=false with a reason that is not "already redeemed".
+    /// Refusal reasons vary (non-giftable, gifting disabled, transient) — the exact
+    /// already-redeemed phrasing is community-documented, unverified against the live API until
+    /// the first real gifting; callers must treat RedeemRefused conservatively (park, don't
+    /// assume the key survives or burned).
+    #[error("humble refused the redeem: {0}")]
+    RedeemRefused(String),
     #[error(
         "humble reported success but returned no gift key — outcome ambiguous, do not retry blindly"
     )]
@@ -35,7 +42,7 @@ pub enum HumbleError {
     #[error("network error talking to humble: {0}")]
     Network(#[from] reqwest::Error),
     #[error("could not parse humble response: {0}")]
-    Parse(#[from] serde_json::Error),
+    Parse(serde_json::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,10 +67,31 @@ pub struct GiftUrl(pub String);
 
 #[derive(serde::Deserialize)]
 struct RedeemResponse {
-    #[serde(default)]
+    // No #[serde(default)] — a 200 body missing `success` must be a parse error, not silently
+    // treated as failure.
     success: bool,
     #[serde(default)]
     giftkey: Option<String>,
+    #[serde(default)]
+    errormsg: Option<String>,
+}
+
+/// Decode a response body as JSON. On serde failure, detect HTML login interstitials
+/// (humble sometimes serves a 200 with HTML when the session cookie is stale) and surface
+/// them as Unauthorized rather than a confusing Parse error.
+fn decode_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, HumbleError> {
+    serde_json::from_slice::<T>(bytes).map_err(|e| {
+        let first_nonws = bytes
+            .iter()
+            .find(|&&b| !b.is_ascii_whitespace())
+            .copied()
+            .unwrap_or(0);
+        if first_nonws == b'<' {
+            HumbleError::Unauthorized
+        } else {
+            HumbleError::Parse(e)
+        }
+    })
 }
 
 pub struct HumbleClient {
@@ -96,7 +124,10 @@ impl HumbleClient {
             .send()
             .await?;
         match resp.status().as_u16() {
-            200 => Ok(resp.json::<T>().await?),
+            200 => {
+                let bytes = resp.bytes().await?;
+                decode_body(&bytes)
+            }
             401 | 403 | 302 => Err(HumbleError::Unauthorized),
             429 => Err(HumbleError::RateLimited),
             s => Err(HumbleError::Api(s)),
@@ -145,6 +176,11 @@ impl HumbleClient {
             .post(format!("{}/humbler/redeemkey", self.base))
             .header("Cookie", format!("_simpleauth_sess={}", self.cookie.0))
             .header("X-Requested-By", "hb_android_app")
+            // keyindex semantics are unverified against the live endpoint — community tooling
+            // passes keytype=<machine_name> as the selector and keyindex=0 regardless of position;
+            // if humble actually selects by index, multi-key orders would gift the wrong entry.
+            // VERIFY on the first real gifting of a non-first key in an order (the read-only probe
+            // cannot test redeems by design) — tracked for the plan-2 live receipt.
             .form(&[
                 ("keytype", machine_name),
                 ("key", gamekey),
@@ -155,7 +191,8 @@ impl HumbleClient {
             .await?;
         match resp.status().as_u16() {
             200 => {
-                let body: RedeemResponse = resp.json().await?;
+                let bytes = resp.bytes().await?;
+                let body: RedeemResponse = decode_body(&bytes)?;
                 match (body.success, body.giftkey) {
                     (true, Some(token)) => Ok(GiftUrl(format!(
                         "https://www.humblebundle.com/gift?key={token}"
@@ -165,7 +202,22 @@ impl HumbleClient {
                     // PARK and reconcile, never compensate: compensating would re-list a key that
                     // could be spent, double-gifting it. Distinct from AlreadyRedeemed on purpose.
                     (true, None) => Err(HumbleError::AmbiguousRedeem),
-                    (false, _) => Err(HumbleError::AlreadyRedeemed),
+                    (false, _) => {
+                        let msg = body
+                            .errormsg
+                            .unwrap_or_else(|| "no error message".to_string());
+                        // Community-documented phrase: "This key has already been redeemed."
+                        // Belt-and-suspenders: also catch if humble ever shortens it to
+                        // "already redeemed" without "been".
+                        let lower = msg.to_lowercase();
+                        if lower.contains("already been redeemed")
+                            || lower.contains("already redeemed")
+                        {
+                            Err(HumbleError::AlreadyRedeemed)
+                        } else {
+                            Err(HumbleError::RedeemRefused(msg))
+                        }
+                    }
                 }
             }
             401 | 403 | 302 => Err(HumbleError::Unauthorized),
