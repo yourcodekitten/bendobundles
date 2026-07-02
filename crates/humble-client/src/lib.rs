@@ -24,6 +24,8 @@ pub enum HumbleError {
     Unauthorized,
     #[error("humble rate-limited us")]
     RateLimited,
+    #[error("key already redeemed on humble")]
+    AlreadyRedeemed,
     #[error("humble returned status {0}")]
     Api(u16),
     #[error("network error talking to humble: {0}")]
@@ -47,6 +49,17 @@ pub struct KeyEntry {
     pub redeemed: bool,
     pub expired: bool,
     pub giftable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GiftUrl(pub String);
+
+#[derive(serde::Deserialize)]
+struct RedeemResponse {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    giftkey: Option<String>,
 }
 
 pub struct HumbleClient {
@@ -116,5 +129,39 @@ impl HumbleClient {
                 })
                 .collect(),
         })
+    }
+
+    pub async fn redeem_as_gift(
+        &self,
+        gamekey: &str,
+        machine_name: &str,
+    ) -> Result<GiftUrl, HumbleError> {
+        let resp = self
+            .http
+            .post(format!("{}/humbler/redeemkey", self.base))
+            .header("Cookie", format!("_simpleauth_sess={}", self.cookie.0))
+            .header("X-Requested-By", "hb_android_app")
+            .form(&[
+                ("keytype", machine_name),
+                ("key", gamekey),
+                ("keyindex", "0"),
+                ("gift", "true"),
+            ])
+            .send()
+            .await?;
+        match resp.status().as_u16() {
+            200 => {
+                let body: RedeemResponse = resp.json().await?;
+                match (body.success, body.giftkey) {
+                    (true, Some(token)) => Ok(GiftUrl(format!(
+                        "https://www.humblebundle.com/gift?key={token}"
+                    ))),
+                    _ => Err(HumbleError::AlreadyRedeemed),
+                }
+            }
+            401 | 403 | 302 => Err(HumbleError::Unauthorized),
+            429 => Err(HumbleError::RateLimited),
+            s => Err(HumbleError::Api(s)),
+        }
     }
 }

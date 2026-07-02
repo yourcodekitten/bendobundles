@@ -1,5 +1,5 @@
 use humble_client::{HumbleClient, SessionCookie};
-use wiremock::matchers::{header, method, path, query_param};
+use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -98,4 +98,46 @@ async fn login_redirect_is_unauthorized() {
 fn cookie_redacts_in_debug() {
     let c = SessionCookie::new("sekrit".into());
     assert_eq!(format!("{c:?}"), "SessionCookie(REDACTED)");
+}
+
+#[tokio::test]
+async fn redeems_as_gift() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .and(body_string_contains("keytype=stardew_valley_steam"))
+        .and(body_string_contains("key=AAAAbbbbCCCC"))
+        .and(body_string_contains("gift=true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "giftkey": "g1ftt0k3n"
+        })))
+        .mount(&server)
+        .await;
+
+    let gift = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "stardew_valley_steam")
+        .await
+        .unwrap();
+    assert_eq!(gift.0, "https://www.humblebundle.com/gift?key=g1ftt0k3n");
+}
+
+#[tokio::test]
+async fn already_redeemed_is_typed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "already_revealed_steam")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::AlreadyRedeemed));
 }
