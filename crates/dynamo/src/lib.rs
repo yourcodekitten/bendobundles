@@ -1,0 +1,682 @@
+//! DynamoDB storage. Single table; see schema.rs for the item contract.
+pub mod schema;
+
+use aws_sdk_dynamodb::Client;
+use aws_sdk_dynamodb::types::{
+    AttributeDefinition, BillingMode, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
+    ProjectionType, ScalarAttributeType,
+};
+use domain::{Claim, ClaimState, Game, GameStatus, Link};
+use schema::{claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body};
+use time::OffsetDateTime;
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("dynamodb error: {0}")]
+    Aws(String),
+    #[error("corrupt item: {0}")]
+    Corrupt(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClaimTxError {
+    #[error("game is not available")]
+    GameUnavailable,
+    #[error("link cannot claim (revoked/expired/exhausted)")]
+    LinkNotClaimable,
+    #[error("duplicate claim id")]
+    DuplicateClaim,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+impl<E: std::fmt::Debug, R: std::fmt::Debug> From<aws_sdk_dynamodb::error::SdkError<E, R>>
+    for StoreError
+{
+    fn from(e: aws_sdk_dynamodb::error::SdkError<E, R>) -> Self {
+        StoreError::Aws(format!("{e:?}"))
+    }
+}
+
+/// Single home for the "a PutItem's condition failed" test. A failed condition on a guarded put is
+/// the designed idempotent-no-op / dedup signal (marker already consumed, item already exists,
+/// ownership already moved) — everywhere that policy lives, it asks this one predicate.
+fn is_ccf_put<R>(
+    e: &aws_sdk_dynamodb::error::SdkError<aws_sdk_dynamodb::operation::put_item::PutItemError, R>,
+) -> bool {
+    matches!(
+        e.as_service_error(),
+        Some(
+            aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(_)
+        )
+    )
+}
+
+pub struct Store {
+    client: Client,
+    table: String,
+}
+
+impl Store {
+    pub fn new(client: Client, table: String) -> Self {
+        Self { client, table }
+    }
+
+    /// Unconditional full-item upsert of a game. NOT safe as a sync-upsert onto an in-flight
+    /// (pending) game — it clobbers status/claim_id and re-adds/removes the listable GSI attrs
+    /// wholesale. Plan 2's catalog sync MUST guard (skip or condition on status) before calling
+    /// this on games that may be mid-claim.
+    pub async fn put_game(&self, g: &Game) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(g)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_game(&self, id: &str) -> Result<Option<Game>, StoreError> {
+        self.get_meta(&game_pk(id)).await
+    }
+
+    /// Create a fresh link. PutItem conditioned `attribute_not_exists(pk)` so it initializes the
+    /// authoritative top-level `claims_used` counter exactly once — a legitimate write of the
+    /// counter, the ONLY one that sets it. ConditionalCheckFailed → the token already exists
+    /// (`Corrupt`): a re-create would clobber a live counter, so we refuse.
+    pub async fn create_link(&self, l: &Link) -> Result<(), StoreError> {
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(link_item(l)))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Err(StoreError::Corrupt("link token already exists"))
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
+    /// Update a link's mutable metadata (body, claims_allowed, revoked, expires_at) via a scoped
+    /// UpdateItem that NEVER touches the top-level `claims_used` counter. The counter is only ever
+    /// moved by `claim_game`'s atomic ADD and `compensate_claim`'s transactional decrement;
+    /// `get_link` overrides body's (possibly stale) counter on read. A full-item put would clobber
+    /// the enforcer's truth — hence this narrow SET/REMOVE. expires_at is written numerically
+    /// (epoch seconds) when Some and REMOVEd when None, matching `link_item`.
+    pub async fn update_link_meta(&self, l: &Link) -> Result<(), StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(&l.token), "META");
+        let expr = if l.expires_at.is_some() {
+            "SET body = :b, claims_allowed = :ca, revoked = :r, expires_at = :exp"
+        } else {
+            "SET body = :b, claims_allowed = :ca, revoked = :r REMOVE expires_at"
+        };
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .update_expression(expr)
+            .expression_attribute_values(
+                ":b",
+                schema::s(serde_json::to_string(l).expect("link serializes")),
+            )
+            .expression_attribute_values(
+                ":ca",
+                aws_sdk_dynamodb::types::AttributeValue::N(l.claims_allowed.to_string()),
+            )
+            .expression_attribute_values(
+                ":r",
+                aws_sdk_dynamodb::types::AttributeValue::Bool(l.revoked),
+            );
+        if let Some(exp) = l.expires_at {
+            req = req.expression_attribute_values(":exp", schema::epoch_s(exp));
+        }
+        req.send().await?;
+        Ok(())
+    }
+
+    pub async fn get_link(&self, token: &str) -> Result<Option<Link>, StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(token), "META");
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        out.item
+            .map(|item| {
+                let mut link: Link = parse_body(&item)?;
+                // Top-level `claims_used` (N) is the authoritative counter — updated atomically
+                // via ADD in claim_game's transaction. Override body's potentially stale value.
+                if let Some(n) = item.get("claims_used").and_then(|v| v.as_n().ok())
+                    && let Ok(v) = n.parse::<u32>()
+                {
+                    link.claims_used = v;
+                }
+                Ok(link)
+            })
+            .transpose()
+    }
+
+    pub async fn put_claim(&self, c: &Claim) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(c)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_claim(
+        &self,
+        link_token: &str,
+        claim_id: &str,
+    ) -> Result<Option<Claim>, StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(link_token), claim_sk(claim_id));
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        out.item.map(|i| parse_body(&i)).transpose()
+    }
+
+    /// Single Query page (DynamoDB's 1 MB / page cap, no pagination). Fine at this app's scale —
+    /// one person's giftable-game catalog is small — but do NOT assume completeness at larger
+    /// scale: a bigger listable set would need `.into_paginator()` to be exhaustive.
+    pub async fn list_listable_games(&self) -> Result<Vec<Game>, StoreError> {
+        let out = self
+            .client
+            .query()
+            .table_name(&self.table)
+            .index_name(schema::GSI_LISTABLE)
+            .key_condition_expression("gsi1pk = :p")
+            .expression_attribute_values(
+                ":p",
+                aws_sdk_dynamodb::types::AttributeValue::S("LISTABLE".into()),
+            )
+            .send()
+            .await?;
+        out.items().iter().map(parse_body).collect()
+    }
+
+    pub async fn claims_for_link(&self, token: &str) -> Result<Vec<Claim>, StoreError> {
+        let out = self
+            .client
+            .query()
+            .table_name(&self.table)
+            .key_condition_expression("pk = :p AND begins_with(sk, :c)")
+            .expression_attribute_values(
+                ":p",
+                aws_sdk_dynamodb::types::AttributeValue::S(link_pk(token)),
+            )
+            .expression_attribute_values(
+                ":c",
+                aws_sdk_dynamodb::types::AttributeValue::S("CLAIM#".into()),
+            )
+            .send()
+            .await?;
+        out.items().iter().map(parse_body).collect()
+    }
+
+    async fn get_meta<T: serde::de::DeserializeOwned>(
+        &self,
+        pk: &str,
+    ) -> Result<Option<T>, StoreError> {
+        let (pk, sk) = schema::key_pair(pk, "META");
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        out.item.map(|i| parse_body(&i)).transpose()
+    }
+
+    /// Atomic claim intake. Three-item transaction: GAME available→pending (removes listable GSI
+    /// attrs), LINK counter increment (conditions: not revoked, not expired, not exhausted),
+    /// CLAIM put (condition: attribute_not_exists = dedup).
+    /// Cancellation reasons map positionally to the three writes.
+    pub async fn claim_game(
+        &self,
+        link_token: &str,
+        game_id: &str,
+        claim_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), ClaimTxError> {
+        // read current bodies so the updated `body` JSON stays in sync with top-level attrs
+        let game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(ClaimTxError::GameUnavailable)?;
+        let link = self
+            .get_link(link_token)
+            .await?
+            .ok_or(ClaimTxError::LinkNotClaimable)?;
+
+        let mut pending = game.clone();
+        pending.status = GameStatus::Pending;
+        pending.claim_id = Some(claim_id.to_string());
+        let mut bumped = link.clone();
+        bumped.claims_used += 1;
+        let claim = domain::Claim {
+            id: claim_id.to_string(),
+            link_token: link_token.to_string(),
+            game_id: game_id.to_string(),
+            state: ClaimState::Pending,
+            gift_url: None,
+            created_at: now,
+        };
+        let av_s = |v: &str| aws_sdk_dynamodb::types::AttributeValue::S(v.to_string());
+
+        let game_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", av_s(&game_pk(game_id)))
+            .key("sk", av_s("META"))
+            // Also stamp the top-level `claim_id` so fulfill's flip can later assert ownership
+            // (`claim_id = :cid`); compensate's re-list clears it (game_item omits None).
+            .update_expression(
+                "SET body = :b, #st = :pending, claim_id = :cid REMOVE gsi1pk, gsi1sk",
+            )
+            // Gate on the sparse listable marker too, not just status. `gsi1pk` exists iff
+            // available ∧ giftable ∧ ¬hidden (schema::game_item). Requiring it here closes the
+            // TOCTOU where a friend claims a game Ben just hid: hiding drops gsi1pk, so this
+            // condition fails race-free even while status is momentarily still "available".
+            .condition_expression("#st = :available AND attribute_exists(gsi1pk)")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(
+                ":b",
+                av_s(&serde_json::to_string(&pending).expect("game")),
+            )
+            .expression_attribute_values(":pending", av_s("pending"))
+            .expression_attribute_values(":available", av_s("available"))
+            .expression_attribute_values(":cid", av_s(claim_id))
+            .build()
+            .expect("game_update");
+        let link_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", av_s(&link_pk(link_token)))
+            .key("sk", av_s("META"))
+            .update_expression("SET body = :b ADD claims_used :one")
+            // expires_at is numeric (epoch seconds via schema::epoch_s), so `expires_at > :now` is a
+            // true numeric compare — immune to fractional-second width and non-UTC offset bugs that
+            // a lexicographic RFC3339 string compare would suffer.
+            .condition_expression(
+                "revoked = :f AND claims_used < claims_allowed \
+                 AND (attribute_not_exists(expires_at) OR expires_at > :now)",
+            )
+            .expression_attribute_values(":b", av_s(&serde_json::to_string(&bumped).expect("link")))
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .expression_attribute_values(":f", aws_sdk_dynamodb::types::AttributeValue::Bool(false))
+            .expression_attribute_values(":now", schema::epoch_s(now))
+            .build()
+            .expect("link_update");
+        let claim_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(schema::claim_item(&claim)))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .expect("claim_put");
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(game_update)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(link_update)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(claim_put)
+                    .build(),
+            )
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                // Capture debug string before borrowing sdk_err via as_service_error()
+                let err_str = format!("{sdk_err:?}");
+                // In aws-sdk-dynamodb 1.116.0 there is no as_transaction_canceled_exception();
+                // pattern-match directly on the public enum variant instead.
+                if let Some(
+                    aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(tce),
+                ) = sdk_err.as_service_error()
+                {
+                    let reasons = tce.cancellation_reasons();
+                    let failed = |i: usize| {
+                        reasons
+                            .get(i)
+                            .and_then(|r| r.code())
+                            .is_some_and(|c| c == "ConditionalCheckFailed")
+                    };
+                    if failed(0) {
+                        return Err(ClaimTxError::GameUnavailable);
+                    }
+                    if failed(1) {
+                        return Err(ClaimTxError::LinkNotClaimable);
+                    }
+                    if failed(2) {
+                        return Err(ClaimTxError::DuplicateClaim);
+                    }
+                }
+                Err(ClaimTxError::Store(StoreError::Aws(err_str)))
+            }
+        }
+    }
+
+    /// Spec invariant: gift URL becomes durable BEFORE the game flips to gifted.
+    ///
+    /// Idempotent + mutually exclusive with `compensate_claim`. Both race for the CLAIM's pending
+    /// marker (`gsi2pk`, present iff `state == Pending`); a conditional put consumes it, so exactly
+    /// one of the two wins. A fulfill that finds the marker already gone rechecks the claim: if it
+    /// reads `Fulfilled`, that's an idempotent retry (Ok); if it reads anything else, compensate
+    /// won and this is a LOUD unrecoverable-by-code error — the gift URL exists but the game was
+    /// re-listed, needing manual/reconcile recovery.
+    ///
+    /// Write 2 (the game flip) additionally gates on `claim_id = :cid`, not just `status = pending`:
+    /// the game must still be OWNED by this claim. If it isn't — already flipped, or the game was
+    /// legitimately re-listed by compensate and re-claimed by a different claim — the flip is a
+    /// no-op (Ok), so a stale fulfill can never hijack another claim's game or resurrect a gifted
+    /// one. See `flip_game_from_pending`.
+    pub async fn fulfill_claim(
+        &self,
+        link_token: &str,
+        claim_id: &str,
+        game_id: &str,
+        gift_url: &str,
+    ) -> Result<(), StoreError> {
+        let mut claim = self
+            .get_claim(link_token, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("fulfill: claim missing"))?;
+        claim.state = ClaimState::Fulfilled;
+        claim.gift_url = Some(gift_url.to_string());
+
+        // write 1: URL durable. Conditional on the pending marker so fulfill/compensate can't both
+        // land. Overwriting with a Fulfilled claim drops gsi2pk (claim_item), consuming the marker.
+        let put_res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(&claim)))
+            .condition_expression("attribute_exists(gsi2pk)")
+            .send()
+            .await;
+        match put_res {
+            Ok(_) => {}
+            Err(sdk_err) => {
+                if !is_ccf_put(&sdk_err) {
+                    return Err(StoreError::Aws(format!("{sdk_err:?}")));
+                }
+                let current = self
+                    .get_claim(link_token, claim_id)
+                    .await?
+                    .ok_or(StoreError::Corrupt("fulfill: claim missing on recheck"))?;
+                if current.state != ClaimState::Fulfilled {
+                    return Err(StoreError::Corrupt(
+                        "fulfill lost to compensate — gift URL needs manual/reconcile recovery",
+                    ));
+                }
+                // idempotent retry: URL already durable. Fall through to re-attempt the
+                // (idempotent) game flip — a transient write-2 failure on the prior attempt
+                // may have left the game stranded in pending.
+            }
+        }
+
+        // write 2: game flips pending → gifted, gated on ownership (claim_id = :cid).
+        self.flip_game_from_pending(game_id, Some(claim_id), GameStatus::Gifted)
+            .await
+    }
+
+    /// Flip a game out of `pending` to a terminal `new_status` via a guarded full-item put. The
+    /// condition is always `status = pending`; when `claim_id` is `Some`, it ALSO requires the
+    /// game still carries that top-level `claim_id`, so the caller only touches a game it still
+    /// owns. A failed condition (already flipped, or ownership moved after a re-list+re-claim) is
+    /// the designed idempotent no-op → `Ok(())`. (compensate's re-list runs inside its own
+    /// TransactWriteItems and so does NOT use this helper.)
+    async fn flip_game_from_pending(
+        &self,
+        game_id: &str,
+        claim_id: Option<&str>,
+        new_status: GameStatus,
+    ) -> Result<(), StoreError> {
+        let mut game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(StoreError::Corrupt("flip: game missing"))?;
+        game.status = new_status;
+        let mut req = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":pending", schema::s("pending"));
+        let cond = if let Some(cid) = claim_id {
+            req = req.expression_attribute_values(":cid", schema::s(cid));
+            "#st = :pending AND claim_id = :cid"
+        } else {
+            "#st = :pending"
+        };
+        let res = req.condition_expression(cond).send().await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(()) // already flipped / ownership moved: idempotent no-op
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
+    /// Idempotent + mutually exclusive with `fulfill_claim` (see that method for the shared
+    /// pending-marker gate).
+    ///
+    /// All three effects — mark the CLAIM `Compensated` (consuming its `gsi2pk` marker), re-list
+    /// the GAME (`pending → available`, clearing `claim_id`), and decrement the LINK counter —
+    /// happen in ONE `TransactWriteItems`, all-or-nothing. This is what kills the leak class: a
+    /// transient failure after the marker was consumed used to short-circuit later retries into an
+    /// early `Ok`, stranding the link slot forever. Now a transient failure rolls the whole
+    /// transaction back, so a retry re-runs all three from scratch.
+    ///
+    /// On `TransactionCanceledException` we only special-case item 0 (the CLAIM put) failing its
+    /// `attribute_exists(gsi2pk)` condition — i.e. the marker was already consumed by someone:
+    /// re-read the claim and
+    /// - `Compensated` → an idempotent retry landing after a prior full success → `Ok(())`;
+    /// - `Fulfilled`   → fulfill won the mutual-exclusion race and now OWNS the game's fate. This
+    ///   is the DESIGNED exclusion, not an error: fulfill's own (idempotent) retry completes the
+    ///   flip, so compensate must be a no-op → `Ok(())`.
+    ///
+    /// Any other cancellation pattern is a genuine anomaly (a live claim whose game isn't pending,
+    /// or whose link counter is already 0) → `StoreError::Aws` with the debug string, loud.
+    pub async fn compensate_claim(
+        &self,
+        link_token: &str,
+        claim_id: &str,
+        game_id: &str,
+    ) -> Result<(), StoreError> {
+        // Read current claim + game BEFORE building the transaction: we need the game struct to
+        // construct the re-listed item (status Available, claim_id cleared) from real fields.
+        let mut claim = self
+            .get_claim(link_token, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("compensate: claim missing"))?;
+        claim.state = ClaimState::Compensated;
+
+        let mut game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(StoreError::Corrupt("compensate: game missing"))?;
+        game.status = GameStatus::Available;
+        game.claim_id = None; // game_item omits top-level claim_id → the re-listed game is unowned
+
+        // item 0: CLAIM put — consume the pending marker (dedup / mutual-exclusion gate).
+        let claim_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(&claim)))
+            .condition_expression("attribute_exists(gsi2pk)")
+            .build()
+            .expect("claim_put");
+        // item 1: GAME put — re-list (game_item re-adds the listable GSI attrs); never resurrect a
+        // game fulfill already flipped to gifted.
+        let game_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .condition_expression("#st = :pending")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":pending", schema::s("pending"))
+            .build()
+            .expect("game_put");
+        // item 2: LINK decrement — atomic ADD, guarded ≥ 1 so it can't go negative.
+        let link_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", schema::s(link_pk(link_token)))
+            .key("sk", schema::s("META"))
+            .update_expression("ADD claims_used :neg_one")
+            .condition_expression("claims_used >= :one")
+            .expression_attribute_values(
+                ":neg_one",
+                aws_sdk_dynamodb::types::AttributeValue::N("-1".into()),
+            )
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .build()
+            .expect("link_update");
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(claim_put)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(game_put)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(link_update)
+                    .build(),
+            )
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                let err_str = format!("{sdk_err:?}");
+                if let Some(
+                    aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(tce),
+                ) = sdk_err.as_service_error()
+                {
+                    let item0_ccf = tce
+                        .cancellation_reasons()
+                        .first()
+                        .and_then(|r| r.code())
+                        .is_some_and(|c| c == "ConditionalCheckFailed");
+                    if item0_ccf {
+                        // Marker already consumed — someone else finished this claim's fate.
+                        let current = self
+                            .get_claim(link_token, claim_id)
+                            .await?
+                            .ok_or(StoreError::Corrupt("compensate: claim missing on recheck"))?;
+                        match current.state {
+                            // idempotent retry after a prior full success.
+                            ClaimState::Compensated => return Ok(()),
+                            // fulfill won the race and owns the game; its retry completes the flip.
+                            ClaimState::Fulfilled => return Ok(()),
+                            // marker gone but still Pending is impossible-by-construction → fall
+                            // through to the loud error below.
+                            ClaimState::Pending => {}
+                        }
+                    }
+                }
+                Err(StoreError::Aws(err_str))
+            }
+        }
+    }
+
+    /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).
+    pub async fn create_table_for_tests(&self) -> Result<(), StoreError> {
+        let attr = |name: &str| {
+            AttributeDefinition::builder()
+                .attribute_name(name)
+                .attribute_type(ScalarAttributeType::S)
+                .build()
+                .expect("attr")
+        };
+        let key = |name: &str, kt: KeyType| {
+            KeySchemaElement::builder()
+                .attribute_name(name)
+                .key_type(kt)
+                .build()
+                .expect("key")
+        };
+        let gsi = |name: &str, pk: &str, sk: &str| {
+            GlobalSecondaryIndex::builder()
+                .index_name(name)
+                .key_schema(key(pk, KeyType::Hash))
+                .key_schema(key(sk, KeyType::Range))
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .expect("gsi")
+        };
+        let _ = self
+            .client
+            .create_table()
+            .table_name(&self.table)
+            .billing_mode(BillingMode::PayPerRequest)
+            .attribute_definitions(attr("pk"))
+            .attribute_definitions(attr("sk"))
+            .attribute_definitions(attr("gsi1pk"))
+            .attribute_definitions(attr("gsi1sk"))
+            .attribute_definitions(attr("gsi2pk"))
+            .attribute_definitions(attr("gsi2sk"))
+            .key_schema(key("pk", KeyType::Hash))
+            .key_schema(key("sk", KeyType::Range))
+            .global_secondary_indexes(gsi(schema::GSI_LISTABLE, "gsi1pk", "gsi1sk"))
+            .global_secondary_indexes(gsi(schema::GSI_PENDING, "gsi2pk", "gsi2sk"))
+            .send()
+            .await; // ignore ResourceInUse on re-run
+        Ok(())
+    }
+}

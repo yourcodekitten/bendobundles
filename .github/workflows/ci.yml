@@ -1,0 +1,31 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:2.5.2
+        ports: ["8000:8000"]
+    env:
+      DYNAMODB_LOCAL_URL: http://localhost:8000
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      # step-security forks are the org pattern, but they hard-fail on PRIVATE repos without a
+      # StepSecurity subscription (verified: run 2026-07-02, "requires a StepSecurity subscription
+      # for private repositories"). Until this repo goes public (or gets a subscription), the
+      # SHA-pinned upstreams stay. Swap back to step-security/* when visibility changes.
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace

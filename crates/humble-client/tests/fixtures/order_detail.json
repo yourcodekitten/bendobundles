@@ -1,0 +1,25 @@
+{
+  "gamekey": "AAAAbbbbCCCC",
+  "product": { "human_name": "Humble Indie Bundle 99", "machine_name": "hib99_bundle" },
+  "tpkd_dict": {
+    "all_tpks": [
+      {
+        "machine_name": "stardew_valley_steam",
+        "human_name": "Stardew Valley",
+        "key_type": "steam"
+      },
+      {
+        "machine_name": "already_revealed_steam",
+        "human_name": "Already Revealed Game",
+        "key_type": "steam",
+        "redeemed_key_val": "AAAA-BBBB-CCCC"
+      },
+      {
+        "machine_name": "dead_key_steam",
+        "human_name": "Dead Old Game",
+        "key_type": "steam",
+        "is_expired": true
+      }
+    ]
+  }
+}

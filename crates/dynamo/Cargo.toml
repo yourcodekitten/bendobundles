@@ -1,0 +1,17 @@
+[package]
+name = "dynamo"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+aws-sdk-dynamodb = "1"
+domain = { path = "../domain" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
+tokio.workspace = true
