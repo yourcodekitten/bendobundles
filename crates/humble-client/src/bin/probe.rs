@@ -2,6 +2,7 @@
 //!   HUMBLE_SESSION='<cookie>' cargo run -p humble-client --features probe --bin probe -- orders
 //!   HUMBLE_SESSION='<cookie>' cargo run -p humble-client --features probe --bin probe -- order <gamekey>
 //!   HUMBLE_SESSION='<cookie>' cargo run -p humble-client --features probe --bin probe -- summary
+//!   HUMBLE_SESSION='<cookie>' cargo run -p humble-client --features probe --bin probe -- find <name-fragment>
 //!   HUMBLE_SESSION='<cookie>' cargo run -p humble-client --features probe --bin probe -- capture <gamekey> [outfile]
 //!
 //! Security: HUMBLE_SESSION is never printed or written to any file.
@@ -38,6 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         [cmd] if cmd == "summary" => {
             run_summary(&client).await?;
         }
+        [cmd, fragment] if cmd == "find" => {
+            run_find(&client, fragment).await?;
+        }
         [cmd, gamekey] if cmd == "capture" => {
             run_capture(&session, gamekey, None).await?;
         }
@@ -46,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             eprintln!(
-                "usage:\n  probe orders\n  probe order <gamekey>\n  probe summary\n  probe capture <gamekey> [outfile]"
+                "usage:\n  probe orders\n  probe order <gamekey>\n  probe summary\n  probe find <name-fragment>\n  probe capture <gamekey> [outfile]"
             );
         }
     }
@@ -143,6 +147,48 @@ async fn run_summary(client: &HumbleClient) -> Result<(), Box<dyn std::error::Er
     for (name, n) in all_bundles.iter().take(10) {
         println!("  {n:>4}  {name}");
     }
+
+    Ok(())
+}
+
+/// Search every order for bundles whose name contains the given fragment
+/// (case-insensitive substring match).
+///
+/// Politely sleeps 300 ms between fetches; prints progress to stderr every 25
+/// orders so you can watch a long run. Matches are printed immediately to stdout.
+/// Any single fetch failure is logged as WARN and skipped — partial results beat
+/// an aborted run. Ends with a match count line.
+async fn run_find(client: &HumbleClient, fragment: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let gamekeys = client.gamekeys().await?;
+    let total = gamekeys.len();
+    let fragment_lower = fragment.to_lowercase();
+    eprintln!("searching {total} orders for '{fragment}'...");
+
+    let mut match_count = 0usize;
+
+    for (i, gamekey) in gamekeys.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        if (i + 1) % 25 == 0 {
+            eprintln!("searched {}/{total}...", i + 1);
+        }
+
+        match client.order(gamekey).await {
+            Ok(order) => {
+                if order.bundle_name.to_lowercase().contains(&fragment_lower) {
+                    println!("{gamekey}  {}", order.bundle_name);
+                    match_count += 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("WARN {gamekey}: {e}");
+            }
+        }
+    }
+
+    let plural = if match_count == 1 { "match" } else { "matches" };
+    println!("{match_count} {plural}");
 
     Ok(())
 }
