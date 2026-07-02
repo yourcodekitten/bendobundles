@@ -175,3 +175,44 @@ async fn compensate_returns_everything() {
     let c = store.get_claim("tok1", "c1").await.unwrap().unwrap();
     assert_eq!(c.state, ClaimState::Compensated);
 }
+
+#[tokio::test]
+async fn claim_concurrent_counter_is_authoritative() {
+    let Some(store) = store_or_skip("claim-concurrent").await else {
+        return;
+    };
+
+    // Link with 2 slots; two available games.
+    let mut lnk = link("tok-cc");
+    lnk.claims_allowed = 2;
+    store.put_link(&lnk).await.unwrap();
+    store.put_game(&game(20, true)).await.unwrap();
+    store.put_game(&game(21, true)).await.unwrap();
+
+    let gid20 = game_id("gk20", "mn");
+    let gid21 = game_id("gk21", "mn");
+    let now = datetime!(2026-07-02 12:00 UTC);
+
+    // Two concurrent claim_game calls on different games via the same link.
+    let (r1, r2) = tokio::join!(
+        store.claim_game("tok-cc", &gid20, "cc1", now),
+        store.claim_game("tok-cc", &gid21, "cc2", now),
+    );
+    assert!(r1.is_ok(), "first concurrent claim failed: {r1:?}");
+    assert!(r2.is_ok(), "second concurrent claim failed: {r2:?}");
+
+    // get_link must read the authoritative top-level counter, not stale body JSON.
+    let l = store.get_link("tok-cc").await.unwrap().unwrap();
+    assert_eq!(
+        l.claims_used, 2,
+        "top-level counter must reflect both atomic increments"
+    );
+
+    // Compensating one claim atomically decrements the counter.
+    store
+        .compensate_claim("tok-cc", "cc1", &gid20)
+        .await
+        .unwrap();
+    let l = store.get_link("tok-cc").await.unwrap().unwrap();
+    assert_eq!(l.claims_used, 1, "counter must be 1 after one compensation");
+}

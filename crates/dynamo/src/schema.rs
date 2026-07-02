@@ -47,6 +47,10 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
     item
 }
 
+/// Top-level `claims_used` (N) is the **authoritative counter** — updated atomically via `ADD`
+/// in `claim_game`'s transaction and enforced by that transaction's condition expression.
+/// `body.claims_used` may go stale under concurrent claims; `Store::get_link` overrides it on
+/// read from this top-level attribute so callers always see the enforcer's truth.
 pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::from([
         ("pk".into(), s(link_pk(&l.token))),

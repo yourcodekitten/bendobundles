@@ -73,7 +73,33 @@ impl Store {
     }
 
     pub async fn get_link(&self, token: &str) -> Result<Option<Link>, StoreError> {
-        self.get_meta(&link_pk(token)).await
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(link_pk(token)),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+            )
+            .send()
+            .await?;
+        out.item
+            .map(|item| {
+                let mut link: Link = parse_body(&item)?;
+                // Top-level `claims_used` (N) is the authoritative counter — updated atomically
+                // via ADD in claim_game's transaction. Override body's potentially stale value.
+                if let Some(n) = item.get("claims_used").and_then(|v| v.as_n().ok())
+                    && let Ok(v) = n.parse::<u32>()
+                {
+                    link.claims_used = v;
+                }
+                Ok(link)
+            })
+            .transpose()
     }
 
     pub async fn put_claim(&self, c: &Claim) -> Result<(), StoreError> {
@@ -340,12 +366,47 @@ impl Store {
         game.claim_id = None;
         self.put_game(&game).await?; // put_game re-adds listable GSI attrs via game_item
 
-        let mut link = self
-            .get_link(link_token)
-            .await?
-            .ok_or(StoreError::Corrupt("compensate: link missing"))?;
-        link.claims_used = link.claims_used.saturating_sub(1);
-        self.put_link(&link).await
+        // Atomically decrement claims_used. The condition prevents going below 0 (saturating
+        // semantics). ConditionalCheckFailed means counter already 0 — treat as success.
+        let result = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(link_pk(link_token)),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+            )
+            .update_expression("ADD claims_used :neg_one")
+            .condition_expression("claims_used >= :one")
+            .expression_attribute_values(
+                ":neg_one",
+                aws_sdk_dynamodb::types::AttributeValue::N("-1".into()),
+            )
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                if let Some(
+                    aws_sdk_dynamodb::operation::update_item::UpdateItemError::ConditionalCheckFailedException(
+                        _,
+                    ),
+                ) = sdk_err.as_service_error()
+                {
+                    Ok(()) // counter already 0: saturating semantics, not an error
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
     }
 
     /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).
