@@ -9,6 +9,7 @@ import {
   type ClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
+import { inviteUrl } from '../inviteUrl';
 
 // Page-level state machine
 type PageState =
@@ -77,8 +78,7 @@ export function Links() {
     const expires = expiresDays !== '' ? parseInt(expiresDays, 10) : undefined;
     withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires), navigate)
       .then((result) => {
-        const fullUrl = `${window.location.origin}${result.url_path}`;
-        setCreatedInfo({ fullUrl, label: trimmedLabel });
+        setCreatedInfo({ fullUrl: inviteUrl(result.token), label: trimmedLabel });
         setFormLabel('');
         setClaimsAllowed(1);
         setExpiresDays('');
@@ -241,7 +241,7 @@ export function Links() {
       {/* ── Links list ─────────────────────────────────────────────────── */}
       <div className="space-y-2">
         {state.links.map((link) => {
-          const inviteUrl = `${window.location.origin}/l/${link.token}`;
+          const linkUrl = inviteUrl(link.token);
           const auditState = auditMap[link.token];
           const armed = revokeArmed.has(link.token);
 
@@ -274,7 +274,7 @@ export function Links() {
                 <div className="ml-auto flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => copyToClipboard(inviteUrl)}
+                    onClick={() => copyToClipboard(linkUrl)}
                     aria-label={`copy invite for ${link.label}`}
                     className="rounded bg-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-600"
                   >
