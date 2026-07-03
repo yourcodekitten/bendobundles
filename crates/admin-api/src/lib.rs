@@ -342,9 +342,29 @@ async fn handle_revoke_link(State(s): State<AppState>, Path(token): Path<String>
 
 // ── GET /admin/api/links/:token/claims ────────────────────────────────────────
 
+/// Admin view of a claim. Deliberately NOT `domain::Claim`: the friend's
+/// one-time gift URL is a bearer secret — the single value the plan says must
+/// never reach the admin surface. The admin only learns THAT one was issued.
+#[derive(serde::Serialize)]
+struct AdminClaimView {
+    game_id: String,
+    state: domain::ClaimState,
+    issued: bool,
+}
+
 async fn handle_link_claims(State(s): State<AppState>, Path(token): Path<String>) -> Response {
     match s.store.claims_for_link(&token).await {
-        Ok(claims) => (StatusCode::OK, Json(claims)).into_response(),
+        Ok(claims) => {
+            let views: Vec<AdminClaimView> = claims
+                .into_iter()
+                .map(|c| AdminClaimView {
+                    game_id: c.game_id,
+                    state: c.state,
+                    issued: c.gift_url.is_some(),
+                })
+                .collect();
+            (StatusCode::OK, Json(views)).into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -478,13 +498,15 @@ async fn handle_status(State(s): State<AppState>) -> Response {
         StatusCode::OK,
         Json(serde_json::json!({
             "sync": sync_state,
+            // Per-status buckets ONLY — the client renders one chip per key,
+            // so a folded-in "total" would masquerade as a sixth status and
+            // double the apparent catalog size.
             "game_counts": {
                 "available": available,
                 "pending": pending,
                 "gifted": gifted,
                 "ben_redeemed": ben_redeemed,
                 "expired": expired,
-                "total": games.len(),
             },
         })),
     )

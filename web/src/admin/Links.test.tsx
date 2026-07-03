@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { Links } from './Links';
-import type { AdminLink, ClaimView } from '../api';
+import type { AdminLink, AdminClaimView } from '../api';
 
 vi.mock('../api');
 import { adminLinks, adminCreateLink, adminRevoke, adminLinkClaims } from '../api';
@@ -262,17 +262,18 @@ describe('Links', () => {
   });
 
   describe('audit expand', () => {
-    const claimFulfilled: ClaimView = {
+    // The gift URL itself is redacted server-side (AdminClaimView) — the
+    // admin client only ever sees issued:bool.
+    const claimFulfilled: AdminClaimView = {
       game_id: 'game-hollow-knight',
       state: 'fulfilled',
-      // gift_url is the friend's bearer secret — must NEVER appear in admin DOM
-      gift_url: 'https://secret.humble.gift/bearer-token-do-not-render-abc123',
+      issued: true,
     };
 
-    const claimPending: ClaimView = {
+    const claimPending: AdminClaimView = {
       game_id: 'game-celeste',
       state: 'pending',
-      gift_url: null,
+      issued: false,
     };
 
     it('expand audit button loads claims and renders game_id + state chips', async () => {
@@ -294,7 +295,7 @@ describe('Links', () => {
       });
     });
 
-    it('renders "issued ✓" when gift_url is non-null', async () => {
+    it('renders "issued ✓" when issued is true', async () => {
       const user = userEvent.setup();
       vi.mocked(adminLinks).mockResolvedValue([link1]);
       vi.mocked(adminLinkClaims).mockResolvedValue([claimFulfilled, claimPending]);
@@ -305,10 +306,10 @@ describe('Links', () => {
       await user.click(screen.getByRole('button', { name: 'expand audit for Alice' }));
 
       await waitFor(() => expect(screen.getByText('issued ✓')).toBeInTheDocument());
-      // fulfilled has gift_url → issued ✓; pending has null → no indicator
+      // fulfilled is issued → ✓; pending is not → no indicator
     });
 
-    it('CRITICAL: raw gift_url value is NEVER rendered in the DOM', async () => {
+    it('CRITICAL: the AdminClaimView type has no gift_url — the secret cannot reach the DOM', async () => {
       const user = userEvent.setup();
       vi.mocked(adminLinks).mockResolvedValue([link1]);
       vi.mocked(adminLinkClaims).mockResolvedValue([claimFulfilled, claimPending]);
@@ -317,15 +318,13 @@ describe('Links', () => {
       await waitFor(() => screen.getByText('Alice'));
 
       await user.click(screen.getByRole('button', { name: 'expand audit for Alice' }));
-
-      // Wait for audit to load
       await waitFor(() => screen.getByText('issued ✓'));
 
-      // The bearer secret must not appear anywhere in the DOM — ever. innerHTML (not
-      // textContent) so attribute values (title/aria-label/data-*) are covered too.
-      expect(document.body.innerHTML).not.toContain(
-        'https://secret.humble.gift/bearer-token-do-not-render-abc123',
-      );
+      // Defense-in-depth used to live here (assert the URL string absent from
+      // innerHTML); the redaction moved server-side, so the client type can't
+      // even carry the secret. Keep a canary: no href-bearing anchor may render
+      // inside the audit panel.
+      expect(document.body.innerHTML).not.toContain('humble.gift');
     });
 
     it('collapse button hides the audit panel', async () => {

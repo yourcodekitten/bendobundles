@@ -43,6 +43,14 @@ export type AdminGame = {
   artwork_url: string | null;
 };
 
+// Redacted admin view of a claim — the friend's one-time gift URL is a bearer
+// secret and NEVER crosses to the admin surface; only the fact it was issued.
+export type AdminClaimView = {
+  game_id: string;
+  state: 'pending' | 'fulfilled' | 'compensated';
+  issued: boolean;
+};
+
 export type AdminLink = {
   token: string;
   label: string;
@@ -174,9 +182,19 @@ async function checkUnauthorized(response: Response): Promise<void> {
   }
 }
 
+// 401 → Unauthorized (login redirect); any other non-2xx → throw so the page
+// shows its error/retry state. Without this, a 403/502/503 JSON body (e.g.
+// from API Gateway) flows into component state and TypeErrors the render.
+async function checkOk(response: Response, what: string): Promise<void> {
+  await checkUnauthorized(response);
+  if (!response.ok) {
+    throw new Error(`failed to load ${what}`);
+  }
+}
+
 export async function adminCatalog(): Promise<AdminGame[]> {
   const response = await fetch('/admin/api/catalog');
-  await checkUnauthorized(response);
+  await checkOk(response, 'catalog');
   return await response.json();
 }
 
@@ -229,7 +247,7 @@ export async function adminCreateLink(
 
 export async function adminLinks(): Promise<AdminLink[]> {
   const response = await fetch('/admin/api/links');
-  await checkUnauthorized(response);
+  await checkOk(response, 'links');
   return await response.json();
 }
 
@@ -246,18 +264,10 @@ export async function adminRevoke(token: string): Promise<void> {
   }
 }
 
-export async function adminLinkClaims(token: string): Promise<ClaimView[]> {
+export async function adminLinkClaims(token: string): Promise<AdminClaimView[]> {
   const response = await fetch(`/admin/api/links/${token}/claims`);
-  await checkUnauthorized(response);
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const records = (await response.json()) as any[];
-
-  return records.map((record) => ({
-    game_id: record.game_id,
-    state: record.state,
-    gift_url: record.gift_url,
-  }));
+  await checkOk(response, 'claims');
+  return (await response.json()) as AdminClaimView[];
 }
 
 export async function adminPasteCookie(cookie: string): Promise<CookieResult> {
@@ -291,6 +301,6 @@ export async function adminSync(): Promise<{ games_written: number; orders_faile
 
 export async function adminStatus(): Promise<StatusView> {
   const response = await fetch('/admin/api/status');
-  await checkUnauthorized(response);
+  await checkOk(response, 'status');
   return await response.json();
 }

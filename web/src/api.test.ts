@@ -18,7 +18,6 @@ import {
   type ClaimResult,
   type CookieResult,
   type StatusView,
-  type ClaimView,
   type AdminGame,
   type AdminLink,
 } from './api';
@@ -34,6 +33,7 @@ beforeEach(() => {
 describe('fetchLink', () => {
   it('returns LinkView on 200', async () => {
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue({
         label: 'Test Link',
@@ -100,6 +100,7 @@ describe('fetchLink', () => {
 
   it('throws FetchFailed on malformed 200 body', async () => {
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockRejectedValue(new SyntaxError('bad json')),
     };
@@ -112,6 +113,7 @@ describe('fetchLink', () => {
 describe('claimGame', () => {
   it('returns {kind:"gifted", gift_url} on 200', async () => {
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue({ gift_url: 'https://humble.example.com/gift' }),
     };
@@ -191,6 +193,7 @@ describe('claimGame', () => {
 
   it('returns {kind:"error", message} on JSON parse error', async () => {
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockRejectedValue(new Error('invalid json')),
     };
@@ -206,6 +209,7 @@ describe('claimGame', () => {
 describe('adminLogin', () => {
   it('returns true on 200', async () => {
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue({}),
     };
@@ -273,6 +277,7 @@ describe('adminCatalog', () => {
     ] as AdminGame[];
 
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue(mockGames),
     };
@@ -295,48 +300,36 @@ describe('adminLinkClaims', () => {
     await expect(adminLinkClaims('token')).rejects.toBeInstanceOf(Unauthorized);
   });
 
-  it('maps ClaimRecord array to ClaimView shape (no title)', async () => {
+  it('returns the redacted AdminClaimView shape (issued flag, NO gift_url)', async () => {
     const mockRecords = [
-      {
-        id: 'claim1',
-        link_token: 'token',
-        game_id: 'game1',
-        state: 'fulfilled',
-        gift_url: 'https://humble.example.com/gift1',
-        created_at: '2026-07-03T12:00:00Z',
-      },
-      {
-        id: 'claim2',
-        link_token: 'token',
-        game_id: 'game2',
-        state: 'pending',
-        gift_url: null,
-        created_at: '2026-07-03T12:01:00Z',
-      },
+      { game_id: 'game1', state: 'fulfilled', issued: true },
+      { game_id: 'game2', state: 'pending', issued: false },
     ];
 
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue(mockRecords),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    const result = (await adminLinkClaims('token')) as ClaimView[];
+    const result = await adminLinkClaims('token');
 
     expect(result).toHaveLength(2);
-    expect(result[0]).toEqual({
-      game_id: 'game1',
-      state: 'fulfilled',
-      gift_url: 'https://humble.example.com/gift1',
-    });
-    expect(result[1]).toEqual({
-      game_id: 'game2',
-      state: 'pending',
-      gift_url: null,
-    });
-    expect(result[0]).not.toHaveProperty('title');
-    expect(result[0]).not.toHaveProperty('id');
-    expect(result[0]).not.toHaveProperty('created_at');
+    expect(result[0]).toEqual({ game_id: 'game1', state: 'fulfilled', issued: true });
+    expect(result[1]).toEqual({ game_id: 'game2', state: 'pending', issued: false });
+    expect(result[0]).not.toHaveProperty('gift_url');
+  });
+
+  it('throws on non-401 error instead of passing the body into state', async () => {
+    const mockResponse = {
+      ok: false,
+      status: 502,
+      json: vi.fn().mockResolvedValue({ message: 'bad gateway' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminLinkClaims('token')).rejects.toThrow(/failed to load claims/);
   });
 });
 
@@ -344,6 +337,7 @@ describe('adminPasteCookie', () => {
   it('returns ok result passthrough', async () => {
     const mockResult: CookieResult = { ok: true };
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue(mockResult),
     };
@@ -385,6 +379,7 @@ describe('adminStatus', () => {
     };
 
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue(mockStatus),
     };
@@ -410,8 +405,8 @@ describe('adminStatus', () => {
 describe('adminSetHidden', () => {
   it('returns {ok:true} on success', async () => {
     const mockResponse = {
-      status: 200,
       ok: true,
+      status: 200,
       json: vi.fn().mockResolvedValue({}),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
@@ -454,6 +449,7 @@ describe('adminCreateLink', () => {
   it('returns {token, url_path} passthrough on success', async () => {
     const mockData = { token: 'abc123', url_path: '/gift/abc123' };
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue(mockData),
     };
@@ -476,6 +472,7 @@ describe('adminCreateLink', () => {
   it('asserts POST body when expires_days is undefined', async () => {
     const mockData = { token: 'xyz789', url_path: '/gift/xyz789' };
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue(mockData),
     };
@@ -528,6 +525,7 @@ describe('adminLinks', () => {
       },
     ];
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue(mockLinks),
     };
@@ -604,8 +602,8 @@ describe('adminSync', () => {
   it('returns {games_written, orders_failed} extraction on success', async () => {
     const mockData = { games_written: 42, orders_failed: 3 };
     const mockResponse = {
-      status: 200,
       ok: true,
+      status: 200,
       json: vi.fn().mockResolvedValue(mockData),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
@@ -631,8 +629,8 @@ describe('adminSync', () => {
 
   it('throws the same message on 200 with a malformed body (json catch branch)', async () => {
     const mockResponse = {
-      status: 200,
       ok: true,
+      status: 200,
       json: vi.fn().mockRejectedValue(new SyntaxError('unexpected token')),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);

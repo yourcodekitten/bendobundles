@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { adminStatus, type StatusView } from '../api';
 import { withAuth } from './withAuth';
 
@@ -15,7 +15,6 @@ export type AdminOutletContext = {
 
 export function AdminApp() {
   const navigate = useNavigate();
-  const { pathname } = useLocation();
   const [status, setStatus] = useState<StatusView | null>(null);
 
   const fetchStatus = useCallback(() => {
@@ -24,12 +23,12 @@ export function AdminApp() {
       .catch(() => {});
   }, [navigate]);
 
-  // Re-fetch on mount and on every route change so the banner stays current.
-  // pathname in deps is intentional: it triggers the effect on navigation even
-  // though it is not read inside the effect body.
+  // Fetch once on mount. Status only changes on cookie-paste or sync, and both
+  // paths already call refreshStatus() — refetching per route change would run
+  // handle_status's full-table Scan on every tab switch for nothing.
   useEffect(() => {
     fetchStatus();
-  }, [fetchStatus, pathname]);
+  }, [fetchStatus]);
 
   // Show the banner only when cookie_ok is explicitly false — null (no sync yet)
   // does not trigger the banner.

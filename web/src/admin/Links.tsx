@@ -6,7 +6,7 @@ import {
   adminRevoke,
   adminLinkClaims,
   type AdminLink,
-  type ClaimView,
+  type AdminClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
 import { inviteUrl } from '../inviteUrl';
@@ -21,7 +21,7 @@ type PageState =
 type AuditData =
   | { phase: 'loading' }
   | { phase: 'error' }
-  | { phase: 'loaded'; claims: ClaimView[] };
+  | { phase: 'loaded'; claims: AdminClaimView[] };
 
 function stateBadgeClass(state: string): string {
   switch (state) {
@@ -338,9 +338,9 @@ export function Links() {
                 </p>
               )}
 
-              {/* Audit panel — gift_url VALUE is intentionally never rendered here;
-                  admin only needs to know a URL was issued ("issued ✓"), not what it is.
-                  The URL is the friend's bearer secret. */}
+              {/* Audit panel — the gift URL is the friend's bearer secret and is
+                  redacted SERVER-side (AdminClaimView sends only issued:bool);
+                  it never even reaches this browser's network tab. */}
               {auditState !== undefined && (
                 <div className="mt-3 border-t border-zinc-800 pt-3">
                   {auditState.phase === 'loading' && (
@@ -362,10 +362,7 @@ export function Links() {
                           >
                             {claim.state}
                           </span>
-                          {/* gift_url presence → show indicator only, NEVER the URL value */}
-                          {claim.gift_url !== null && (
-                            <span className="text-green-400">issued ✓</span>
-                          )}
+                          {claim.issued && <span className="text-green-400">issued ✓</span>}
                         </div>
                       ))}
                     </div>

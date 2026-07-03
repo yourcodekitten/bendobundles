@@ -73,20 +73,14 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
 
   return (
     <>
-      {/* Backdrop — same policy as Escape, via dismissKindFor */}
-      <div
-        className="fixed inset-0 z-40 bg-black/60"
-        onClick={
-          dismissKindFor(step) === null
-            ? undefined
-            : dismissKindFor(step) === 'refresh'
-              ? handleCloseWithRefresh
-              : onClose
-        }
-        aria-hidden="true"
-      />
+      {/* Backdrop — pure dim layer. The dialog container below is a full-viewport
+          sibling stacked ABOVE it, so clicks on the dimmed area land on the
+          container, never here — the click-outside handler lives there. */}
+      <div className="fixed inset-0 z-40 bg-black/60" aria-hidden="true" />
 
-      {/* Dialog panel */}
+      {/* Dialog panel — click-outside-to-dismiss: a click whose target is the
+          container itself (not the panel or its children) is a backdrop click,
+          routed through the same dismissKindFor policy as Escape */}
       <div
         ref={containerRef}
         role="dialog"
@@ -94,6 +88,13 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
         aria-label={`claim ${game.title}`}
         tabIndex={-1}
         className="fixed inset-0 z-50 flex items-center justify-center p-4 outline-none"
+        onClick={(e) => {
+          if (e.target !== e.currentTarget) return;
+          const kind = dismissKindFor(step);
+          if (kind === null) return;
+          if (kind === 'refresh') onRefresh();
+          onClose();
+        }}
       >
         <div className="w-full max-w-md rounded-xl bg-zinc-900 p-6 shadow-2xl ring-1 ring-zinc-700">
           {step === 'confirm' && (

@@ -186,26 +186,26 @@ describe('ClaimDialog', () => {
     });
   });
 
-  describe('backdrop dismiss', () => {
-    const clickBackdrop = (container: HTMLElement) => {
-      const backdrop = container.querySelector('div[aria-hidden="true"]');
-      expect(backdrop).not.toBeNull();
-      return userEvent.setup().click(backdrop as Element);
+  describe('click-outside dismiss', () => {
+    // Real clicks on the dimmed area land on the full-viewport dialog CONTAINER
+    // (z-50, stacked above the visual backdrop) — the old z-40 backdrop never
+    // receives pointer events, so the handler lives on the container with an
+    // e.target === e.currentTarget guard.
+    const clickBackdrop = () => {
+      return userEvent.setup().click(screen.getByRole('dialog'));
     };
 
     it('on processing triggers onRefresh then onClose (same as the close button)', async () => {
       const user = userEvent.setup();
       vi.mocked(claimGame).mockResolvedValue({ kind: 'processing', message: 'generating' });
-      const { container } = render(
-        <ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />,
-      );
+      render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
 
       await user.click(screen.getByRole('button', { name: /confirm/i }));
       await waitFor(() => {
         expect(screen.getByText('generating')).toBeInTheDocument();
       });
 
-      await clickBackdrop(container);
+      await clickBackdrop();
       expect(onRefresh).toHaveBeenCalledOnce();
       expect(onClose).toHaveBeenCalledOnce();
     });
@@ -213,27 +213,32 @@ describe('ClaimDialog', () => {
     it('on refused triggers onRefresh then onClose', async () => {
       const user = userEvent.setup();
       vi.mocked(claimGame).mockResolvedValue({ kind: 'refused', message: 'already claimed' });
-      const { container } = render(
-        <ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />,
-      );
+      render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
 
       await user.click(screen.getByRole('button', { name: /confirm/i }));
       await waitFor(() => {
         expect(screen.getByText('already claimed')).toBeInTheDocument();
       });
 
-      await clickBackdrop(container);
+      await clickBackdrop();
       expect(onRefresh).toHaveBeenCalledOnce();
       expect(onClose).toHaveBeenCalledOnce();
     });
 
     it('on confirm closes without onRefresh', async () => {
-      const { container } = render(
-        <ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />,
-      );
-      await clickBackdrop(container);
+      render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+      await clickBackdrop();
       expect(onClose).toHaveBeenCalledOnce();
       expect(onRefresh).not.toHaveBeenCalled();
+    });
+
+    it('clicking INSIDE the panel does not dismiss (target guard)', async () => {
+      const user = userEvent.setup();
+      render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+      // The heading is inside the panel — its clicks bubble to the container
+      // but target !== currentTarget, so no dismiss.
+      await user.click(screen.getByText(/this uses 1 of your claims/i));
+      expect(onClose).not.toHaveBeenCalled();
     });
   });
 

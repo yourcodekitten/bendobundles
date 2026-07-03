@@ -823,3 +823,68 @@ async fn catalog_does_not_leak_order_key_material() {
         assert!(game.get(kept).is_some(), "catalog must keep {kept}");
     }
 }
+
+/// GET /admin/api/links/:token/claims must NOT ship the friend's one-time
+/// gift URL to the admin — the wire carries a redacted AdminClaimView with
+/// only `issued: bool`. The URL is the friend's bearer secret; the plan says
+/// it never reaches the admin surface, and "we just don't render it" is not
+/// redaction.
+#[tokio::test]
+async fn link_claims_redact_gift_url_to_issued_bool() {
+    let Some(store) = store_or_skip("claims-redact").await else {
+        return;
+    };
+    let lnk = test_link("aud-tok");
+    store.create_link(&lnk).await.unwrap();
+    store
+        .put_claim(&domain::Claim {
+            id: "c-1".into(),
+            link_token: "aud-tok".into(),
+            game_id: "g-1".into(),
+            state: domain::ClaimState::Fulfilled,
+            gift_url: Some("https://humble.example/gift?key=SECRET".into()),
+            created_at: datetime!(2026-07-03 14:00 UTC),
+        })
+        .await
+        .unwrap();
+
+    let password = "auditpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
+        games_written: 0,
+        orders_failed: 0,
+    });
+    let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let req = Request::get("/admin/api/links/aud-tok/claims")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(req)
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = std::str::from_utf8(&raw).unwrap();
+    assert!(
+        !body_str.contains("SECRET"),
+        "gift_url must never appear on the admin wire, got: {body_str}"
+    );
+    let j: serde_json::Value = serde_json::from_str(body_str).unwrap();
+    let claim = &j.as_array().unwrap()[0];
+    assert_eq!(claim["game_id"], "g-1");
+    assert_eq!(claim["state"], "fulfilled");
+    assert_eq!(claim["issued"], true);
+    assert!(claim.get("gift_url").is_none(), "no gift_url key at all");
+}
