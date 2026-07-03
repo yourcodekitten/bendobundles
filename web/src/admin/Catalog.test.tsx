@@ -232,6 +232,37 @@ describe('Catalog', () => {
       );
     });
 
+    it('concurrent toggles: refused revert on row A does not clobber row B', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminCatalog).mockResolvedValue([gameAvailable, gameGifted]); // both hidden:false
+      let resolveA!: (r: { ok: false; message: string }) => void;
+      vi.mocked(adminSetHidden).mockImplementation((id) => {
+        if (id === 'g1') {
+          return new Promise((resolve) => {
+            resolveA = resolve;
+          });
+        }
+        return Promise.resolve({ ok: true });
+      });
+      renderCatalog();
+
+      await waitFor(() => screen.getByText('Hollow Knight'));
+
+      const toggleA = screen.getByRole('switch', { name: /hide Hollow Knight/i });
+      const toggleB = screen.getByRole('switch', { name: /hide Hades/i });
+
+      await user.click(toggleA); // A in flight, unresolved
+      await user.click(toggleB); // B flips and succeeds while A is pending
+      await waitFor(() => expect(toggleB).toBeChecked());
+
+      // A comes back refused → only row A reverts
+      resolveA({ ok: false, message: 'game is currently being claimed' });
+
+      await waitFor(() => expect(toggleA).not.toBeChecked());
+      // B's committed flip must survive A's revert
+      expect(toggleB).toBeChecked();
+    });
+
     it('toggle refused error clears on subsequent successful toggle', async () => {
       const user = userEvent.setup();
       vi.mocked(adminCatalog).mockResolvedValue([gameAvailable]);

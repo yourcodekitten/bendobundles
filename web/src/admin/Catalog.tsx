@@ -71,19 +71,28 @@ export function Catalog() {
   const handleToggle = (game: AdminGame) => {
     if (state.phase !== 'loaded') return;
     const newHidden = !game.hidden;
-    const prevGames = state.games; // capture before optimistic update
+
+    // Functional updates throughout: concurrent toggles must never revert
+    // through a stale whole-list snapshot (that would clobber other rows).
+    const setRowHidden = (hidden: boolean) => {
+      setState((s) =>
+        s.phase === 'loaded'
+          ? {
+              phase: 'loaded',
+              games: s.games.map((g) => (g.id === game.id ? { ...g, hidden } : g)),
+            }
+          : s,
+      );
+    };
 
     // Optimistic flip
-    setState({
-      phase: 'loaded',
-      games: prevGames.map((g) => (g.id === game.id ? { ...g, hidden: newHidden } : g)),
-    });
+    setRowHidden(newHidden);
 
     withAuth(() => adminSetHidden(game.id, newHidden), navigate)
       .then((result) => {
         if (!result.ok) {
-          // Server refused (e.g. mid-claim 409) — revert + show message
-          setState({ phase: 'loaded', games: prevGames });
+          // Server refused (e.g. mid-claim 409) — revert this row + show message
+          setRowHidden(game.hidden);
           setRowErrors((prev) => ({ ...prev, [game.id]: result.message }));
         } else {
           // Clear any previous row error on success
@@ -95,8 +104,8 @@ export function Catalog() {
         }
       })
       .catch(() => {
-        // Unexpected error — revert silently (withAuth already redirected on 401)
-        setState({ phase: 'loaded', games: prevGames });
+        // Unexpected error — revert this row silently (withAuth already redirected on 401)
+        setRowHidden(game.hidden);
       });
   };
 
