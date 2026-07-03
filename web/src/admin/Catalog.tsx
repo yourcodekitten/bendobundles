@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { adminCatalog, adminSetHidden, type AdminGame } from '../api';
 import { withAuth } from './withAuth';
@@ -27,6 +27,9 @@ type PageState =
   | { phase: 'loading' }
   | { phase: 'error' }
   | { phase: 'loaded'; games: AdminGame[] };
+
+// Stable empty list so the memos below don't recompute across loading renders.
+const NO_GAMES: AdminGame[] = [];
 
 export function Catalog() {
   const navigate = useNavigate();
@@ -88,6 +91,33 @@ export function Catalog() {
       });
   };
 
+  // Memos live above the early returns (hooks must run unconditionally).
+  // summary derives only from the full unfiltered list — it must not
+  // recompute per search keystroke; filtered recomputes only on games/query.
+  const games = state.phase === 'loaded' ? state.games : NO_GAMES;
+  const q = search.toLowerCase();
+
+  const filtered = useMemo(
+    () =>
+      q === ''
+        ? games
+        : games.filter(
+            (g) =>
+              g.title.toLowerCase().includes(q) || g.bundle.toLowerCase().includes(q),
+          ),
+    [games, q],
+  );
+
+  const summary = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const g of games) {
+      counts[g.status] = (counts[g.status] ?? 0) + 1;
+    }
+    return Object.entries(counts)
+      .map(([s, n]) => `${s}: ${n}`)
+      .join(' · ');
+  }, [games]);
+
   if (state.phase === 'loading') {
     return <p className="text-zinc-400">loading…</p>;
   }
@@ -106,24 +136,6 @@ export function Catalog() {
       </div>
     );
   }
-
-  const q = search.toLowerCase();
-  const filtered =
-    q === ''
-      ? state.games
-      : state.games.filter(
-          (g) =>
-            g.title.toLowerCase().includes(q) || g.bundle.toLowerCase().includes(q),
-        );
-
-  // Summary counts by status — computed from the full (unfiltered) loaded list
-  const counts: Record<string, number> = {};
-  for (const g of state.games) {
-    counts[g.status] = (counts[g.status] ?? 0) + 1;
-  }
-  const summary = Object.entries(counts)
-    .map(([s, n]) => `${s}: ${n}`)
-    .join(' · ');
 
   return (
     <div>

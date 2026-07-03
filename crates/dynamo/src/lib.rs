@@ -122,6 +122,54 @@ impl Store {
         self.get_meta(&game_pk(id)).await
     }
 
+    /// Batch-fetch game META items by id — one `BatchGetItem` per 100 ids (the
+    /// DynamoDB batch cap), re-requesting unprocessed keys until drained.
+    /// Missing ids are simply absent from the returned map; callers decide how
+    /// to degrade. Avoids the N-serial-GetItem shape on hot read paths.
+    pub async fn batch_get_games(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, Game>, StoreError> {
+        use aws_sdk_dynamodb::types::KeysAndAttributes;
+        let mut games = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(100) {
+            let mut keys: Vec<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = chunk
+                .iter()
+                .map(|id| {
+                    let (pk, sk) = schema::key_pair(game_pk(id), "META");
+                    HashMap::from([("pk".to_string(), pk), ("sk".to_string(), sk)])
+                })
+                .collect();
+            while !keys.is_empty() {
+                let ka = KeysAndAttributes::builder()
+                    .set_keys(Some(keys))
+                    .build()
+                    .map_err(|e| StoreError::Aws(format!("{e:?}")))?;
+                let resp = self
+                    .client
+                    .batch_get_item()
+                    .request_items(&self.table, ka)
+                    .send()
+                    .await?;
+                for item in resp
+                    .responses()
+                    .and_then(|tables| tables.get(&self.table))
+                    .map(|items| items.as_slice())
+                    .unwrap_or_default()
+                {
+                    let g: Game = parse_body(item)?;
+                    games.insert(g.id.clone(), g);
+                }
+                keys = resp
+                    .unprocessed_keys()
+                    .and_then(|tables| tables.get(&self.table))
+                    .map(|ka| ka.keys().to_vec())
+                    .unwrap_or_default();
+            }
+        }
+        Ok(games)
+    }
+
     /// Create a fresh link. PutItem conditioned `attribute_not_exists(pk)` so it initializes the
     /// authoritative top-level `claims_used` counter exactly once — a legitimate write of the
     /// counter, the ONLY one that sets it. ConditionalCheckFailed → the token already exists
