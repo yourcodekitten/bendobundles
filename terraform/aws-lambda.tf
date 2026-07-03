@@ -61,6 +61,11 @@ module "lambda_public_api" {
   environment_variables = {
     TABLE_NAME     = aws_dynamodb_table.this.name
     FULFILLMENT_FN = module.lambda_fulfillment.lambda_function_name
+    # REST API GW puts the stage in the path; lambda_http PREPENDS it (turning
+    # /api/l/x into /live/api/l/x), which axum then 404s. This flag makes
+    # lambda_http return the stage-less path so the routes match. Verified
+    # against lambda_http 0.14 request.rs::apigw_path_with_stage.
+    AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
   }
 
   addl_inline_policies = {
@@ -89,6 +94,8 @@ module "lambda_admin_api" {
     FULFILLMENT_FN      = module.lambda_fulfillment.lambda_function_name
     ADMIN_HASH_PARAM    = aws_ssm_parameter.admin_hash.name
     HUMBLE_COOKIE_PARAM = aws_ssm_parameter.humble_cookie.name
+    # See public-api: strips the REST stage prefix so axum's /admin/api/* routes match.
+    AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
   }
 
   addl_inline_policies = {
