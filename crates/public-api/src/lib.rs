@@ -76,7 +76,9 @@ struct ClaimView {
     game_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
-    state: String,
+    /// Serialized via domain::ClaimState's own serde (snake_case) — the one
+    /// representation, shared with admin-api's AdminClaimView.
+    state: domain::ClaimState,
     gift_url: Option<String>,
 }
 
@@ -85,7 +87,11 @@ struct LinkView {
     label: String,
     claims_allowed: u32,
     claims_used: u32,
-    active: bool,
+    /// Explicit link state: "active" | "revoked" | "expired" | "exhausted".
+    /// The SINGLE liveness representation on the wire — the client renders
+    /// banners and gates claim buttons from this; it must never have to infer
+    /// the reason from side signals like games.len().
+    state: &'static str,
     games: Vec<GameView>,
     claims: Vec<ClaimView>,
 }
@@ -134,45 +140,61 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
     };
 
     let now = OffsetDateTime::now_utc();
-    let revoked = link.revoked;
-    let expired = link.expires_at.is_some_and(|exp| exp <= now);
-    // active: single can_claim rule — one implementation, never a manual re-derivation
-    let active = link.can_claim(now).is_ok();
+    // state + games-gating from ONE exhaustive match over the single can_claim
+    // rule — a future refusal variant forces a decision here at compile time
+    // instead of silently leaking the catalog through a string comparison.
+    // Revoked/expired hide the games (dead link, don't leak catalog);
+    // exhausted keeps them visible so the friend can browse (claim buttons
+    // are disabled client-side).
+    let (state, hide_games) = match link.can_claim(now) {
+        Ok(()) => ("active", false),
+        Err(domain::ClaimRefusal::Revoked) => ("revoked", true),
+        Err(domain::ClaimRefusal::Expired) => ("expired", true),
+        Err(domain::ClaimRefusal::Exhausted) => ("exhausted", false),
+    };
 
-    // Revoked/expired: show no games (link is dead; don't leak catalog).
-    // Exhausted: games stay visible so the friend can browse; claim buttons
-    // are disabled client-side via claims_used == claims_allowed.
-    let games: Vec<GameView> = if revoked || expired {
-        vec![]
-    } else {
-        match s.store.list_listable_games().await {
-            Ok(gs) => gs
-                .into_iter()
-                .map(|g| GameView {
-                    id: g.id,
-                    title: g.title,
-                    bundle: g.bundle,
-                    key_type: g.key_type,
-                    artwork_url: g.artwork_url,
+    // The games list and the claims history are independent reads — run them
+    // concurrently. Each degrades on its own (empty grid / empty history).
+    // Claims history is ALWAYS returned intact (spec §7); titles come from one
+    // BatchGetItem over the claimed ids (claimed games leave the listable set,
+    // so the games list can't supply them). A failed lookup degrades to
+    // title:None — the client falls back to game_id.
+    let (games, claims) = tokio::join!(
+        async {
+            if hide_games {
+                return vec![];
+            }
+            match s.store.list_listable_games().await {
+                Ok(gs) => gs
+                    .into_iter()
+                    .map(|g| GameView {
+                        id: g.id,
+                        title: g.title,
+                        bundle: g.bundle,
+                        key_type: g.key_type,
+                        artwork_url: g.artwork_url,
+                    })
+                    .collect(),
+                Err(_) => vec![],
+            }
+        },
+        async {
+            let cs = match s.store.claims_for_link(&token).await {
+                Ok(cs) => cs,
+                Err(_) => return vec![],
+            };
+            let ids: Vec<String> = cs.iter().map(|c| c.game_id.clone()).collect();
+            let titles = s.store.batch_get_games(&ids).await.unwrap_or_default();
+            cs.into_iter()
+                .map(|c| ClaimView {
+                    title: titles.get(&c.game_id).map(|g| g.title.clone()),
+                    game_id: c.game_id,
+                    state: c.state,
+                    gift_url: c.gift_url,
                 })
-                .collect(),
-            Err(_) => vec![],
+                .collect::<Vec<_>>()
         }
-    };
-
-    // Claims history is ALWAYS returned intact (spec §7).
-    let claims: Vec<ClaimView> = match s.store.claims_for_link(&token).await {
-        Ok(cs) => cs
-            .into_iter()
-            .map(|c| ClaimView {
-                game_id: c.game_id,
-                title: None,
-                state: claim_state_str(c.state),
-                gift_url: c.gift_url,
-            })
-            .collect(),
-        Err(_) => vec![],
-    };
+    );
 
     (
         StatusCode::OK,
@@ -180,19 +202,12 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             label: link.label,
             claims_allowed: link.claims_allowed,
             claims_used: link.claims_used,
-            active,
+            state,
             games,
             claims,
         }),
     )
         .into_response()
-}
-
-fn claim_state_str(state: domain::ClaimState) -> String {
-    serde_json::to_value(state)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 // ── POST /api/l/:token/claim ──────────────────────────────────────────────────

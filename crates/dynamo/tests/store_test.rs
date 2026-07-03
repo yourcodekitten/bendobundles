@@ -647,3 +647,27 @@ async fn set_game_hidden_contested() {
     );
     assert!(after.claim_id.is_some(), "claim_id must be preserved");
 }
+
+/// batch_get_games: found ids come back keyed by id; missing ids are simply
+/// absent (no error); empty input short-circuits to an empty map with no I/O.
+#[tokio::test]
+async fn batch_get_games_found_and_missing() {
+    let Some(store) = store_or_skip("batch-get-games").await else {
+        return;
+    };
+    let g1 = game(1, true);
+    let g2 = game(2, true);
+    store.put_game(&g1).await.unwrap();
+    store.put_game(&g2).await.unwrap();
+
+    let ids = vec![g1.id.clone(), g2.id.clone(), "GAMEKEY:nope".to_string()];
+    let map = store.batch_get_games(&ids).await.unwrap();
+
+    assert_eq!(map.len(), 2, "two found, one missing");
+    assert_eq!(map.get(&g1.id).unwrap().title, "Game 1");
+    assert_eq!(map.get(&g2.id).unwrap().title, "Game 2");
+    assert!(!map.contains_key("GAMEKEY:nope"));
+
+    let empty = store.batch_get_games(&[]).await.unwrap();
+    assert!(empty.is_empty());
+}
