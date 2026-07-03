@@ -53,6 +53,17 @@ async fn parses_order_key_states() {
 
     let dead = &order.keys[2];
     assert!(dead.expired && !dead.giftable);
+
+    assert_eq!(order.keys[0].keyindex, 0);
+    assert_eq!(order.keys[1].keyindex, 1);
+    assert_eq!(order.keys[2].keyindex, 2);
+    assert_eq!(order.subproducts.len(), 2);
+    assert_eq!(order.subproducts[0].human_name, "Stardew Valley");
+    assert_eq!(
+        order.subproducts[0].icon.as_deref(),
+        Some("https://hb.imgix.net/stardew.png")
+    );
+    assert_eq!(order.subproducts[1].icon, None);
 }
 
 #[tokio::test]
@@ -107,7 +118,7 @@ async fn redeems_as_gift() {
         .and(path("/humbler/redeemkey"))
         .and(body_string_contains("keytype=stardew_valley_steam"))
         .and(body_string_contains("key=AAAAbbbbCCCC"))
-        .and(body_string_contains("keyindex=0"))
+        .and(body_string_contains("keyindex=3"))
         .and(body_string_contains("gift=true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true,
@@ -118,7 +129,7 @@ async fn redeems_as_gift() {
 
     let gift = client(&server)
         .await
-        .redeem_as_gift("AAAAbbbbCCCC", "stardew_valley_steam")
+        .redeem_as_gift("AAAAbbbbCCCC", "stardew_valley_steam", 3)
         .await
         .unwrap();
     assert_eq!(gift.0, "https://www.humblebundle.com/gift?key=g1ftt0k3n");
@@ -138,7 +149,7 @@ async fn already_redeemed_is_typed() {
 
     let err = client(&server)
         .await
-        .redeem_as_gift("AAAAbbbbCCCC", "already_revealed_steam")
+        .redeem_as_gift("AAAAbbbbCCCC", "already_revealed_steam", 0)
         .await
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::AlreadyRedeemed));
@@ -158,7 +169,7 @@ async fn refused_redeem_is_typed() {
 
     let err = client(&server)
         .await
-        .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam")
+        .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam", 0)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -180,7 +191,7 @@ async fn malformed_redeem_is_parse_error() {
 
     let err = client(&server)
         .await
-        .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam")
+        .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam", 0)
         .await
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::Parse(_)));
@@ -218,7 +229,7 @@ async fn ambiguous_redeem_is_typed() {
 
     let err = client(&server)
         .await
-        .redeem_as_gift("AAAAbbbbCCCC", "stardew_valley_steam")
+        .redeem_as_gift("AAAAbbbbCCCC", "stardew_valley_steam", 0)
         .await
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::AmbiguousRedeem));

@@ -1,0 +1,28 @@
+[package]
+name = "fulfillment"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+humble-client = { path = "../humble-client" }
+dynamo = { path = "../dynamo" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio = { workspace = true, features = ["time"] }
+# bin-only deps (lambda_runtime dispatch, SSM config, observability)
+lambda_runtime = "0.14"
+aws-sdk-ssm = "1"
+aws-sdk-dynamodb = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
+aws-sdk-dynamodb = "1"
+tokio.workspace = true
+wiremock = "0.6"

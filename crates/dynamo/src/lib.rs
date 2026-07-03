@@ -7,8 +7,50 @@ use aws_sdk_dynamodb::types::{
     ProjectionType, ScalarAttributeType,
 };
 use domain::{Claim, ClaimState, Game, GameStatus, Link};
-use schema::{claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body};
+use schema::{
+    claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body, session_item,
+    session_pk, sync_state_item,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
+
+/// Outcome of a guarded sync-upsert. The ONLY way catalog sync should write a game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncWrite {
+    /// Game was written (new or refreshed).
+    Written,
+    /// An optimistic-lock condition failed: a concurrent claim (or fulfill/compensate) changed the
+    /// game's status while sync was preparing the write. Do NOT retry — the in-flight claim owns
+    /// the game.
+    SkippedInFlight,
+    /// `domain::merge_sync` returned `None`: the stored game is already identical to what sync
+    /// would write. No I/O was performed.
+    Unchanged,
+}
+
+/// Outcome of a guarded hidden-flag write. The ONLY safe way to toggle `hidden` on a game.
+/// Closes the admin-toggle vs claim race that an unguarded `put_game` would lose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HiddenWrite {
+    /// Hidden flag was written (game was found and the condition passed).
+    Written,
+    /// No game with that ID exists; caller should 404.
+    NotFound,
+    /// A concurrent claim holds a `claim_id` on the game — the conditional put's
+    /// `attribute_not_exists(claim_id)` clause fired. Caller should 409 and retry later.
+    Contested,
+}
+
+/// Persisted summary of a catalog-sync run. Storage-shaped (lives in dynamo, not in domain).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SyncState {
+    pub last_run_epoch: i64,
+    pub ok: bool,
+    pub cookie_ok: bool,
+    pub games_written: u32,
+    pub message: String,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -629,6 +671,297 @@ impl Store {
                 Err(StoreError::Aws(err_str))
             }
         }
+    }
+
+    /// Toggle a game's `hidden` flag with a guarded conditional write.
+    ///
+    /// Race handling:
+    /// - If the game is already `Pending` at read time, return `Contested` immediately — the
+    ///   claim is in flight and any hide attempt would race its fulfill/compensate.
+    /// - Otherwise use an optimistic lock on status (`#st = :expected`): a claim that lands
+    ///   between our read and the put flips the game to `Pending`, which CCFs the condition
+    ///   and safely returns `Contested`.
+    ///
+    /// The old `attribute_not_exists(claim_id)` guard permanently blocked gifted games (which
+    /// retain `claim_id` after `fulfill_claim`) from ever being hidden. The status-only lock
+    /// is the correct gate: `Gifted` games have a stable status string and no competing writer.
+    pub async fn set_game_hidden(
+        &self,
+        game_id: &str,
+        hidden: bool,
+    ) -> Result<HiddenWrite, StoreError> {
+        let Some(mut game) = self.get_game(game_id).await? else {
+            return Ok(HiddenWrite::NotFound);
+        };
+
+        // Pending means a claim is actively in flight — return Contested immediately.
+        // A claim landing AFTER this read will flip status to Pending → the put condition
+        // below (status must equal the read value) will CCF → Contested.
+        if game.status == GameStatus::Pending {
+            return Ok(HiddenWrite::Contested);
+        }
+
+        game.hidden = hidden;
+
+        // Optimistic lock: status must match what we read. Mirrors upsert_game_from_sync.
+        let status_str = serde_json::to_value(game.status)
+            .expect("status serializes")
+            .as_str()
+            .expect("status is a string")
+            .to_string();
+
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":expected", schema::s(status_str))
+            .condition_expression("#st = :expected")
+            .send()
+            .await;
+
+        match res {
+            Ok(_) => Ok(HiddenWrite::Written),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(HiddenWrite::Contested)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
+    /// Guarded sync-upsert: the ONLY correct writer for catalog-sync. `put_game` remains unsafe
+    /// for sync — it clobbers status/claim_id and resets the listable GSI attrs wholesale, without
+    /// the optimistic lock that prevents mid-sync races with an in-flight claim.
+    ///
+    /// `domain::merge_sync` branch-c takes identity fields (`gamekey`, `machine_name`) from
+    /// `fresh` — safe here because `fresh` is constructed from the same `gamekey:machine_name`
+    /// that produced the lookup `id` (carry-note from task-2 review).
+    pub async fn upsert_game_from_sync(&self, fresh: Game) -> Result<SyncWrite, StoreError> {
+        let existing = self.get_game(&fresh.id).await?;
+        let Some(merged) = domain::merge_sync(existing.as_ref(), fresh) else {
+            return Ok(SyncWrite::Unchanged);
+        };
+
+        // Condition: if no existing record, guard with attribute_not_exists(pk) so a concurrent
+        // first-insert doesn't clobber a claim that landed between our read and write.
+        // If an existing record was found, optimistic-lock on its status string — a CCF means a
+        // concurrent claim/compensate/fulfill changed status under us → SkippedInFlight.
+        // When the existing game is owned (claim_id is Some), add an ownership clause to close a
+        // TOCTOU where a compensate+reclaim lands inside sync's read→write window. Without it, the
+        // put would stamp the stale claim_id and strand the live claim (whose fulfill gate checks
+        // claim_id for ownership).
+        let mut req = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&merged)));
+
+        let cond = match &existing {
+            None => "attribute_not_exists(pk)".to_string(),
+            Some(e) => {
+                let status_str = serde_json::to_value(e.status)
+                    .expect("status serializes")
+                    .as_str()
+                    .expect("status is a string")
+                    .to_string();
+                req = req
+                    .expression_attribute_names("#st", "status")
+                    .expression_attribute_values(":expected", schema::s(status_str));
+                // If the existing game is owned, add the ownership clause to the condition.
+                if let Some(cid) = &e.claim_id {
+                    req = req.expression_attribute_values(":cid", schema::s(cid.clone()));
+                    "#st = :expected AND claim_id = :cid".to_string()
+                } else {
+                    "#st = :expected".to_string()
+                }
+            }
+        };
+
+        let res = req.condition_expression(cond).send().await;
+        match res {
+            Ok(_) => Ok(SyncWrite::Written),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(SyncWrite::SkippedInFlight)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
+    /// Query the `pending-claims` GSI for all claims currently in `Pending` state, oldest first
+    /// (ascending by gsi2sk, which is the RFC3339 `created_at`).
+    ///
+    /// Single Query page (DynamoDB's 1 MB / page cap, no pagination). Fine at this app's scale —
+    /// pending claims are transient and expected to be few — but do NOT assume completeness at
+    /// larger scale: a larger pending set would need `.into_paginator()` to be exhaustive.
+    pub async fn list_pending_claims(&self) -> Result<Vec<Claim>, StoreError> {
+        let out = self
+            .client
+            .query()
+            .table_name(&self.table)
+            .index_name(schema::GSI_PENDING)
+            .key_condition_expression("gsi2pk = :p")
+            .expression_attribute_values(
+                ":p",
+                aws_sdk_dynamodb::types::AttributeValue::S("PENDINGCLAIM".into()),
+            )
+            .scan_index_forward(true)
+            .send()
+            .await?;
+        out.items().iter().map(parse_body).collect()
+    }
+
+    /// Full-catalog Scan over every GAME# item. Admin needs completeness: game IDs are scattered
+    /// across arbitrary partition keys (`GAME#gamekey:machine_name`), so a Query is impossible
+    /// without a dedicated GSI. A Scan with `FilterExpression = begins_with(pk, "GAME#") AND
+    /// sk = "META"` is correct and acceptably fast at this catalog scale (single-digit MB at most).
+    /// We loop on `last_evaluated_key` to exhaust every page — admin can never see a truncated list.
+    /// At tens-of-thousands-of-games scale a `type` attribute + GSI would be preferred over a full
+    /// table scan, but that day is not today.
+    pub async fn list_all_games(&self) -> Result<Vec<Game>, StoreError> {
+        let mut games: Vec<Game> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .filter_expression("begins_with(pk, :pfx) AND sk = :meta")
+                .expression_attribute_values(
+                    ":pfx",
+                    aws_sdk_dynamodb::types::AttributeValue::S("GAME#".into()),
+                )
+                .expression_attribute_values(
+                    ":meta",
+                    aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+                )
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await?;
+            for item in out.items() {
+                games.push(parse_body(item)?);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(games)
+    }
+
+    /// Full Scan for all LINK# META items. Paginated via `last_evaluated_key` for completeness.
+    /// The filter `begins_with(pk, "LINK#") AND sk = "META"` excludes CLAIM# sub-items (those
+    /// have `sk = "CLAIM#<id>"`) and any other item types. `claims_used` is overridden from the
+    /// authoritative top-level counter on each item — same logic as `get_link` — so the result
+    /// always reflects the enforcer's truth rather than a potentially-stale `body` counter.
+    pub async fn list_links(&self) -> Result<Vec<Link>, StoreError> {
+        let mut links: Vec<Link> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .filter_expression("begins_with(pk, :pfx) AND sk = :meta")
+                .expression_attribute_values(
+                    ":pfx",
+                    aws_sdk_dynamodb::types::AttributeValue::S("LINK#".into()),
+                )
+                .expression_attribute_values(
+                    ":meta",
+                    aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+                )
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await?;
+            for item in out.items() {
+                let mut link: Link = parse_body(item)?;
+                // Top-level `claims_used` (N) is the authoritative counter — same override as
+                // `get_link`. The body's counter can lag under concurrent claim_game ADD ops.
+                if let Some(n) = item.get("claims_used").and_then(|v| v.as_n().ok())
+                    && let Ok(v) = n.parse::<u32>()
+                {
+                    link.claims_used = v;
+                }
+                links.push(link);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(links)
+    }
+
+    /// Persist a catalog-sync run summary. Unconditional upsert — only one SYNC#STATE item exists.
+    pub async fn put_sync_state(&self, state: &SyncState) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(sync_state_item(state)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Retrieve the most recent catalog-sync run summary, or `None` if no run has been recorded.
+    pub async fn get_sync_state(&self) -> Result<Option<SyncState>, StoreError> {
+        self.get_meta("SYNC#STATE").await
+    }
+
+    /// Persist an admin session. pk="SESSION#<token>", sk="META". Both `expires_epoch` and `ttl`
+    /// are set to the same value; `ttl` is reserved for DynamoDB TTL (enabled in plan 4's
+    /// terraform). Until then, callers are responsible for checking expiry against wall clock.
+    pub async fn create_session(&self, token: &str, expires_epoch: i64) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(session_item(token, expires_epoch)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Look up an admin session by token, returning the stored `expires_epoch` (seconds since
+    /// Unix epoch). Returns `None` if the session does not exist. Expiry enforcement (comparing
+    /// against the current time) is the caller's responsibility.
+    pub async fn get_session(&self, token: &str) -> Result<Option<i64>, StoreError> {
+        let (pk, sk) = schema::key_pair(session_pk(token), "META");
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        out.item
+            .map(|item| {
+                item.get("expires_epoch")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .ok_or(StoreError::Corrupt("session missing expires_epoch"))
+            })
+            .transpose()
+    }
+
+    /// Delete an admin session. Idempotent — silently succeeds if the token does not exist.
+    pub async fn delete_session(&self, token: &str) -> Result<(), StoreError> {
+        let (pk, sk) = schema::key_pair(session_pk(token), "META");
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        Ok(())
     }
 
     /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).

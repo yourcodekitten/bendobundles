@@ -1,10 +1,12 @@
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
-use dynamo::{ClaimTxError, Store};
+use dynamo::{ClaimTxError, HiddenWrite, Store, SyncState, SyncWrite};
 use time::macros::datetime;
 
 async fn store_or_skip(test: &str) -> Option<Store> {
-    let url =
-        std::env::var("DYNAMODB_LOCAL_URL").unwrap_or_else(|_| "http://localhost:8000".into());
+    let (url, explicit) = match std::env::var("DYNAMODB_LOCAL_URL") {
+        Ok(v) => (v, true),
+        Err(_) => ("http://localhost:8000".into(), false),
+    };
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url(&url)
         .region("us-east-1")
@@ -13,6 +15,12 @@ async fn store_or_skip(test: &str) -> Option<Store> {
         .await;
     let client = aws_sdk_dynamodb::Client::new(&config);
     if client.list_tables().send().await.is_err() {
+        if explicit {
+            panic!(
+                "DYNAMODB_LOCAL_URL is set but dynamodb-local is unreachable — \
+                 refusing to skip (this would forge a green run)"
+            );
+        }
         eprintln!("SKIP {test}: no dynamodb-local at {url}");
         return None;
     }
@@ -35,6 +43,7 @@ fn game(n: u32, listable: bool) -> Game {
         status: GameStatus::Available,
         claim_id: None,
         artwork_url: None,
+        keyindex: 0,
     }
 }
 
@@ -365,4 +374,276 @@ async fn claim_concurrent_counter_is_authoritative() {
         .unwrap();
     let l = store.get_link("tok-cc").await.unwrap().unwrap();
     assert_eq!(l.claims_used, 1, "counter must be 1 after one compensation");
+}
+
+#[tokio::test]
+async fn sync_upsert_respects_ownership() {
+    let Some(store) = store_or_skip("sync-upsert").await else {
+        return;
+    };
+    // new game → Written
+    let g = game(1, true);
+    assert!(matches!(
+        store.upsert_game_from_sync(g.clone()).await.unwrap(),
+        SyncWrite::Written
+    ));
+    // unchanged → Unchanged
+    assert!(matches!(
+        store.upsert_game_from_sync(g.clone()).await.unwrap(),
+        SyncWrite::Unchanged
+    ));
+    // hidden survives a humble-side change
+    let mut hidden = g.clone();
+    hidden.hidden = true;
+    store.put_game(&hidden).await.unwrap();
+    let mut fresh = g.clone();
+    fresh.title = "Renamed".into();
+    assert!(matches!(
+        store.upsert_game_from_sync(fresh).await.unwrap(),
+        SyncWrite::Written
+    ));
+    let got = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(got.hidden);
+    assert_eq!(got.title, "Renamed");
+    // pending game: sync may refresh cosmetics but never the status.
+    // NOTE: g is hidden at this point (asserted above), and hidden games are unclaimable by
+    // design (claim_game's gsi1pk listability gate) — so this phase uses a SECOND, visible
+    // game. This exact line once claimed the hidden g and failed in CI: the gate worked.
+    let g2 = game(2, true);
+    store.put_game(&g2).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    store
+        .claim_game("tok1", &g2.id, "c1", datetime!(2026-07-02 12:00 UTC))
+        .await
+        .unwrap();
+    let mut fresh2 = g2.clone();
+    fresh2.status = GameStatus::BenRedeemed;
+    fresh2.title = "Renamed Again".into();
+    let w = store.upsert_game_from_sync(fresh2).await.unwrap();
+    assert!(matches!(w, SyncWrite::Written | SyncWrite::SkippedInFlight));
+    let after = store.get_game(&g2.id).await.unwrap().unwrap();
+    assert_eq!(after.status, GameStatus::Pending); // status untouched either way
+}
+
+#[tokio::test]
+async fn pending_claims_and_sync_state_and_sessions() {
+    let Some(store) = store_or_skip("pending-state-sessions").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    store
+        .claim_game(
+            "tok1",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-02 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    let pending = store.list_pending_claims().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "c1");
+
+    let st = SyncState {
+        last_run_epoch: 1_800_000_000,
+        ok: true,
+        cookie_ok: true,
+        games_written: 3,
+        message: "ok".into(),
+    };
+    store.put_sync_state(&st).await.unwrap();
+    assert_eq!(store.get_sync_state().await.unwrap().unwrap(), st);
+
+    store.create_session("sess1", 2_000_000_000).await.unwrap();
+    assert_eq!(
+        store.get_session("sess1").await.unwrap(),
+        Some(2_000_000_000)
+    );
+    store.delete_session("sess1").await.unwrap();
+    assert_eq!(store.get_session("sess1").await.unwrap(), None);
+}
+
+/// `list_all_games` must return every GAME# META item, including non-listable ones (hidden,
+/// non-giftable, non-Available). The listable GSI only covers Available+giftable+unhidden; admin
+/// needs the whole picture including games ben has hidden or that are in mid-claim state.
+#[tokio::test]
+async fn list_all_games_includes_non_listable() {
+    let Some(store) = store_or_skip("list-all-games").await else {
+        return;
+    };
+    // Game 1: giftable + available (listable)
+    store.put_game(&game(1, true)).await.unwrap();
+    // Game 2: giftable + available but hidden (NOT listable; admin still needs it)
+    let mut hidden_g = game(2, true);
+    hidden_g.hidden = true;
+    store.put_game(&hidden_g).await.unwrap();
+
+    let all = store.list_all_games().await.unwrap();
+    assert_eq!(all.len(), 2, "list_all_games must return both games");
+
+    let ids: std::collections::HashSet<_> = all.iter().map(|g| g.id.as_str()).collect();
+    assert!(
+        ids.contains(game_id("gk1", "mn").as_str()),
+        "game 1 must be present"
+    );
+    assert!(
+        ids.contains(game_id("gk2", "mn").as_str()),
+        "hidden game 2 must be present"
+    );
+
+    // The listable GSI covers only game 1.
+    let listable = store.list_listable_games().await.unwrap();
+    assert_eq!(
+        listable.len(),
+        1,
+        "listable GSI must still only return game 1"
+    );
+    assert_eq!(listable[0].id, game_id("gk1", "mn"));
+}
+
+/// `list_links` must return every LINK# META item with the authoritative top-level counter.
+/// CLAIM# sub-items share the same pk prefix but have sk = "CLAIM#..." — they must be excluded.
+#[tokio::test]
+async fn list_links_returns_all_with_authoritative_counter() {
+    let Some(store) = store_or_skip("list-links").await else {
+        return;
+    };
+    // Seed two links; allow 1 claim each.
+    store.create_link(&link("tok-la")).await.unwrap();
+    let mut lnk_b = link("tok-lb");
+    lnk_b.claims_allowed = 5;
+    store.create_link(&lnk_b).await.unwrap();
+
+    // Claim a game via tok-la to drive the authoritative ADD counter.
+    store.put_game(&game(10, true)).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    store
+        .claim_game("tok-la", &game_id("gk10", "mn"), "cla1", now)
+        .await
+        .unwrap();
+
+    let links = store.list_links().await.unwrap();
+    assert_eq!(
+        links.len(),
+        2,
+        "both links must be returned; no CLAIM# items"
+    );
+
+    let la = links.iter().find(|l| l.token == "tok-la").unwrap();
+    assert_eq!(
+        la.claims_used, 1,
+        "authoritative counter must reflect the ADD"
+    );
+
+    let lb = links.iter().find(|l| l.token == "tok-lb").unwrap();
+    assert_eq!(lb.claims_used, 0);
+    assert_eq!(lb.claims_allowed, 5);
+}
+
+/// `set_game_hidden` basic: seed a game, toggle hidden → Written, re-read confirms hidden=true.
+/// Unknown id → NotFound.
+#[tokio::test]
+async fn set_game_hidden_basic() {
+    let Some(store) = store_or_skip("set-game-hidden-basic").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Set hidden=true → Written
+    let result = store.set_game_hidden(&gid, true).await.unwrap();
+    assert!(
+        matches!(result, HiddenWrite::Written),
+        "set_game_hidden on available unclaimed game must be Written"
+    );
+
+    // Re-read: hidden must be true
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        got.hidden,
+        "game must be hidden after set_game_hidden(true)"
+    );
+
+    // Unknown id → NotFound
+    let nf = store.set_game_hidden("no-such-id", true).await.unwrap();
+    assert!(
+        matches!(nf, HiddenWrite::NotFound),
+        "unknown game id must return NotFound"
+    );
+
+    // Gifted game (has claim_id from fulfill) must also allow set_game_hidden → Written.
+    // This was the bug: the old `attribute_not_exists(claim_id)` guard permanently blocked
+    // gifted games since fulfill_claim leaves claim_id on the DynamoDB item.
+    let g2 = game(2, true);
+    let gid2 = g2.id.clone();
+    store.put_game(&g2).await.unwrap();
+    let mut lnk2 = link("tok-hide-gifted");
+    lnk2.claims_allowed = 1;
+    store.create_link(&lnk2).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    store
+        .claim_game("tok-hide-gifted", &gid2, "c-hide", now)
+        .await
+        .unwrap();
+    store
+        .fulfill_claim(
+            "tok-hide-gifted",
+            "c-hide",
+            &gid2,
+            "https://www.humblebundle.com/gift?key=TESTKEYXYZ",
+        )
+        .await
+        .unwrap();
+    // Gifted game still carries claim_id — set_game_hidden must now succeed (Written).
+    let gifted = store.get_game(&gid2).await.unwrap().unwrap();
+    assert_eq!(gifted.status, GameStatus::Gifted);
+    assert!(gifted.claim_id.is_some(), "gifted game retains claim_id");
+    let result2 = store.set_game_hidden(&gid2, true).await.unwrap();
+    assert!(
+        matches!(result2, HiddenWrite::Written),
+        "set_game_hidden on a gifted game must be Written (not Contested), got {result2:?}"
+    );
+    let after2 = store.get_game(&gid2).await.unwrap().unwrap();
+    assert!(
+        after2.hidden,
+        "gifted game must be hidden after set_game_hidden(true)"
+    );
+}
+
+/// `set_game_hidden` contested: a Pending game (mid-claim) triggers an early Contested return
+/// before the put even runs — the Pending status is the gate, not claim_id presence.
+#[tokio::test]
+async fn set_game_hidden_contested() {
+    let Some(store) = store_or_skip("set-game-hidden-contested").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+
+    // Claim the game — it is now Pending with a top-level claim_id attribute.
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+    let claimed = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(claimed.status, GameStatus::Pending);
+    assert!(claimed.claim_id.is_some());
+
+    // set_game_hidden must detect Pending status and return Contested early.
+    let result = store.set_game_hidden(&gid, true).await.unwrap();
+    assert!(
+        matches!(result, HiddenWrite::Contested),
+        "set_game_hidden on a Pending game must return Contested, got {result:?}"
+    );
+
+    // The game's claim must be intact (no clobber).
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        GameStatus::Pending,
+        "status must still be Pending"
+    );
+    assert!(after.claim_id.is_some(), "claim_id must be preserved");
 }

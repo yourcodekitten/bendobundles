@@ -50,6 +50,7 @@ pub struct Order {
     pub gamekey: String,
     pub bundle_name: String,
     pub keys: Vec<KeyEntry>,
+    pub subproducts: Vec<Subproduct>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,14 @@ pub struct KeyEntry {
     pub redeemed: bool,
     pub expired: bool,
     pub giftable: bool,
+    pub keyindex: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subproduct {
+    pub machine_name: String,
+    pub human_name: String,
+    pub icon: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +169,17 @@ impl HumbleClient {
                         key_type: t.key_type,
                         redeemed,
                         expired,
+                        keyindex: t.keyindex,
                     }
+                })
+                .collect(),
+            subproducts: wire
+                .subproducts
+                .into_iter()
+                .map(|s| Subproduct {
+                    machine_name: s.machine_name,
+                    human_name: s.human_name,
+                    icon: s.icon,
                 })
                 .collect(),
         })
@@ -170,21 +189,22 @@ impl HumbleClient {
         &self,
         gamekey: &str,
         machine_name: &str,
+        keyindex: u32,
     ) -> Result<GiftUrl, HumbleError> {
         let resp = self
             .http
             .post(format!("{}/humbler/redeemkey", self.base))
             .header("Cookie", format!("_simpleauth_sess={}", self.cookie.0))
             .header("X-Requested-By", "hb_android_app")
-            // keyindex semantics are unverified against the live endpoint — community tooling
-            // passes keytype=<machine_name> as the selector and keyindex=0 regardless of position;
-            // if humble actually selects by index, multi-key orders would gift the wrong entry.
-            // VERIFY on the first real gifting of a non-first key in an order (the read-only probe
-            // cannot test redeems by design) — tracked for the plan-2 live receipt.
+            // keyindex now passes the tpk's true index; we pass the position in the order's
+            // key list. if humble actually selects by keytype=<machine_name>, this index is
+            // redundant. VERIFY on the first real gifting of a non-first key in an order
+            // (the read-only probe cannot test redeems by design) — tracked for the plan-2
+            // live receipt.
             .form(&[
                 ("keytype", machine_name),
                 ("key", gamekey),
-                ("keyindex", "0"),
+                ("keyindex", &keyindex.to_string()),
                 ("gift", "true"),
             ])
             .send()

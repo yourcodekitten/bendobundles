@@ -33,6 +33,8 @@ pub struct Game {
     pub status: GameStatus,
     pub claim_id: Option<String>,
     pub artwork_url: Option<String>,
+    #[serde(default)]
+    pub keyindex: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +98,90 @@ pub fn game_id(gamekey: &str, machine_name: &str) -> String {
     format!("{gamekey}:{machine_name}")
 }
 
+pub fn sync_status(redeemed: bool, expired: bool) -> GameStatus {
+    if expired {
+        GameStatus::Expired
+    } else if redeemed {
+        GameStatus::BenRedeemed
+    } else {
+        GameStatus::Available
+    }
+}
+
+pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
+    match existing {
+        None => Some(fresh),
+        Some(existing_game) => {
+            let merged = match existing_game.status {
+                GameStatus::Pending | GameStatus::Gifted => {
+                    // App owns the record: keep status, claim_id, hidden, giftable
+                    // Refresh: title, bundle, artwork_url, keyindex, key_type from fresh
+                    Game {
+                        id: existing_game.id.clone(),
+                        title: fresh.title,
+                        bundle: fresh.bundle,
+                        gamekey: existing_game.gamekey.clone(),
+                        machine_name: existing_game.machine_name.clone(),
+                        key_type: fresh.key_type,
+                        giftable: existing_game.giftable,
+                        hidden: existing_game.hidden,
+                        status: existing_game.status,
+                        claim_id: existing_game.claim_id.clone(),
+                        artwork_url: fresh.artwork_url,
+                        keyindex: fresh.keyindex,
+                    }
+                }
+                GameStatus::Available | GameStatus::BenRedeemed | GameStatus::Expired => {
+                    // Humble-owned: fresh wins entirely except hidden. No catch-all `_` —
+                    // a future GameStatus variant must be consciously classified here,
+                    // same as the no-`_` rule in fulfillment's gift_decision.
+                    Game {
+                        hidden: existing_game.hidden,
+                        ..fresh
+                    }
+                }
+            };
+
+            if merged == *existing_game {
+                None
+            } else {
+                Some(merged)
+            }
+        }
+    }
+}
+
+pub fn match_artwork<'a>(
+    human_name: &str,
+    subproducts: &'a [(String, Option<String>)],
+) -> Option<&'a str> {
+    let human_lower = human_name.to_lowercase();
+
+    // First try exact case-insensitive match
+    for (name, icon) in subproducts {
+        if name.to_lowercase() == human_lower {
+            // Exact match found, return its icon (even if None)
+            return icon.as_deref();
+        }
+    }
+
+    // Then try prefix match (either direction, case-insensitive): prefer the longest
+    // matching subproduct name so "Portal 2" beats "Portal" for key "Portal 2 Steam Key".
+    let best = subproducts
+        .iter()
+        .filter(|(name, icon)| {
+            let name_lower = name.to_lowercase();
+            icon.is_some()
+                && (name_lower.starts_with(&human_lower) || human_lower.starts_with(&name_lower))
+        })
+        .max_by_key(|(name, _)| name.len());
+    if let Some((_, icon)) = best {
+        return icon.as_deref();
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +213,7 @@ mod tests {
             status: GameStatus::Available,
             claim_id: None,
             artwork_url: None,
+            keyindex: 0,
         };
         assert!(g.is_listable());
         g.hidden = true;
@@ -160,5 +247,97 @@ mod tests {
     #[test]
     fn game_id_shape() {
         assert_eq!(game_id("abc", "def_tpk"), "abc:def_tpk");
+    }
+
+    #[test]
+    fn sync_status_derivation() {
+        assert_eq!(sync_status(false, false), GameStatus::Available);
+        assert_eq!(sync_status(true, false), GameStatus::BenRedeemed);
+        assert_eq!(sync_status(false, true), GameStatus::Expired);
+        assert_eq!(sync_status(true, true), GameStatus::Expired);
+    }
+
+    fn fresh_game() -> Game {
+        Game {
+            id: game_id("gk", "mn"),
+            title: "New Title".into(),
+            bundle: "B".into(),
+            gamekey: "gk".into(),
+            machine_name: "mn".into(),
+            key_type: "steam".into(),
+            giftable: true,
+            hidden: false,
+            status: GameStatus::Available,
+            claim_id: None,
+            artwork_url: Some("new.png".into()),
+            keyindex: 4,
+        }
+    }
+
+    #[test]
+    fn merge_new_game_is_fresh() {
+        assert_eq!(merge_sync(None, fresh_game()), Some(fresh_game()));
+    }
+
+    #[test]
+    fn merge_preserves_hidden_on_humble_owned() {
+        let mut existing = fresh_game();
+        existing.hidden = true;
+        existing.title = "Old Title".into();
+        let merged = merge_sync(Some(&existing), fresh_game()).unwrap();
+        assert!(merged.hidden);
+        assert_eq!(merged.title, "New Title");
+        assert_eq!(merged.status, GameStatus::Available);
+    }
+
+    #[test]
+    fn merge_never_touches_app_owned_status() {
+        let mut existing = fresh_game();
+        existing.status = GameStatus::Gifted;
+        existing.claim_id = Some("c1".into());
+        existing.title = "Old Title".into();
+        let mut fresh = fresh_game();
+        fresh.status = GameStatus::BenRedeemed; // humble sees the gifted key as redeemed
+        let merged = merge_sync(Some(&existing), fresh).unwrap();
+        assert_eq!(merged.status, GameStatus::Gifted);
+        assert_eq!(merged.claim_id.as_deref(), Some("c1"));
+        assert_eq!(merged.title, "New Title"); // cosmetics refresh
+    }
+
+    #[test]
+    fn merge_no_change_returns_none() {
+        let g = fresh_game();
+        assert_eq!(merge_sync(Some(&g), g.clone()), None);
+    }
+
+    #[test]
+    fn artwork_matching() {
+        let subs = vec![
+            ("Stardew Valley".to_string(), Some("s.png".to_string())),
+            ("Undertale".to_string(), None),
+            ("BIT.TRIP".to_string(), Some("b.png".to_string())),
+        ];
+        assert_eq!(match_artwork("stardew valley", &subs), Some("s.png"));
+        assert_eq!(match_artwork("Undertale", &subs), None); // matched but no icon
+        assert_eq!(
+            match_artwork("BIT.TRIP BEAT Steam Key", &subs),
+            Some("b.png")
+        ); // prefix
+        assert_eq!(match_artwork("Nothing Alike", &subs), None);
+    }
+
+    #[test]
+    fn artwork_longest_prefix_wins() {
+        // "Portal" is a prefix of "Portal 2 Steam Key"; "Portal 2" is a longer prefix.
+        // The longest matching subproduct name must win.
+        let subs = vec![
+            ("Portal".to_string(), Some("p.png".to_string())),
+            ("Portal 2".to_string(), Some("p2.png".to_string())),
+        ];
+        assert_eq!(
+            match_artwork("Portal 2 Steam Key", &subs),
+            Some("p2.png"),
+            "longest prefix (Portal 2) must beat shorter prefix (Portal)"
+        );
     }
 }

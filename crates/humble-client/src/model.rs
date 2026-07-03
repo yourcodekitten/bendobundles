@@ -12,6 +12,8 @@ pub(crate) struct OrderWire {
     pub product: ProductWire,
     #[serde(default)]
     pub tpkd_dict: TpkdDict,
+    #[serde(default)]
+    pub subproducts: Vec<SubproductWire>,
 }
 
 #[derive(Deserialize)]
@@ -35,4 +37,14 @@ pub(crate) struct TpkWire {
     pub redeemed_key_val: Option<String>,
     #[serde(default)]
     pub is_expired: bool,
+    #[serde(default)]
+    pub keyindex: u32,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SubproductWire {
+    pub machine_name: String,
+    pub human_name: String,
+    #[serde(default)]
+    pub icon: Option<String>,
 }
