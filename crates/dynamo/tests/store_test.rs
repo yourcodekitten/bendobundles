@@ -450,3 +450,80 @@ async fn pending_claims_and_sync_state_and_sessions() {
     store.delete_session("sess1").await.unwrap();
     assert_eq!(store.get_session("sess1").await.unwrap(), None);
 }
+
+/// `list_all_games` must return every GAME# META item, including non-listable ones (hidden,
+/// non-giftable, non-Available). The listable GSI only covers Available+giftable+unhidden; admin
+/// needs the whole picture including games ben has hidden or that are in mid-claim state.
+#[tokio::test]
+async fn list_all_games_includes_non_listable() {
+    let Some(store) = store_or_skip("list-all-games").await else {
+        return;
+    };
+    // Game 1: giftable + available (listable)
+    store.put_game(&game(1, true)).await.unwrap();
+    // Game 2: giftable + available but hidden (NOT listable; admin still needs it)
+    let mut hidden_g = game(2, true);
+    hidden_g.hidden = true;
+    store.put_game(&hidden_g).await.unwrap();
+
+    let all = store.list_all_games().await.unwrap();
+    assert_eq!(all.len(), 2, "list_all_games must return both games");
+
+    let ids: std::collections::HashSet<_> = all.iter().map(|g| g.id.as_str()).collect();
+    assert!(
+        ids.contains(game_id("gk1", "mn").as_str()),
+        "game 1 must be present"
+    );
+    assert!(
+        ids.contains(game_id("gk2", "mn").as_str()),
+        "hidden game 2 must be present"
+    );
+
+    // The listable GSI covers only game 1.
+    let listable = store.list_listable_games().await.unwrap();
+    assert_eq!(
+        listable.len(),
+        1,
+        "listable GSI must still only return game 1"
+    );
+    assert_eq!(listable[0].id, game_id("gk1", "mn"));
+}
+
+/// `list_links` must return every LINK# META item with the authoritative top-level counter.
+/// CLAIM# sub-items share the same pk prefix but have sk = "CLAIM#..." — they must be excluded.
+#[tokio::test]
+async fn list_links_returns_all_with_authoritative_counter() {
+    let Some(store) = store_or_skip("list-links").await else {
+        return;
+    };
+    // Seed two links; allow 1 claim each.
+    store.create_link(&link("tok-la")).await.unwrap();
+    let mut lnk_b = link("tok-lb");
+    lnk_b.claims_allowed = 5;
+    store.create_link(&lnk_b).await.unwrap();
+
+    // Claim a game via tok-la to drive the authoritative ADD counter.
+    store.put_game(&game(10, true)).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    store
+        .claim_game("tok-la", &game_id("gk10", "mn"), "cla1", now)
+        .await
+        .unwrap();
+
+    let links = store.list_links().await.unwrap();
+    assert_eq!(
+        links.len(),
+        2,
+        "both links must be returned; no CLAIM# items"
+    );
+
+    let la = links.iter().find(|l| l.token == "tok-la").unwrap();
+    assert_eq!(
+        la.claims_used, 1,
+        "authoritative counter must reflect the ADD"
+    );
+
+    let lb = links.iter().find(|l| l.token == "tok-lb").unwrap();
+    assert_eq!(lb.claims_used, 0);
+    assert_eq!(lb.claims_allowed, 5);
+}

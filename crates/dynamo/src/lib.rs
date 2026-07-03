@@ -12,6 +12,7 @@ use schema::{
     session_pk, sync_state_item,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
 /// Outcome of a guarded sync-upsert. The ONLY way catalog sync should write a game.
@@ -741,6 +742,88 @@ impl Store {
             .send()
             .await?;
         out.items().iter().map(parse_body).collect()
+    }
+
+    /// Full-catalog Scan over every GAME# item. Admin needs completeness: game IDs are scattered
+    /// across arbitrary partition keys (`GAME#gamekey:machine_name`), so a Query is impossible
+    /// without a dedicated GSI. A Scan with `FilterExpression = begins_with(pk, "GAME#") AND
+    /// sk = "META"` is correct and acceptably fast at this catalog scale (single-digit MB at most).
+    /// We loop on `last_evaluated_key` to exhaust every page — admin can never see a truncated list.
+    /// At tens-of-thousands-of-games scale a `type` attribute + GSI would be preferred over a full
+    /// table scan, but that day is not today.
+    pub async fn list_all_games(&self) -> Result<Vec<Game>, StoreError> {
+        let mut games: Vec<Game> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .filter_expression("begins_with(pk, :pfx) AND sk = :meta")
+                .expression_attribute_values(
+                    ":pfx",
+                    aws_sdk_dynamodb::types::AttributeValue::S("GAME#".into()),
+                )
+                .expression_attribute_values(
+                    ":meta",
+                    aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+                )
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await?;
+            for item in out.items() {
+                games.push(parse_body(item)?);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(games)
+    }
+
+    /// Full Scan for all LINK# META items. Paginated via `last_evaluated_key` for completeness.
+    /// The filter `begins_with(pk, "LINK#") AND sk = "META"` excludes CLAIM# sub-items (those
+    /// have `sk = "CLAIM#<id>"`) and any other item types. `claims_used` is overridden from the
+    /// authoritative top-level counter on each item — same logic as `get_link` — so the result
+    /// always reflects the enforcer's truth rather than a potentially-stale `body` counter.
+    pub async fn list_links(&self) -> Result<Vec<Link>, StoreError> {
+        let mut links: Vec<Link> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .filter_expression("begins_with(pk, :pfx) AND sk = :meta")
+                .expression_attribute_values(
+                    ":pfx",
+                    aws_sdk_dynamodb::types::AttributeValue::S("LINK#".into()),
+                )
+                .expression_attribute_values(
+                    ":meta",
+                    aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+                )
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await?;
+            for item in out.items() {
+                let mut link: Link = parse_body(item)?;
+                // Top-level `claims_used` (N) is the authoritative counter — same override as
+                // `get_link`. The body's counter can lag under concurrent claim_game ADD ops.
+                if let Some(n) = item.get("claims_used").and_then(|v| v.as_n().ok())
+                    && let Ok(v) = n.parse::<u32>()
+                {
+                    link.claims_used = v;
+                }
+                links.push(link);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(links)
     }
 
     /// Persist a catalog-sync run summary. Unconditional upsert — only one SYNC#STATE item exists.
