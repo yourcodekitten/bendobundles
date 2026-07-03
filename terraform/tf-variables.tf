@@ -11,7 +11,7 @@ variable "region" {
 
 variable "namespace" {
   type        = string
-  default     = "bd"
+  default     = "brd"
   description = "Org namespace for context/labels."
 }
 

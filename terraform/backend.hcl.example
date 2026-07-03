@@ -1,4 +1,4 @@
-bucket               = "bd-prod-ue1-tfstate-store" # ben: confirm your real state bucket
+bucket               = "brd-prod-ue1-tfstate-store"
 key                  = "terraform.tfstate"
 kms_key_id           = "alias/aws/s3"
 encrypt              = true
