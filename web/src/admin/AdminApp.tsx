@@ -3,11 +3,15 @@ import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { adminStatus, type StatusView } from '../api';
 import { withAuth } from './withAuth';
 
-// The refresh callback is threaded to child routes via Outlet context.
+// Status + its refresh callback are threaded to child routes via Outlet context.
 // Outlet context is used (over a separate React context) because the only
 // consumer is the Ops child route — a direct child of this layout — so there
 // is no deep prop-threading and no need for an extra context provider.
-export type AdminOutletContext = { refreshStatus: () => void };
+// status lives HERE only; children must not keep their own copy of it.
+export type AdminOutletContext = {
+  status: StatusView | null;
+  refreshStatus: () => void;
+};
 
 export function AdminApp() {
   const navigate = useNavigate();
@@ -71,7 +75,7 @@ export function AdminApp() {
       )}
 
       <main className="p-6">
-        <Outlet context={{ refreshStatus: fetchStatus } satisfies AdminOutletContext} />
+        <Outlet context={{ status, refreshStatus: fetchStatus } satisfies AdminOutletContext} />
       </main>
     </div>
   );

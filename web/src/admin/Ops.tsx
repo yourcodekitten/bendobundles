@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState } from 'react';
 import { useNavigate, useOutletContext } from 'react-router-dom';
-import { adminPasteCookie, adminSync, adminStatus, type StatusView } from '../api';
+import { adminPasteCookie, adminSync } from '../api';
 import { withAuth } from './withAuth';
 import type { AdminOutletContext } from './AdminApp';
 
@@ -19,10 +19,10 @@ function formatRelativeTime(epoch: number): string {
 
 export function Ops() {
   const navigate = useNavigate();
-  // refreshStatus: triggers a re-fetch of status in AdminApp so the banner
-  // updates immediately after cookie paste or sync, without waiting for the next
-  // route navigation.
-  const { refreshStatus } = useOutletContext<AdminOutletContext>();
+  // status is owned by AdminApp (single copy of the server state); refreshStatus
+  // triggers its re-fetch so the banner AND this card update immediately after
+  // cookie paste or sync, without waiting for the next route navigation.
+  const { status, refreshStatus } = useOutletContext<AdminOutletContext>();
 
   // Cookie panel
   const [cookieValue, setCookieValue] = useState('');
@@ -32,19 +32,6 @@ export function Ops() {
   // Sync panel
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
-
-  // Status card
-  const [status, setStatus] = useState<StatusView | null>(null);
-
-  const loadStatus = useCallback(() => {
-    withAuth(() => adminStatus(), navigate)
-      .then(setStatus)
-      .catch(() => {});
-  }, [navigate]);
-
-  useEffect(() => {
-    loadStatus();
-  }, [loadStatus]);
 
   const handleCookieSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,7 +52,6 @@ export function Ops() {
         } else {
           setCookieMsg('cookie failed validation');
         }
-        loadStatus();
         refreshStatus();
       })
       .catch(() => {
@@ -82,7 +68,6 @@ export function Ops() {
     withAuth(() => adminSync(), navigate)
       .then((result) => {
         setSyncMsg(`wrote ${result.games_written} games, ${result.orders_failed} orders failed`);
-        loadStatus();
         refreshStatus();
       })
       .catch((err: unknown) => {

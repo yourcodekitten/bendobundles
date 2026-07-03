@@ -6,20 +6,30 @@ import { Ops } from './Ops';
 import type { StatusView } from '../api';
 
 vi.mock('../api');
-import { adminPasteCookie, adminSync, adminStatus } from '../api';
+import { adminPasteCookie, adminSync } from '../api';
 
 // Provides the Outlet context that Ops requires without needing the real AdminApp.
 // Using <Outlet context={...} /> (react-router-dom) is the canonical approach
 // when the component under test is a child route that calls useOutletContext().
-function TestLayout({ refreshStatus }: { refreshStatus?: () => void }) {
-  return <Outlet context={{ refreshStatus: refreshStatus ?? (() => {}) }} />;
+// status is owned by the layout (AdminApp in prod) — Ops only renders it.
+function TestLayout({
+  status = null,
+  refreshStatus,
+}: {
+  status?: StatusView | null;
+  refreshStatus?: () => void;
+}) {
+  return <Outlet context={{ status, refreshStatus: refreshStatus ?? (() => {}) }} />;
 }
 
-function renderOps(refreshStatus?: () => void) {
+function renderOps(opts: { status?: StatusView | null; refreshStatus?: () => void } = {}) {
   return render(
     <MemoryRouter initialEntries={['/admin/ops']}>
       <Routes>
-        <Route path="/admin" element={<TestLayout refreshStatus={refreshStatus} />}>
+        <Route
+          path="/admin"
+          element={<TestLayout status={opts.status} refreshStatus={opts.refreshStatus} />}
+        >
           <Route path="ops" element={<Ops />} />
         </Route>
         <Route path="/admin/login" element={<div>login page</div>} />
@@ -28,21 +38,9 @@ function renderOps(refreshStatus?: () => void) {
   );
 }
 
-const defaultStatus: StatusView = {
-  sync: {
-    last_run_epoch: Math.floor(Date.now() / 1000) - 180,
-    ok: true,
-    cookie_ok: true,
-    games_written: 10,
-    message: 'all systems nominal',
-  },
-  game_counts: { available: 5, gifted: 3 },
-};
-
 describe('Ops', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(adminStatus).mockResolvedValue(defaultStatus);
   });
 
   afterEach(() => {
@@ -185,17 +183,18 @@ describe('Ops', () => {
       const nowMs = 1_751_664_000_000;
       vi.spyOn(Date, 'now').mockReturnValue(nowMs);
       const nowSec = nowMs / 1000;
-      vi.mocked(adminStatus).mockResolvedValue({
-        sync: {
-          last_run_epoch: nowSec - 180, // 3 minutes ago
-          ok: true,
-          cookie_ok: true,
-          games_written: 0,
-          message: '',
+      renderOps({
+        status: {
+          sync: {
+            last_run_epoch: nowSec - 180, // 3 minutes ago
+            ok: true,
+            cookie_ok: true,
+            games_written: 0,
+            message: '',
+          },
+          game_counts: {},
         },
-        game_counts: {},
       });
-      renderOps();
 
       await waitFor(() => {
         expect(screen.getByText('3m ago')).toBeInTheDocument();
@@ -204,17 +203,18 @@ describe('Ops', () => {
 
     it('title attr on relative-time element is ISO string of epoch', async () => {
       const epoch = 1_751_664_000;
-      vi.mocked(adminStatus).mockResolvedValue({
-        sync: {
-          last_run_epoch: epoch,
-          ok: true,
-          cookie_ok: true,
-          games_written: 0,
-          message: '',
+      renderOps({
+        status: {
+          sync: {
+            last_run_epoch: epoch,
+            ok: true,
+            cookie_ok: true,
+            games_written: 0,
+            message: '',
+          },
+          game_counts: {},
         },
-        game_counts: {},
       });
-      renderOps();
 
       await waitFor(() => {
         const el = screen.getByTitle(new Date(epoch * 1000).toISOString());
@@ -223,17 +223,18 @@ describe('Ops', () => {
     });
 
     it('shows ok ✓ and cookie ✓ badges when both true', async () => {
-      vi.mocked(adminStatus).mockResolvedValue({
-        sync: {
-          last_run_epoch: Math.floor(Date.now() / 1000) - 60,
-          ok: true,
-          cookie_ok: true,
-          games_written: 0,
-          message: '',
+      renderOps({
+        status: {
+          sync: {
+            last_run_epoch: Math.floor(Date.now() / 1000) - 60,
+            ok: true,
+            cookie_ok: true,
+            games_written: 0,
+            message: '',
+          },
+          game_counts: {},
         },
-        game_counts: {},
       });
-      renderOps();
 
       await waitFor(() => {
         expect(screen.getByText('ok ✓')).toBeInTheDocument();
@@ -242,17 +243,18 @@ describe('Ops', () => {
     });
 
     it('shows ok ✗ and cookie ✗ badges when both false', async () => {
-      vi.mocked(adminStatus).mockResolvedValue({
-        sync: {
-          last_run_epoch: Math.floor(Date.now() / 1000) - 60,
-          ok: false,
-          cookie_ok: false,
-          games_written: 0,
-          message: 'auth failed',
+      renderOps({
+        status: {
+          sync: {
+            last_run_epoch: Math.floor(Date.now() / 1000) - 60,
+            ok: false,
+            cookie_ok: false,
+            games_written: 0,
+            message: 'auth failed',
+          },
+          game_counts: {},
         },
-        game_counts: {},
       });
-      renderOps();
 
       await waitFor(() => {
         expect(screen.getByText('ok ✗')).toBeInTheDocument();
@@ -261,17 +263,18 @@ describe('Ops', () => {
     });
 
     it('shows game_counts chips for each entry', async () => {
-      vi.mocked(adminStatus).mockResolvedValue({
-        sync: {
-          last_run_epoch: Math.floor(Date.now() / 1000) - 60,
-          ok: true,
-          cookie_ok: true,
-          games_written: 0,
-          message: '',
+      renderOps({
+        status: {
+          sync: {
+            last_run_epoch: Math.floor(Date.now() / 1000) - 60,
+            ok: true,
+            cookie_ok: true,
+            games_written: 0,
+            message: '',
+          },
+          game_counts: { available: 10, gifted: 5 },
         },
-        game_counts: { available: 10, gifted: 5 },
       });
-      renderOps();
 
       await waitFor(() => {
         expect(screen.getByText('available: 10')).toBeInTheDocument();
@@ -280,11 +283,12 @@ describe('Ops', () => {
     });
 
     it('shows "never" when sync is null', async () => {
-      vi.mocked(adminStatus).mockResolvedValue({
-        sync: null,
-        game_counts: {},
+      renderOps({
+        status: {
+          sync: null,
+          game_counts: {},
+        },
       });
-      renderOps();
 
       await waitFor(() => {
         expect(screen.getByText('never')).toBeInTheDocument();
@@ -297,7 +301,7 @@ describe('Ops', () => {
       const user = userEvent.setup();
       const refreshStatus = vi.fn();
       vi.mocked(adminPasteCookie).mockResolvedValue({ ok: true });
-      renderOps(refreshStatus);
+      renderOps({ refreshStatus });
 
       await user.type(screen.getByLabelText(/humble session cookie/i), 'cookie');
       await user.click(screen.getByRole('button', { name: /submit/i }));
@@ -311,7 +315,7 @@ describe('Ops', () => {
       const user = userEvent.setup();
       const refreshStatus = vi.fn();
       vi.mocked(adminSync).mockResolvedValue({ games_written: 1, orders_failed: 0 });
-      renderOps(refreshStatus);
+      renderOps({ refreshStatus });
 
       await user.click(screen.getByRole('button', { name: /sync now/i }));
 
