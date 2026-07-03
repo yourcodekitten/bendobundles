@@ -1,1 +1,3 @@
-# Outputs — TBD per resource tasks
+output "dynamodb_table_name" {
+  value = aws_dynamodb_table.this.name
+}
