@@ -42,9 +42,32 @@ so treat them as an upper bound.
 
 - **Terraform >= 1.10** — required for S3-native state locking (`use_lockfile`)
 - **AWS CLI v2** — for `aws dynamodb`, `aws ssm`, and credential setup
+- **Rust via `rustup`** (NOT Homebrew) + the arm64 cross-target. Homebrew's Rust has no
+  `rustup`, so it cannot cross-compile and cargo-lambda's target auto-add silently no-ops:
+  ```bash
+  # if `cargo` is currently brew's:  brew uninstall rust && brew install rustup && rustup default stable
+  rustup target add aarch64-unknown-linux-gnu
+  ```
 - **cargo-lambda** — builds the Lambda zips; bundles its own Zig toolchain (`pip3 install cargo-lambda` or `brew install cargo-lambda`)
 - **Node 22** — for the SPA build (`./terraform/build.sh` calls `npm run build`)
 - **argon2 CLI** — for the one-liner that generates the admin password hash
+
+> **No local toolchain?** CI builds the same artifacts on every push to `main`. Download the
+> latest green run's `lambda-zips` into `terraform/artifacts/` and `web-dist` into `web/dist/`,
+> then flatten the lambda zips to the names Terraform references (`artifacts/<bin>.zip` — the
+> artifact stores them as `<bin>/bootstrap.zip`, which `terraform plan`/`apply` can't see):
+>
+> ```bash
+> gh run download <run-id> -n lambda-zips -D terraform/artifacts
+> gh run download <run-id> -n web-dist -D web/dist
+> for b in public-api admin-api fulfillment; do
+>   mv terraform/artifacts/$b/bootstrap.zip terraform/artifacts/$b.zip && rmdir terraform/artifacts/$b
+> done
+> ```
+>
+> That rename is the same thing `build.sh`'s second loop does — with it done, skip `build.sh`.
+> (`web-dist` needs no rename: its contents are stored relative to `web/dist/`, exactly where
+> `deploy-web.sh` expects them.)
 
 ---
 
@@ -77,14 +100,20 @@ The output is a PHC string like `$argon2id$v=19$m=65536,...`. You will pass this
 `TF_VAR_admin_password_hash` (recommended) or in `production.tfvars` (less good — it ends up in
 plan output).
 
-**3. Init and workspace**
+**3. Init and workspace** ⚠️ **do not skip the workspace step**
 
 ```bash
 cd terraform
 terraform init -backend-config=backend.hcl
 terraform workspace new production   # or `select production` if it already exists
-terraform workspace list             # confirm you're in production
+terraform workspace list             # confirm the '*' is on production, NOT default
 ```
+
+> **Why this is load-bearing, not ceremony:** in the **`default`** workspace the S3 backend
+> ignores `workspace_key_prefix` and reads `terraform.tfstate` at the **bucket root** — which is
+> very likely a *different* stack's state. Planning against it will propose **destroying that
+> other stack**. Always confirm `terraform workspace show` prints `production` before you plan or
+> apply. (This bit us once; the only reason nothing was destroyed was an unrelated provider error.)
 
 ---
 
@@ -98,6 +127,7 @@ Run this sequence any time you want to ship a new version:
 
 # 2. Plan (review the diff before touching live infra)
 cd terraform
+terraform workspace show          # MUST print 'production' — see bootstrap step 3
 terraform plan \
   -var-file=production.tfvars \
   -out=tf.plan
@@ -108,6 +138,17 @@ terraform apply tf.plan
 # 4. Publish the SPA (sync web/dist → S3 + CloudFront invalidation)
 ./deploy-web.sh
 ```
+
+> **On the FIRST deploy, the plan must be create-only.** If `terraform plan` shows *any*
+> `destroy` (or you see providers you don't recognise, e.g. `google`), stop — you are almost
+> certainly in the wrong workspace pointed at foreign state. Re-check step 3.
+
+### First apply: the account-level API Gateway logging role
+
+The stack owns an `aws_api_gateway_account` CloudWatch-logs role (needed because the stage enables
+execution logging). This is a **per-region account singleton** — if the account already has one
+set from another stack, terraform adopts/overwrites it. Harmless for a single-app account; worth
+knowing if you share the account.
 
 ### Example `production.tfvars`
 
@@ -131,7 +172,7 @@ export TF_VAR_discord_webhook_url='https://discord.com/api/webhooks/...'  # opti
 | Variable | Default | Notes |
 |---|---|---|
 | `region` | `us-east-1` | CloudFront ACM requires us-east-1; don't change |
-| `namespace` | `bd` | Org namespace for resource labels |
+| `namespace` | `brd` | Org namespace for resource labels |
 | `role` | `production` | Context role tag |
 | `domain_zone_name` | `bendobundles.com` | Route53 zone name |
 | `route53_profile` | `null` | AWS profile for the Route53 account if different from the main account |
