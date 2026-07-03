@@ -405,18 +405,23 @@ async fn sync_upsert_respects_ownership() {
     let got = store.get_game(&g.id).await.unwrap().unwrap();
     assert!(got.hidden);
     assert_eq!(got.title, "Renamed");
-    // pending game: sync may refresh cosmetics but never the status
+    // pending game: sync may refresh cosmetics but never the status.
+    // NOTE: g is hidden at this point (asserted above), and hidden games are unclaimable by
+    // design (claim_game's gsi1pk listability gate) — so this phase uses a SECOND, visible
+    // game. This exact line once claimed the hidden g and failed in CI: the gate worked.
+    let g2 = game(2, true);
+    store.put_game(&g2).await.unwrap();
     store.create_link(&link("tok1")).await.unwrap();
     store
-        .claim_game("tok1", &g.id, "c1", datetime!(2026-07-02 12:00 UTC))
+        .claim_game("tok1", &g2.id, "c1", datetime!(2026-07-02 12:00 UTC))
         .await
         .unwrap();
-    let mut fresh2 = g.clone();
+    let mut fresh2 = g2.clone();
     fresh2.status = GameStatus::BenRedeemed;
     fresh2.title = "Renamed Again".into();
     let w = store.upsert_game_from_sync(fresh2).await.unwrap();
     assert!(matches!(w, SyncWrite::Written | SyncWrite::SkippedInFlight));
-    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    let after = store.get_game(&g2.id).await.unwrap().unwrap();
     assert_eq!(after.status, GameStatus::Pending); // status untouched either way
 }
 
