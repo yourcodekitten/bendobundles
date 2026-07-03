@@ -260,15 +260,26 @@ export async function adminSync(): Promise<{ games_written: number; orders_faile
   });
 
   await checkUnauthorized(response);
-  const data = (await response.json()) as {
-    result: string;
+
+  if (!response.ok) {
+    throw new Error('sync failed — check status panel');
+  }
+
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error('sync failed — check status panel');
+  }
+
+  const typed = data as {
     games_written: number;
     orders_failed: number;
   };
 
   return {
-    games_written: data.games_written,
-    orders_failed: data.orders_failed,
+    games_written: typed.games_written,
+    orders_failed: typed.orders_failed,
   };
 }
 

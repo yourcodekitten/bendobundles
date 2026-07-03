@@ -7,6 +7,11 @@ import {
   adminLinkClaims,
   adminPasteCookie,
   adminStatus,
+  adminSetHidden,
+  adminCreateLink,
+  adminLinks,
+  adminRevoke,
+  adminSync,
   NotFound,
   Unauthorized,
   type ClaimResult,
@@ -14,6 +19,7 @@ import {
   type StatusView,
   type ClaimView,
   type AdminGame,
+  type AdminLink,
 } from './api';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -320,7 +326,7 @@ describe('adminLinkClaims', () => {
 
 describe('adminPasteCookie', () => {
   it('returns ok result passthrough', async () => {
-    const mockResult: CookieResult = { ok: true, restored_previous: false };
+    const mockResult: CookieResult = { ok: true };
     const mockResponse = {
       status: 200,
       json: vi.fn().mockResolvedValue(mockResult),
@@ -330,6 +336,7 @@ describe('adminPasteCookie', () => {
     const result = await adminPasteCookie('cookie_value');
 
     expect(result).toEqual(mockResult);
+    expect(result).not.toHaveProperty('restored_previous');
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/cookie', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -381,5 +388,228 @@ describe('adminStatus', () => {
     mockFetch.mockResolvedValueOnce(mockResponse);
 
     await expect(adminStatus()).rejects.toBeInstanceOf(Unauthorized);
+  });
+});
+
+describe('adminSetHidden', () => {
+  it('returns {ok:true} on success', async () => {
+    const mockResponse = {
+      status: 200,
+      ok: true,
+      json: vi.fn().mockResolvedValue({}),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    const result = await adminSetHidden('game1', true);
+
+    expect(result).toEqual({ ok: true });
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/games/game1/hidden', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hidden: true }),
+    });
+  });
+
+  it('returns {ok:false, message} on 409 with error', async () => {
+    const mockResponse = {
+      status: 409,
+      ok: false,
+      json: vi.fn().mockResolvedValue({ error: 'conflict error' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    const result = await adminSetHidden('game1', false);
+
+    expect(result).toEqual({ ok: false, message: 'conflict error' });
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    const mockResponse = {
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSetHidden('game1', true)).rejects.toBeInstanceOf(Unauthorized);
+  });
+});
+
+describe('adminCreateLink', () => {
+  it('returns {token, url_path} passthrough on success', async () => {
+    const mockData = { token: 'abc123', url_path: '/gift/abc123' };
+    const mockResponse = {
+      status: 200,
+      json: vi.fn().mockResolvedValue(mockData),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    const result = await adminCreateLink('My Link', 10, 30);
+
+    expect(result).toEqual(mockData);
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/links', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: 'My Link',
+        claims_allowed: 10,
+        expires_days: 30,
+      }),
+    });
+  });
+
+  it('asserts POST body when expires_days is undefined', async () => {
+    const mockData = { token: 'xyz789', url_path: '/gift/xyz789' };
+    const mockResponse = {
+      status: 200,
+      json: vi.fn().mockResolvedValue(mockData),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await adminCreateLink('No Expiry', 5);
+
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/links', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: 'No Expiry',
+        claims_allowed: 5,
+        expires_days: undefined,
+      }),
+    });
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    const mockResponse = {
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminCreateLink('Link', 10)).rejects.toBeInstanceOf(Unauthorized);
+  });
+});
+
+describe('adminLinks', () => {
+  it('returns AdminLink[] array passthrough on success', async () => {
+    const mockLinks: AdminLink[] = [
+      {
+        token: 'token1',
+        label: 'Link 1',
+        claims_allowed: 5,
+        claims_used: 2,
+        revoked: false,
+        expires_at: '2026-08-03T00:00:00Z',
+        created_at: '2026-07-03T00:00:00Z',
+      },
+      {
+        token: 'token2',
+        label: 'Link 2',
+        claims_allowed: 10,
+        claims_used: 0,
+        revoked: false,
+        expires_at: null,
+        created_at: '2026-07-03T01:00:00Z',
+      },
+    ];
+    const mockResponse = {
+      status: 200,
+      json: vi.fn().mockResolvedValue(mockLinks),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    const result = await adminLinks();
+
+    expect(result).toEqual(mockLinks);
+    expect(result).toHaveLength(2);
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/links');
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    const mockResponse = {
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminLinks()).rejects.toBeInstanceOf(Unauthorized);
+  });
+});
+
+describe('adminRevoke', () => {
+  it('completes successfully on 200', async () => {
+    const mockResponse = {
+      status: 200,
+      json: vi.fn().mockResolvedValue({}),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await adminRevoke('token123');
+
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/links/token123/revoke', {
+      method: 'POST',
+    });
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    const mockResponse = {
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminRevoke('token')).rejects.toBeInstanceOf(Unauthorized);
+  });
+});
+
+describe('adminSync', () => {
+  it('returns {games_written, orders_failed} extraction on success', async () => {
+    const mockData = { games_written: 42, orders_failed: 3 };
+    const mockResponse = {
+      status: 200,
+      ok: true,
+      json: vi.fn().mockResolvedValue(mockData),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    const result = await adminSync();
+
+    expect(result).toEqual({ games_written: 42, orders_failed: 3 });
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/sync', {
+      method: 'POST',
+    });
+  });
+
+  it('throws Error with message on 500 with empty body', async () => {
+    const mockResponse = {
+      status: 500,
+      ok: false,
+      json: vi.fn().mockRejectedValue(new Error('invalid json')),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
+  });
+
+  it('throws Error with message on non-ok status before attempting json', async () => {
+    const mockResponse = {
+      status: 502,
+      ok: false,
+      json: vi.fn(),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
+    // Verify json() was not called since we guard before it
+    expect(mockResponse.json).not.toHaveBeenCalled();
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    const mockResponse = {
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).rejects.toBeInstanceOf(Unauthorized);
   });
 });
