@@ -172,7 +172,7 @@ describe('Catalog', () => {
 
       await waitFor(() => screen.getByText('Hollow Knight'));
 
-      const toggle = screen.getByRole('switch', { name: /hidden/i });
+      const toggle = screen.getByRole('switch', { name: /hide Hollow Knight/i });
       expect(toggle).not.toBeChecked();
 
       await user.click(toggle);
@@ -189,7 +189,7 @@ describe('Catalog', () => {
 
       await waitFor(() => screen.getByText('Celeste'));
 
-      await user.click(screen.getByRole('switch', { name: /hidden/i }));
+      await user.click(screen.getByRole('switch', { name: /hide Celeste/i }));
 
       await waitFor(() => expect(adminSetHidden).toHaveBeenCalledWith('g2', false));
     });
@@ -205,7 +205,7 @@ describe('Catalog', () => {
 
       await waitFor(() => screen.getByText('Hollow Knight'));
 
-      const toggle = screen.getByRole('switch', { name: /hidden/i });
+      const toggle = screen.getByRole('switch', { name: /hide Hollow Knight/i });
       expect(toggle).not.toBeChecked(); // starts unchecked
 
       await user.click(toggle);
@@ -225,10 +225,39 @@ describe('Catalog', () => {
 
       await waitFor(() => screen.getByText('Hollow Knight'));
 
-      await user.click(screen.getByRole('switch', { name: /hidden/i }));
+      await user.click(screen.getByRole('switch', { name: /hide Hollow Knight/i }));
 
       await waitFor(() =>
         expect(screen.getByText('game is currently being claimed')).toBeInTheDocument(),
+      );
+    });
+
+    it('toggle refused error clears on subsequent successful toggle', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminCatalog).mockResolvedValue([gameAvailable]);
+      // First toggle fails, second succeeds
+      vi.mocked(adminSetHidden)
+        .mockResolvedValueOnce({
+          ok: false,
+          message: 'game is currently being claimed',
+        })
+        .mockResolvedValueOnce({ ok: true });
+      renderCatalog();
+
+      await waitFor(() => screen.getByText('Hollow Knight'));
+
+      const toggle = screen.getByRole('switch', { name: /hide Hollow Knight/i });
+
+      // First toggle — fails, shows error
+      await user.click(toggle);
+      await waitFor(() =>
+        expect(screen.getByText('game is currently being claimed')).toBeInTheDocument(),
+      );
+
+      // Second toggle — succeeds, error message is cleared
+      await user.click(toggle);
+      await waitFor(() =>
+        expect(screen.queryByText('game is currently being claimed')).not.toBeInTheDocument(),
       );
     });
   });

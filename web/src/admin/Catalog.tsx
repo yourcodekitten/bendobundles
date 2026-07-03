@@ -203,6 +203,7 @@ export function Catalog() {
                 <input
                   type="checkbox"
                   role="switch"
+                  aria-label={`hide ${game.title}`}
                   checked={game.hidden}
                   onChange={() => handleToggle(game)}
                   className="h-4 w-4 cursor-pointer accent-zinc-500"
