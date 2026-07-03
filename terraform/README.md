@@ -159,7 +159,7 @@ export TF_VAR_discord_webhook_url='https://discord.com/api/webhooks/...'  # opti
 | Variable | Default | Notes |
 |---|---|---|
 | `region` | `us-east-1` | CloudFront ACM requires us-east-1; don't change |
-| `namespace` | `bd` | Org namespace for resource labels |
+| `namespace` | `brd` | Org namespace for resource labels |
 | `role` | `production` | Context role tag |
 | `domain_zone_name` | `bendobundles.com` | Route53 zone name |
 | `route53_profile` | `null` | AWS profile for the Route53 account if different from the main account |
