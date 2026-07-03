@@ -5,3 +5,6 @@ terraform/backend.hcl
 terraform/artifacts/
 terraform/*.tfplan
 terraform/*.tfvars
+terraform-iam/.terraform/
+terraform-iam/backend.hcl
+terraform-iam/*.tfplan
