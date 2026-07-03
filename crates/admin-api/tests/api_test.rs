@@ -720,3 +720,106 @@ async fn cookie_paste_success_single_put_no_rollback() {
     assert_eq!(puts.len(), 1, "success must produce exactly one SSM put");
     assert_eq!(puts[0], "shiny-new-cookie");
 }
+
+/// GET /admin/api/status on a store that has NEVER synced → `sync` is JSON
+/// null (not a defaulted SyncState). A defaulted object would carry
+/// cookie_ok:false and fire the client's red "humble session needs attention"
+/// banner on every fresh deploy; null renders the clean "never" state.
+#[tokio::test]
+async fn status_never_synced_serializes_sync_null() {
+    let Some(store) = store_or_skip("status-null").await else {
+        return;
+    };
+
+    let password = "statuspw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
+        games_written: 0,
+        orders_failed: 0,
+    });
+    let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let req = Request::get("/admin/api/status")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(req)
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert!(
+        j["sync"].is_null(),
+        "never-synced must serialize sync as null, got: {}",
+        j["sync"]
+    );
+    assert!(j["game_counts"].is_object(), "game_counts always present");
+}
+
+/// GET /admin/api/catalog must NOT leak humble order-key material: the raw
+/// domain::Game carries gamekey / machine_name / keyindex, which build
+/// FulfillRequest::Gift and have no business in a browser network tab.
+#[tokio::test]
+async fn catalog_does_not_leak_order_key_material() {
+    let Some(store) = store_or_skip("catalog-no-leak").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+
+    let password = "leakpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
+        games_written: 0,
+        orders_failed: 0,
+    });
+    let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let req = Request::get("/admin/api/catalog")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(req)
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let game = &j.as_array().unwrap()[0];
+    for leaked in ["gamekey", "machine_name", "keyindex"] {
+        assert!(
+            game.get(leaked).is_none(),
+            "catalog must not expose {leaked}"
+        );
+    }
+    // The fields the admin UI actually renders are all present.
+    for kept in [
+        "id",
+        "title",
+        "bundle",
+        "key_type",
+        "giftable",
+        "hidden",
+        "status",
+        "claim_id",
+        "artwork_url",
+    ] {
+        assert!(game.get(kept).is_some(), "catalog must keep {kept}");
+    }
+}

@@ -32,7 +32,6 @@ const baseLink: LinkView = {
   label: 'Test Bundle',
   claims_allowed: 3,
   claims_used: 1,
-  active: true,
   state: 'active',
   games: [],
   claims: [],
@@ -127,7 +126,6 @@ describe('LinkPage', () => {
   it('shows exhausted banner and disabled grid on state:"exhausted"', async () => {
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
-      active: false,
       state: 'exhausted',
       games: [{ id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null }],
     });
@@ -142,7 +140,6 @@ describe('LinkPage', () => {
   it('shows revoked banner and no grid on state:"revoked"', async () => {
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
-      active: false,
       state: 'revoked',
       games: [],
     });
@@ -159,7 +156,6 @@ describe('LinkPage', () => {
   it('shows the same dead banner on state:"expired"', async () => {
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
-      active: false,
       state: 'expired',
       games: [],
     });
@@ -175,7 +171,6 @@ describe('LinkPage', () => {
     // amber exhausted banner.
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
-      active: false,
       state: 'revoked',
       games: [{ id: '1', title: 'Celeste', bundle: 'B', key_type: 'steam', artwork_url: null }],
     });

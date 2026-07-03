@@ -145,7 +145,7 @@ async fn unknown_token_is_404() {
     assert_eq!(j["error"], "unknown link");
 }
 
-/// Revoked link → 200, active:false, games:[] (dead link shows no catalog),
+/// Revoked link → 200, state:"revoked", games:[] (dead link shows no catalog),
 /// but claims history is intact (even if empty here).
 #[tokio::test]
 async fn revoked_link_active_false_games_empty() {
@@ -170,13 +170,12 @@ async fn revoked_link_active_false_games_empty() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
-    assert_eq!(j["active"], false);
     assert_eq!(j["state"], "revoked");
     assert_eq!(j["games"], serde_json::json!([]));
     assert!(j["claims"].as_array().is_some());
 }
 
-/// Exhausted link → 200, active:false, state:"exhausted", games STILL visible
+/// Exhausted link → 200, state:"exhausted", games STILL visible
 /// (friend can browse; claim buttons disabled client-side). The explicit state
 /// field is what lets the client tell exhausted from revoked without guessing
 /// from games.len().
@@ -202,12 +201,11 @@ async fn exhausted_link_state_exhausted_games_visible() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
-    assert_eq!(j["active"], false);
     assert_eq!(j["state"], "exhausted");
     assert_eq!(j["games"].as_array().unwrap().len(), 1);
 }
 
-/// Expired link → 200, active:false, state:"expired", games hidden like revoked.
+/// Expired link → 200, state:"expired", games hidden like revoked.
 #[tokio::test]
 async fn expired_link_state_expired_games_empty() {
     let Some(store) = store_or_skip("expired-link").await else {
@@ -230,7 +228,6 @@ async fn expired_link_state_expired_games_empty() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
-    assert_eq!(j["active"], false);
     assert_eq!(j["state"], "expired");
     assert_eq!(j["games"], serde_json::json!([]));
 }
@@ -286,6 +283,10 @@ async fn happy_claim_gift_url_and_fields_verified() {
     let claims = get_j["claims"].as_array().unwrap();
     assert_eq!(claims.len(), 1, "claim must appear in history");
     assert_eq!(claims[0]["game_id"], gid);
+    assert_eq!(
+        claims[0]["title"], "Game 1",
+        "claim history must carry the game title (friends see names, not ids)"
+    );
 
     // Assert MockInvoker received correct game fields.
     let captured = mock

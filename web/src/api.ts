@@ -20,7 +20,6 @@ export type LinkView = {
   label: string;
   claims_allowed: number;
   claims_used: number;
-  active: boolean;
   state: LinkState;
   games: GameView[];
   claims: ClaimView[];
@@ -42,7 +41,6 @@ export type AdminGame = {
   status: string;
   claim_id: string | null;
   artwork_url: string | null;
-  keyindex: number;
 };
 
 export type AdminLink = {
@@ -240,6 +238,12 @@ export async function adminRevoke(token: string): Promise<void> {
     method: 'POST',
   });
   await checkUnauthorized(response);
+
+  // Revoking a leaked invite is a security action — a 404/500 must surface,
+  // never resolve as if the link were dead.
+  if (!response.ok) {
+    throw new Error('revoke failed — the link may still be live');
+  }
 }
 
 export async function adminLinkClaims(token: string): Promise<ClaimView[]> {
@@ -278,22 +282,11 @@ export async function adminSync(): Promise<{ games_written: number; orders_faile
     throw new Error('sync failed — check status panel');
   }
 
-  let data;
   try {
-    data = await response.json();
+    return (await response.json()) as { games_written: number; orders_failed: number };
   } catch {
     throw new Error('sync failed — check status panel');
   }
-
-  const typed = data as {
-    games_written: number;
-    orders_failed: number;
-  };
-
-  return {
-    games_written: typed.games_written,
-    orders_failed: typed.orders_failed,
-  };
 }
 
 export async function adminStatus(): Promise<StatusView> {

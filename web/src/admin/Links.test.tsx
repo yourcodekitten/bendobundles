@@ -223,6 +223,29 @@ describe('Links', () => {
       });
     });
 
+    it('revoke failure shows a loud error and keeps the button armed for retry', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([link1]);
+      vi.mocked(adminRevoke).mockRejectedValue(
+        new Error('revoke failed — the link may still be live'),
+      );
+
+      renderLinks();
+      await waitFor(() => screen.getByText('Alice'));
+
+      await user.click(screen.getByRole('button', { name: 'revoke Alice' }));
+      await user.click(screen.getByRole('button', { name: 'confirm revoke Alice' }));
+
+      // Failure surfaces as an alert — never silent success
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent(/revoke failed.*still be live/i);
+      });
+      // Button stays armed so the next click retries immediately
+      expect(screen.getByRole('button', { name: 'confirm revoke Alice' })).toBeInTheDocument();
+      // No reload happened (list fetch only once, from mount)
+      expect(adminLinks).toHaveBeenCalledTimes(1);
+    });
+
     it('revoked links do not show a revoke button', async () => {
       vi.mocked(adminLinks).mockResolvedValue([link2]); // revoked: true
 

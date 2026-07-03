@@ -54,6 +54,9 @@ export function Links() {
 
   // Two-step revoke: set of armed token strings
   const [revokeArmed, setRevokeArmed] = useState<Set<string>>(new Set());
+  // Per-token revoke failure — revoking a leaked invite is a security action,
+  // a failure must never look like success
+  const [revokeErrors, setRevokeErrors] = useState<Record<string, string>>({});
 
   // Audit expansions: token → AuditData (noUncheckedIndexedAccess → AuditData | undefined)
   const [auditMap, setAuditMap] = useState<Record<string, AuditData>>({});
@@ -107,10 +110,21 @@ export function Links() {
           next.delete(link.token);
           return next;
         });
+        setRevokeErrors((prev) => {
+          const next = { ...prev };
+          delete next[link.token];
+          return next;
+        });
         load();
       })
       .catch(() => {
-        // withAuth handles 401; leave armed state intact on other errors
+        // withAuth handles 401. Anything else (adminRevoke throws on !ok, or
+        // network) means the link may STILL BE LIVE — say so, keep the button
+        // armed so the next click retries immediately.
+        setRevokeErrors((prev) => ({
+          ...prev,
+          [link.token]: 'revoke failed — the link may still be live. try again.',
+        }));
       });
   };
 
@@ -244,6 +258,7 @@ export function Links() {
           const linkUrl = inviteUrl(link.token);
           const auditState = auditMap[link.token];
           const armed = revokeArmed.has(link.token);
+          const revokeErr = revokeErrors[link.token];
 
           return (
             <div key={link.token} className="rounded bg-zinc-900 p-4">
@@ -315,6 +330,13 @@ export function Links() {
                   </button>
                 </div>
               </div>
+
+              {/* Revoke failure — must be loud; the link may still be claimable */}
+              {revokeErr !== undefined && (
+                <p role="alert" className="mt-2 text-xs text-red-400">
+                  {revokeErr}
+                </p>
+              )}
 
               {/* Audit panel — gift_url VALUE is intentionally never rendered here;
                   admin only needs to know a URL was issued ("issued ✓"), not what it is.

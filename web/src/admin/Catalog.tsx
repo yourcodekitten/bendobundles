@@ -2,28 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { adminCatalog, adminSetHidden, type AdminGame } from '../api';
 import { withAuth } from './withAuth';
-
-// Deterministic color from title — same hash as friend/GameGrid.tsx.
-// Duplicated here rather than extracted: the two call-sites have different
-// shape needs (aspect-video vs fixed thumb) and sharing would add a
-// questionable abstraction for two files.
-function titleColorClass(title: string): string {
-  let hash = 0;
-  for (let i = 0; i < title.length; i++) {
-    hash = ((hash << 5) - hash + title.charCodeAt(i)) | 0;
-  }
-  const palette = [
-    'bg-violet-800',
-    'bg-blue-800',
-    'bg-green-800',
-    'bg-amber-800',
-    'bg-red-800',
-    'bg-pink-800',
-    'bg-teal-800',
-    'bg-indigo-800',
-  ] as const;
-  return palette[Math.abs(hash) % palette.length] ?? 'bg-zinc-700';
-}
+import { titleColorClass } from '../titleColor';
 
 // Status badge — exact color mapping from plan (snake_case serde values)
 //   available=green, pending=amber, gifted=violet, ben_redeemed=slate, expired=red

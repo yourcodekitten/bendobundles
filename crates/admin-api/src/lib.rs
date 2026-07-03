@@ -196,9 +196,42 @@ async fn handle_login(State(s): State<AppState>, Json(body): Json<LoginBody>) ->
 
 // ── GET /admin/api/catalog ────────────────────────────────────────────────────
 
+/// Admin catalog view of a game. Deliberately NOT `domain::Game`: the raw
+/// struct carries `gamekey`/`machine_name`/`keyindex` — the humble order-key
+/// material used to build `FulfillRequest::Gift` — which no client needs and
+/// which must not leak into browser network tabs, session-gated or not.
+#[derive(serde::Serialize)]
+struct CatalogGameView {
+    id: String,
+    title: String,
+    bundle: String,
+    key_type: String,
+    giftable: bool,
+    hidden: bool,
+    status: domain::GameStatus,
+    claim_id: Option<String>,
+    artwork_url: Option<String>,
+}
+
 async fn handle_catalog(State(s): State<AppState>) -> Response {
     match s.store.list_all_games().await {
-        Ok(games) => (StatusCode::OK, Json(games)).into_response(),
+        Ok(games) => {
+            let views: Vec<CatalogGameView> = games
+                .into_iter()
+                .map(|g| CatalogGameView {
+                    id: g.id,
+                    title: g.title,
+                    bundle: g.bundle,
+                    key_type: g.key_type,
+                    giftable: g.giftable,
+                    hidden: g.hidden,
+                    status: g.status,
+                    claim_id: g.claim_id,
+                    artwork_url: g.artwork_url,
+                })
+                .collect();
+            (StatusCode::OK, Json(views)).into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -411,8 +444,12 @@ async fn handle_sync(State(s): State<AppState>) -> Response {
 /// `list_all_games` is a paginated Scan; see `dynamo::Store::list_all_games` for the
 /// scan-is-fine-at-this-scale rationale.
 async fn handle_status(State(s): State<AppState>) -> Response {
+    // Never-run stays None → serialized as JSON null, which is what the client
+    // types (`sync: {…} | null`) and renders ("never" + no attention banner).
+    // Flattening to SyncState::default() here would fake a failed sync with
+    // cookie_ok:false and fire the red banner on every fresh deploy.
     let sync_state = match s.store.get_sync_state().await {
-        Ok(st) => st.unwrap_or_default(),
+        Ok(st) => st,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 

@@ -10,6 +10,18 @@ interface ClaimDialogProps {
 
 type Step = 'confirm' | 'loading' | 'gifted' | 'processing' | 'refused' | 'error';
 
+// The per-step CASUAL-dismiss policy (Escape, backdrop click) — one place, so
+// the surfaces can never drift: null = not dismissible (gifted protects the
+// one-time URL; loading has a claim in flight), 'refresh' = a claim was
+// consumed so dismissal must refetch, 'close' = plain close. The explicit
+// close BUTTONS are not dismissal: gifted deliberately allows its button
+// while blocking stray Escapes/clicks.
+function dismissKindFor(step: Step): 'close' | 'refresh' | null {
+  if (step === 'gifted' || step === 'loading') return null;
+  if (step === 'processing' || step === 'refused') return 'refresh';
+  return 'close';
+}
+
 export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProps) {
   const [step, setStep] = useState<Step>('confirm');
   const [result, setResult] = useState<ClaimResult | null>(null);
@@ -21,15 +33,13 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
     containerRef.current?.focus();
   }, []);
 
-  // Escape key — blocks close on gifted; otherwise closes with appropriate side-effects
+  // Escape key — same policy as the backdrop, via dismissKindFor
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
-      if (step === 'gifted') return; // stray Escape must not eat the URL
-      if (step === 'loading') return; // claim in flight — closing now would eat the result
-      if (step === 'processing' || step === 'refused') {
-        onRefresh();
-      }
+      const kind = dismissKindFor(step);
+      if (kind === null) return;
+      if (kind === 'refresh') onRefresh();
       onClose();
     };
     document.addEventListener('keydown', handleKeyDown);
@@ -63,14 +73,13 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
 
   return (
     <>
-      {/* Backdrop — not dismissible on gifted (protect the URL) or loading (claim
-          in flight); processing/refused consumed a claim, so dismiss must refresh */}
+      {/* Backdrop — same policy as Escape, via dismissKindFor */}
       <div
         className="fixed inset-0 z-40 bg-black/60"
         onClick={
-          step === 'gifted' || step === 'loading'
+          dismissKindFor(step) === null
             ? undefined
-            : step === 'processing' || step === 'refused'
+            : dismissKindFor(step) === 'refresh'
               ? handleCloseWithRefresh
               : onClose
         }

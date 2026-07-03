@@ -85,9 +85,9 @@ struct LinkView {
     label: String,
     claims_allowed: u32,
     claims_used: u32,
-    active: bool,
     /// Explicit link state: "active" | "revoked" | "expired" | "exhausted".
-    /// The client renders banners from this — it must never have to infer
+    /// The SINGLE liveness representation on the wire — the client renders
+    /// banners and gates claim buttons from this; it must never have to infer
     /// the reason from side signals like games.len().
     state: &'static str,
     games: Vec<GameView>,
@@ -145,7 +145,6 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
         Err(domain::ClaimRefusal::Expired) => "expired",
         Err(domain::ClaimRefusal::Exhausted) => "exhausted",
     };
-    let active = state == "active";
 
     // Revoked/expired: show no games (link is dead; don't leak catalog).
     // Exhausted: games stay visible so the friend can browse; claim buttons
@@ -168,17 +167,28 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
         }
     };
 
-    // Claims history is ALWAYS returned intact (spec §7).
+    // Claims history is ALWAYS returned intact (spec §7). Titles come from a
+    // per-claim game lookup: claimed games leave the listable set, so the
+    // `games` list above can't provide them. Claims per link are bounded by
+    // claims_allowed (single digits), so the extra gets are fine. A failed
+    // lookup degrades to title:None — the client falls back to game_id.
     let claims: Vec<ClaimView> = match s.store.claims_for_link(&token).await {
-        Ok(cs) => cs
-            .into_iter()
-            .map(|c| ClaimView {
-                game_id: c.game_id,
-                title: None,
-                state: claim_state_str(c.state),
-                gift_url: c.gift_url,
-            })
-            .collect(),
+        Ok(cs) => {
+            let mut views = Vec::with_capacity(cs.len());
+            for c in cs {
+                let title = match s.store.get_game(&c.game_id).await {
+                    Ok(Some(g)) => Some(g.title),
+                    _ => None,
+                };
+                views.push(ClaimView {
+                    game_id: c.game_id,
+                    title,
+                    state: claim_state_str(c.state),
+                    gift_url: c.gift_url,
+                });
+            }
+            views
+        }
         Err(_) => vec![],
     };
 
@@ -188,7 +198,6 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             label: link.label,
             claims_allowed: link.claims_allowed,
             claims_used: link.claims_used,
-            active,
             state,
             games,
             claims,

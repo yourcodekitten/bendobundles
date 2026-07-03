@@ -29,7 +29,6 @@ const gameAvailable: AdminGame = {
   status: 'available',
   claim_id: null,
   artwork_url: null,
-  keyindex: 0,
 };
 
 const gamePending: AdminGame = {
@@ -42,7 +41,6 @@ const gamePending: AdminGame = {
   status: 'pending',
   claim_id: 'c-999',
   artwork_url: 'https://example.com/celeste.jpg',
-  keyindex: 1,
 };
 
 const gameGifted: AdminGame = {
@@ -55,7 +53,6 @@ const gameGifted: AdminGame = {
   status: 'gifted',
   claim_id: 'c-100',
   artwork_url: null,
-  keyindex: 2,
 };
 
 describe('Catalog', () => {

@@ -8,6 +8,8 @@ import type { AdminOutletContext } from './AdminApp';
 // Called with Date.now() as the reference so callers can mock Date.now in tests.
 function formatRelativeTime(epoch: number): string {
   const diffSeconds = Math.floor(Date.now() / 1000 - epoch);
+  // Server/client clock skew can put epoch slightly in the future — never "-3s ago"
+  if (diffSeconds < 0) return 'just now';
   if (diffSeconds < 60) return `${diffSeconds}s ago`;
   const diffMinutes = Math.floor(diffSeconds / 60);
   if (diffMinutes < 60) return `${diffMinutes}m ago`;

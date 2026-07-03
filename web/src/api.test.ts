@@ -39,7 +39,6 @@ describe('fetchLink', () => {
         label: 'Test Link',
         claims_allowed: 5,
         claims_used: 2,
-        active: true,
         state: 'active',
         games: [
           {
@@ -67,7 +66,7 @@ describe('fetchLink', () => {
     expect(result.label).toBe('Test Link');
     expect(result.claims_allowed).toBe(5);
     expect(result.claims_used).toBe(2);
-    expect(result.active).toBe(true);
+    expect(result.state).toBe('active');
     expect(result.games).toHaveLength(1);
     expect(result.claims).toHaveLength(1);
     expect(mockFetch).toHaveBeenCalledWith('/api/l/token123');
@@ -270,7 +269,6 @@ describe('adminCatalog', () => {
         status: 'available',
         claim_id: null,
         artwork_url: 'https://example.com/art.png',
-        keyindex: 0,
       },
     ] as AdminGame[];
 
@@ -556,6 +554,7 @@ describe('adminLinks', () => {
 describe('adminRevoke', () => {
   it('completes successfully on 200', async () => {
     const mockResponse = {
+      ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue({}),
     };
@@ -576,6 +575,28 @@ describe('adminRevoke', () => {
     mockFetch.mockResolvedValueOnce(mockResponse);
 
     await expect(adminRevoke('token')).rejects.toBeInstanceOf(Unauthorized);
+  });
+
+  it('throws on 404 — a failed revoke must never look successful', async () => {
+    const mockResponse = {
+      ok: false,
+      status: 404,
+      json: vi.fn().mockResolvedValue({}),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminRevoke('token')).rejects.toThrow(/revoke failed/);
+  });
+
+  it('throws on 500', async () => {
+    const mockResponse = {
+      ok: false,
+      status: 500,
+      json: vi.fn().mockResolvedValue({}),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminRevoke('token')).rejects.toThrow(/revoke failed/);
   });
 });
 

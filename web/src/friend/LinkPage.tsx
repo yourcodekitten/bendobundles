@@ -125,7 +125,7 @@ export function LinkPage() {
 
       {/* Grid: shown for exhausted (disabled buttons) or active; hidden for revoked/expired */}
       {!dead && (
-        <GameGrid games={data.games} active={data.active} onClaim={setClaimingGame} />
+        <GameGrid games={data.games} active={data.state === 'active'} onClaim={setClaimingGame} />
       )}
 
       <ClaimsHistory claims={data.claims} />

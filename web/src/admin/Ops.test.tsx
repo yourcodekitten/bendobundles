@@ -282,6 +282,28 @@ describe('Ops', () => {
       });
     });
 
+    it('clamps future epochs to "just now" — clock skew must never render "-3s ago"', async () => {
+      const nowMs = 1_751_664_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+      renderOps({
+        status: {
+          sync: {
+            last_run_epoch: nowMs / 1000 + 3, // server clock 3s ahead
+            ok: true,
+            cookie_ok: true,
+            games_written: 0,
+            message: '',
+          },
+          game_counts: {},
+        },
+      });
+
+      await waitFor(() => {
+        expect(screen.getByText('just now')).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/-\d+s ago/)).not.toBeInTheDocument();
+    });
+
     it('shows "never" when sync is null', async () => {
       renderOps({
         status: {

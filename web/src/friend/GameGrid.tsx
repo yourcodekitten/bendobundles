@@ -1,28 +1,10 @@
 import type { GameView } from '../api';
+import { titleColorClass } from '../titleColor';
 
 interface GameGridProps {
   games: GameView[];
   active: boolean;
   onClaim: (game: GameView) => void;
-}
-
-// Deterministic color from title — stable across renders
-function titleColorClass(title: string): string {
-  let hash = 0;
-  for (let i = 0; i < title.length; i++) {
-    hash = ((hash << 5) - hash + title.charCodeAt(i)) | 0;
-  }
-  const palette = [
-    'bg-violet-800',
-    'bg-blue-800',
-    'bg-green-800',
-    'bg-amber-800',
-    'bg-red-800',
-    'bg-pink-800',
-    'bg-teal-800',
-    'bg-indigo-800',
-  ] as const;
-  return palette[Math.abs(hash) % palette.length] ?? 'bg-zinc-700';
 }
 
 export function GameGrid({ games, active, onClaim }: GameGridProps) {
