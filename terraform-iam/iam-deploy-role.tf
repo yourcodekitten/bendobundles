@@ -21,8 +21,9 @@ resource "aws_iam_role" "kitten_deploy" {
 
 data "aws_iam_policy_document" "deploy" {
   # ── Terraform state backend — MAIN stack prefix ONLY ────────────────────────
-  # Scoped to the main stack's state, NOT this IAM stack's. The deploy role can
-  # deploy the app but cannot rewrite its own permissions (no priv-esc path).
+  # Scoped to the main stack's state, NOT this IAM stack's. State scoping is one
+  # of three containment layers; the other two live in the IAM section below
+  # (permissions boundary on grants + the NeverTouchKittenIam Deny floor).
   statement {
     sid       = "StateBucketList"
     effect    = "Allow"
@@ -41,7 +42,13 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["arn:aws:s3:::${var.state_bucket}/${var.main_stack_state_prefix}/*"]
   }
 
-  # ── Lambda ──────────────────────────────────────────────────────────────────
+  # ── Lambda — list on * (unscopeable), everything else on app functions ──────
+  statement {
+    sid       = "LambdaList"
+    effect    = "Allow"
+    actions   = ["lambda:ListFunctions"]
+    resources = ["*"]
+  }
   statement {
     sid    = "Lambda"
     effect = "Allow"
@@ -56,36 +63,86 @@ data "aws_iam_policy_document" "deploy" {
       "lambda:GetFunctionConfiguration",
       "lambda:GetPolicy",
       "lambda:ListVersionsByFunction",
-      "lambda:ListFunctions",
       "lambda:TagResource",
       "lambda:UntagResource",
       "lambda:PublishVersion",
     ]
-    resources = ["*"]
+    resources = ["arn:aws:lambda:${local.region}:${local.account}:function:${local.app_prefix}*"]
   }
 
-  # ── IAM — manage the app's roles/policies ONLY, scoped by naming ────────────
+  # ── IAM — manage the app's roles, CONTAINED by the permissions boundary ─────
+  # Naming-scope alone does not contain this: PutRolePolicy on an app execution
+  # role + UpdateFunctionCode + invoke = account admin. Split by escalation
+  # potential — reads and deletions ride the name scope; anything that GRANTS
+  # power additionally requires the target role to carry the kitten-app-boundary
+  # (created WITH it, for CreateRole), so effective permissions can never exceed
+  # the boundary no matter what policy gets attached.
   statement {
-    sid    = "IamAppRoles"
+    sid    = "IamAppRolesRead"
+    effect = "Allow"
+    actions = [
+      "iam:GetRole",
+      "iam:GetRolePolicy",
+      "iam:ListRolePolicies",
+      "iam:ListAttachedRolePolicies",
+      "iam:TagRole",
+      "iam:UntagRole",
+    ]
+    resources = ["arn:aws:iam::${local.account}:role/${local.app_prefix}*"]
+  }
+  statement {
+    sid    = "IamAppRolesShrink"
+    effect = "Allow"
+    actions = [
+      "iam:DeleteRole",
+      "iam:DeleteRolePolicy",
+      "iam:DetachRolePolicy",
+    ]
+    resources = ["arn:aws:iam::${local.account}:role/${local.app_prefix}*"]
+  }
+  statement {
+    sid    = "IamAppRolesGrowBounded"
     effect = "Allow"
     actions = [
       "iam:CreateRole",
-      "iam:DeleteRole",
-      "iam:GetRole",
-      "iam:TagRole",
-      "iam:UntagRole",
       "iam:PutRolePolicy",
-      "iam:DeleteRolePolicy",
-      "iam:GetRolePolicy",
-      "iam:ListRolePolicies",
       "iam:AttachRolePolicy",
-      "iam:DetachRolePolicy",
-      "iam:ListAttachedRolePolicies",
-      "iam:PassRole",
       "iam:UpdateAssumeRolePolicy",
+      # For migrating the already-deployed app roles under the boundary.
+      "iam:PutRolePermissionsBoundary",
     ]
-    # Only roles under the app's naming — cannot touch the kitten-* roles/user.
     resources = ["arn:aws:iam::${local.account}:role/${local.app_prefix}*"]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [aws_iam_policy.app_boundary.arn]
+    }
+  }
+  # PassRole only into the services this stack actually hands roles to.
+  statement {
+    sid       = "IamPassRoleToServices"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = ["arn:aws:iam::${local.account}:role/${local.app_prefix}*"]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["lambda.amazonaws.com", "apigateway.amazonaws.com"]
+    }
+  }
+  # HARD FLOOR: never any IAM action on this stack's own identities or ceiling.
+  # Needed because label naming puts these at brd-…-bendobundles-iam-kitten-*,
+  # which the ${app_prefix}* glob above MATCHES — without this Deny the Allows
+  # would cover the deploy role itself (self-modification path).
+  statement {
+    sid     = "NeverTouchKittenIam"
+    effect  = "Deny"
+    actions = ["iam:*"]
+    resources = [
+      "arn:aws:iam::${local.account}:role/*kitten*",
+      "arn:aws:iam::${local.account}:user/*kitten*",
+      "arn:aws:iam::${local.account}:policy/*kitten*",
+    ]
   }
 
   # ── DynamoDB — the app table + indexes ──────────────────────────────────────
@@ -149,21 +206,31 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["arn:aws:events:${local.region}:${local.account}:rule/${local.app_prefix}*"]
   }
 
-  # ── CloudWatch Logs (lambda + apigw log groups) ─────────────────────────────
+  # ── CloudWatch Logs — describe on * (unscopeable), mutation on the stack's
+  # groups: app-prefixed (lambda) + API-Gateway-Execution-Logs_* (named by AWS).
+  statement {
+    sid       = "LogsDescribe"
+    effect    = "Allow"
+    actions   = ["logs:DescribeLogGroups"]
+    resources = ["*"]
+  }
   statement {
     sid    = "Logs"
     effect = "Allow"
     actions = [
       "logs:CreateLogGroup",
       "logs:DeleteLogGroup",
-      "logs:DescribeLogGroups",
       "logs:PutRetentionPolicy",
       "logs:TagResource",
       "logs:ListTagsForResource",
       "logs:TagLogGroup",
       "logs:ListTagsLogGroup",
     ]
-    resources = ["*"]
+    resources = [
+      "arn:aws:logs:${local.region}:${local.account}:log-group:/aws/lambda/${local.app_prefix}*",
+      "arn:aws:logs:${local.region}:${local.account}:log-group:${local.app_prefix}*",
+      "arn:aws:logs:${local.region}:${local.account}:log-group:API-Gateway-Execution-Logs_*",
+    ]
   }
 
   # ── Route53 — validation + alias records in the site's zone ─────────────────

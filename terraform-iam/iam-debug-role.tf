@@ -59,11 +59,6 @@ data "aws_iam_policy_document" "debug" {
       "cloudfront:ListDistributions",
       "cloudfront:GetFunction",
       "cloudfront:DescribeFunction",
-      # S3 — list/read the SPA bucket (AES256, no KMS).
-      "s3:ListBucket",
-      "s3:GetObject",
-      "s3:GetBucketPolicy",
-      "s3:GetBucketLocation",
       # EventBridge.
       "events:DescribeRule",
       "events:ListRules",
@@ -81,6 +76,25 @@ data "aws_iam_policy_document" "debug" {
       "sts:GetCallerIdentity",
     ]
     resources = ["*"]
+  }
+
+  # S3 — the SPA bucket only. These actions DO support resource scoping (unlike
+  # most of the read/list/describe block above), so they get their own statement:
+  # account-wide s3 read would be breadth without purpose, and the grant should
+  # match what it's for.
+  statement {
+    sid    = "S3SpaRead"
+    effect = "Allow"
+    actions = [
+      "s3:ListBucket",
+      "s3:GetObject",
+      "s3:GetBucketPolicy",
+      "s3:GetBucketLocation",
+    ]
+    resources = [
+      "arn:aws:s3:::${local.app_prefix}*",
+      "arn:aws:s3:::${local.app_prefix}*/*",
+    ]
   }
 
   # HARD BOUNDARY: the debug role can never read the humble session cookie or
