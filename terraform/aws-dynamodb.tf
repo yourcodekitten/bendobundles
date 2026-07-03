@@ -8,8 +8,12 @@ module "label_table" {
 resource "aws_dynamodb_table" "this" {
   name         = module.label_table.id
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "pk"
-  range_key    = "sk"
+
+  # Table-level hash_key/range_key are NOT deprecated in provider 6.x (verified
+  # against the provider schema); only the GSI-level ones are, hence the mixed
+  # style: args here, key_schema blocks inside the GSIs.
+  hash_key  = "pk"
+  range_key = "sk"
 
   attribute {
     name = "pk"
@@ -38,16 +42,30 @@ resource "aws_dynamodb_table" "this" {
 
   global_secondary_index {
     name            = "listable"
-    hash_key        = "gsi1pk"
-    range_key       = "gsi1sk"
     projection_type = "ALL"
+
+    key_schema {
+      attribute_name = "gsi1pk"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "gsi1sk"
+      key_type       = "RANGE"
+    }
   }
 
   global_secondary_index {
     name            = "pending-claims"
-    hash_key        = "gsi2pk"
-    range_key       = "gsi2sk"
     projection_type = "ALL"
+
+    key_schema {
+      attribute_name = "gsi2pk"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "gsi2sk"
+      key_type       = "RANGE"
+    }
   }
 
   # Sessions carry a numeric `ttl` epoch (schema.rs writes it; code also checks
