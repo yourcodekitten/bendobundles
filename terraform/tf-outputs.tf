@@ -14,3 +14,15 @@ output "lambda_function_names" {
 output "api_stage_invoke_url" {
   value = module.apigateway.stage_invoke_url
 }
+
+output "site_url" {
+  value = module.site.cloudfront_distribution_alias_domain_name
+}
+
+output "s3_bucket_id" {
+  value = module.site.s3_bucket_id
+}
+
+output "cloudfront_distribution_id" {
+  value = module.site.cloudfront_distribution_id
+}
