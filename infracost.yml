@@ -1,0 +1,7 @@
+# Infracost config — same pattern as the bendoerr-terraform-modules repos.
+# `infracost breakdown --config-file=infracost.yml`
+version: 0.1
+projects:
+  - path: terraform
+    name: bendobundles (expected personal-scale usage)
+    usage_file: terraform/infracost-usage.yml

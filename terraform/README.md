@@ -28,6 +28,16 @@ Stack outputs after apply:
 
 ---
 
+## Expected cost
+
+Idle cost is ~$0.50/mo (the Route53 zone) — everything else is on-demand /
+scale-to-zero and sits inside the AWS free tier at personal scale. The
+committed expected-usage model lives in `terraform/infracost-usage.yml`
+(~200 friend views + ~20 claims + daily sync per month); CI's `infracost`
+job posts the estimate on PRs once the `INFRACOST_API_KEY` repo secret is
+set (free key: https://dashboard.infracost.io). Estimates are pre-free-tier,
+so treat them as an upper bound.
+
 ## Prerequisites
 
 - **Terraform >= 1.10** — required for S3-native state locking (`use_lockfile`)
