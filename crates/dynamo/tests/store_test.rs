@@ -35,6 +35,7 @@ fn game(n: u32, listable: bool) -> Game {
         status: GameStatus::Available,
         claim_id: None,
         artwork_url: None,
+        keyindex: 0,
     }
 }
 
