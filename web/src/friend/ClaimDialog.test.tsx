@@ -66,6 +66,28 @@ describe('ClaimDialog', () => {
       });
     });
 
+    it('Escape during the in-flight loading step does NOT close (URL not eaten)', async () => {
+      const user = userEvent.setup();
+      let resolveClaim!: (r: { kind: 'gifted'; gift_url: string }) => void;
+      vi.mocked(claimGame).mockReturnValue(
+        new Promise((resolve) => {
+          resolveClaim = resolve;
+        }),
+      );
+      render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+
+      await user.click(screen.getByRole('button', { name: /confirm/i }));
+      expect(screen.getByText(/claiming/i)).toBeInTheDocument();
+
+      await user.keyboard('{Escape}');
+      expect(onClose).not.toHaveBeenCalled();
+
+      resolveClaim({ kind: 'gifted', gift_url: GIFT_URL });
+      await waitFor(() => {
+        expect(screen.getByText(GIFT_URL)).toBeInTheDocument();
+      });
+    });
+
     it('Escape does NOT close the gifted view', async () => {
       const user = userEvent.setup();
       vi.mocked(claimGame).mockResolvedValue({ kind: 'gifted', gift_url: GIFT_URL });
@@ -161,6 +183,57 @@ describe('ClaimDialog', () => {
       await user.click(screen.getByRole('button', { name: /close/i }));
       expect(onRefresh).toHaveBeenCalledOnce();
       expect(onClose).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('backdrop dismiss', () => {
+    const clickBackdrop = (container: HTMLElement) => {
+      const backdrop = container.querySelector('div[aria-hidden="true"]');
+      expect(backdrop).not.toBeNull();
+      return userEvent.setup().click(backdrop as Element);
+    };
+
+    it('on processing triggers onRefresh then onClose (same as the close button)', async () => {
+      const user = userEvent.setup();
+      vi.mocked(claimGame).mockResolvedValue({ kind: 'processing', message: 'generating' });
+      const { container } = render(
+        <ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /confirm/i }));
+      await waitFor(() => {
+        expect(screen.getByText('generating')).toBeInTheDocument();
+      });
+
+      await clickBackdrop(container);
+      expect(onRefresh).toHaveBeenCalledOnce();
+      expect(onClose).toHaveBeenCalledOnce();
+    });
+
+    it('on refused triggers onRefresh then onClose', async () => {
+      const user = userEvent.setup();
+      vi.mocked(claimGame).mockResolvedValue({ kind: 'refused', message: 'already claimed' });
+      const { container } = render(
+        <ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /confirm/i }));
+      await waitFor(() => {
+        expect(screen.getByText('already claimed')).toBeInTheDocument();
+      });
+
+      await clickBackdrop(container);
+      expect(onRefresh).toHaveBeenCalledOnce();
+      expect(onClose).toHaveBeenCalledOnce();
+    });
+
+    it('on confirm closes without onRefresh', async () => {
+      const { container } = render(
+        <ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />,
+      );
+      await clickBackdrop(container);
+      expect(onClose).toHaveBeenCalledOnce();
+      expect(onRefresh).not.toHaveBeenCalled();
     });
   });
 

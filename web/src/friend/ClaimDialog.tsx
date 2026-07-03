@@ -26,6 +26,7 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       if (step === 'gifted') return; // stray Escape must not eat the URL
+      if (step === 'loading') return; // claim in flight — closing now would eat the result
       if (step === 'processing' || step === 'refused') {
         onRefresh();
       }
@@ -62,10 +63,17 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
 
   return (
     <>
-      {/* Backdrop — not dismissible on gifted to protect the URL */}
+      {/* Backdrop — not dismissible on gifted (protect the URL) or loading (claim
+          in flight); processing/refused consumed a claim, so dismiss must refresh */}
       <div
         className="fixed inset-0 z-40 bg-black/60"
-        onClick={step !== 'gifted' && step !== 'loading' ? onClose : undefined}
+        onClick={
+          step === 'gifted' || step === 'loading'
+            ? undefined
+            : step === 'processing' || step === 'refused'
+              ? handleCloseWithRefresh
+              : onClose
+        }
         aria-hidden="true"
       />
 
