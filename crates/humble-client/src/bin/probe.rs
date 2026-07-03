@@ -6,7 +6,7 @@
 //!   HUMBLE_SESSION='<cookie>' cargo run -p humble-client --features probe --bin probe -- capture <gamekey> [outfile]
 //!
 //! Security: HUMBLE_SESSION is never printed or written to any file.
-use humble_client::{HumbleClient, SessionCookie};
+use humble_client::{HumbleClient, Order, SessionCookie};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -57,16 +57,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Fetch every order, aggregate stats, and print a coverage report.
-///
-/// Politely sleeps 300 ms between fetches; prints progress to stderr every 25
-/// orders so you can watch a long run. Any single fetch failure is logged as
-/// WARN and skipped — partial data beats an aborted run.
-async fn run_summary(client: &HumbleClient) -> Result<(), Box<dyn std::error::Error>> {
+/// Fetch every order in the library, politely: sleeps 300 ms between fetches,
+/// prints `progress_verb N/total` progress to stderr every 25 orders, and logs
+/// any single fetch failure as WARN then skips it — partial data beats an
+/// aborted run. `on_start` receives the order count before the loop (for an
+/// intro line); `f` is called for each cleanly-fetched order. Returns the
+/// (total orders, fetch failures) counts.
+async fn for_each_order(
+    client: &HumbleClient,
+    progress_verb: &str,
+    on_start: impl FnOnce(usize),
+    mut f: impl FnMut(&str, Order),
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     let gamekeys = client.gamekeys().await?;
     let total = gamekeys.len();
-    eprintln!("fetching {total} orders...");
+    on_start(total);
 
+    let mut fail_count = 0usize;
+    for (i, gamekey) in gamekeys.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        if (i + 1) % 25 == 0 {
+            eprintln!("{progress_verb} {}/{total}...", i + 1);
+        }
+
+        match client.order(gamekey).await {
+            Ok(order) => f(gamekey, order),
+            Err(e) => {
+                eprintln!("WARN {gamekey}: {e}");
+                fail_count += 1;
+            }
+        }
+    }
+
+    Ok((total, fail_count))
+}
+
+/// Fetch every order, aggregate stats, and print a coverage report.
+async fn run_summary(client: &HumbleClient) -> Result<(), Box<dyn std::error::Error>> {
     let mut total_keys = 0usize;
     let mut key_type_counts: HashMap<String, usize> = HashMap::new();
     let mut redeemed_count = 0usize;
@@ -74,45 +103,35 @@ async fn run_summary(client: &HumbleClient) -> Result<(), Box<dyn std::error::Er
     let mut giftable_count = 0usize;
     let mut zero_key_bundles: Vec<String> = Vec::new();
     let mut all_bundles: Vec<(String, usize)> = Vec::new(); // (bundle_name, giftable_count)
-    let mut fail_count = 0usize;
 
-    for (i, gamekey) in gamekeys.iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        if (i + 1) % 25 == 0 {
-            eprintln!("fetched {}/{total}...", i + 1);
-        }
-
-        match client.order(gamekey).await {
-            Ok(order) => {
-                let n_keys = order.keys.len();
-                total_keys += n_keys;
-                let mut bundle_giftable = 0usize;
-                for k in &order.keys {
-                    *key_type_counts.entry(k.key_type.clone()).or_insert(0) += 1;
-                    if k.redeemed {
-                        redeemed_count += 1;
-                    }
-                    if k.expired {
-                        expired_count += 1;
-                    }
-                    if k.giftable {
-                        giftable_count += 1;
-                        bundle_giftable += 1;
-                    }
+    let (total, fail_count) = for_each_order(
+        client,
+        "fetched",
+        |total| eprintln!("fetching {total} orders..."),
+        |_gamekey, order| {
+            let n_keys = order.keys.len();
+            total_keys += n_keys;
+            let mut bundle_giftable = 0usize;
+            for k in &order.keys {
+                *key_type_counts.entry(k.key_type.clone()).or_insert(0) += 1;
+                if k.redeemed {
+                    redeemed_count += 1;
                 }
-                if n_keys == 0 {
-                    zero_key_bundles.push(order.bundle_name.clone());
+                if k.expired {
+                    expired_count += 1;
                 }
-                all_bundles.push((order.bundle_name, bundle_giftable));
+                if k.giftable {
+                    giftable_count += 1;
+                    bundle_giftable += 1;
+                }
             }
-            Err(e) => {
-                eprintln!("WARN {gamekey}: {e}");
-                fail_count += 1;
+            if n_keys == 0 {
+                zero_key_bundles.push(order.bundle_name.clone());
             }
-        }
-    }
+            all_bundles.push((order.bundle_name, bundle_giftable));
+        },
+    )
+    .await?;
 
     // Sort bundles by giftable desc for top-10
     all_bundles.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -152,40 +171,24 @@ async fn run_summary(client: &HumbleClient) -> Result<(), Box<dyn std::error::Er
 }
 
 /// Search every order for bundles whose name contains the given fragment
-/// (case-insensitive substring match).
-///
-/// Politely sleeps 300 ms between fetches; prints progress to stderr every 25
-/// orders so you can watch a long run. Matches are printed immediately to stdout.
-/// Any single fetch failure is logged as WARN and skipped — partial results beat
-/// an aborted run. Ends with a match count line.
+/// (case-insensitive substring match). Matches are printed immediately to
+/// stdout; ends with a match count line.
 async fn run_find(client: &HumbleClient, fragment: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let gamekeys = client.gamekeys().await?;
-    let total = gamekeys.len();
     let fragment_lower = fragment.to_lowercase();
-    eprintln!("searching {total} orders for '{fragment}'...");
-
     let mut match_count = 0usize;
 
-    for (i, gamekey) in gamekeys.iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        if (i + 1) % 25 == 0 {
-            eprintln!("searched {}/{total}...", i + 1);
-        }
-
-        match client.order(gamekey).await {
-            Ok(order) => {
-                if order.bundle_name.to_lowercase().contains(&fragment_lower) {
-                    println!("{gamekey}  {}", order.bundle_name);
-                    match_count += 1;
-                }
+    for_each_order(
+        client,
+        "searched",
+        |total| eprintln!("searching {total} orders for '{fragment}'..."),
+        |gamekey, order| {
+            if order.bundle_name.to_lowercase().contains(&fragment_lower) {
+                println!("{gamekey}  {}", order.bundle_name);
+                match_count += 1;
             }
-            Err(e) => {
-                eprintln!("WARN {gamekey}: {e}");
-            }
-        }
-    }
+        },
+    )
+    .await?;
 
     let plural = if match_count == 1 { "match" } else { "matches" };
     println!("{match_count} {plural}");
