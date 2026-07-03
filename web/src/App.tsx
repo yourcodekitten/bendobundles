@@ -1,4 +1,4 @@
-import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { Landing } from './friend/Landing';
 import { LinkPage } from './friend/LinkPage';
 import { AdminApp } from './admin/AdminApp';
@@ -18,6 +18,7 @@ function App() {
         {/* Admin surface */}
         <Route path="/admin/login" element={<Login />} />
         <Route path="/admin" element={<AdminApp />}>
+          <Route index element={<Navigate to="catalog" replace />} />
           <Route path="catalog" element={<Catalog />} />
           <Route path="links" element={<Links />} />
           <Route path="ops" element={<Ops />} />
