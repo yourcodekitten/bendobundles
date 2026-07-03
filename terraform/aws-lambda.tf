@@ -64,15 +64,8 @@ module "lambda_public_api" {
   }
 
   addl_inline_policies = {
-    dynamo = data.aws_iam_policy_document.dynamo_rw.json
-    invoke_fulfillment = jsonencode({
-      Version = "2012-10-17"
-      Statement = [{
-        Effect   = "Allow"
-        Action   = ["lambda:InvokeFunction"]
-        Resource = [module.lambda_fulfillment.lambda_function_arn]
-      }]
-    })
+    dynamo             = data.aws_iam_policy_document.dynamo_rw.json
+    invoke_fulfillment = data.aws_iam_policy_document.invoke_fulfillment.json
   }
 }
 
@@ -99,15 +92,8 @@ module "lambda_admin_api" {
   }
 
   addl_inline_policies = {
-    dynamo = data.aws_iam_policy_document.dynamo_rw.json
-    invoke_fulfillment = jsonencode({
-      Version = "2012-10-17"
-      Statement = [{
-        Effect   = "Allow"
-        Action   = ["lambda:InvokeFunction"]
-        Resource = [module.lambda_fulfillment.lambda_function_arn]
-      }]
-    })
+    dynamo             = data.aws_iam_policy_document.dynamo_rw.json
+    invoke_fulfillment = data.aws_iam_policy_document.invoke_fulfillment.json
     # paste flow: snapshot old cookie (Get) + write new (Put); hash: boot read
     ssm = jsonencode({
       Version = "2012-10-17"
@@ -124,6 +110,16 @@ module "lambda_admin_api" {
         }
       ]
     })
+  }
+}
+
+# Shared invoke policy: both API lambdas call fulfillment with the same single
+# statement — one definition, edited once.
+data "aws_iam_policy_document" "invoke_fulfillment" {
+  statement {
+    effect    = "Allow"
+    actions   = ["lambda:InvokeFunction"]
+    resources = [module.lambda_fulfillment.lambda_function_arn]
   }
 }
 

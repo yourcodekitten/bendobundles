@@ -41,6 +41,9 @@ resource_type_default_usage:
     request_duration_ms: 150
 
 resource_usage:
+  # Address verified against the resolved module source (lambda v0.3.0
+  # main.tf: `resource "aws_lambda_function" "this"`) — a rename there would
+  # silently drop this override, so re-check on module upgrades.
   # Fulfillment overrides the lambda default: ~30 daily syncs (minutes each,
   # paced + jittered humble calls) + ~20 gifts + ~10 cookie validations. The
   # duration average is sync-dominated.

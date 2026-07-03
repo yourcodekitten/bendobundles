@@ -22,7 +22,11 @@ resource "aws_ssm_parameter" "humble_cookie" {
   name  = "/${module.label_param.id}/humble-cookie"
   type  = "SecureString"
   value = "UNSET"
-  tags  = module.label_param.tags
+  # Advanced tier lifts the 4 KB Standard cap: the paste flow PutParameters
+  # the raw humble cookie, and an oversized value would ValidationException
+  # at runtime. Costs $0.05/mo; overwrite keeps the tier.
+  tier = "Advanced"
+  tags = module.label_param.tags
 
   lifecycle {
     ignore_changes = [value]

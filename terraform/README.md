@@ -60,16 +60,10 @@ cp terraform/backend.hcl.example terraform/backend.hcl
 $EDITOR terraform/backend.hcl
 ```
 
-The example values:
-
-```hcl
-bucket               = "bd-prod-ue1-tfstate-store" # confirm your real state bucket
-key                  = "terraform.tfstate"
-kms_key_id           = "alias/aws/s3"
-region               = "us-east-1"
-use_lockfile         = true  # S3-native locking (TF >= 1.10); no dynamodb_table needed
-workspace_key_prefix = "bendobundles"
-```
+The committed [`backend.hcl.example`](./backend.hcl.example) is the single
+source of truth for the values (bucket, key, kms + `encrypt = true`,
+`use_lockfile`, `workspace_key_prefix`) — copy it, then adjust the bucket to
+your real state bucket.
 
 **2. Generate the admin password hash**
 
