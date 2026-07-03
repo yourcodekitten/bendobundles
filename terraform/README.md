@@ -167,18 +167,13 @@ multi-key Humble order with a real recipient:
 
 ## Module pin note
 
-`module "site"` currently pins the immutable merge sha of the module enhancement:
-
-```hcl
-source = "git::https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin.git?ref=041718bffaa9abe60693b42f3cc4644634ac0467"
-```
-
-That sha is [cf-s3-origin#137](https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin/pull/137)
-(additional-origins support), MERGED to main. Once `v0.5.0` is tagged, swap to:
+`module "site"` consumes the registry release:
 
 ```hcl
 source  = "bendoerr-terraform-modules/cloudfront-and-s3-origin/aws"
-version = "<new release tag>"
+version = "0.5.0"
 ```
 
-Then run `terraform init -upgrade` and replan.
+`v0.5.0` ships the additional-origins support from
+[cf-s3-origin#137](https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin/pull/137).
+To take a future release: bump `version`, run `terraform init -upgrade`, replan.
