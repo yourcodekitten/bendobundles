@@ -298,8 +298,9 @@ describe('Links', () => {
       // Wait for audit to load
       await waitFor(() => screen.getByText('issued ✓'));
 
-      // The bearer secret must not appear anywhere in the DOM — ever
-      expect(document.body.textContent).not.toContain(
+      // The bearer secret must not appear anywhere in the DOM — ever. innerHTML (not
+      // textContent) so attribute values (title/aria-label/data-*) are covered too.
+      expect(document.body.innerHTML).not.toContain(
         'https://secret.humble.gift/bearer-token-do-not-render-abc123',
       );
     });
