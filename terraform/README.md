@@ -53,8 +53,21 @@ so treat them as an upper bound.
 - **argon2 CLI** — for the one-liner that generates the admin password hash
 
 > **No local toolchain?** CI builds the same artifacts on every push to `main`. Download the
-> latest green run's `lambda-zips` into `terraform/artifacts/` and `web-dist` into `web/dist/`
-> (`gh run download <run-id> -n lambda-zips …`) and skip `build.sh`.
+> latest green run's `lambda-zips` into `terraform/artifacts/` and `web-dist` into `web/dist/`,
+> then flatten the lambda zips to the names Terraform references (`artifacts/<bin>.zip` — the
+> artifact stores them as `<bin>/bootstrap.zip`, which `terraform plan`/`apply` can't see):
+>
+> ```bash
+> gh run download <run-id> -n lambda-zips -D terraform/artifacts
+> gh run download <run-id> -n web-dist -D web/dist
+> for b in public-api admin-api fulfillment; do
+>   mv terraform/artifacts/$b/bootstrap.zip terraform/artifacts/$b.zip && rmdir terraform/artifacts/$b
+> done
+> ```
+>
+> That rename is the same thing `build.sh`'s second loop does — with it done, skip `build.sh`.
+> (`web-dist` needs no rename: its contents are stored relative to `web/dist/`, exactly where
+> `deploy-web.sh` expects them.)
 
 ---
 
