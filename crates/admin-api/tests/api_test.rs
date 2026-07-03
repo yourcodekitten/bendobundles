@@ -118,26 +118,49 @@ impl AdminInvoker for MockAdminInvoker {
 
 // ── MockSsmPutter ──────────────────────────────────────────────────────────────
 
-#[derive(Default)]
 struct MockSsmPutter {
-    captured: Mutex<Option<String>>,
+    /// Existing cookie returned by get_cookie (simulates the current SSM value at test start).
+    initial_value: Option<String>,
+    /// All values passed to put_cookie in call order.
+    puts: Mutex<Vec<String>>,
 }
 
 impl MockSsmPutter {
     fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Arc::new(Self {
+            initial_value: None,
+            puts: Mutex::new(vec![]),
+        })
     }
 
+    /// Build a mock that already has `value` stored (get_cookie returns Some(value)).
+    fn with_existing(value: &str) -> Arc<Self> {
+        Arc::new(Self {
+            initial_value: Some(value.to_string()),
+            puts: Mutex::new(vec![]),
+        })
+    }
+
+    /// All put_cookie calls in order.
+    async fn all_puts(&self) -> Vec<String> {
+        self.puts.lock().await.clone()
+    }
+
+    /// Convenience: last put_cookie value (backward compat for existing tests).
     async fn last_cookie(&self) -> Option<String> {
-        self.captured.lock().await.clone()
+        self.puts.lock().await.last().cloned()
     }
 }
 
 #[async_trait]
 impl SsmPutter for MockSsmPutter {
     async fn put_cookie(&self, value: &str) -> Result<(), String> {
-        *self.captured.lock().await = Some(value.to_string());
+        self.puts.lock().await.push(value.to_string());
         Ok(())
+    }
+
+    async fn get_cookie(&self) -> Result<Option<String>, String> {
+        Ok(self.initial_value.clone())
     }
 }
 
@@ -579,4 +602,121 @@ async fn cookie_paste_captures_value_and_returns_ok_status() {
         matches!(last_call, Some(FulfillRequest::ValidateCookie)),
         "invoker must have received ValidateCookie, got: {last_call:?}"
     );
+}
+
+/// POST /admin/api/cookie when ValidateCookie returns CookieStatus{ok:false}: SSM must see TWO
+/// puts (new cookie, then rollback to old), response is {"ok":false,"restored_previous":true}.
+#[tokio::test]
+async fn cookie_paste_failed_validate_rolls_back_and_reports() {
+    let Some(store) = store_or_skip("cookie-rollback").await else {
+        return;
+    };
+    let password = "rollbackpw";
+    let admin_hash = test_admin_hash(password);
+    // Invoker returns CookieStatus{ok:false} — the new cookie is dead.
+    let invoker_mock = MockAdminInvoker::new(FulfillResponse::CookieStatus { ok: false });
+    let invoker: Arc<dyn AdminInvoker> = Arc::clone(&invoker_mock) as Arc<dyn AdminInvoker>;
+    // SSM already has an "old-good-cookie" (the existing value to roll back to).
+    let ssm_mock = MockSsmPutter::with_existing("old-good-cookie");
+    let ssm: Arc<dyn SsmPutter> = Arc::clone(&ssm_mock) as Arc<dyn SsmPutter>;
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let cookie_req = Request::post("/admin/api/cookie")
+        .header("content-type", "application/json")
+        .header("cookie", format!("session={session}"))
+        .body(Body::from(r#"{"cookie":"bad-new-cookie"}"#))
+        .unwrap();
+
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(cookie_req)
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    // Validation failed → ok:false with rollback indicator.
+    assert_eq!(body["ok"], false);
+    assert_eq!(
+        body["restored_previous"], true,
+        "snapshot existed so rollback must have run"
+    );
+    let body_str = body.to_string();
+    assert!(
+        !body_str.contains("bad-new-cookie"),
+        "new cookie value must NOT appear in response: {body_str}"
+    );
+    assert!(
+        !body_str.contains("old-good-cookie"),
+        "snapshot cookie value must NOT appear in response: {body_str}"
+    );
+
+    // SSM mock must have seen exactly two puts: new cookie first, then the rollback.
+    let puts = ssm_mock.all_puts().await;
+    assert_eq!(
+        puts.len(),
+        2,
+        "SSM must see exactly two puts (new then rollback), got: {puts:?}"
+    );
+    assert_eq!(
+        puts[0], "bad-new-cookie",
+        "first put must be the new cookie"
+    );
+    assert_eq!(
+        puts[1], "old-good-cookie",
+        "second put must be the rollback"
+    );
+}
+
+/// POST /admin/api/cookie when ValidateCookie succeeds: SSM sees exactly ONE put (no rollback).
+/// Response is {"ok":true} with no rollback fields.
+#[tokio::test]
+async fn cookie_paste_success_single_put_no_rollback() {
+    let Some(store) = store_or_skip("cookie-success-put").await else {
+        return;
+    };
+    let password = "successpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker_mock = MockAdminInvoker::new(FulfillResponse::CookieStatus { ok: true });
+    let invoker: Arc<dyn AdminInvoker> = Arc::clone(&invoker_mock) as Arc<dyn AdminInvoker>;
+    let ssm_mock = MockSsmPutter::with_existing("prev-cookie");
+    let ssm: Arc<dyn SsmPutter> = Arc::clone(&ssm_mock) as Arc<dyn SsmPutter>;
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let cookie_req = Request::post("/admin/api/cookie")
+        .header("content-type", "application/json")
+        .header("cookie", format!("session={session}"))
+        .body(Body::from(r#"{"cookie":"shiny-new-cookie"}"#))
+        .unwrap();
+
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(cookie_req)
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["ok"], true, "success response must be ok:true");
+    // No rollback fields on success.
+    assert!(
+        body.get("restored_previous").is_none(),
+        "no restored_previous on success"
+    );
+
+    // Exactly one put.
+    let puts = ssm_mock.all_puts().await;
+    assert_eq!(puts.len(), 1, "success must produce exactly one SSM put");
+    assert_eq!(puts[0], "shiny-new-cookie");
 }

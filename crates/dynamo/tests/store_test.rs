@@ -572,11 +572,48 @@ async fn set_game_hidden_basic() {
         matches!(nf, HiddenWrite::NotFound),
         "unknown game id must return NotFound"
     );
+
+    // Gifted game (has claim_id from fulfill) must also allow set_game_hidden → Written.
+    // This was the bug: the old `attribute_not_exists(claim_id)` guard permanently blocked
+    // gifted games since fulfill_claim leaves claim_id on the DynamoDB item.
+    let g2 = game(2, true);
+    let gid2 = g2.id.clone();
+    store.put_game(&g2).await.unwrap();
+    let mut lnk2 = link("tok-hide-gifted");
+    lnk2.claims_allowed = 1;
+    store.create_link(&lnk2).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    store
+        .claim_game("tok-hide-gifted", &gid2, "c-hide", now)
+        .await
+        .unwrap();
+    store
+        .fulfill_claim(
+            "tok-hide-gifted",
+            "c-hide",
+            &gid2,
+            "https://www.humblebundle.com/gift?key=TESTKEYXYZ",
+        )
+        .await
+        .unwrap();
+    // Gifted game still carries claim_id — set_game_hidden must now succeed (Written).
+    let gifted = store.get_game(&gid2).await.unwrap().unwrap();
+    assert_eq!(gifted.status, GameStatus::Gifted);
+    assert!(gifted.claim_id.is_some(), "gifted game retains claim_id");
+    let result2 = store.set_game_hidden(&gid2, true).await.unwrap();
+    assert!(
+        matches!(result2, HiddenWrite::Written),
+        "set_game_hidden on a gifted game must be Written (not Contested), got {result2:?}"
+    );
+    let after2 = store.get_game(&gid2).await.unwrap().unwrap();
+    assert!(
+        after2.hidden,
+        "gifted game must be hidden after set_game_hidden(true)"
+    );
 }
 
-/// `set_game_hidden` contested: a claimed game (Pending, has top-level claim_id) triggers the
-/// `attribute_not_exists(claim_id)` guard → Contested. Deterministic because claiming sets
-/// claim_id on the DynamoDB item before set_game_hidden's put even runs.
+/// `set_game_hidden` contested: a Pending game (mid-claim) triggers an early Contested return
+/// before the put even runs — the Pending status is the gate, not claim_id presence.
 #[tokio::test]
 async fn set_game_hidden_contested() {
     let Some(store) = store_or_skip("set-game-hidden-contested").await else {
@@ -594,11 +631,11 @@ async fn set_game_hidden_contested() {
     assert_eq!(claimed.status, GameStatus::Pending);
     assert!(claimed.claim_id.is_some());
 
-    // set_game_hidden must see the claim_id attribute and return Contested.
+    // set_game_hidden must detect Pending status and return Contested early.
     let result = store.set_game_hidden(&gid, true).await.unwrap();
     assert!(
         matches!(result, HiddenWrite::Contested),
-        "set_game_hidden on a claimed (Pending) game must return Contested, got {result:?}"
+        "set_game_hidden on a Pending game must return Contested, got {result:?}"
     );
 
     // The game's claim must be intact (no clobber).

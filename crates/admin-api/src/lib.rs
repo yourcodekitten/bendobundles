@@ -38,13 +38,17 @@ pub trait AdminInvoker: Send + Sync {
     async fn call(&self, req: FulfillRequest) -> Result<FulfillResponse, String>;
 }
 
-/// SSM SecureString writer for the humble session cookie. Separate from aws-sdk-ssm so tests can
-/// inject a mock without pulling in the real SSM SDK.
+/// SSM SecureString reader/writer for the humble session cookie. Separate from aws-sdk-ssm so
+/// tests can inject a mock without pulling in the real SSM SDK.
 #[async_trait]
 pub trait SsmPutter: Send + Sync {
     /// Overwrite the configured SSM parameter with `value` (SecureString). SECURITY: callers must
     /// never log or echo `value` — it is the humble session cookie.
     async fn put_cookie(&self, value: &str) -> Result<(), String>;
+
+    /// Read the current value of the configured SSM parameter. Returns `Ok(None)` if the
+    /// parameter does not exist yet. SECURITY: callers must never log or echo the returned value.
+    async fn get_cookie(&self) -> Result<Option<String>, String>;
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -319,14 +323,23 @@ struct CookieBody {
     cookie: String,
 }
 
-/// Paste a fresh humble session cookie. Writes it to SSM (SecureString overwrite) so the
-/// fulfillment lambda picks it up on the next call, then immediately validates it via the
-/// invoker's `ValidateCookie` op and returns `{"ok": bool}`.
+/// Paste a fresh humble session cookie. Snapshots the existing value for rollback, writes the
+/// new cookie to SSM (SecureString overwrite), then immediately validates it via the invoker's
+/// `ValidateCookie` op.
+///
+/// - Validation success → `{"ok": true}`.
+/// - Validation definitive failure (CookieStatus{ok:false}) → roll back to snapshot if present,
+///   respond `{"ok": false, "restored_previous": bool}`.
+/// - Validation inconclusive (invoker Error or unexpected variant) → roll back to snapshot too
+///   (the known-good old value is safer than an unverified new one) and respond
+///   `{"ok": false, "inconclusive": true, "restored_previous": bool}`.
 ///
 /// SECURITY: the cookie value MUST NOT appear in any log, response body, or error message.
-/// Only its validity (`ok`) is returned. If SSM write fails, 500 is returned without echoing
-/// the value.
+/// Only its validity (`ok`) is returned. If the initial SSM write fails, 500 is returned.
 async fn handle_cookie(State(s): State<AppState>, Json(body): Json<CookieBody>) -> Response {
+    // Snapshot the current cookie for rollback. Ignore errors (SSM unreachable) → treat as None.
+    let snapshot = s.ssm.get_cookie().await.ok().flatten();
+
     if s.ssm.put_cookie(&body.cookie).await.is_err() {
         // Do not echo the cookie value in the error response.
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -334,10 +347,38 @@ async fn handle_cookie(State(s): State<AppState>, Json(body): Json<CookieBody>) 
     // cookie value is no longer needed after SSM write — it's in `body` which will be dropped.
 
     match s.invoker.call(FulfillRequest::ValidateCookie).await {
-        Ok(FulfillResponse::CookieStatus { ok }) => {
-            (StatusCode::OK, Json(serde_json::json!({"ok": ok}))).into_response()
+        Ok(FulfillResponse::CookieStatus { ok: true }) => {
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
         }
-        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(FulfillResponse::CookieStatus { ok: false }) => {
+            // Definitive failure: roll back to snapshot if one exists.
+            let restored_previous = if let Some(ref old) = snapshot {
+                s.ssm.put_cookie(old).await.is_ok()
+            } else {
+                false
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ok": false, "restored_previous": restored_previous})),
+            )
+                .into_response()
+        }
+        // Error or unexpected variant: inconclusive (humble unreachable). Roll back too —
+        // the known-good old value is safer than an unverified new one.
+        _ => {
+            let restored_previous = if let Some(ref old) = snapshot {
+                s.ssm.put_cookie(old).await.is_ok()
+            } else {
+                false
+            };
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::json!({"ok": false, "inconclusive": true, "restored_previous": restored_previous}),
+                ),
+            )
+                .into_response()
+        }
     }
 }
 

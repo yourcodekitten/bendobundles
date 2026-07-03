@@ -673,15 +673,18 @@ impl Store {
         }
     }
 
-    /// Toggle a game's `hidden` flag with a guarded conditional write. Closes the admin-toggle vs
-    /// claim race that an unguarded `put_game` would lose: a claim landing in the read→write window
-    /// sets a top-level `claim_id` attribute, which fires the `attribute_not_exists(claim_id)`
-    /// guard and returns `Contested` rather than clobbering the in-flight claim's ownership.
+    /// Toggle a game's `hidden` flag with a guarded conditional write.
     ///
-    /// The condition is `#st = :expected AND attribute_not_exists(claim_id)`:
-    /// - `:expected` is the serde-serialised status from the read (mirrors `upsert_game_from_sync`).
-    /// - `attribute_not_exists(claim_id)` always guards — unlike `upsert_game_from_sync` which omits
-    ///   this clause for the None case, here we *want* the guard so any claim in-flight CCFs.
+    /// Race handling:
+    /// - If the game is already `Pending` at read time, return `Contested` immediately — the
+    ///   claim is in flight and any hide attempt would race its fulfill/compensate.
+    /// - Otherwise use an optimistic lock on status (`#st = :expected`): a claim that lands
+    ///   between our read and the put flips the game to `Pending`, which CCFs the condition
+    ///   and safely returns `Contested`.
+    ///
+    /// The old `attribute_not_exists(claim_id)` guard permanently blocked gifted games (which
+    /// retain `claim_id` after `fulfill_claim`) from ever being hidden. The status-only lock
+    /// is the correct gate: `Gifted` games have a stable status string and no competing writer.
     pub async fn set_game_hidden(
         &self,
         game_id: &str,
@@ -691,9 +694,16 @@ impl Store {
             return Ok(HiddenWrite::NotFound);
         };
 
+        // Pending means a claim is actively in flight — return Contested immediately.
+        // A claim landing AFTER this read will flip status to Pending → the put condition
+        // below (status must equal the read value) will CCF → Contested.
+        if game.status == GameStatus::Pending {
+            return Ok(HiddenWrite::Contested);
+        }
+
         game.hidden = hidden;
 
-        // Status string via serde — same encoding as upsert_game_from_sync's optimistic lock.
+        // Optimistic lock: status must match what we read. Mirrors upsert_game_from_sync.
         let status_str = serde_json::to_value(game.status)
             .expect("status serializes")
             .as_str()
@@ -707,7 +717,7 @@ impl Store {
             .set_item(Some(game_item(&game)))
             .expression_attribute_names("#st", "status")
             .expression_attribute_values(":expected", schema::s(status_str))
-            .condition_expression("#st = :expected AND attribute_not_exists(claim_id)")
+            .condition_expression("#st = :expected")
             .send()
             .await;
 

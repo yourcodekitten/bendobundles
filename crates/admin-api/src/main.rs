@@ -64,6 +64,36 @@ impl SsmPutter for RealSsmPutter {
             .map_err(|e| format!("{e:?}"))?;
         Ok(())
     }
+
+    async fn get_cookie(&self) -> Result<Option<String>, String> {
+        // SECURITY: the returned value is the humble session cookie — never log or echo it.
+        match self
+            .client
+            .get_parameter()
+            .name(&self.param_name)
+            .with_decryption(true)
+            .send()
+            .await
+        {
+            Ok(out) => Ok(out.parameter().and_then(|p| p.value()).map(str::to_string)),
+            Err(e) => {
+                // ParameterNotFound is a legitimate "no prior value" state — return Ok(None).
+                if e.as_service_error()
+                    .map(|se| {
+                        matches!(
+                            se,
+                            aws_sdk_ssm::operation::get_parameter::GetParameterError::ParameterNotFound(_)
+                        )
+                    })
+                    .unwrap_or(false)
+                {
+                    Ok(None)
+                } else {
+                    Err(format!("{e:?}"))
+                }
+            }
+        }
+    }
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────

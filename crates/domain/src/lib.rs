@@ -33,6 +33,7 @@ pub struct Game {
     pub status: GameStatus,
     pub claim_id: Option<String>,
     pub artwork_url: Option<String>,
+    #[serde(default)]
     pub keyindex: u32,
 }
 
@@ -130,8 +131,10 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                         keyindex: fresh.keyindex,
                     }
                 }
-                _ => {
-                    // Humble-owned (Available, BenRedeemed, Expired): fresh wins entirely except hidden
+                GameStatus::Available | GameStatus::BenRedeemed | GameStatus::Expired => {
+                    // Humble-owned: fresh wins entirely except hidden. No catch-all `_` —
+                    // a future GameStatus variant must be consciously classified here,
+                    // same as the no-`_` rule in fulfillment's gift_decision.
                     Game {
                         hidden: existing_game.hidden,
                         ..fresh
@@ -162,14 +165,18 @@ pub fn match_artwork<'a>(
         }
     }
 
-    // Then try prefix match (either direction, case-insensitive)
-    for (name, icon) in subproducts {
-        let name_lower = name.to_lowercase();
-        if (name_lower.starts_with(&human_lower) || human_lower.starts_with(&name_lower))
-            && icon.is_some()
-        {
-            return icon.as_deref();
-        }
+    // Then try prefix match (either direction, case-insensitive): prefer the longest
+    // matching subproduct name so "Portal 2" beats "Portal" for key "Portal 2 Steam Key".
+    let best = subproducts
+        .iter()
+        .filter(|(name, icon)| {
+            let name_lower = name.to_lowercase();
+            icon.is_some()
+                && (name_lower.starts_with(&human_lower) || human_lower.starts_with(&name_lower))
+        })
+        .max_by_key(|(name, _)| name.len());
+    if let Some((_, icon)) = best {
+        return icon.as_deref();
     }
 
     None
@@ -317,5 +324,20 @@ mod tests {
             Some("b.png")
         ); // prefix
         assert_eq!(match_artwork("Nothing Alike", &subs), None);
+    }
+
+    #[test]
+    fn artwork_longest_prefix_wins() {
+        // "Portal" is a prefix of "Portal 2 Steam Key"; "Portal 2" is a longer prefix.
+        // The longest matching subproduct name must win.
+        let subs = vec![
+            ("Portal".to_string(), Some("p.png".to_string())),
+            ("Portal 2".to_string(), Some("p2.png".to_string())),
+        ];
+        assert_eq!(
+            match_artwork("Portal 2 Steam Key", &subs),
+            Some("p2.png"),
+            "longest prefix (Portal 2) must beat shorter prefix (Portal)"
+        );
     }
 }

@@ -270,3 +270,101 @@ async fn dead_cookie_parks_flags_and_pings_without_leaking_cookie() {
         "ping body leaked the session cookie"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// ValidateCookie: transient error must NOT write SyncState; Unauthorized must flag dead.
+// ---------------------------------------------------------------------------------------------
+
+/// Transient error (429) from humble during ValidateCookie → Error response, SyncState untouched.
+/// This is the key regression guard for R1: a rate-limit must not silently mark the cookie dead.
+#[tokio::test]
+async fn validate_cookie_transient_error_does_not_touch_sync_state() {
+    let Some(store) = store_or_skip("validate-transient").await else {
+        return;
+    };
+
+    // Write a known-good SyncState so we can detect if it gets clobbered.
+    let initial_state = dynamo::SyncState {
+        last_run_epoch: 1_800_000_000,
+        ok: true,
+        cookie_ok: true,
+        games_written: 5,
+        message: "all good".into(),
+    };
+    store.put_sync_state(&initial_state).await.unwrap();
+
+    // Humble returns 429 (rate-limited) for /api/v1/user/order.
+    let humble = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&humble)
+        .await;
+
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, FulfillRequest::ValidateCookie).await;
+
+    // Must surface as an inconclusive Error, not CookieStatus{ok:false}.
+    assert!(
+        matches!(resp, FulfillResponse::Error { .. }),
+        "transient humble error must return Error, got: {resp:?}"
+    );
+
+    // SyncState must be unchanged — we must NOT have written cookie_ok=false.
+    let st = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.cookie_ok,
+        "cookie_ok must be unchanged after a transient humble error"
+    );
+    assert_eq!(
+        st.games_written, 5,
+        "SyncState must not have been overwritten"
+    );
+}
+
+/// Unauthorized from humble during ValidateCookie → CookieStatus{ok:false} and SyncState updated.
+#[tokio::test]
+async fn validate_cookie_unauthorized_flags_dead() {
+    let Some(store) = store_or_skip("validate-unauth").await else {
+        return;
+    };
+
+    let humble = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&humble)
+        .await;
+
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, FulfillRequest::ValidateCookie).await;
+
+    assert_eq!(resp, FulfillResponse::CookieStatus { ok: false });
+    let st = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(!st.cookie_ok, "cookie_ok must be false after Unauthorized");
+}
+
+/// Success from humble during ValidateCookie → CookieStatus{ok:true} and SyncState updated.
+#[tokio::test]
+async fn validate_cookie_success_flags_ok() {
+    let Some(store) = store_or_skip("validate-ok").await else {
+        return;
+    };
+
+    let humble = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&humble)
+        .await;
+
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, FulfillRequest::ValidateCookie).await;
+
+    assert_eq!(resp, FulfillResponse::CookieStatus { ok: true });
+    let st = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.cookie_ok,
+        "cookie_ok must be true after a successful gamekeys call"
+    );
+}

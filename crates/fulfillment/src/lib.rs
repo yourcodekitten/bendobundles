@@ -324,7 +324,16 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
     } else {
         "humble session cookie is dead".to_string()
     };
-    persist_sync(deps, cookie_ok, cookie_ok, games_written, &msg).await;
+    // ok = run completed with a live cookie AND no order-level failures.
+    // cookie_ok tracks session health independently of order success rate.
+    persist_sync(
+        deps,
+        cookie_ok && orders_failed == 0,
+        cookie_ok,
+        games_written,
+        &msg,
+    )
+    .await;
     FulfillResponse::SyncDone {
         games_written,
         orders_failed,
@@ -388,18 +397,42 @@ async fn reconcile(deps: &Deps) {
 
 /// Validate the stored humble session cookie by making a cheap authenticated call, and record the
 /// result in `SyncState.cookie_ok`.
+///
+/// Transient errors (rate-limited, API errors, network failures) do NOT update the persisted
+/// cookie state — the cookie's validity is unknown, and writing `cookie_ok=false` on a 429
+/// would be wrong. Only `Unauthorized` is a definitive dead-cookie signal.
 async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
-    let ok = deps.humble.gamekeys().await.is_ok();
-    let mut st = deps
-        .store
-        .get_sync_state()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    st.cookie_ok = ok;
-    let _ = deps.store.put_sync_state(&st).await;
-    FulfillResponse::CookieStatus { ok }
+    match deps.humble.gamekeys().await {
+        Ok(_) => {
+            let mut st = deps
+                .store
+                .get_sync_state()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            st.cookie_ok = true;
+            let _ = deps.store.put_sync_state(&st).await;
+            FulfillResponse::CookieStatus { ok: true }
+        }
+        Err(HumbleError::Unauthorized) => {
+            let mut st = deps
+                .store
+                .get_sync_state()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            st.cookie_ok = false;
+            let _ = deps.store.put_sync_state(&st).await;
+            FulfillResponse::CookieStatus { ok: false }
+        }
+        // Transient errors: rate-limited, API errors, network issues.
+        // Do NOT touch SyncState — cookie validity is unknown.
+        Err(_) => FulfillResponse::Error {
+            message: "humble unreachable — cookie state unknown, try again".into(),
+        },
+    }
 }
 
 const COOKIE_DEAD_MSG: &str = "humble session cookie is DEAD — paste a fresh one in admin";

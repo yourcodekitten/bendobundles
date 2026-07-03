@@ -136,9 +136,8 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
     let now = OffsetDateTime::now_utc();
     let revoked = link.revoked;
     let expired = link.expires_at.is_some_and(|exp| exp <= now);
-    let exhausted = link.claims_used >= link.claims_allowed;
-    // active = usable for claiming right now
-    let active = !revoked && !expired && !exhausted;
+    // active: single can_claim rule — one implementation, never a manual re-derivation
+    let active = link.can_claim(now).is_ok();
 
     // Revoked/expired: show no games (link is dead; don't leak catalog).
     // Exhausted: games stay visible so the friend can browse; claim buttons
