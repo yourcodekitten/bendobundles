@@ -71,7 +71,7 @@ module "apigateway" {
 
 # Module does NOT create integration permissions (confirmed) — caller wires them.
 resource "aws_lambda_permission" "apigw_public" {
-  statement_id  = "AllowAPIGatewayInvoke"
+  statement_id  = "AllowAPIGatewayInvokePublic"
   action        = "lambda:InvokeFunction"
   function_name = module.lambda_public_api.lambda_function_name
   principal     = "apigateway.amazonaws.com"
@@ -79,7 +79,7 @@ resource "aws_lambda_permission" "apigw_public" {
 }
 
 resource "aws_lambda_permission" "apigw_admin" {
-  statement_id  = "AllowAPIGatewayInvoke"
+  statement_id  = "AllowAPIGatewayInvokeAdmin"
   action        = "lambda:InvokeFunction"
   function_name = module.lambda_admin_api.lambda_function_name
   principal     = "apigateway.amazonaws.com"
