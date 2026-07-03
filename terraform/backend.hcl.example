@@ -1,0 +1,6 @@
+bucket               = "bd-prod-ue1-tfstate-store" # ben: confirm your real state bucket
+key                  = "terraform.tfstate"
+kms_key_id           = "alias/aws/s3"
+region               = "us-east-1"
+use_lockfile         = true # S3-native locking (TF >= 1.10); no dynamodb_table
+workspace_key_prefix = "bendobundles"
