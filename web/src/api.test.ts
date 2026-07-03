@@ -590,6 +590,17 @@ describe('adminSync', () => {
     await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
   });
 
+  it('throws the same message on 200 with a malformed body (json catch branch)', async () => {
+    const mockResponse = {
+      status: 200,
+      ok: true,
+      json: vi.fn().mockRejectedValue(new SyntaxError('unexpected token')),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
+  });
+
   it('throws Error with message on non-ok status before attempting json', async () => {
     const mockResponse = {
       status: 502,
