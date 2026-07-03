@@ -127,7 +127,7 @@ describe('Ops', () => {
   });
 
   describe('sync panel', () => {
-    it('button is disabled and shows "syncing…" while in flight, re-enables after', async () => {
+    it('button is disabled and shows "syncing…" while the start request is in flight', async () => {
       const user = userEvent.setup();
       let resolveSync!: () => void;
       vi.mocked(adminSync).mockReturnValue(
@@ -143,13 +143,62 @@ describe('Ops', () => {
       await waitFor(() => {
         expect(screen.getByRole('button', { name: /syncing/i })).toBeDisabled();
       });
-
-      // Resolve the pending sync (fire-and-forget: no payload)
       resolveSync();
+    });
 
-      // After completion: button re-enabled with original label
+    it('button STAYS locked after the 202 — a 202 means "queued", not "done"', async () => {
+      // Regression guard for the concurrent-backfill hole: unlocking at the 202 (the old
+      // .finally(setSyncing(false)) behavior) let a second click queue a second walk while
+      // the first still ran. The button must stay locked while we wait for the run marker.
+      const user = userEvent.setup();
+      vi.mocked(adminSync).mockResolvedValue(undefined);
+      renderOps();
+
+      await user.click(screen.getByRole('button', { name: /sync now/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/sync started — watch the status card/i)).toBeInTheDocument();
+      });
+      expect(screen.getByRole('button', { name: /syncing/i })).toBeDisabled();
+    });
+
+    it('button re-enables when the start request is rejected', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminSync).mockRejectedValue(new Error('couldn’t start sync — try again'));
+      renderOps();
+
+      await user.click(screen.getByRole('button', { name: /sync now/i }));
+
       await waitFor(() => {
         expect(screen.getByRole('button', { name: /sync now/i })).not.toBeDisabled();
+      });
+    });
+
+    it('button is disabled without any click while the server reports a running sync', () => {
+      renderOps({
+        status: {
+          sync: null,
+          sync_run: { started_epoch: Math.floor(Date.now() / 1000) - 30, running: true },
+          game_counts: {},
+        },
+      });
+
+      expect(screen.getByRole('button', { name: /syncing/i })).toBeDisabled();
+    });
+
+    it('shows the already-running message on a 409 rejection', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminSync).mockRejectedValue(
+        new Error('a sync is already running — watch the status card'),
+      );
+      renderOps();
+
+      await user.click(screen.getByRole('button', { name: /sync now/i }));
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('a sync is already running — watch the status card'),
+        ).toBeInTheDocument();
       });
     });
 
@@ -192,6 +241,7 @@ describe('Ops', () => {
             games_written: 0,
             message: '',
           },
+          sync_run: null,
           game_counts: {},
         },
       });
@@ -212,6 +262,7 @@ describe('Ops', () => {
             games_written: 0,
             message: '',
           },
+          sync_run: null,
           game_counts: {},
         },
       });
@@ -232,6 +283,7 @@ describe('Ops', () => {
             games_written: 0,
             message: '',
           },
+          sync_run: null,
           game_counts: {},
         },
       });
@@ -252,6 +304,7 @@ describe('Ops', () => {
             games_written: 0,
             message: 'auth failed',
           },
+          sync_run: null,
           game_counts: {},
         },
       });
@@ -272,6 +325,7 @@ describe('Ops', () => {
             games_written: 0,
             message: '',
           },
+          sync_run: null,
           game_counts: { available: 10, gifted: 5 },
         },
       });
@@ -294,6 +348,7 @@ describe('Ops', () => {
             games_written: 0,
             message: '',
           },
+          sync_run: null,
           game_counts: {},
         },
       });
@@ -308,6 +363,7 @@ describe('Ops', () => {
       renderOps({
         status: {
           sync: null,
+          sync_run: null,
           game_counts: {},
         },
       });
@@ -315,6 +371,37 @@ describe('Ops', () => {
       await waitFor(() => {
         expect(screen.getByText('never')).toBeInTheDocument();
       });
+    });
+
+    it('shows the running line while a sync run is live', () => {
+      const nowMs = 1_751_664_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+      renderOps({
+        status: {
+          sync: null,
+          sync_run: { started_epoch: nowMs / 1000 - 120, running: true },
+          game_counts: {},
+        },
+      });
+
+      expect(screen.getByText(/sync running — started 2m ago/)).toBeInTheDocument();
+    });
+
+    it('surfaces a dead run (marker present, not running) — a dropped backfill must not look idle', () => {
+      // This is the observability half of the fire-and-forget contract: if fulfillment
+      // crashes/times out before reporting, the leftover marker is the ONLY evidence.
+      const nowMs = 1_751_664_000_000;
+      vi.spyOn(Date, 'now').mockReturnValue(nowMs);
+      renderOps({
+        status: {
+          sync: null,
+          sync_run: { started_epoch: nowMs / 1000 - 1200, running: false },
+          game_counts: {},
+        },
+      });
+
+      expect(screen.getByText(/started 20m ago but never\s+reported/)).toBeInTheDocument();
+      expect(screen.getByText(/likely failed; safe to retry/)).toBeInTheDocument();
     });
   });
 

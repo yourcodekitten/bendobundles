@@ -615,7 +615,23 @@ describe('adminSync', () => {
     expect(mockResponse.json).not.toHaveBeenCalled();
   });
 
-  it('throws a start-failure error on a non-ok status', async () => {
+  it('resolves on a 202 whose body is malformed — fire-and-forget must never parse the body', async () => {
+    // THE contract this PR locks in: the 202 is a pure ack. If adminSync ever starts reading
+    // the body, this malformed-JSON response makes that regression fail loudly.
+    const mockResponse = {
+      ok: true,
+      status: 202,
+      json: vi.fn().mockRejectedValue(new SyntaxError('Unexpected token < in JSON')),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).resolves.toBeUndefined();
+    expect(mockResponse.json).not.toHaveBeenCalled();
+  });
+
+  // Full message strings on purpose: this copy is user-facing (Ops renders err.message
+  // verbatim), so a copy regression here is a UI regression, not a cosmetic one.
+  it('throws the exact start-failure message on a 500', async () => {
     const mockResponse = {
       status: 500,
       ok: false,
@@ -623,7 +639,31 @@ describe('adminSync', () => {
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    await expect(adminSync()).rejects.toThrow(/start sync/);
+    await expect(adminSync()).rejects.toThrow('couldn’t start sync — try again');
+    expect(mockResponse.json).not.toHaveBeenCalled();
+  });
+
+  it('throws the exact start-failure message on a 502 (bad gateway is not special)', async () => {
+    const mockResponse = {
+      status: 502,
+      ok: false,
+      json: vi.fn(),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).rejects.toThrow('couldn’t start sync — try again');
+    expect(mockResponse.json).not.toHaveBeenCalled();
+  });
+
+  it('throws the exact already-running message on a 409', async () => {
+    const mockResponse = {
+      status: 409,
+      ok: false,
+      json: vi.fn(),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).rejects.toThrow('a sync is already running — watch the status card');
     expect(mockResponse.json).not.toHaveBeenCalled();
   });
 

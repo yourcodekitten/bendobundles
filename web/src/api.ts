@@ -77,6 +77,11 @@ export type StatusView = {
         message: string;
       }
     | null;
+  // Present while a sync-run marker exists; completion deletes the marker, so null = idle.
+  // `running` is computed server-side (the browser clock can't judge staleness against
+  // server-written epochs): true = a run is live; false = a run began but never reported
+  // (crash/timeout) — likely failed, safe to retry.
+  sync_run: { started_epoch: number; running: boolean } | null;
   game_counts: Record<string, number>;
 };
 
@@ -292,6 +297,11 @@ export async function adminSync(): Promise<void> {
 
   await checkUnauthorized(response);
 
+  // 409 = a live run already holds the sync-run marker; distinct copy so the admin knows
+  // waiting (not retrying) is the move.
+  if (response.status === 409) {
+    throw new Error('a sync is already running — watch the status card');
+  }
   if (!response.ok) {
     throw new Error('couldn’t start sync — try again');
   }

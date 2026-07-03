@@ -450,6 +450,25 @@ async fn handle_cookie(State(s): State<AppState>, Json(body): Json<CookieBody>) 
 /// request path (that 504s). Returns 202 immediately; the admin watches the status card, which
 /// fulfillment updates (`put_sync_state`) when the background run finishes.
 async fn handle_sync(State(s): State<AppState>) -> Response {
+    // Refuse to queue a second backfill while a live run marker exists: concurrent walks double
+    // the humble request rate for nothing. This read-then-fire is best-effort UX (a clear 409
+    // instead of a silently-skipped duplicate) — the authoritative serialization is fulfillment's
+    // conditional `begin_sync_run`. On a marker read error, fire anyway for the same reason.
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let run_live = match s.store.get_sync_run().await {
+        Ok(Some(started)) => dynamo::sync_run_is_live(started, now),
+        Ok(None) | Err(_) => false,
+    };
+    if run_live {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "a sync is already running — watch the status card"
+            })),
+        )
+            .into_response();
+    }
+
     match s.invoker.fire(FulfillRequest::Sync).await {
         Ok(()) => (
             StatusCode::ACCEPTED,
@@ -482,6 +501,15 @@ async fn handle_status(State(s): State<AppState>) -> Response {
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
+    // The run marker drives the client's "sync running" affordances (disabled button, poll
+    // loop, running badge). `running` is computed HERE because liveness needs a trustworthy
+    // clock — the browser's can't judge staleness against server-written epochs.
+    let sync_run = match s.store.get_sync_run().await {
+        Ok(r) => r,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+
     let games = match s.store.list_all_games().await {
         Ok(gs) => gs,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -507,6 +535,13 @@ async fn handle_status(State(s): State<AppState>) -> Response {
         StatusCode::OK,
         Json(serde_json::json!({
             "sync": sync_state,
+            // null = no marker (idle or a completed run — completion deletes it).
+            // running:false with a marker present = a run began but never reported
+            // (crash/timeout); the client surfaces that as "likely failed, safe to retry".
+            "sync_run": sync_run.map(|started| serde_json::json!({
+                "started_epoch": started,
+                "running": dynamo::sync_run_is_live(started, now),
+            })),
             // Per-status buckets ONLY — the client renders one chip per key,
             // so a folded-in "total" would masquerade as a sixth status and
             // double the apparent catalog size.
