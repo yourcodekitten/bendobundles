@@ -163,7 +163,11 @@ async fn handle_gift(
                     Err(e) => {
                         ping(
                             deps,
-                            &format!("fulfill after redeem failed for claim {claim_id}: {e}"),
+                            &format!(
+                                "fulfill after redeem failed for claim {claim_id}: {e} — \
+                                 gift URL was generated but not recorded — recover it from \
+                                 humble's gift history page (purchases → the order → gift link)"
+                            ),
                         )
                         .await;
                         FulfillResponse::Error {
@@ -368,6 +372,12 @@ async fn reconcile(deps: &Deps) {
             .await;
         } else {
             // The redeem never landed — safe to return the slot and re-list the game.
+            // VERIFY on the first real gifting BEFORE trusting this arm in production: this arm
+            // assumes gift-generation sets redeemed_key_val on the order's tpk so humble marks the
+            // key redeemed. If humble does NOT mark gift-generated keys redeemed there, a
+            // crash-after-redeem claim would reconcile here as not-redeemed → compensate →
+            // re-list a burned key (double-burn). Until verified, treat reconcile compensates of
+            // gift-path claims with suspicion — tracked for the plan-2 live receipt.
             let _ = deps
                 .store
                 .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)

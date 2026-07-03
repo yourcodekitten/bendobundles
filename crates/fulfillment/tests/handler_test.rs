@@ -52,8 +52,10 @@ fn gift_decision_ladder_is_exhaustive_and_safe() {
 // Integration scaffolding (dynamo-gated).
 // ---------------------------------------------------------------------------------------------
 async fn store_or_skip(test: &str) -> Option<Store> {
-    let url =
-        std::env::var("DYNAMODB_LOCAL_URL").unwrap_or_else(|_| "http://localhost:8000".into());
+    let (url, explicit) = match std::env::var("DYNAMODB_LOCAL_URL") {
+        Ok(v) => (v, true),
+        Err(_) => ("http://localhost:8000".into(), false),
+    };
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url(&url)
         .region("us-east-1")
@@ -62,6 +64,12 @@ async fn store_or_skip(test: &str) -> Option<Store> {
         .await;
     let client = aws_sdk_dynamodb::Client::new(&config);
     if client.list_tables().send().await.is_err() {
+        if explicit {
+            panic!(
+                "DYNAMODB_LOCAL_URL is set but dynamodb-local is unreachable — \
+                 refusing to skip (this would forge a green run)"
+            );
+        }
         eprintln!("SKIP {test}: no dynamodb-local at {url}");
         return None;
     }
