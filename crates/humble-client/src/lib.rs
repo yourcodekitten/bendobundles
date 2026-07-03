@@ -209,7 +209,19 @@ impl HumbleClient {
             ])
             .send()
             .await?;
-        match resp.status().as_u16() {
+        let status = resp.status().as_u16();
+        // Diagnostic: the redeem WRITE path is the least-evidenced corner of the
+        // whole system (reads work via GET; this POST may need a credential the
+        // reads don't — e.g. a CSRF token → 302/403). Log the status + key
+        // identifiers (never the cookie or the gift token). On the first real
+        // gifting this line names exactly what humble did.
+        tracing::info!(
+            status,
+            machine_name,
+            keyindex,
+            "humble redeem POST response"
+        );
+        match status {
             200 => {
                 let bytes = resp.bytes().await?;
                 let body: RedeemResponse = decode_body(&bytes)?;
@@ -229,6 +241,9 @@ impl HumbleClient {
                         // Community-documented phrase: "This key has already been redeemed."
                         // Belt-and-suspenders: also catch if humble ever shortens it to
                         // "already redeemed" without "been".
+                        // The refusal text is humble's own — safe to log and the
+                        // single most useful clue for a redeem that won't complete.
+                        tracing::warn!(errormsg = %msg, "humble redeem refused (success=false)");
                         let lower = msg.to_lowercase();
                         if lower.contains("already been redeemed")
                             || lower.contains("already redeemed")
@@ -240,7 +255,17 @@ impl HumbleClient {
                     }
                 }
             }
-            401 | 403 | 302 => Err(HumbleError::Unauthorized),
+            401 | 403 | 302 => {
+                // The redeem POST got an auth/redirect rejection. If reads work
+                // (sync succeeds) but this fires, the cookie is fine and the
+                // WRITE needs something we're not sending — most likely a CSRF
+                // token. This is the signature to look for on first gifting.
+                tracing::warn!(
+                    status,
+                    "humble redeem returned auth/redirect — likely a missing write credential (CSRF?), NOT necessarily a dead cookie"
+                );
+                Err(HumbleError::Unauthorized)
+            }
             429 => Err(HumbleError::RateLimited),
             s => Err(HumbleError::Api(s)),
         }

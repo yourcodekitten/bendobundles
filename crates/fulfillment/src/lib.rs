@@ -118,6 +118,13 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
             machine_name,
             keyindex,
         } => {
+            tracing::info!(
+                claim_id,
+                game_id,
+                machine_name,
+                keyindex,
+                "fulfillment: gift request"
+            );
             handle_gift(
                 deps,
                 &claim_id,
@@ -148,6 +155,13 @@ async fn handle_gift(
         .humble
         .redeem_as_gift(gamekey, machine_name, keyindex)
         .await;
+    // Log the mapped outcome (never the gift URL/token). On a park, this names
+    // which HumbleError variant drove it — pairs with humble-client's status log.
+    if let Err(e) = &outcome {
+        tracing::warn!(claim_id, game_id, error = ?e, "gift redeem did not return a URL");
+    } else {
+        tracing::info!(claim_id, game_id, "gift redeem returned a URL");
+    }
     match gift_decision(&outcome) {
         Decision::Record => match outcome {
             Ok(GiftUrl(url)) => {
@@ -235,6 +249,7 @@ async fn handle_gift(
 /// Catalog sync. Runs [`reconcile`] first (parked-claim recovery against humble truth), then walks
 /// every order and upserts each key's `Game` via the guarded sync-upsert.
 async fn handle_sync(deps: &Deps) -> FulfillResponse {
+    tracing::info!("sync started (reconcile, then order walk)");
     // Reconcile parked claims BEFORE the walk — humble is the source of truth for both.
     reconcile(deps).await;
 
@@ -334,6 +349,7 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
         &msg,
     )
     .await;
+    tracing::info!(games_written, orders_failed, cookie_ok, "sync finished");
     FulfillResponse::SyncDone {
         games_written,
         orders_failed,
@@ -368,6 +384,7 @@ async fn reconcile(deps: &Deps) {
             continue;
         };
         if key.redeemed {
+            tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
             // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message
             // carries claim id + human game context only — NEVER a key value.
             ping(
@@ -387,6 +404,7 @@ async fn reconcile(deps: &Deps) {
             // crash-after-redeem claim would reconcile here as not-redeemed → compensate →
             // re-list a burned key (double-burn). Until verified, treat reconcile compensates of
             // gift-path claims with suspicion — tracked for the plan-2 live receipt.
+            tracing::info!(claim_id = %claim.id, "reconcile: parked claim not redeemed on humble — compensating (slot returns, game re-lists)");
             let _ = deps
                 .store
                 .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
@@ -402,7 +420,9 @@ async fn reconcile(deps: &Deps) {
 /// cookie state — the cookie's validity is unknown, and writing `cookie_ok=false` on a 429
 /// would be wrong. Only `Unauthorized` is a definitive dead-cookie signal.
 async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
-    match deps.humble.gamekeys().await {
+    let result = deps.humble.gamekeys().await;
+    tracing::info!(ok = result.is_ok(), "cookie validation (gamekeys read)");
+    match result {
         Ok(_) => {
             let mut st = deps
                 .store

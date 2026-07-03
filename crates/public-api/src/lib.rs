@@ -306,7 +306,16 @@ async fn handle_post_claim(
         keyindex: game.keyindex,
     };
 
-    match s.invoker.gift(fulfill_req).await {
+    let gift_result = s.invoker.gift(fulfill_req).await;
+    // Log the claim's fulfillment outcome (never the gift URL/token). A park
+    // here is the friend-visible "processing" — this line says which variant.
+    match &gift_result {
+        Ok(FulfillResponse::GiftUrl { .. }) => tracing::info!("claim: gifted"),
+        Ok(FulfillResponse::AlreadyRedeemed) => tracing::info!("claim: already-redeemed (410)"),
+        Ok(other) => tracing::warn!(outcome = ?other, "claim: parked"),
+        Err(e) => tracing::warn!(error = %e, "claim: fulfillment invoke failed → parked"),
+    }
+    match gift_result {
         Ok(FulfillResponse::GiftUrl { url }) => {
             (StatusCode::OK, Json(serde_json::json!({"gift_url": url}))).into_response()
         }
