@@ -676,6 +676,10 @@ impl Store {
         // first-insert doesn't clobber a claim that landed between our read and write.
         // If an existing record was found, optimistic-lock on its status string — a CCF means a
         // concurrent claim/compensate/fulfill changed status under us → SkippedInFlight.
+        // When the existing game is owned (claim_id is Some), add an ownership clause to close a
+        // TOCTOU where a compensate+reclaim lands inside sync's read→write window. Without it, the
+        // put would stamp the stale claim_id and strand the live claim (whose fulfill gate checks
+        // claim_id for ownership).
         let mut req = self
             .client
             .put_item()
@@ -693,7 +697,13 @@ impl Store {
                 req = req
                     .expression_attribute_names("#st", "status")
                     .expression_attribute_values(":expected", schema::s(status_str));
-                "#st = :expected".to_string()
+                // If the existing game is owned, add the ownership clause to the condition.
+                if let Some(cid) = &e.claim_id {
+                    req = req.expression_attribute_values(":cid", schema::s(cid.clone()));
+                    "#st = :expected AND claim_id = :cid".to_string()
+                } else {
+                    "#st = :expected".to_string()
+                }
             }
         };
 
