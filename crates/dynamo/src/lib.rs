@@ -29,6 +29,19 @@ pub enum SyncWrite {
     Unchanged,
 }
 
+/// Outcome of a guarded hidden-flag write. The ONLY safe way to toggle `hidden` on a game.
+/// Closes the admin-toggle vs claim race that an unguarded `put_game` would lose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HiddenWrite {
+    /// Hidden flag was written (game was found and the condition passed).
+    Written,
+    /// No game with that ID exists; caller should 404.
+    NotFound,
+    /// A concurrent claim holds a `claim_id` on the game — the conditional put's
+    /// `attribute_not_exists(claim_id)` clause fired. Caller should 409 and retry later.
+    Contested,
+}
+
 /// Persisted summary of a catalog-sync run. Storage-shaped (lives in dynamo, not in domain).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SyncState {
@@ -656,6 +669,56 @@ impl Store {
                     }
                 }
                 Err(StoreError::Aws(err_str))
+            }
+        }
+    }
+
+    /// Toggle a game's `hidden` flag with a guarded conditional write. Closes the admin-toggle vs
+    /// claim race that an unguarded `put_game` would lose: a claim landing in the read→write window
+    /// sets a top-level `claim_id` attribute, which fires the `attribute_not_exists(claim_id)`
+    /// guard and returns `Contested` rather than clobbering the in-flight claim's ownership.
+    ///
+    /// The condition is `#st = :expected AND attribute_not_exists(claim_id)`:
+    /// - `:expected` is the serde-serialised status from the read (mirrors `upsert_game_from_sync`).
+    /// - `attribute_not_exists(claim_id)` always guards — unlike `upsert_game_from_sync` which omits
+    ///   this clause for the None case, here we *want* the guard so any claim in-flight CCFs.
+    pub async fn set_game_hidden(
+        &self,
+        game_id: &str,
+        hidden: bool,
+    ) -> Result<HiddenWrite, StoreError> {
+        let Some(mut game) = self.get_game(game_id).await? else {
+            return Ok(HiddenWrite::NotFound);
+        };
+
+        game.hidden = hidden;
+
+        // Status string via serde — same encoding as upsert_game_from_sync's optimistic lock.
+        let status_str = serde_json::to_value(game.status)
+            .expect("status serializes")
+            .as_str()
+            .expect("status is a string")
+            .to_string();
+
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":expected", schema::s(status_str))
+            .condition_expression("#st = :expected AND attribute_not_exists(claim_id)")
+            .send()
+            .await;
+
+        match res {
+            Ok(_) => Ok(HiddenWrite::Written),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(HiddenWrite::Contested)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
             }
         }
     }

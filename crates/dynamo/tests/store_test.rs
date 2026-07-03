@@ -1,5 +1,5 @@
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
-use dynamo::{ClaimTxError, Store, SyncState, SyncWrite};
+use dynamo::{ClaimTxError, HiddenWrite, Store, SyncState, SyncWrite};
 use time::macros::datetime;
 
 async fn store_or_skip(test: &str) -> Option<Store> {
@@ -526,4 +526,74 @@ async fn list_links_returns_all_with_authoritative_counter() {
     let lb = links.iter().find(|l| l.token == "tok-lb").unwrap();
     assert_eq!(lb.claims_used, 0);
     assert_eq!(lb.claims_allowed, 5);
+}
+
+/// `set_game_hidden` basic: seed a game, toggle hidden → Written, re-read confirms hidden=true.
+/// Unknown id → NotFound.
+#[tokio::test]
+async fn set_game_hidden_basic() {
+    let Some(store) = store_or_skip("set-game-hidden-basic").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Set hidden=true → Written
+    let result = store.set_game_hidden(&gid, true).await.unwrap();
+    assert!(
+        matches!(result, HiddenWrite::Written),
+        "set_game_hidden on available unclaimed game must be Written"
+    );
+
+    // Re-read: hidden must be true
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        got.hidden,
+        "game must be hidden after set_game_hidden(true)"
+    );
+
+    // Unknown id → NotFound
+    let nf = store.set_game_hidden("no-such-id", true).await.unwrap();
+    assert!(
+        matches!(nf, HiddenWrite::NotFound),
+        "unknown game id must return NotFound"
+    );
+}
+
+/// `set_game_hidden` contested: a claimed game (Pending, has top-level claim_id) triggers the
+/// `attribute_not_exists(claim_id)` guard → Contested. Deterministic because claiming sets
+/// claim_id on the DynamoDB item before set_game_hidden's put even runs.
+#[tokio::test]
+async fn set_game_hidden_contested() {
+    let Some(store) = store_or_skip("set-game-hidden-contested").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+
+    // Claim the game — it is now Pending with a top-level claim_id attribute.
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+    let claimed = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(claimed.status, GameStatus::Pending);
+    assert!(claimed.claim_id.is_some());
+
+    // set_game_hidden must see the claim_id attribute and return Contested.
+    let result = store.set_game_hidden(&gid, true).await.unwrap();
+    assert!(
+        matches!(result, HiddenWrite::Contested),
+        "set_game_hidden on a claimed (Pending) game must return Contested, got {result:?}"
+    );
+
+    // The game's claim must be intact (no clobber).
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        GameStatus::Pending,
+        "status must still be Pending"
+    );
+    assert!(after.claim_id.is_some(), "claim_id must be preserved");
 }

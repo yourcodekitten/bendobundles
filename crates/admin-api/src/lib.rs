@@ -24,7 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dynamo::Store;
+use dynamo::{HiddenWrite, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -206,27 +206,25 @@ struct HiddenBody {
     hidden: bool,
 }
 
-/// Toggle a game's `hidden` flag. Uses `put_game` (unconditional full-item upsert) because
-/// `hidden` is a cosmetic admin preference — it lives orthogonal to the claim/sync state machine.
-/// `merge_sync` already preserves `hidden` on every sync write, so a concurrent sync cannot
-/// silently un-hide a game; the worst case is a cosmetic flicker if sync and this handler race,
-/// which the admin can resolve with a re-toggle. This handler is deliberately NOT on the
-/// fulfillment path and does not need the guarded upsert.
+/// Toggle a game's `hidden` flag via a guarded conditional write (`store.set_game_hidden`).
+/// Returns 200 on success, 404 if the game does not exist, 409 if a concurrent claim owns the
+/// game (the admin should retry once the claim completes). The unguarded `put_game` was previously
+/// used here but would clobber a live claim's status/claim_id in a mid-claim race.
 async fn handle_game_hidden(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<HiddenBody>,
 ) -> Response {
-    let mut game = match s.store.get_game(&id).await {
-        Ok(Some(g)) => g,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    game.hidden = body.hidden;
-
-    match s.store.put_game(&game).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+    match s.store.set_game_hidden(&id, body.hidden).await {
+        Ok(HiddenWrite::Written) => {
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
+        Ok(HiddenWrite::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Ok(HiddenWrite::Contested) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "game is mid-claim — try again in a moment"})),
+        )
+            .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
