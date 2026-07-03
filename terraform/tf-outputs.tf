@@ -10,3 +10,7 @@ output "lambda_function_names" {
     fulfillment = module.lambda_fulfillment.lambda_function_name
   }
 }
+
+output "api_stage_invoke_url" {
+  value = module.apigateway.stage_invoke_url
+}
