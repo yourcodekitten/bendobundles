@@ -67,13 +67,16 @@ export function Ops() {
   const handleSync = () => {
     setSyncing(true);
     setSyncMsg(null);
+    // Fire-and-forget: adminSync resolves when the backfill is QUEUED (202),
+    // not when it finishes. Progress + final counts land on the status card
+    // once the background run writes its SyncState.
     withAuth(() => adminSync(), navigate)
-      .then((result) => {
-        setSyncMsg(`wrote ${result.games_written} games, ${result.orders_failed} orders failed`);
+      .then(() => {
+        setSyncMsg('sync started — watch the status card; a full backfill takes a few minutes');
         refreshStatus();
       })
       .catch((err: unknown) => {
-        setSyncMsg(err instanceof Error ? err.message : 'sync failed — check status panel');
+        setSyncMsg(err instanceof Error ? err.message : 'couldn’t start sync — try again');
       })
       .finally(() => {
         setSyncing(false);

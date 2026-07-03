@@ -129,7 +129,7 @@ describe('Ops', () => {
   describe('sync panel', () => {
     it('button is disabled and shows "syncing…" while in flight, re-enables after', async () => {
       const user = userEvent.setup();
-      let resolveSync!: (v: { games_written: number; orders_failed: number }) => void;
+      let resolveSync!: () => void;
       vi.mocked(adminSync).mockReturnValue(
         new Promise((r) => {
           resolveSync = r;
@@ -144,8 +144,8 @@ describe('Ops', () => {
         expect(screen.getByRole('button', { name: /syncing/i })).toBeDisabled();
       });
 
-      // Resolve the pending sync
-      resolveSync({ games_written: 5, orders_failed: 0 });
+      // Resolve the pending sync (fire-and-forget: no payload)
+      resolveSync();
 
       // After completion: button re-enabled with original label
       await waitFor(() => {
@@ -153,27 +153,27 @@ describe('Ops', () => {
       });
     });
 
-    it('shows "wrote N games, M orders failed" after successful sync', async () => {
+    it('shows the fire-and-forget "sync started" message on a 202', async () => {
       const user = userEvent.setup();
-      vi.mocked(adminSync).mockResolvedValue({ games_written: 42, orders_failed: 3 });
+      vi.mocked(adminSync).mockResolvedValue(undefined);
       renderOps();
 
       await user.click(screen.getByRole('button', { name: /sync now/i }));
 
       await waitFor(() => {
-        expect(screen.getByText('wrote 42 games, 3 orders failed')).toBeInTheDocument();
+        expect(screen.getByText(/sync started — watch the status card/i)).toBeInTheDocument();
       });
     });
 
-    it('shows "sync failed — check status panel" on sync error', async () => {
+    it('shows the start-failure message when the sync request is rejected', async () => {
       const user = userEvent.setup();
-      vi.mocked(adminSync).mockRejectedValue(new Error('sync failed — check status panel'));
+      vi.mocked(adminSync).mockRejectedValue(new Error('couldn’t start sync — try again'));
       renderOps();
 
       await user.click(screen.getByRole('button', { name: /sync now/i }));
 
       await waitFor(() => {
-        expect(screen.getByText('sync failed — check status panel')).toBeInTheDocument();
+        expect(screen.getByText(/couldn’t start sync — try again/i)).toBeInTheDocument();
       });
     });
   });
@@ -333,10 +333,10 @@ describe('Ops', () => {
       });
     });
 
-    it('calls refreshStatus after sync completes', async () => {
+    it('calls refreshStatus after sync is accepted', async () => {
       const user = userEvent.setup();
       const refreshStatus = vi.fn();
-      vi.mocked(adminSync).mockResolvedValue({ games_written: 1, orders_failed: 0 });
+      vi.mocked(adminSync).mockResolvedValue(undefined);
       renderOps({ refreshStatus });
 
       await user.click(screen.getByRole('button', { name: /sync now/i }));

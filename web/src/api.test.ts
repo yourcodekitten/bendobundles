@@ -599,55 +599,31 @@ describe('adminRevoke', () => {
 });
 
 describe('adminSync', () => {
-  it('returns {games_written, orders_failed} extraction on success', async () => {
-    const mockData = { games_written: 42, orders_failed: 3 };
+  it('resolves (void) on a 202 fire-and-forget accept', async () => {
     const mockResponse = {
       ok: true,
-      status: 200,
-      json: vi.fn().mockResolvedValue(mockData),
+      status: 202,
+      json: vi.fn().mockResolvedValue({ status: 'started' }),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    const result = await adminSync();
-
-    expect(result).toEqual({ games_written: 42, orders_failed: 3 });
+    await expect(adminSync()).resolves.toBeUndefined();
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/sync', {
       method: 'POST',
     });
+    // fire-and-forget: no body is read, no counts are extracted
+    expect(mockResponse.json).not.toHaveBeenCalled();
   });
 
-  it('throws Error with message on 500 with empty body', async () => {
+  it('throws a start-failure error on a non-ok status', async () => {
     const mockResponse = {
       status: 500,
-      ok: false,
-      json: vi.fn().mockRejectedValue(new Error('invalid json')),
-    };
-    mockFetch.mockResolvedValueOnce(mockResponse);
-
-    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
-  });
-
-  it('throws the same message on 200 with a malformed body (json catch branch)', async () => {
-    const mockResponse = {
-      ok: true,
-      status: 200,
-      json: vi.fn().mockRejectedValue(new SyntaxError('unexpected token')),
-    };
-    mockFetch.mockResolvedValueOnce(mockResponse);
-
-    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
-  });
-
-  it('throws Error with message on non-ok status before attempting json', async () => {
-    const mockResponse = {
-      status: 502,
       ok: false,
       json: vi.fn(),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
-    // Verify json() was not called since we guard before it
+    await expect(adminSync()).rejects.toThrow(/start sync/);
     expect(mockResponse.json).not.toHaveBeenCalled();
   });
 

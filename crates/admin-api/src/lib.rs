@@ -35,7 +35,15 @@ use time::OffsetDateTime;
 /// an api→api crate dependency; the shape is intentionally minimal.
 #[async_trait]
 pub trait AdminInvoker: Send + Sync {
+    /// Synchronous invoke (`RequestResponse`) — caller needs the typed response.
+    /// Used by cookie validation, which is fast.
     async fn call(&self, req: FulfillRequest) -> Result<FulfillResponse, String>;
+
+    /// Fire-and-forget invoke (`Event`) — returns as soon as the request is
+    /// accepted, not when the work finishes. Used by sync-now: a full backfill
+    /// runs for minutes, far past any HTTP timeout, so it MUST NOT be awaited
+    /// through the request path.
+    async fn fire(&self, req: FulfillRequest) -> Result<(), String>;
 }
 
 /// SSM SecureString reader/writer for the humble session cookie. Separate from aws-sdk-ssm so
@@ -437,24 +445,25 @@ async fn handle_cookie(State(s): State<AppState>, Json(body): Json<CookieBody>) 
 
 // ── POST /admin/api/sync ──────────────────────────────────────────────────────
 
-/// Trigger a catalog sync now. Uses `RequestResponse` (synchronous) — admin waits for
-/// completion. The fulfillment lambda's execution timeout is the effective ceiling; plan 4's
-/// API Gateway timeout will be configured to match. For a normal catalog this finishes in well
-/// under 60 s.
+/// Trigger a catalog sync now. Fire-and-forget (`Event` invoke): a full backfill runs for
+/// minutes — far past the API Gateway integration timeout — so we must NOT await it through the
+/// request path (that 504s). Returns 202 immediately; the admin watches the status card, which
+/// fulfillment updates (`put_sync_state`) when the background run finishes.
 async fn handle_sync(State(s): State<AppState>) -> Response {
-    match s.invoker.call(FulfillRequest::Sync).await {
-        Ok(FulfillResponse::SyncDone {
-            games_written,
-            orders_failed,
-        }) => (
-            StatusCode::OK,
+    match s.invoker.fire(FulfillRequest::Sync).await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
             Json(serde_json::json!({
-                "games_written": games_written,
-                "orders_failed": orders_failed,
+                "status": "started",
+                "message": "sync started — watch the status card; a full backfill takes a few minutes"
             })),
         )
             .into_response(),
-        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "couldn't start sync — try again"})),
+        )
+            .into_response(),
     }
 }
 

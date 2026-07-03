@@ -114,6 +114,11 @@ impl AdminInvoker for MockAdminInvoker {
         *self.captured.lock().await = Some(serde_json::to_value(&req).unwrap());
         Ok(serde_json::from_str(&self.response_json).unwrap())
     }
+
+    async fn fire(&self, req: FulfillRequest) -> Result<(), String> {
+        *self.captured.lock().await = Some(serde_json::to_value(&req).unwrap());
+        Ok(())
+    }
 }
 
 // ── MockSsmPutter ──────────────────────────────────────────────────────────────
@@ -887,4 +892,50 @@ async fn link_claims_redact_gift_url_to_issued_bool() {
     assert_eq!(claim["state"], "fulfilled");
     assert_eq!(claim["issued"], true);
     assert!(claim.get("gift_url").is_none(), "no gift_url key at all");
+}
+
+/// POST /admin/api/sync fires the backfill async and returns 202 immediately —
+/// it must NOT block on completion (a full backfill outruns the API Gateway
+/// timeout → 504). The mock captures the Sync request to prove it was invoked.
+#[tokio::test]
+async fn sync_now_fires_async_and_returns_202() {
+    let Some(store) = store_or_skip("sync-async").await else {
+        return;
+    };
+
+    let password = "syncpw";
+    let admin_hash = test_admin_hash(password);
+    let mock = MockAdminInvoker::new(FulfillResponse::SyncDone {
+        games_written: 0,
+        orders_failed: 0,
+    });
+    let invoker: Arc<dyn AdminInvoker> = mock.clone();
+    let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let req = Request::post("/admin/api/sync")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(req)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "sync-now must return 202 (fire-and-forget), never block for completion"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(j["status"], "started");
+
+    // The invoker received exactly a Sync request via the fire path.
+    assert_eq!(mock.last_call().await, Some(FulfillRequest::Sync));
 }

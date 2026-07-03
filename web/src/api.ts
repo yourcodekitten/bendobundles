@@ -281,7 +281,11 @@ export async function adminPasteCookie(cookie: string): Promise<CookieResult> {
   return await response.json();
 }
 
-export async function adminSync(): Promise<{ games_written: number; orders_failed: number }> {
+// Sync-now is fire-and-forget: the server returns 202 the moment the backfill
+// is queued (a full backfill runs for minutes, past any HTTP timeout). There
+// are no counts to return — the status card reflects progress once the
+// background run writes its SyncState.
+export async function adminSync(): Promise<void> {
   const response = await fetch('/admin/api/sync', {
     method: 'POST',
   });
@@ -289,13 +293,7 @@ export async function adminSync(): Promise<{ games_written: number; orders_faile
   await checkUnauthorized(response);
 
   if (!response.ok) {
-    throw new Error('sync failed — check status panel');
-  }
-
-  try {
-    return (await response.json()) as { games_written: number; orders_failed: number };
-  } catch {
-    throw new Error('sync failed — check status panel');
+    throw new Error('couldn’t start sync — try again');
   }
 }
 
