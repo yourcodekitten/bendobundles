@@ -1,8 +1,9 @@
-# Pin the PR branch ref until OMBB releases the enhancement (Task 1); swap to
+# Pinned to the immutable merge sha of cf-s3-origin#137 (MERGED; the feature
+# branch is deleted). Swap to
 # `source = "bendoerr-terraform-modules/cloudfront-and-s3-origin/aws", version = "0.5.0"`
-# when tagged. Tracked in the PR body checklist.
+# the moment the release is tagged (OMBB shepherds after ben's greenlight).
 module "site" {
-  source  = "git::https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin.git?ref=kitten/additional-origins"
+  source  = "git::https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin.git?ref=041718bffaa9abe60693b42f3cc4644634ac0467"
   context = module.context.shared
   name    = "site"
 

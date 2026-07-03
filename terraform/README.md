@@ -167,14 +167,14 @@ multi-key Humble order with a real recipient:
 
 ## Module pin note
 
-`module "site"` currently pins the PR branch:
+`module "site"` currently pins the immutable merge sha of the module enhancement:
 
 ```hcl
-source = "git::https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin.git?ref=kitten/additional-origins"
+source = "git::https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin.git?ref=041718bffaa9abe60693b42f3cc4644634ac0467"
 ```
 
-This is tracking [bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin#137](https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin/pull/137)
-(additional-origins support). Once that PR is merged and a release is tagged, swap to:
+That sha is [cf-s3-origin#137](https://github.com/bendoerr-terraform-modules/terraform-aws-cloudfront-and-s3-origin/pull/137)
+(additional-origins support), MERGED to main. Once `v0.5.0` is tagged, swap to:
 
 ```hcl
 source  = "bendoerr-terraform-modules/cloudfront-and-s3-origin/aws"
