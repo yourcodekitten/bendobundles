@@ -6,20 +6,27 @@
       {
         "machine_name": "stardew_valley_steam",
         "human_name": "Stardew Valley",
-        "key_type": "steam"
+        "key_type": "steam",
+        "keyindex": 0
       },
       {
         "machine_name": "already_revealed_steam",
         "human_name": "Already Revealed Game",
         "key_type": "steam",
-        "redeemed_key_val": "AAAA-BBBB-CCCC"
+        "redeemed_key_val": "AAAA-BBBB-CCCC",
+        "keyindex": 1
       },
       {
         "machine_name": "dead_key_steam",
         "human_name": "Dead Old Game",
         "key_type": "steam",
-        "is_expired": true
+        "is_expired": true,
+        "keyindex": 2
       }
     ]
-  }
+  },
+  "subproducts": [
+    { "machine_name": "stardew_valley", "human_name": "Stardew Valley", "icon": "https://hb.imgix.net/stardew.png", "downloads": [] },
+    { "machine_name": "noicon_game", "human_name": "No Icon Game", "downloads": [] }
+  ]
 }
