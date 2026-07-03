@@ -1,0 +1,52 @@
+# Expected-usage estimates for Infracost (https://infracost.io/usage-file/).
+# Personal scale, deliberately generous so the estimate is an upper bound:
+#   ~200 friend page views + ~20 claims/mo, ~300 admin calls/mo, daily sync,
+#   ~12 web deploys/mo. Fixed costs not in this file: Route53 zone $0.50/mo.
+# SSM standard parameters are free. Values are raw (Infracost does not apply
+# the AWS free tier, so the real bill is lower than the report).
+version: 0.1
+
+resource_type_default_usage:
+  # Single REST API — both surfaces proxy through it.
+  aws_api_gateway_rest_api:
+    monthly_requests: 1000
+
+  # Single on-demand table. Sync upserts ~500 games daily (guarded writes skip
+  # unchanged); admin status/catalog scans dominate reads.
+  aws_dynamodb_table:
+    monthly_write_request_units: 20000
+    monthly_read_request_units: 150000
+    storage_gb: 0.5
+
+  aws_cloudfront_distribution:
+    monthly_https_requests: 5000
+    monthly_data_transfer_to_internet_gb: 2
+    monthly_invalidation_paths: 12 # deploy-web.sh invalidates /* per deploy
+
+  # Three log groups (one per lambda), 30-day retention, sync is the chatty one.
+  aws_cloudwatch_log_group:
+    storage_gb: 0.2
+    monthly_data_ingested_gb: 0.3
+
+  # SPA bundle — a few MB of hashed assets.
+  aws_s3_bucket:
+    standard:
+      storage_gb: 0.1
+      monthly_tier_1_requests: 500 # PUTs from deploys
+      monthly_tier_2_requests: 2000 # GETs (CloudFront misses)
+
+  # Default for the two API lambdas (public-api / admin-api): short axum handlers.
+  aws_lambda_function:
+    monthly_requests: 400
+    request_duration_ms: 150
+
+resource_usage:
+  # Address verified against the resolved module source (lambda v0.3.0
+  # main.tf: `resource "aws_lambda_function" "this"`) — a rename there would
+  # silently drop this override, so re-check on module upgrades.
+  # Fulfillment overrides the lambda default: ~30 daily syncs (minutes each,
+  # paced + jittered humble calls) + ~20 gifts + ~10 cookie validations. The
+  # duration average is sync-dominated.
+  module.lambda_fulfillment.aws_lambda_function.this:
+    monthly_requests: 60
+    request_duration_ms: 120000
