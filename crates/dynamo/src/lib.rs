@@ -7,8 +7,36 @@ use aws_sdk_dynamodb::types::{
     ProjectionType, ScalarAttributeType,
 };
 use domain::{Claim, ClaimState, Game, GameStatus, Link};
-use schema::{claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body};
+use schema::{
+    claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body, session_item,
+    session_pk, sync_state_item,
+};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+
+/// Outcome of a guarded sync-upsert. The ONLY way catalog sync should write a game.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncWrite {
+    /// Game was written (new or refreshed).
+    Written,
+    /// An optimistic-lock condition failed: a concurrent claim (or fulfill/compensate) changed the
+    /// game's status while sync was preparing the write. Do NOT retry — the in-flight claim owns
+    /// the game.
+    SkippedInFlight,
+    /// `domain::merge_sync` returned `None`: the stored game is already identical to what sync
+    /// would write. No I/O was performed.
+    Unchanged,
+}
+
+/// Persisted summary of a catalog-sync run. Storage-shaped (lives in dynamo, not in domain).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SyncState {
+    pub last_run_epoch: i64,
+    pub ok: bool,
+    pub cookie_ok: bool,
+    pub games_written: u32,
+    pub message: String,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -629,6 +657,145 @@ impl Store {
                 Err(StoreError::Aws(err_str))
             }
         }
+    }
+
+    /// Guarded sync-upsert: the ONLY correct writer for catalog-sync. `put_game` remains unsafe
+    /// for sync — it clobbers status/claim_id and resets the listable GSI attrs wholesale, without
+    /// the optimistic lock that prevents mid-sync races with an in-flight claim.
+    ///
+    /// `domain::merge_sync` branch-c takes identity fields (`gamekey`, `machine_name`) from
+    /// `fresh` — safe here because `fresh` is constructed from the same `gamekey:machine_name`
+    /// that produced the lookup `id` (carry-note from task-2 review).
+    pub async fn upsert_game_from_sync(&self, fresh: Game) -> Result<SyncWrite, StoreError> {
+        let existing = self.get_game(&fresh.id).await?;
+        let Some(merged) = domain::merge_sync(existing.as_ref(), fresh) else {
+            return Ok(SyncWrite::Unchanged);
+        };
+
+        // Condition: if no existing record, guard with attribute_not_exists(pk) so a concurrent
+        // first-insert doesn't clobber a claim that landed between our read and write.
+        // If an existing record was found, optimistic-lock on its status string — a CCF means a
+        // concurrent claim/compensate/fulfill changed status under us → SkippedInFlight.
+        let mut req = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&merged)));
+
+        let cond = match &existing {
+            None => "attribute_not_exists(pk)".to_string(),
+            Some(e) => {
+                let status_str = serde_json::to_value(e.status)
+                    .expect("status serializes")
+                    .as_str()
+                    .expect("status is a string")
+                    .to_string();
+                req = req
+                    .expression_attribute_names("#st", "status")
+                    .expression_attribute_values(":expected", schema::s(status_str));
+                "#st = :expected".to_string()
+            }
+        };
+
+        let res = req.condition_expression(cond).send().await;
+        match res {
+            Ok(_) => Ok(SyncWrite::Written),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(SyncWrite::SkippedInFlight)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
+    /// Query the `pending-claims` GSI for all claims currently in `Pending` state, oldest first
+    /// (ascending by gsi2sk, which is the RFC3339 `created_at`).
+    ///
+    /// Single Query page (DynamoDB's 1 MB / page cap, no pagination). Fine at this app's scale —
+    /// pending claims are transient and expected to be few — but do NOT assume completeness at
+    /// larger scale: a larger pending set would need `.into_paginator()` to be exhaustive.
+    pub async fn list_pending_claims(&self) -> Result<Vec<Claim>, StoreError> {
+        let out = self
+            .client
+            .query()
+            .table_name(&self.table)
+            .index_name(schema::GSI_PENDING)
+            .key_condition_expression("gsi2pk = :p")
+            .expression_attribute_values(
+                ":p",
+                aws_sdk_dynamodb::types::AttributeValue::S("PENDINGCLAIM".into()),
+            )
+            .scan_index_forward(true)
+            .send()
+            .await?;
+        out.items().iter().map(parse_body).collect()
+    }
+
+    /// Persist a catalog-sync run summary. Unconditional upsert — only one SYNC#STATE item exists.
+    pub async fn put_sync_state(&self, state: &SyncState) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(sync_state_item(state)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Retrieve the most recent catalog-sync run summary, or `None` if no run has been recorded.
+    pub async fn get_sync_state(&self) -> Result<Option<SyncState>, StoreError> {
+        self.get_meta("SYNC#STATE").await
+    }
+
+    /// Persist an admin session. pk="SESSION#<token>", sk="META". Both `expires_epoch` and `ttl`
+    /// are set to the same value; `ttl` is reserved for DynamoDB TTL (enabled in plan 4's
+    /// terraform). Until then, callers are responsible for checking expiry against wall clock.
+    pub async fn create_session(&self, token: &str, expires_epoch: i64) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(session_item(token, expires_epoch)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Look up an admin session by token, returning the stored `expires_epoch` (seconds since
+    /// Unix epoch). Returns `None` if the session does not exist. Expiry enforcement (comparing
+    /// against the current time) is the caller's responsibility.
+    pub async fn get_session(&self, token: &str) -> Result<Option<i64>, StoreError> {
+        let (pk, sk) = schema::key_pair(session_pk(token), "META");
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        out.item
+            .map(|item| {
+                item.get("expires_epoch")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .ok_or(StoreError::Corrupt("session missing expires_epoch"))
+            })
+            .transpose()
+    }
+
+    /// Delete an admin session. Idempotent — silently succeeds if the token does not exist.
+    pub async fn delete_session(&self, token: &str) -> Result<(), StoreError> {
+        let (pk, sk) = schema::key_pair(session_pk(token), "META");
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        Ok(())
     }
 
     /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).

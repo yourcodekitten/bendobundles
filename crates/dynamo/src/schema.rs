@@ -123,6 +123,36 @@ pub fn claim_item(c: &Claim) -> HashMap<String, AttributeValue> {
     item
 }
 
+/// Build the full item for a `SyncState` record. pk="SYNC#STATE", sk="META", body=json.
+/// Use `Store::put_sync_state` / `Store::get_sync_state` — do not write SYNC#STATE items directly.
+pub fn sync_state_item(state: &crate::SyncState) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        ("pk".into(), s("SYNC#STATE")),
+        ("sk".into(), s("META")),
+        (
+            "body".into(),
+            s(serde_json::to_string(state).expect("SyncState serializes")),
+        ),
+    ])
+}
+
+pub fn session_pk(token: &str) -> String {
+    format!("SESSION#{token}")
+}
+
+/// Build the item for an admin session. pk="SESSION#<token>", sk="META", top-level
+/// `expires_epoch` N + `ttl` N (same value). `ttl` is the DynamoDB TTL attribute — terraform
+/// will enable it in plan 4. Until then, expiry enforcement is the caller's job (compare epoch).
+pub fn session_item(token: &str, expires_epoch: i64) -> HashMap<String, AttributeValue> {
+    let epoch_str = expires_epoch.to_string();
+    HashMap::from([
+        ("pk".into(), s(session_pk(token))),
+        ("sk".into(), s("META")),
+        ("expires_epoch".into(), AttributeValue::N(epoch_str.clone())),
+        ("ttl".into(), AttributeValue::N(epoch_str)),
+    ])
+}
+
 pub fn parse_body<T: serde::de::DeserializeOwned>(
     item: &HashMap<String, AttributeValue>,
 ) -> Result<T, crate::StoreError> {

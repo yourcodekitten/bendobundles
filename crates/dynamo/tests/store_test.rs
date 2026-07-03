@@ -1,5 +1,5 @@
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
-use dynamo::{ClaimTxError, Store};
+use dynamo::{ClaimTxError, Store, SyncState, SyncWrite};
 use time::macros::datetime;
 
 async fn store_or_skip(test: &str) -> Option<Store> {
@@ -366,4 +366,87 @@ async fn claim_concurrent_counter_is_authoritative() {
         .unwrap();
     let l = store.get_link("tok-cc").await.unwrap().unwrap();
     assert_eq!(l.claims_used, 1, "counter must be 1 after one compensation");
+}
+
+#[tokio::test]
+async fn sync_upsert_respects_ownership() {
+    let Some(store) = store_or_skip("sync-upsert").await else {
+        return;
+    };
+    // new game → Written
+    let g = game(1, true);
+    assert!(matches!(
+        store.upsert_game_from_sync(g.clone()).await.unwrap(),
+        SyncWrite::Written
+    ));
+    // unchanged → Unchanged
+    assert!(matches!(
+        store.upsert_game_from_sync(g.clone()).await.unwrap(),
+        SyncWrite::Unchanged
+    ));
+    // hidden survives a humble-side change
+    let mut hidden = g.clone();
+    hidden.hidden = true;
+    store.put_game(&hidden).await.unwrap();
+    let mut fresh = g.clone();
+    fresh.title = "Renamed".into();
+    assert!(matches!(
+        store.upsert_game_from_sync(fresh).await.unwrap(),
+        SyncWrite::Written
+    ));
+    let got = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(got.hidden);
+    assert_eq!(got.title, "Renamed");
+    // pending game: sync may refresh cosmetics but never the status
+    store.create_link(&link("tok1")).await.unwrap();
+    store
+        .claim_game("tok1", &g.id, "c1", datetime!(2026-07-02 12:00 UTC))
+        .await
+        .unwrap();
+    let mut fresh2 = g.clone();
+    fresh2.status = GameStatus::BenRedeemed;
+    fresh2.title = "Renamed Again".into();
+    let w = store.upsert_game_from_sync(fresh2).await.unwrap();
+    assert!(matches!(w, SyncWrite::Written | SyncWrite::SkippedInFlight));
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(after.status, GameStatus::Pending); // status untouched either way
+}
+
+#[tokio::test]
+async fn pending_claims_and_sync_state_and_sessions() {
+    let Some(store) = store_or_skip("pending-state-sessions").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    store
+        .claim_game(
+            "tok1",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-02 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    let pending = store.list_pending_claims().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "c1");
+
+    let st = SyncState {
+        last_run_epoch: 1_800_000_000,
+        ok: true,
+        cookie_ok: true,
+        games_written: 3,
+        message: "ok".into(),
+    };
+    store.put_sync_state(&st).await.unwrap();
+    assert_eq!(store.get_sync_state().await.unwrap().unwrap(), st);
+
+    store.create_session("sess1", 2_000_000_000).await.unwrap();
+    assert_eq!(
+        store.get_session("sess1").await.unwrap(),
+        Some(2_000_000_000)
+    );
+    store.delete_session("sess1").await.unwrap();
+    assert_eq!(store.get_session("sess1").await.unwrap(), None);
 }
