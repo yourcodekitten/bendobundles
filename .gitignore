@@ -4,3 +4,4 @@ terraform/.terraform/
 terraform/backend.hcl
 terraform/artifacts/
 terraform/*.tfplan
+terraform/*.tfvars

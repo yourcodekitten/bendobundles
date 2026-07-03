@@ -9,11 +9,11 @@
 
 The Terraform stack provisions the full bendobundles.com production infrastructure in a single AWS
 account: a DynamoDB table (product catalogue + key inventory + gift records), three Lambda functions
-(public-api, admin-api, fulfillment) behind an API Gateway HTTP API, an EventBridge schedule for
+(public-api, admin-api, fulfillment) behind an API Gateway REST API, an EventBridge schedule for
 the daily Humble Bundle sync, SSM parameter store entries for secrets, a CloudFront distribution
 fronting an S3 bucket for the SPA, and a Route 53 DNS record. See spec §3 for the architecture
 diagram (API → CloudFront → Lambda fanout with `/api/*` and `/admin/api/*` path patterns routed
-to the HTTP API origin; everything else served from S3).
+to the REST API origin; everything else served from S3).
 
 Stack outputs after apply:
 
@@ -25,6 +25,16 @@ Stack outputs after apply:
 | `site_url` | CloudFront distribution domain (also the live site) |
 | `s3_bucket_id` | S3 bucket for `./deploy-web.sh` syncs |
 | `cloudfront_distribution_id` | Distribution ID for manual invalidations |
+
+---
+
+## Prerequisites
+
+- **Terraform >= 1.10** — required for S3-native state locking (`use_lockfile`)
+- **AWS CLI v2** — for `aws dynamodb`, `aws ssm`, and credential setup
+- **cargo-lambda** — builds the Lambda zips; bundles its own Zig toolchain (`pip3 install cargo-lambda` or `brew install cargo-lambda`)
+- **Node 22** — for the SPA build (`./terraform/build.sh` calls `npm run build`)
+- **argon2 CLI** — for the one-liner that generates the admin password hash
 
 ---
 
