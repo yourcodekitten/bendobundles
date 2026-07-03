@@ -375,6 +375,7 @@ describe('adminStatus', () => {
         games_written: 42,
         message: 'sync completed',
       },
+      sync_run: null,
       game_counts: { available: 10, pending: 2, gifted: 1 },
     };
 
