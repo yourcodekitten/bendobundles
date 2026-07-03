@@ -52,6 +52,27 @@ pub struct SyncState {
     pub message: String,
 }
 
+/// A sync-run marker older than this is dead: the fulfillment lambda's hard timeout is 900s, so
+/// a run that began more than 900s (+ a skew margin) ago cannot still be executing. A stale
+/// marker means a run crashed/timed out before reporting — it may be taken over.
+pub const SYNC_RUN_STALE_SECS: i64 = 960;
+
+/// True if a sync run that began at `started_epoch` could still be executing at `now_epoch`.
+/// The single liveness definition shared by the fire-guard (admin-api) and the run mutex
+/// (`begin_sync_run`) — they must never disagree on what "running" means.
+pub fn sync_run_is_live(started_epoch: i64, now_epoch: i64) -> bool {
+    now_epoch - started_epoch < SYNC_RUN_STALE_SECS
+}
+
+/// Outcome of [`Store::begin_sync_run`] — did this caller take ownership of the sync run?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncBegin {
+    /// Marker written — this caller owns the run and must `end_sync_run` when done.
+    Started,
+    /// A live marker exists — another run owns the walk; do not sync.
+    AlreadyRunning,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("dynamodb error: {0}")]
@@ -961,6 +982,75 @@ impl Store {
     /// Retrieve the most recent catalog-sync run summary, or `None` if no run has been recorded.
     pub async fn get_sync_state(&self) -> Result<Option<SyncState>, StoreError> {
         self.get_meta("SYNC#STATE").await
+    }
+
+    /// Take the sync-run mutex: write the SYNC#RUN marker iff none exists or the existing one is
+    /// stale (see [`SYNC_RUN_STALE_SECS`]). The marker lives outside the SyncState body JSON
+    /// because a condition expression can't see inside a serialized string — `started_epoch` is a
+    /// top-level N attribute exactly so this put can condition on it. The conditional put is what
+    /// makes concurrent walks impossible no matter how many sync invokes get queued.
+    pub async fn begin_sync_run(&self, now_epoch: i64) -> Result<SyncBegin, StoreError> {
+        let (pk, sk) = schema::key_pair("SYNC#RUN", "META");
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .item("pk", pk)
+            .item("sk", sk)
+            .item(
+                "started_epoch",
+                aws_sdk_dynamodb::types::AttributeValue::N(now_epoch.to_string()),
+            )
+            .condition_expression("attribute_not_exists(pk) OR started_epoch < :stale_before")
+            .expression_attribute_values(
+                ":stale_before",
+                aws_sdk_dynamodb::types::AttributeValue::N(
+                    (now_epoch - SYNC_RUN_STALE_SECS).to_string(),
+                ),
+            )
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(SyncBegin::Started),
+            Err(e) if is_ccf_put(&e) => Ok(SyncBegin::AlreadyRunning),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Release the sync-run mutex. Idempotent; a failed delete only delays the next sync until
+    /// the marker goes stale — it cannot wedge the system.
+    pub async fn end_sync_run(&self) -> Result<(), StoreError> {
+        let (pk, sk) = schema::key_pair("SYNC#RUN", "META");
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Read the sync-run marker's `started_epoch`, or `None` if no run marker exists. Liveness
+    /// (vs. a crashed run's leftover marker) is the caller's judgment via [`sync_run_is_live`].
+    pub async fn get_sync_run(&self) -> Result<Option<i64>, StoreError> {
+        let (pk, sk) = schema::key_pair("SYNC#RUN", "META");
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        out.item
+            .map(|item| {
+                item.get("started_epoch")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<i64>().ok())
+                    .ok_or(StoreError::Corrupt("sync run missing started_epoch"))
+            })
+            .transpose()
     }
 
     /// Persist an admin session. pk="SESSION#<token>", sk="META". Both `expires_epoch` and `ttl`

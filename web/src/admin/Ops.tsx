@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate, useOutletContext } from 'react-router-dom';
 import { adminPasteCookie, adminSync } from '../api';
 import { withAuth } from './withAuth';
@@ -64,21 +64,49 @@ export function Ops() {
       });
   };
 
+  // True while the server says a sync run is live. This is what disables the button for the
+  // WHOLE backfill (the 202 lands ~1s after click; local `syncing` alone would re-enable it
+  // and let a second concurrent walk be queued).
+  const syncRunning = status?.sync_run?.running === true;
+
   const handleSync = () => {
     setSyncing(true);
     setSyncMsg(null);
+    // Fire-and-forget: adminSync resolves when the backfill is QUEUED (202),
+    // not when it finishes. Progress + final counts land on the status card
+    // once the background run writes its SyncState.
     withAuth(() => adminSync(), navigate)
-      .then((result) => {
-        setSyncMsg(`wrote ${result.games_written} games, ${result.orders_failed} orders failed`);
+      .then(() => {
+        setSyncMsg('sync started — watch the status card; a full backfill takes a few minutes');
         refreshStatus();
       })
       .catch((err: unknown) => {
-        setSyncMsg(err instanceof Error ? err.message : 'sync failed — check status panel');
-      })
-      .finally(() => {
+        setSyncMsg(err instanceof Error ? err.message : 'couldn’t start sync — try again');
         setSyncing(false);
       });
   };
+
+  // `syncing` bridges the gap between the 202 and the run marker appearing in status (the
+  // fulfillment lambda may still be cold-starting): keep the button locked and poll briefly
+  // until the marker shows up, then AdminApp's running-poll owns the cadence. If the marker
+  // never appears (~30s), unlock — the status card will say whether a run ever reported.
+  useEffect(() => {
+    if (!syncing) return;
+    if (syncRunning) {
+      setSyncing(false);
+      return;
+    }
+    let attempts = 0;
+    const id = setInterval(() => {
+      attempts += 1;
+      if (attempts > 15) {
+        setSyncing(false);
+        return;
+      }
+      refreshStatus();
+    }, 2000);
+    return () => clearInterval(id);
+  }, [syncing, syncRunning, refreshStatus]);
 
   return (
     <div className="flex flex-col gap-8">
@@ -118,10 +146,10 @@ export function Ops() {
         <button
           type="button"
           onClick={handleSync}
-          disabled={syncing}
+          disabled={syncing || syncRunning}
           className="w-fit rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600 disabled:opacity-50"
         >
-          {syncing ? 'syncing…' : 'sync now'}
+          {syncing || syncRunning ? 'syncing…' : 'sync now'}
         </button>
         {syncMsg !== null && (
           <p role="status" className="text-sm text-zinc-300">
@@ -146,6 +174,20 @@ export function Ops() {
                 </span>
               )}
             </p>
+
+            {status.sync_run !== null && status.sync_run.running && (
+              <p className="text-xs text-amber-300">
+                sync running — started {formatRelativeTime(status.sync_run.started_epoch)}
+              </p>
+            )}
+            {/* Marker present but not live: the run died before reporting (crash/timeout).
+                Without this line a dropped backfill is indistinguishable from idle. */}
+            {status.sync_run !== null && !status.sync_run.running && (
+              <p className="text-xs text-red-300">
+                a sync started {formatRelativeTime(status.sync_run.started_epoch)} but never
+                reported — it likely failed; safe to retry
+              </p>
+            )}
 
             {status.sync !== null && (
               <>

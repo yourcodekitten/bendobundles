@@ -85,22 +85,35 @@ fn test_admin_hash(password: &str) -> String {
 // ── MockAdminInvoker ───────────────────────────────────────────────────────────
 
 struct MockAdminInvoker {
-    /// Pre-serialised response returned for every call.
+    /// Pre-serialised response returned for every `call` (never consulted by `fire`).
     response_json: String,
-    /// Last request received, stored as Value (FulfillRequest doesn't derive Clone).
-    captured: Mutex<Option<serde_json::Value>>,
+    /// Last request received via `call` / via `fire`, captured SEPARATELY so tests can prove
+    /// WHICH invoke path a handler used — a shared slot would report `Some(Sync)` whether the
+    /// handler blocked (`call`) or fired async, which is exactly the regression sync-now guards
+    /// against. Stored as Value (FulfillRequest doesn't derive Clone).
+    called: Mutex<Option<serde_json::Value>>,
+    fired: Mutex<Option<serde_json::Value>>,
 }
 
 impl MockAdminInvoker {
     fn new(resp: FulfillResponse) -> Arc<Self> {
         Arc::new(Self {
             response_json: serde_json::to_string(&resp).unwrap(),
-            captured: Mutex::new(None),
+            called: Mutex::new(None),
+            fired: Mutex::new(None),
         })
     }
 
-    async fn last_call(&self) -> Option<FulfillRequest> {
-        self.captured
+    async fn last_called(&self) -> Option<FulfillRequest> {
+        self.called
+            .lock()
+            .await
+            .clone()
+            .map(|v| serde_json::from_value(v).expect("captured request must deserialize"))
+    }
+
+    async fn last_fired(&self) -> Option<FulfillRequest> {
+        self.fired
             .lock()
             .await
             .clone()
@@ -111,8 +124,13 @@ impl MockAdminInvoker {
 #[async_trait]
 impl AdminInvoker for MockAdminInvoker {
     async fn call(&self, req: FulfillRequest) -> Result<FulfillResponse, String> {
-        *self.captured.lock().await = Some(serde_json::to_value(&req).unwrap());
+        *self.called.lock().await = Some(serde_json::to_value(&req).unwrap());
         Ok(serde_json::from_str(&self.response_json).unwrap())
+    }
+
+    async fn fire(&self, req: FulfillRequest) -> Result<(), String> {
+        *self.fired.lock().await = Some(serde_json::to_value(&req).unwrap());
+        Ok(())
     }
 }
 
@@ -256,10 +274,7 @@ fn test_link(token: &str) -> Link {
 #[tokio::test]
 async fn login_wrong_password_returns_401() {
     let store = fake_store().await;
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
     let admin_hash = test_admin_hash("correct-pw");
 
@@ -281,10 +296,7 @@ async fn login_wrong_password_returns_401() {
 #[tokio::test]
 async fn no_session_cookie_on_protected_route_returns_401() {
     let store = fake_store().await;
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
     let admin_hash = test_admin_hash("pw");
 
@@ -311,10 +323,7 @@ async fn login_correct_password_sets_cookie_and_enables_auth() {
     };
     let password = "hunter42";
     let admin_hash = test_admin_hash(password);
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
 
     let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
@@ -353,10 +362,7 @@ async fn create_link_token_is_64_chars_and_visible_in_list() {
     };
     let password = "linkpw";
     let admin_hash = test_admin_hash(password);
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
 
     let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
@@ -428,10 +434,7 @@ async fn catalog_and_hidden_toggle_reflected() {
 
     let password = "hidepw";
     let admin_hash = test_admin_hash(password);
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
 
     let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
@@ -513,10 +516,7 @@ async fn revoke_link_is_reflected_in_store() {
 
     let password = "revokepw";
     let admin_hash = test_admin_hash(password);
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
 
     let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
@@ -596,11 +596,12 @@ async fn cookie_paste_captures_value_and_returns_ok_status() {
         "SSM mock must have received the cookie value"
     );
 
-    // Invoker must have received ValidateCookie.
-    let last_call = invoker_mock.last_call().await;
+    // Invoker must have received ValidateCookie via the blocking path (the handler needs
+    // the typed CookieStatus response).
+    let last_called = invoker_mock.last_called().await;
     assert!(
-        matches!(last_call, Some(FulfillRequest::ValidateCookie)),
-        "invoker must have received ValidateCookie, got: {last_call:?}"
+        matches!(last_called, Some(FulfillRequest::ValidateCookie)),
+        "invoker must have received ValidateCookie, got: {last_called:?}"
     );
 }
 
@@ -733,10 +734,7 @@ async fn status_never_synced_serializes_sync_null() {
 
     let password = "statuspw";
     let admin_hash = test_admin_hash(password);
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
 
     let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
@@ -777,10 +775,7 @@ async fn catalog_does_not_leak_order_key_material() {
 
     let password = "leakpw";
     let admin_hash = test_admin_hash(password);
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
 
     let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
@@ -850,10 +845,7 @@ async fn link_claims_redact_gift_url_to_issued_bool() {
 
     let password = "auditpw";
     let admin_hash = test_admin_hash(password);
-    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone {
-        games_written: 0,
-        orders_failed: 0,
-    });
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new(FulfillResponse::SyncDone);
     let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
 
     let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
@@ -887,4 +879,143 @@ async fn link_claims_redact_gift_url_to_issued_bool() {
     assert_eq!(claim["state"], "fulfilled");
     assert_eq!(claim["issued"], true);
     assert!(claim.get("gift_url").is_none(), "no gift_url key at all");
+}
+
+/// POST /admin/api/sync fires the backfill async and returns 202 immediately —
+/// it must NOT block on completion (a full backfill outruns the API Gateway
+/// timeout → 504). The mock captures the Sync request to prove it was invoked.
+#[tokio::test]
+async fn sync_now_fires_async_and_returns_202() {
+    let Some(store) = store_or_skip("sync-async").await else {
+        return;
+    };
+
+    let password = "syncpw";
+    let admin_hash = test_admin_hash(password);
+    // Seeded with an Error response on purpose: fire() never consults the canned response, so
+    // if sync-now regressed to the blocking call() path this poisoned response (plus the
+    // last_called assertion below) makes the regression unmissable.
+    let mock = MockAdminInvoker::new(FulfillResponse::Error {
+        message: "sync-now must never use the blocking call() path".into(),
+    });
+    let invoker: Arc<dyn AdminInvoker> = mock.clone();
+    let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let req = Request::post("/admin/api/sync")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(req)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "sync-now must return 202 (fire-and-forget), never block for completion"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(j["status"], "started");
+
+    // Sync went through fire() and ONLY fire() — the separate capture slots distinguish the
+    // async path from a regression to the blocking one.
+    assert_eq!(mock.last_fired().await, Some(FulfillRequest::Sync));
+    assert_eq!(mock.last_called().await, None);
+}
+
+/// POST /admin/api/sync while a LIVE sync-run marker exists → 409, and the fulfillment lambda
+/// is NOT invoked. This is the server-side guard that replaces the serialization the old
+/// blocking invoke gave for free (the button re-enables ~1s after the 202 now).
+#[tokio::test]
+async fn sync_now_refuses_while_run_live() {
+    let Some(store) = store_or_skip("sync-409").await else {
+        return;
+    };
+
+    let password = "syncpw";
+    let admin_hash = test_admin_hash(password);
+    let mock = MockAdminInvoker::new(FulfillResponse::SyncDone);
+    let invoker: Arc<dyn AdminInvoker> = mock.clone();
+    let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
+
+    // A run that began just now — definitively live.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    store.begin_sync_run(now).await.unwrap();
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let req = Request::post("/admin/api/sync")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(req)
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["error"],
+        "a sync is already running — watch the status card"
+    );
+    assert_eq!(
+        mock.last_fired().await,
+        None,
+        "a refused sync must not queue an invoke"
+    );
+}
+
+/// POST /admin/api/sync with a STALE run marker (a run that crashed before reporting) → the
+/// guard must NOT wedge: it fires a new sync and returns 202.
+#[tokio::test]
+async fn sync_now_fires_past_stale_run_marker() {
+    let Some(store) = store_or_skip("sync-stale").await else {
+        return;
+    };
+
+    let password = "syncpw";
+    let admin_hash = test_admin_hash(password);
+    let mock = MockAdminInvoker::new(FulfillResponse::SyncDone);
+    let invoker: Arc<dyn AdminInvoker> = mock.clone();
+    let ssm: Arc<dyn SsmPutter> = MockSsmPutter::new();
+
+    // A marker older than any possible live run (fulfillment's hard timeout < staleness cutoff).
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    store
+        .begin_sync_run(now - dynamo::SYNC_RUN_STALE_SECS - 60)
+        .await
+        .unwrap();
+
+    let session = admin_login(&store, &invoker, &ssm, &admin_hash, password).await;
+
+    let req = Request::post("/admin/api/sync")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        Arc::clone(&ssm),
+        admin_hash,
+    )
+    .oneshot(req)
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(mock.last_fired().await, Some(FulfillRequest::Sync));
 }

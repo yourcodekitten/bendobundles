@@ -10,7 +10,7 @@
 //! silently rot.
 
 use domain::Game;
-use dynamo::{Store, SyncState, SyncWrite};
+use dynamo::{Store, SyncBegin, SyncState, SyncWrite};
 use humble_client::{GiftUrl, HumbleClient, HumbleError};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -51,10 +51,10 @@ pub enum FulfillResponse {
     Parked {
         reason: String,
     },
-    SyncDone {
-        games_written: u32,
-        orders_failed: u32,
-    },
+    /// Sync ran (or was skipped because another run holds the sync-run marker). Fieldless on
+    /// purpose: sync is only ever invoked async (`Event`), whose return payload Lambda discards —
+    /// the run's real results live in the persisted `SyncState`, not on the wire.
+    SyncDone,
     CookieStatus {
         ok: bool,
     },
@@ -232,9 +232,29 @@ async fn handle_gift(
     }
 }
 
-/// Catalog sync. Runs [`reconcile`] first (parked-claim recovery against humble truth), then walks
-/// every order and upserts each key's `Game` via the guarded sync-upsert.
+/// Catalog sync entry point. Takes the sync-run marker FIRST — a conditional put that makes
+/// concurrent walks impossible no matter how many sync invokes are queued (admin double-click,
+/// EventBridge overlap, async-invoke retry) — then runs the walk and releases the marker.
+/// Two concurrent walks would double the humble request rate and race `put_sync_state`.
 async fn handle_sync(deps: &Deps) -> FulfillResponse {
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    match deps.store.begin_sync_run(now).await {
+        Ok(SyncBegin::Started) => {}
+        // A live run owns the walk — skip; the owner reports via SyncState. Also skip when the
+        // marker is unreadable: running unserialized is worse than missing one scheduled run.
+        Ok(SyncBegin::AlreadyRunning) | Err(_) => return FulfillResponse::SyncDone,
+    }
+    run_sync(deps).await;
+    // Best-effort release — a failed delete only delays the next sync until the marker goes
+    // stale (SYNC_RUN_STALE_SECS); it cannot wedge the system.
+    let _ = deps.store.end_sync_run().await;
+    FulfillResponse::SyncDone
+}
+
+/// The sync walk. Runs [`reconcile`] first (parked-claim recovery against humble truth), then
+/// walks every order and upserts each key's `Game` via the guarded sync-upsert. Every exit path
+/// persists a `SyncState` — the caller holds the run marker, so this must always report.
+async fn run_sync(deps: &Deps) {
     // Reconcile parked claims BEFORE the walk — humble is the source of truth for both.
     reconcile(deps).await;
 
@@ -243,10 +263,7 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
         Err(HumbleError::Unauthorized) => {
             ping(deps, COOKIE_DEAD_MSG).await;
             persist_sync(deps, false, false, 0, "humble session cookie is dead").await;
-            return FulfillResponse::SyncDone {
-                games_written: 0,
-                orders_failed: 0,
-            };
+            return;
         }
         Err(e) => {
             persist_sync(
@@ -257,10 +274,7 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
                 &format!("sync failed listing orders: {e}"),
             )
             .await;
-            return FulfillResponse::SyncDone {
-                games_written: 0,
-                orders_failed: 0,
-            };
+            return;
         }
     };
 
@@ -334,10 +348,6 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
         &msg,
     )
     .await;
-    FulfillResponse::SyncDone {
-        games_written,
-        orders_failed,
-    }
 }
 
 /// Reconcile parked (`Pending`) claims older than [`RECONCILE_MIN_AGE`] against humble's truth.

@@ -39,6 +39,22 @@ impl AdminInvoker for RealAdminInvoker {
             .ok_or_else(|| "no payload in lambda response".to_string())?;
         serde_json::from_slice(blob.as_ref()).map_err(|e| e.to_string())
     }
+
+    async fn fire(&self, req: FulfillRequest) -> Result<(), String> {
+        let payload = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        // Event = async invoke: returns once the request is queued, does NOT
+        // wait for the handler. A full backfill runs for minutes; awaiting it
+        // through the API Gateway request path 504s.
+        self.client
+            .invoke()
+            .function_name(&self.fn_name)
+            .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
+            .payload(aws_sdk_lambda::primitives::Blob::new(payload))
+            .send()
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(())
+    }
 }
 
 // ── Real SsmPutter ────────────────────────────────────────────────────────────

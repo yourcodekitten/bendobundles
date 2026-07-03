@@ -1,5 +1,8 @@
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
-use dynamo::{ClaimTxError, HiddenWrite, Store, SyncState, SyncWrite};
+use dynamo::{
+    ClaimTxError, HiddenWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin, SyncState, SyncWrite,
+    sync_run_is_live,
+};
 use time::macros::datetime;
 
 async fn store_or_skip(test: &str) -> Option<Store> {
@@ -462,6 +465,46 @@ async fn pending_claims_and_sync_state_and_sessions() {
     );
     store.delete_session("sess1").await.unwrap();
     assert_eq!(store.get_session("sess1").await.unwrap(), None);
+}
+
+/// The sync-run marker is a mutex: begin takes it, a second begin is refused while the first is
+/// live, a stale marker (crashed run) may be taken over, and end releases it. This conditional
+/// put is the ONLY thing serializing concurrent sync walks — the semantics here are load-bearing.
+#[tokio::test]
+async fn sync_run_marker_serializes_runs() {
+    let Some(store) = store_or_skip("sync-run").await else {
+        return;
+    };
+    let now = 1_800_000_000;
+
+    // No marker → nothing running, first begin takes ownership.
+    assert_eq!(store.get_sync_run().await.unwrap(), None);
+    assert_eq!(store.begin_sync_run(now).await.unwrap(), SyncBegin::Started);
+    assert_eq!(store.get_sync_run().await.unwrap(), Some(now));
+
+    // Live marker → concurrent begin refused; the marker keeps the FIRST run's start time.
+    assert_eq!(
+        store.begin_sync_run(now + 5).await.unwrap(),
+        SyncBegin::AlreadyRunning
+    );
+    assert_eq!(store.get_sync_run().await.unwrap(), Some(now));
+
+    // Stale marker (older than any possible live run) → takeover allowed.
+    let later = now + SYNC_RUN_STALE_SECS + 1;
+    assert!(!sync_run_is_live(now, later));
+    assert_eq!(
+        store.begin_sync_run(later).await.unwrap(),
+        SyncBegin::Started
+    );
+    assert_eq!(store.get_sync_run().await.unwrap(), Some(later));
+
+    // End releases → marker gone → begin works again immediately.
+    store.end_sync_run().await.unwrap();
+    assert_eq!(store.get_sync_run().await.unwrap(), None);
+    assert_eq!(
+        store.begin_sync_run(later + 5).await.unwrap(),
+        SyncBegin::Started
+    );
 }
 
 /// `list_all_games` must return every GAME# META item, including non-listable ones (hidden,
