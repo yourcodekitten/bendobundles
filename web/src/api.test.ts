@@ -40,6 +40,7 @@ describe('fetchLink', () => {
         claims_allowed: 5,
         claims_used: 2,
         active: true,
+        state: 'active',
         games: [
           {
             id: 'game1',

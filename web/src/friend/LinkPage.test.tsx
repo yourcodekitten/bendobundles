@@ -33,6 +33,7 @@ const baseLink: LinkView = {
   claims_allowed: 3,
   claims_used: 1,
   active: true,
+  state: 'active',
   games: [],
   claims: [],
 };
@@ -123,10 +124,11 @@ describe('LinkPage', () => {
     });
   });
 
-  it('shows exhausted banner and disabled grid when active:false + games present', async () => {
+  it('shows exhausted banner and disabled grid on state:"exhausted"', async () => {
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
       active: false,
+      state: 'exhausted',
       games: [{ id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null }],
     });
     renderLinkPage();
@@ -137,10 +139,11 @@ describe('LinkPage', () => {
     expect(screen.getByRole('button', { name: /claim/i })).toBeDisabled();
   });
 
-  it('shows revoked banner and no grid when active:false + games empty', async () => {
+  it('shows revoked banner and no grid on state:"revoked"', async () => {
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
       active: false,
+      state: 'revoked',
       games: [],
     });
     renderLinkPage();
@@ -153,29 +156,35 @@ describe('LinkPage', () => {
     expect(screen.queryByRole('button', { name: /claim/i })).not.toBeInTheDocument();
   });
 
-  it('renders exhausted with grid visible vs revoked without grid (distinction)', async () => {
-    // exhausted: games present → grid rendered (even if disabled)
+  it('shows the same dead banner on state:"expired"', async () => {
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
       active: false,
-      games: [{ id: '1', title: 'Celeste', bundle: 'B', key_type: 'steam', artwork_url: null }],
-    });
-    const { unmount } = renderLinkPage('exhausted-token');
-    await waitFor(() => {
-      expect(screen.getByText('Celeste')).toBeInTheDocument();
-    });
-    unmount();
-
-    // revoked: no games → no grid
-    vi.mocked(fetchLink).mockResolvedValue({
-      ...baseLink,
-      active: false,
+      state: 'expired',
       games: [],
     });
-    renderLinkPage('revoked-token');
+    renderLinkPage();
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent("this invite isn't active anymore");
     });
+  });
+
+  it('banner follows state, not games.length: revoked + games present is still revoked', async () => {
+    // The exact ambiguity the state field exists to kill: a revoked link that
+    // (for any backend reason) still carries a games array must NOT render the
+    // amber exhausted banner.
+    vi.mocked(fetchLink).mockResolvedValue({
+      ...baseLink,
+      active: false,
+      state: 'revoked',
+      games: [{ id: '1', title: 'Celeste', bundle: 'B', key_type: 'steam', artwork_url: null }],
+    });
+    renderLinkPage();
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent("this invite isn't active anymore");
+    });
+    expect(screen.queryByText(/used all your claims/i)).not.toBeInTheDocument();
+    // dead link → grid hidden regardless of games payload
     expect(screen.queryByText('Celeste')).not.toBeInTheDocument();
   });
 });

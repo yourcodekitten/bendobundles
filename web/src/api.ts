@@ -14,11 +14,14 @@ export type ClaimView = {
   gift_url: string | null;
 };
 
+export type LinkState = 'active' | 'revoked' | 'expired' | 'exhausted';
+
 export type LinkView = {
   label: string;
   claims_allowed: number;
   claims_used: number;
   active: boolean;
+  state: LinkState;
   games: GameView[];
   claims: ClaimView[];
 };

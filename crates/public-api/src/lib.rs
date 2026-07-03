@@ -86,6 +86,10 @@ struct LinkView {
     claims_allowed: u32,
     claims_used: u32,
     active: bool,
+    /// Explicit link state: "active" | "revoked" | "expired" | "exhausted".
+    /// The client renders banners from this — it must never have to infer
+    /// the reason from side signals like games.len().
+    state: &'static str,
     games: Vec<GameView>,
     claims: Vec<ClaimView>,
 }
@@ -134,15 +138,19 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
     };
 
     let now = OffsetDateTime::now_utc();
-    let revoked = link.revoked;
-    let expired = link.expires_at.is_some_and(|exp| exp <= now);
-    // active: single can_claim rule — one implementation, never a manual re-derivation
-    let active = link.can_claim(now).is_ok();
+    // state: single can_claim rule — one implementation, never a manual re-derivation
+    let state = match link.can_claim(now) {
+        Ok(()) => "active",
+        Err(domain::ClaimRefusal::Revoked) => "revoked",
+        Err(domain::ClaimRefusal::Expired) => "expired",
+        Err(domain::ClaimRefusal::Exhausted) => "exhausted",
+    };
+    let active = state == "active";
 
     // Revoked/expired: show no games (link is dead; don't leak catalog).
     // Exhausted: games stay visible so the friend can browse; claim buttons
     // are disabled client-side via claims_used == claims_allowed.
-    let games: Vec<GameView> = if revoked || expired {
+    let games: Vec<GameView> = if state == "revoked" || state == "expired" {
         vec![]
     } else {
         match s.store.list_listable_games().await {
@@ -181,6 +189,7 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             claims_allowed: link.claims_allowed,
             claims_used: link.claims_used,
             active,
+            state,
             games,
             claims,
         }),

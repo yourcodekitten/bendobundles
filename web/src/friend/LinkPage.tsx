@@ -92,10 +92,9 @@ export function LinkPage() {
   }
 
   const { data } = view;
-  // active:false + games present = exhausted all claims
-  const exhausted = !data.active && data.games.length > 0;
-  // active:false + games empty = revoked or expired
-  const revoked = !data.active && data.games.length === 0;
+  // Explicit server state — never inferred from side signals like games.length
+  const exhausted = data.state === 'exhausted';
+  const dead = data.state === 'revoked' || data.state === 'expired';
 
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
@@ -115,7 +114,7 @@ export function LinkPage() {
         </div>
       )}
 
-      {revoked && (
+      {dead && (
         <div
           role="alert"
           className="mx-6 mt-4 rounded border border-red-800 bg-red-950 px-4 py-3 text-red-200"
@@ -124,8 +123,8 @@ export function LinkPage() {
         </div>
       )}
 
-      {/* Grid: shown for exhausted (disabled buttons) or active; hidden for revoked */}
-      {!revoked && (
+      {/* Grid: shown for exhausted (disabled buttons) or active; hidden for revoked/expired */}
+      {!dead && (
         <GameGrid games={data.games} active={data.active} onClaim={setClaimingGame} />
       )}
 
