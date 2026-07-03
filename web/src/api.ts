@@ -86,25 +86,35 @@ export class NotFound extends Error {
   }
 }
 
+// Transient failure (5xx, network drop, malformed body) — retryable, NOT a dead link.
+export class FetchFailed extends Error {
+  constructor() {
+    super('fetch failed');
+    this.name = 'FetchFailed';
+  }
+}
+
 // Friend API
 export async function fetchLink(token: string): Promise<LinkView> {
+  let response: Response;
   try {
-    const response = await fetch(`/api/l/${token}`);
+    response = await fetch(`/api/l/${token}`);
+  } catch {
+    throw new FetchFailed();
+  }
 
-    if (response.status === 404 || response.status === 500) {
-      throw new NotFound();
-    }
-
-    if (response.status !== 200) {
-      throw new NotFound();
-    }
-
-    return await response.json();
-  } catch (error) {
-    if (error instanceof NotFound) {
-      throw error;
-    }
+  if (response.status === 404) {
     throw new NotFound();
+  }
+
+  if (response.status !== 200) {
+    throw new FetchFailed();
+  }
+
+  try {
+    return (await response.json()) as LinkView;
+  } catch {
+    throw new FetchFailed();
   }
 }
 

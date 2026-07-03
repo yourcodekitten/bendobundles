@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { fetchLink, type GameView, type LinkView } from '../api';
+import { fetchLink, NotFound, type GameView, type LinkView } from '../api';
 import { ClaimDialog } from './ClaimDialog';
 import { ClaimsHistory } from './ClaimsHistory';
 import { GameGrid } from './GameGrid';
@@ -8,6 +8,7 @@ import { GameGrid } from './GameGrid';
 type ViewState =
   | { kind: 'loading' }
   | { kind: 'not-found' }
+  | { kind: 'error' }
   | { kind: 'loaded'; data: LinkView };
 
 export function LinkPage() {
@@ -15,6 +16,7 @@ export function LinkPage() {
   const [view, setView] = useState<ViewState>({ kind: 'loading' });
   const [claimingGame, setClaimingGame] = useState<GameView | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
+  const prevTokenRef = useRef<string | undefined>(undefined);
 
   const refresh = useCallback(() => setRefreshTick((t) => t + 1), []);
 
@@ -26,12 +28,23 @@ export function LinkPage() {
         setView({ kind: 'not-found' });
         return;
       }
-      setView({ kind: 'loading' });
+      // Hard reset to the spinner only on token change (initial load / navigation).
+      // refreshTick bumps refetch behind the current view — no blank flash mid-claim.
+      if (prevTokenRef.current !== token) {
+        prevTokenRef.current = token;
+        setView({ kind: 'loading' });
+      }
       try {
         const data = await fetchLink(token);
         if (!cancelled) setView({ kind: 'loaded', data });
-      } catch {
-        if (!cancelled) setView({ kind: 'not-found' });
+      } catch (error) {
+        if (cancelled) return;
+        if (error instanceof NotFound) {
+          setView({ kind: 'not-found' });
+        } else {
+          // Transient failure — keep stale loaded data if we have it
+          setView((v) => (v.kind === 'loaded' ? v : { kind: 'error' }));
+        }
       }
     }
 
@@ -45,6 +58,24 @@ export function LinkPage() {
     return (
       <div className="flex min-h-screen items-center justify-center bg-zinc-950 text-zinc-100">
         <p className="text-zinc-400">loading...</p>
+      </div>
+    );
+  }
+
+  if (view.kind === 'error') {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-zinc-950 text-zinc-100">
+        <main className="text-center">
+          <h1 className="text-2xl font-bold">couldn&apos;t load this page</h1>
+          <p className="mt-2 text-zinc-400">something hiccuped on our end — the link is fine</p>
+          <button
+            type="button"
+            onClick={refresh}
+            className="mt-4 rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600"
+          >
+            retry
+          </button>
+        </main>
       </div>
     );
   }

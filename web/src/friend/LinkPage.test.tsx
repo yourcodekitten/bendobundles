@@ -1,13 +1,22 @@
 import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { LinkPage } from './LinkPage';
 import type { LinkView } from '../api';
 
-vi.mock('../api');
+// Partial mock: fetch functions mocked, error classes REAL so instanceof
+// checks in LinkPage exercise the production classes.
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api')>();
+  return {
+    ...actual,
+    fetchLink: vi.fn(),
+    claimGame: vi.fn(),
+  };
+});
 
-// importOriginal is used in other tests; here we just use auto-mock + vi.mocked
-import { fetchLink } from '../api';
+import { fetchLink, claimGame, NotFound, FetchFailed } from '../api';
 
 function renderLinkPage(token = 'abc123') {
   return render(
@@ -40,12 +49,69 @@ describe('LinkPage', () => {
     expect(screen.getByText(/loading/i)).toBeInTheDocument();
   });
 
-  it('shows not-found view on error', async () => {
-    vi.mocked(fetchLink).mockRejectedValue(new Error('not found'));
+  it('shows not-found view on NotFound (genuine 404)', async () => {
+    vi.mocked(fetchLink).mockRejectedValue(new NotFound());
     renderLinkPage();
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: /link not found/i })).toBeInTheDocument();
     });
+  });
+
+  it('shows retryable error view (NOT "link not found") on transient failure', async () => {
+    vi.mocked(fetchLink).mockRejectedValue(new FetchFailed());
+    renderLinkPage();
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /couldn't load this page/i })).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/link not found/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it('retry after a transient failure loads the link', async () => {
+    const user = userEvent.setup();
+    vi.mocked(fetchLink)
+      .mockRejectedValueOnce(new FetchFailed())
+      .mockResolvedValueOnce({ ...baseLink });
+    renderLinkPage();
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
+    });
+
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    await waitFor(() => {
+      expect(screen.getByText('Test Bundle')).toBeInTheDocument();
+    });
+  });
+
+  it('refresh after a claim keeps the page visible (no full-page loading flash)', async () => {
+    const user = userEvent.setup();
+    const withGame: LinkView = {
+      ...baseLink,
+      games: [{ id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null }],
+    };
+    // First load resolves; the refreshTick refetch hangs forever — the old view must stay.
+    vi.mocked(fetchLink)
+      .mockResolvedValueOnce(withGame)
+      .mockImplementation(() => new Promise(() => {}));
+    vi.mocked(claimGame).mockResolvedValue({ kind: 'refused', message: 'already claimed' });
+
+    renderLinkPage();
+    await waitFor(() => {
+      expect(screen.getByText('Portal')).toBeInTheDocument();
+    });
+
+    // Full claim round-trip: open dialog → confirm → refused → close (triggers refresh)
+    await user.click(screen.getByRole('button', { name: /claim/i }));
+    await user.click(screen.getByRole('button', { name: /confirm/i }));
+    await waitFor(() => {
+      expect(screen.getByText('already claimed')).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: /close/i }));
+
+    // Soft refresh: header and grid still there, no full-page spinner
+    expect(screen.getByText('Test Bundle')).toBeInTheDocument();
+    expect(screen.getByText('Portal')).toBeInTheDocument();
+    expect(screen.queryByText(/^loading\.\.\.$/)).not.toBeInTheDocument();
   });
 
   it('shows loaded state with label and claim counts', async () => {

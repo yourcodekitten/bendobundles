@@ -13,6 +13,7 @@ import {
   adminRevoke,
   adminSync,
   NotFound,
+  FetchFailed,
   Unauthorized,
   type ClaimResult,
   type CookieResult,
@@ -81,14 +82,30 @@ describe('fetchLink', () => {
     await expect(fetchLink('badtoken')).rejects.toBeInstanceOf(NotFound);
   });
 
-  it('throws NotFound on 500 from fetchLink', async () => {
+  it('throws FetchFailed (not NotFound) on 500 — transient, retryable', async () => {
     const mockResponse = {
       status: 500,
       json: vi.fn().mockResolvedValue({ error: 'server error' }),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    await expect(fetchLink('token')).rejects.toBeInstanceOf(NotFound);
+    await expect(fetchLink('token')).rejects.toBeInstanceOf(FetchFailed);
+  });
+
+  it('throws FetchFailed on network error', async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError('failed to fetch'));
+
+    await expect(fetchLink('token')).rejects.toBeInstanceOf(FetchFailed);
+  });
+
+  it('throws FetchFailed on malformed 200 body', async () => {
+    const mockResponse = {
+      status: 200,
+      json: vi.fn().mockRejectedValue(new SyntaxError('bad json')),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(fetchLink('token')).rejects.toBeInstanceOf(FetchFailed);
   });
 });
 
