@@ -1,8 +1,12 @@
 module "apigateway" {
   source  = "bendoerr-terraform-modules/apigateway/aws"
   version = "1.1.1"
-  context = module.context.shared
-  name    = "api"
+
+  # The stage's method_settings (INFO logging) 400 unless the account-level
+  # CloudWatch role below exists first.
+  depends_on = [aws_api_gateway_account.this]
+  context    = module.context.shared
+  name       = "api"
 
   description = "bendobundles API: /api/* -> public-api, /admin/api/* -> admin-api"
 
@@ -88,4 +92,42 @@ resource "aws_lambda_permission" "apigw_admin" {
 
 locals {
   api_origin_domain = "${module.apigateway.rest_api_id}.execute-api.${var.region}.amazonaws.com"
+}
+
+# ── Account-level API Gateway logging role ────────────────────────────────────
+# Execution logging (method_settings logging_level INFO) requires a PER-REGION
+# account setting pointing at a role API Gateway can assume to push logs — a
+# classic one-time gotcha: without it, UpdateStage 400s with "CloudWatch Logs
+# role ARN must be set in account settings". This stack owns that setting.
+module "label_apigw_logs" {
+  source  = "bendoerr-terraform-modules/label/null"
+  version = "1.0.1"
+  context = module.context.shared
+  name    = "apigw-logs"
+}
+
+data "aws_iam_policy_document" "apigw_logs_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["apigateway.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "apigw_cloudwatch" {
+  name               = module.label_apigw_logs.id
+  assume_role_policy = data.aws_iam_policy_document.apigw_logs_assume.json
+  tags               = module.label_apigw_logs.tags
+}
+
+resource "aws_iam_role_policy_attachment" "apigw_cloudwatch" {
+  role       = aws_iam_role.apigw_cloudwatch.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+}
+
+resource "aws_api_gateway_account" "this" {
+  cloudwatch_role_arn = aws_iam_role.apigw_cloudwatch.arn
 }
