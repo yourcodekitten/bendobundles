@@ -1,0 +1,9 @@
+bucket               = "brd-prod-ue1-tfstate-store"
+key                  = "terraform.tfstate"
+kms_key_id           = "alias/aws/s3"
+region               = "us-east-1"
+encrypt              = true
+use_lockfile         = true
+# DISTINCT prefix from the main stack (main uses "bendobundles"). The deploy
+# role is scoped to the main stack's state only, never this one.
+workspace_key_prefix = "bendobundles-iam"
