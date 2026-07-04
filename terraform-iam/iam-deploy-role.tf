@@ -61,6 +61,11 @@ data "aws_iam_policy_document" "deploy" {
       "lambda:RemovePermission",
       "lambda:GetFunction",
       "lambda:GetFunctionConfiguration",
+      # The provider reads code-signing config as part of every function
+      # update — without this the apply dies mid-flight AFTER
+      # UpdateFunctionCode succeeds (caught live on the first kitten deploy,
+      # 2026-07-04: fulfillment updated, public-api/admin-api stranded).
+      "lambda:GetFunctionCodeSigningConfig",
       "lambda:GetPolicy",
       "lambda:ListVersionsByFunction",
       "lambda:TagResource",
@@ -180,12 +185,22 @@ data "aws_iam_policy_document" "deploy" {
       "ssm:DeleteParameter",
       "ssm:GetParameter",
       "ssm:GetParameters",
-      "ssm:DescribeParameters",
       "ssm:AddTagsToResource",
       "ssm:RemoveTagsFromResource",
       "ssm:ListTagsForResource",
     ]
     resources = ["arn:aws:ssm:${local.region}:${local.account}:parameter/${local.app_prefix}*"]
+  }
+  # DescribeParameters is a list-type action AWS evaluates against * — a
+  # parameter-ARN scope NEVER matches, so keeping it in the scoped statement
+  # above is a silent no-grant (caught live on the first kitten deploy,
+  # 2026-07-04: terraform refresh of every managed param 403'd). It exposes
+  # parameter METADATA only; values stay behind the scoped GetParameter.
+  statement {
+    sid       = "SsmDescribeUnscopeable"
+    effect    = "Allow"
+    actions   = ["ssm:DescribeParameters"]
+    resources = ["*"]
   }
 
   # ── EventBridge (the daily-sync rule) ───────────────────────────────────────
