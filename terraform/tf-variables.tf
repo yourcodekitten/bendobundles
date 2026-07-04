@@ -51,6 +51,12 @@ variable "discord_webhook_url" {
   description = "Optional Discord webhook for cookie-death pings. Null disables (fulfillment treats a missing param as webhooks-off)."
 }
 
+variable "humble_username" {
+  type        = string
+  default     = null
+  description = "Humble account username (email) for secure-area step-up. Null disables step-up (a gated gift redeem parks). Not a secret — the password + TOTP seed live in SSM SecureStrings."
+}
+
 variable "sync_schedule_expression" {
   type        = string
   default     = "cron(0 9 * * ? *)" # 09:00 UTC daily = pre-dawn US-East

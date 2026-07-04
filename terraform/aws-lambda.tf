@@ -20,7 +20,8 @@ module "lambda_fulfillment" {
     },
     local.discord_webhook_param_name == null ? {} : {
       DISCORD_WEBHOOK_PARAM = local.discord_webhook_param_name
-    }
+    },
+    local.humble_step_up_env
   )
 
   addl_inline_policies = {
@@ -29,9 +30,10 @@ module "lambda_fulfillment" {
       Version = "2012-10-17"
       Statement = concat(
         [{
-          Effect   = "Allow"
-          Action   = ["ssm:GetParameter"]
-          Resource = [aws_ssm_parameter.humble_cookie.arn]
+          Effect = "Allow"
+          Action = ["ssm:GetParameter"]
+          # The cookie plus, when step-up is enabled, the password + TOTP seed.
+          Resource = concat([aws_ssm_parameter.humble_cookie.arn], local.humble_step_up_param_arns)
         }],
         local.discord_webhook_param_arn == null ? [] : [{
           Effect   = "Allow"

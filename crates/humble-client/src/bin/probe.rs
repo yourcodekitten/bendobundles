@@ -196,15 +196,16 @@ async fn run_find(client: &HumbleClient, fragment: &str) -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// Fetch a raw order response as `serde_json::Value` using a probe-local reqwest
+/// Fetch a raw order response as `serde_json::Value` using a probe-local wreq
 /// client — the library's typed client stays typed; no lib changes needed.
 /// The session value is used only in the Cookie header and never logged.
 async fn raw_get(
     session: &str,
     url: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let http = wreq::Client::builder()
+        .emulation(wreq_util::Emulation::Chrome137)
+        .redirect(wreq::redirect::Policy::none())
         .build()?;
     let resp = http
         .get(url)

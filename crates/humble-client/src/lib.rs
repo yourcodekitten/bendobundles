@@ -2,7 +2,10 @@
 //! No test touches the real API — see the probe binary for live verification.
 mod model;
 
+use hmac::{Hmac, Mac};
 use model::{GamekeyEntry, OrderWire};
+use sha1::Sha1;
+use wreq_util::Emulation;
 
 pub struct SessionCookie(String);
 
@@ -16,6 +19,123 @@ impl std::fmt::Debug for SessionCookie {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SessionCookie(REDACTED)")
     }
+}
+
+/// Credentials for humble's secure-area step-up. Humble gates key reveal/redeem/gift behind a
+/// fresh-password re-auth that a session cookie alone can't pass: a redeem on a perfectly healthy
+/// session returns `login_required` until that session is elevated by POSTing the account password
+/// plus a current app-TOTP code to `/processlogin`. Held only in memory (read from SSM per-invoke,
+/// same as the cookie); every field is redacted in `Debug` and never logged.
+pub struct StepUpCredentials {
+    username: String,
+    password: String,
+    /// The bare base32 TOTP seed (humble app authenticator: RFC 6238, SHA1, 6 digits, 30s step).
+    totp_secret: String,
+}
+
+impl StepUpCredentials {
+    pub fn new(username: String, password: String, totp_secret: String) -> Self {
+        Self {
+            username,
+            password,
+            totp_secret,
+        }
+    }
+}
+
+impl std::fmt::Debug for StepUpCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact everything — even the username is account-identifying and never needed in a log.
+        write!(f, "StepUpCredentials(REDACTED)")
+    }
+}
+
+/// Compute the current humble app-TOTP for a base32 seed (RFC 6238: SHA1, 6 digits, 30s step).
+fn totp_now(secret_b32: &str) -> Result<String, String> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system clock is before the unix epoch: {e}"))?
+        .as_secs();
+    totp_at(secret_b32, secs / 30)
+}
+
+/// TOTP for an explicit 30-second counter — the pure, testable core (drives the RFC 6238 vectors).
+fn totp_at(secret_b32: &str, counter: u64) -> Result<String, String> {
+    let key = decode_b32_secret(secret_b32)?;
+    let mut mac =
+        Hmac::<Sha1>::new_from_slice(&key).map_err(|_| "TOTP HMAC rejected the key".to_string())?;
+    mac.update(&counter.to_be_bytes());
+    let hs = mac.finalize().into_bytes();
+    // Dynamic truncation, RFC 4226 §5.3: the low nibble of the last byte picks a 4-byte window.
+    let offset = (hs[19] & 0x0f) as usize;
+    let bin = (u32::from(hs[offset] & 0x7f) << 24)
+        | (u32::from(hs[offset + 1]) << 16)
+        | (u32::from(hs[offset + 2]) << 8)
+        | u32::from(hs[offset + 3]);
+    Ok(format!("{:06}", bin % 1_000_000))
+}
+
+/// Decode a base32 TOTP seed (RFC 4648), tolerant of humble's formatting — spaces, lowercase, and
+/// trailing `=` padding are all normalized first. Errors carry only a symbol POSITION, never the
+/// seed itself.
+fn decode_b32_secret(seed: &str) -> Result<Vec<u8>, String> {
+    let normalized = seed
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .trim_end_matches('=')
+        .to_ascii_uppercase();
+    // A seed that normalizes away to nothing ("  ", "====") would base32-decode to an EMPTY key,
+    // which HMAC-SHA1 happily accepts — yielding a syntactically valid but guaranteed-wrong TOTP
+    // that we'd POST to the live account on every gated redeem. Fail here and name the real cause.
+    if normalized.is_empty() {
+        return Err("TOTP seed is empty after normalization".to_string());
+    }
+    let key = data_encoding::BASE32_NOPAD
+        .decode(normalized.as_bytes())
+        .map_err(|e| {
+            format!(
+                "malformed base32 TOTP seed (bad symbol at position {})",
+                e.position
+            )
+        })?;
+    if key.is_empty() {
+        return Err("TOTP seed decoded to zero bytes".to_string());
+    }
+    Ok(key)
+}
+
+/// Does a redeem response body carry humble's `login_required` gate marker? A gated (but healthy)
+/// session returns this before the key is touched — the signal to step up and retry, not to fail.
+fn is_login_required(bytes: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct GateProbe {
+        #[serde(default)]
+        error_id: Option<String>,
+    }
+    matches!(
+        serde_json::from_slice::<GateProbe>(bytes),
+        Ok(GateProbe { error_id: Some(e) }) if e == "login_required"
+    )
+}
+
+/// Did `/processlogin` accept the step-up? Success is a `200` whose body carries a `goto` and no
+/// `errors` (a rejection returns `{"errors":{"_all":[…]}}`). Verified live 2026-07-04.
+fn processlogin_ok(bytes: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ProcessLoginResp {
+        #[serde(default)]
+        goto: Option<String>,
+        #[serde(default)]
+        errors: Option<serde_json::Value>,
+    }
+    matches!(
+        serde_json::from_slice::<ProcessLoginResp>(bytes),
+        Ok(ProcessLoginResp {
+            goto: Some(_),
+            errors: None
+        })
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +154,14 @@ pub enum HumbleError {
         "humble rejected the redeem write at the auth/CSRF layer (status {status}, csrf_minted={csrf_minted})"
     )]
     RedeemAuthRejected { status: u16, csrf_minted: bool },
+    /// The redeem was gated behind humble's secure-area step-up and the step-up itself did not
+    /// complete (bad password/TOTP, a locked account, a csrf-preflight miss, or humble still
+    /// gating after a `200 {goto}` from `/processlogin`). The key was NOT burned — a gated redeem
+    /// returns `login_required` before touching the key — so this always parks, never compensates.
+    /// `reason` is a short human diagnosis and NEVER contains the password, the TOTP seed, or a
+    /// computed code.
+    #[error("secure-area step-up did not complete: {reason}")]
+    SecureAreaStepUpFailed { reason: String },
     #[error("humble rate-limited us")]
     RateLimited,
     #[error("key already redeemed on humble")]
@@ -52,7 +180,7 @@ pub enum HumbleError {
     #[error("humble returned status {0}")]
     Api(u16),
     #[error("network error talking to humble: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(#[from] wreq::Error),
     #[error("could not parse humble response: {0}")]
     Parse(serde_json::Error),
 }
@@ -97,9 +225,21 @@ struct RedeemResponse {
     errormsg: Option<String>,
 }
 
+/// The positive outcome of a single redeem attempt. Failures come back as `Err(HumbleError)`;
+/// the two non-error shapes a caller must tell apart are a completed redeem and a redeem that was
+/// gated behind humble's secure-area step-up.
+enum RedeemStep {
+    /// The redeem completed and humble handed back a gift URL.
+    Done(GiftUrl),
+    /// Humble gated the write behind a secure-area step-up (`login_required` / a `secureArea`
+    /// redirect). The session is healthy and **the key was not burned** — retrying after a
+    /// successful step-up is safe. Carries the observed HTTP status for logging only.
+    StepUpNeeded { status: u16 },
+}
+
 /// Read one response header as an owned `String`, or `"-"` when absent/unprintable. Kept small
 /// so the diagnostic log line on a redeem rejection stays flat and greppable.
-fn header_str(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+fn header_str(headers: &wreq::header::HeaderMap, name: &str) -> String {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -112,7 +252,7 @@ fn header_str(headers: &reqwest::header::HeaderMap, name: &str) -> String {
 /// login redirect ever grows a `?return_to=` (or similar) echoing request data, an
 /// allowlist-by-name still logs its value. Dropping the query/fragment makes that permanently
 /// impossible while keeping the one bit we want — which path it redirects to. (OMBB, PR#14.)
-fn location_str(headers: &reqwest::header::HeaderMap) -> String {
+fn location_str(headers: &wreq::header::HeaderMap) -> String {
     let raw = header_str(headers, "location");
     match raw.split(['?', '#']).next() {
         Some(base) if !base.is_empty() => base.to_string(),
@@ -165,21 +305,38 @@ fn decode_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Humble
 }
 
 pub struct HumbleClient {
-    http: reqwest::Client,
+    http: wreq::Client,
     base: String,
     cookie: SessionCookie,
+    /// Optional secure-area step-up credentials. `None` on the read-only / cookie-validate paths
+    /// (they never gift); `Some` on the fulfillment lambda, which reads them from SSM per-invoke.
+    /// Absent → a gated redeem parks exactly as it did before this module existed.
+    step_up: Option<StepUpCredentials>,
 }
 
 impl HumbleClient {
     pub fn new(base_url: &str, cookie: SessionCookie) -> Result<Self, HumbleError> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none()) // a 302-to-login must surface, not follow
+        // Emulate a real Chrome's TLS/JA3 + HTTP2 fingerprint. Humble sits behind Cloudflare,
+        // whose WAF challenges non-browser TLS: the rustls fingerprint got the redeem POST a
+        // Cloudflare interstitial (verified 2026-07-04), while a genuine Chrome handshake reaches
+        // humble's app. This is the prod half of that fix — reqwest+rustls could not fake it.
+        let http = wreq::Client::builder()
+            .emulation(Emulation::Chrome137)
+            .redirect(wreq::redirect::Policy::none()) // a 302-to-login must surface, not follow
             .build()?;
         Ok(Self {
             http,
             base: base_url.trim_end_matches('/').to_string(),
             cookie,
+            step_up: None,
         })
+    }
+
+    /// Attach secure-area step-up credentials so a `login_required`-gated redeem can elevate the
+    /// session and retry, instead of parking. Builder-style so read-only callers stay untouched.
+    pub fn with_step_up(mut self, creds: StepUpCredentials) -> Self {
+        self.step_up = Some(creds);
+        self
     }
 
     /// The session cookie header value shared by every authenticated call — one builder so the
@@ -297,12 +454,86 @@ impl HumbleClient {
         }
     }
 
+    /// Build a POST carrying humble's double-submit CSRF pair — `csrf_cookie` replayed as BOTH the
+    /// cookie and the `csrf-prevention-token` header — plus the same-origin `Origin`/`Referer` a
+    /// browser sends. Every humble write (`/humbler/redeemkey`, `/processlogin`) goes through this
+    /// one builder so the two can't drift: change the dance in one place, both writes move together.
+    /// `referer_path` is appended to `base` (e.g. `/home/library`, `/login`).
+    fn csrf_write(&self, url: String, csrf: &str, referer_path: &str) -> wreq::RequestBuilder {
+        self.http
+            .post(url)
+            .header(
+                "Cookie",
+                format!("{}; csrf_cookie={csrf}", self.session_cookie()),
+            )
+            .header("csrf-prevention-token", csrf)
+            .header("Origin", &self.base)
+            .header("Referer", format!("{}{referer_path}", self.base))
+    }
+
+    /// Redeem a key as a gift, transparently clearing humble's secure-area step-up when it gates
+    /// the write. Flow: try once; if humble answers `login_required`/`secureArea` AND step-up
+    /// credentials are configured, elevate the session via `/processlogin` and retry EXACTLY once.
+    ///
+    /// Safety (the burns-once invariant): a gated redeem returns `login_required` *before* touching
+    /// the key, so the retry is the first and only attempt that can burn it — there is no
+    /// double-redeem window. If the retry is still gated, or step-up fails, we return an error that
+    /// [`crate`]'s caller parks on; the key is never assumed burned.
     pub async fn redeem_as_gift(
         &self,
         gamekey: &str,
         machine_name: &str,
         keyindex: u32,
     ) -> Result<GiftUrl, HumbleError> {
+        match self.redeem_once(gamekey, machine_name, keyindex).await? {
+            RedeemStep::Done(url) => Ok(url),
+            RedeemStep::StepUpNeeded { status } => {
+                if self.step_up.is_none() {
+                    // Gate positively identified, but step-up isn't configured. Do NOT reuse
+                    // RedeemAuthRejected: its ping blames the CSRF dance ("humble rejected its own
+                    // token, re-pasting won't help"), which misdirects the operator when the real
+                    // fix is enabling step-up (set humble_username). Same Park decision, honest
+                    // reason. (This is also NOT the pre-PR behavior — a 200 `login_required` body
+                    // used to be a silent Parse-error park with no ping at all.)
+                    tracing::warn!(
+                        status,
+                        "redeem gated behind secure-area step-up but step-up is not configured — parking (set humble_username to enable)"
+                    );
+                    return Err(HumbleError::SecureAreaStepUpFailed {
+                        reason:
+                            "secure-area step-up required but not configured (set humble_username)"
+                                .into(),
+                    });
+                }
+                self.secure_area_step_up().await?;
+                match self.redeem_once(gamekey, machine_name, keyindex).await? {
+                    RedeemStep::Done(url) => Ok(url),
+                    // Still gated after `/processlogin` said OK. The key is NOT burned (still
+                    // `login_required`), so this parks — a distinct, correctly-labeled failure so a
+                    // persistent mismatch surfaces instead of masquerading as a plain 403.
+                    RedeemStep::StepUpNeeded { status } => {
+                        tracing::warn!(
+                            status,
+                            "redeem still gated after a successful step-up — parking (key not burned)"
+                        );
+                        Err(HumbleError::SecureAreaStepUpFailed {
+                            reason: "redeem still returned login_required after /processlogin accepted the step-up".into(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// One redeem attempt. Detects humble's secure-area gate (`login_required` body or a
+    /// `secureArea` redirect) and reports it as [`RedeemStep::StepUpNeeded`] so the orchestrator can
+    /// elevate and retry; every other outcome maps to a completed redeem or a typed error.
+    async fn redeem_once(
+        &self,
+        gamekey: &str,
+        machine_name: &str,
+        keyindex: u32,
+    ) -> Result<RedeemStep, HumbleError> {
         // Prefer humble's own token; mint only as a fallback. With a pure double-submit check
         // only the cookie/header MATCH matters and a wrong mint costs the 403 we'd get anyway —
         // but a minted pair is tracked (`csrf_minted`) so a systematic capture failure surfaces
@@ -316,20 +547,15 @@ impl HumbleClient {
                 (uuid::Uuid::new_v4().simple().to_string(), true)
             }
         };
+        // Browser-shaped write via the shared CSRF-write builder (double-submit csrf pair +
+        // same-origin Origin/Referer). NO X-Requested-By — the android-app header belongs to the
+        // read API, not the browser-surface /humbler/ endpoints — so the form is added here.
         let resp = self
-            .http
-            .post(format!("{}/humbler/redeemkey", self.base))
-            // Browser-shaped write, mirroring the proven redeemer flow (FailSpy's
-            // humble-steam-key-redeemer): double-submit csrf_cookie + csrf-prevention-token
-            // header, same-origin Origin/Referer, and NO X-Requested-By — the android-app header
-            // belongs to the read API, not the browser-surface /humbler/ endpoints.
-            .header(
-                "Cookie",
-                format!("{}; csrf_cookie={csrf}", self.session_cookie()),
+            .csrf_write(
+                format!("{}/humbler/redeemkey", self.base),
+                &csrf,
+                "/home/library",
             )
-            .header("csrf-prevention-token", &csrf)
-            .header("Origin", &self.base)
-            .header("Referer", format!("{}/home/library", self.base))
             // keyindex now passes the tpk's true index; we pass the position in the order's
             // key list. if humble actually selects by keytype=<machine_name>, this index is
             // redundant. VERIFY on the first real gifting of a non-first key in an order
@@ -358,11 +584,21 @@ impl HumbleClient {
         match status {
             200 => {
                 let bytes = resp.bytes().await?;
+                // A gated redeem on a HEALTHY session returns `login_required` (verified live
+                // 2026-07-04) — catch it BEFORE the success parse so it drives a step-up, not a
+                // Parse error, and above all NOT a burn: the key is untouched behind the gate.
+                if is_login_required(&bytes) {
+                    tracing::info!(
+                        status,
+                        "redeem gated: humble returned login_required — secure-area step-up needed"
+                    );
+                    return Ok(RedeemStep::StepUpNeeded { status });
+                }
                 let body: RedeemResponse = decode_body(&bytes)?;
                 match (body.success, body.giftkey) {
-                    (true, Some(token)) => Ok(GiftUrl(format!(
+                    (true, Some(token)) => Ok(RedeemStep::Done(GiftUrl(format!(
                         "https://www.humblebundle.com/gift?key={token}"
-                    ))),
+                    )))),
                     // AmbiguousRedeem: possible API drift where humble claims success but hands
                     // back no key — the key MAY have already burned server-side. Callers must
                     // PARK and reconcile, never compensate: compensating would re-list a key that
@@ -407,8 +643,29 @@ impl HumbleClient {
                 let location = location_str(resp.headers());
                 let cf_mitigated = header_str(resp.headers(), "cf-mitigated");
                 let server = header_str(resp.headers(), "server");
-                let body_preview = match resp.bytes().await {
-                    Ok(b) => body_signature(&b),
+                // Raw location (query intact, unlike the logged `location`) so we can spot humble's
+                // `?reason=secureArea` step-up redirect — a gated-but-live session, NOT a rejection.
+                let raw_location = header_str(resp.headers(), "location");
+                // Keep the read Result: a mid-read failure must stay DISTINGUISHABLE from an empty
+                // body. Collapsing both to `unwrap_or_default()` would let a dropped read of a
+                // `login_required` body be misclassified as a plain auth rejection (no step-up),
+                // and log an empty preview with no hint the read failed.
+                let body_read = resp.bytes().await;
+                let login_required_body = matches!(&body_read, Ok(b) if is_login_required(b));
+                // Secure-area gate on a healthy session shows up here two ways: a 302 to
+                // `/login?reason=secureArea` (header-only, survives a body-read failure), or a
+                // 401/403 carrying a `login_required` JSON body. Either is a step-up trigger, not a
+                // dead-cookie/CF block — the key is untouched.
+                if raw_location.contains("secureArea") || login_required_body {
+                    tracing::info!(
+                        status,
+                        location,
+                        "redeem gated behind secure-area step-up (healthy session) — will step up and retry"
+                    );
+                    return Ok(RedeemStep::StepUpNeeded { status });
+                }
+                let body_preview = match &body_read {
+                    Ok(b) => body_signature(b),
                     Err(e) => format!("<body read failed: {e}>"),
                 };
                 tracing::warn!(
@@ -430,12 +687,80 @@ impl HumbleClient {
             s => Err(HumbleError::Api(s)),
         }
     }
+
+    /// Elevate the session through humble's secure-area step-up: `POST /processlogin` with the
+    /// account password + a current app-TOTP, guarded by the same double-submit CSRF pair as a
+    /// redeem (csrf_cookie from a root `GET /`, replayed as cookie + `csrf-prevention-token`).
+    /// Verified end-to-end live on 2026-07-04.
+    ///
+    /// On success we deliberately do NOT capture a rotated `_simpleauth_sess`: the live spike
+    /// showed the SAME cookie redeems afterward and the elevation persists server-side for a window
+    /// (a later run redeemed on the unchanged cookie even when its own re-step-up failed). So
+    /// elevation is server-side on the existing session, not a new cookie. If humble ever changes
+    /// that, the follow-up redeem simply re-gates → we park (no burn) — a safe failure mode.
+    async fn secure_area_step_up(&self) -> Result<(), HumbleError> {
+        let creds = self
+            .step_up
+            .as_ref()
+            .ok_or_else(|| HumbleError::SecureAreaStepUpFailed {
+                reason: "no step-up credentials configured".into(),
+            })?;
+        // Fresh csrf_cookie from root — same double-submit source the redeem uses, and the SAME
+        // mint-on-miss fallback: `redeem_once` tolerates a missing csrf_cookie by minting a
+        // matching pair (a pure double-submit check only cares that cookie == header), so a
+        // transient preflight miss must not park step-up with a misleading "check the seed" ping
+        // when a mint would likely have passed.
+        let csrf = match self.csrf_token().await {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    "step-up csrf capture failed — minting a double-submit fallback (same as the redeem path)"
+                );
+                uuid::Uuid::new_v4().simple().to_string()
+            }
+        };
+        let code = totp_now(&creds.totp_secret).map_err(|reason| {
+            // `reason` names the failure class (e.g. malformed base32) with a position only — never
+            // the seed or the derived code.
+            HumbleError::SecureAreaStepUpFailed {
+                reason: format!("TOTP: {reason}"),
+            }
+        })?;
+        let resp = self
+            .csrf_write(format!("{}/processlogin", self.base), &csrf, "/login")
+            // Field shape captured from the live login (2026-07-04): the four auth fields plus the
+            // three empties humble's SPA always sends. `goto` steers post-login to the keys area.
+            .form(&[
+                ("access_token", ""),
+                ("access_token_provider_id", ""),
+                ("username", creds.username.as_str()),
+                ("password", creds.password.as_str()),
+                ("code", code.as_str()),
+                ("goto", "/home/keys"),
+                ("qs", ""),
+            ])
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        // NEVER log the body — a /processlogin response can echo account/session state. The parsed
+        // outcome bit + status is the entire safe signal.
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let ok = status == 200 && processlogin_ok(&bytes);
+        tracing::info!(status, ok, "secure-area step-up (/processlogin) response");
+        if ok {
+            Ok(())
+        } else {
+            Err(HumbleError::SecureAreaStepUpFailed {
+                reason: format!("humble /processlogin returned status {status} without a goto"),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
 mod signature_tests {
     use super::{body_signature, location_str};
-    use reqwest::header::HeaderMap;
+    use wreq::header::HeaderMap;
 
     fn headers_with_location(value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -507,5 +832,95 @@ mod signature_tests {
     fn short_json_passes_through_readable() {
         let sig = body_signature(br#"{"error":"csrf token invalid"}"#);
         assert_eq!(sig, r#"{"error":"csrf token invalid"}"#);
+    }
+}
+
+#[cfg(test)]
+mod step_up_tests {
+    use super::{StepUpCredentials, is_login_required, processlogin_ok, totp_at};
+
+    // RFC 6238 Appendix B, SHA1 profile. Seed = ASCII "12345678901234567890" in base32. The 6-digit
+    // TOTP is the low 6 digits of the published 8-digit value at each timestamp (counter = T / 30).
+    const RFC6238_SHA1_SEED_B32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    #[test]
+    fn totp_matches_rfc6238_vectors() {
+        // T=59 → counter 1 → 94287082 → "287082".
+        assert_eq!(totp_at(RFC6238_SHA1_SEED_B32, 59 / 30).unwrap(), "287082");
+        // T=1111111109 → counter 37037036 → 07081804 → "081804".
+        assert_eq!(
+            totp_at(RFC6238_SHA1_SEED_B32, 1111111109 / 30).unwrap(),
+            "081804"
+        );
+        // T=1234567890 → counter 41152263 → 89005924 → "005924" (exercises leading-zero padding).
+        assert_eq!(
+            totp_at(RFC6238_SHA1_SEED_B32, 1234567890 / 30).unwrap(),
+            "005924"
+        );
+    }
+
+    #[test]
+    fn totp_tolerates_lowercase_spaces_and_padding_in_the_seed() {
+        // Same seed, humble-app formatting: lowercase, spaced into groups, trailing pad.
+        let messy = "gezd gnbv gy3t qojq gezd gnbv gy3t qojq==";
+        assert_eq!(totp_at(messy, 59 / 30).unwrap(), "287082");
+    }
+
+    #[test]
+    fn totp_rejects_a_malformed_seed_without_echoing_it() {
+        // '1' and '8' are not in the base32 alphabet.
+        let err = totp_at("not-valid-base32-1888", 1).unwrap_err();
+        assert!(err.contains("malformed base32"), "got: {err}");
+        assert!(!err.contains("1888"), "error must not echo the seed: {err}");
+    }
+
+    #[test]
+    fn totp_rejects_a_seed_that_normalizes_to_empty() {
+        // Whitespace-only and pure-padding seeds decode to an empty key, which HMAC would ACCEPT —
+        // producing a garbage-but-valid code we'd POST to the live account. These must error, not
+        // silently compute.
+        for seed in ["", "   ", "\t\n ", "===="] {
+            let err = totp_at(seed, 1).unwrap_err();
+            assert!(
+                err.contains("empty"),
+                "seed {seed:?} should error as empty: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_required_body_is_detected_as_the_step_up_gate() {
+        assert!(is_login_required(br#"{"error_id":"login_required"}"#));
+        // A different error_id, or a normal redeem body, is NOT the gate.
+        assert!(!is_login_required(br#"{"error_id":"rate_limited"}"#));
+        assert!(!is_login_required(br#"{"success":true,"giftkey":"abc"}"#));
+        assert!(!is_login_required(b"not json at all"));
+    }
+
+    #[test]
+    fn processlogin_success_needs_a_goto_and_no_errors() {
+        assert!(processlogin_ok(br#"{"goto":"/home/keys"}"#));
+        // A rejection carries errors (the live 403 shape) — not success even if a goto tags along.
+        assert!(!processlogin_ok(
+            br#"{"errors":{"_all":["Invalid request."]}}"#
+        ));
+        assert!(!processlogin_ok(
+            br#"{"goto":"/home/keys","errors":{"_all":["nope"]}}"#
+        ));
+        assert!(!processlogin_ok(b"{}"));
+    }
+
+    #[test]
+    fn step_up_credentials_debug_is_fully_redacted() {
+        let creds = StepUpCredentials::new(
+            "person@example.com".into(),
+            "hunter2".into(),
+            "GEZDGNBV".into(),
+        );
+        let shown = format!("{creds:?}");
+        assert_eq!(shown, "StepUpCredentials(REDACTED)");
+        assert!(!shown.contains("hunter2"));
+        assert!(!shown.contains("person@example.com"));
+        assert!(!shown.contains("GEZDGNBV"));
     }
 }

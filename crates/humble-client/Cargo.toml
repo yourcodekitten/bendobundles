@@ -5,13 +5,19 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 tracing = "0.1"
 uuid.workspace = true
+wreq = { version = "5.3.0", features = ["json", "cookies", "gzip"] }
+wreq-util = "2.2.6"
+# secure-area step-up: a humble app-TOTP (RFC 6238, SHA1/6/30s) over the base32 seed.
+# All pure-Rust (RustCrypto + data-encoding) — no C, so the boring-sys cross-build is untouched.
+hmac = "0.12"
+sha1 = "0.10"
+data-encoding = "2"
 
 [dev-dependencies]
 tokio.workspace = true
