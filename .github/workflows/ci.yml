@@ -70,14 +70,19 @@ jobs:
       - run: terraform -chdir=terraform validate
 
   artifacts:
-    runs-on: ubuntu-latest
+    # NATIVE arm64 runner (not x86). wreq pulls boring-sys, which compiles BoringSSL's C via cmake.
+    # On an x86 runner, cross-compiling that to aarch64 makes boring-sys's cmake toolchain pass
+    # `--target=aarch64-...` to `/usr/bin/cc` (x86 GCC), which rejects it — a clang/zig-only flag.
+    # Building on a native arm64 runner sidesteps the C cross-compile entirely (host == target), the
+    # exact path proven locally; cargo-lambda still links via zig, pinning glibc low for al2023.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-      # wreq → boring-sys needs cmake (BoringSSL) + libclang (bindgen). See the test job.
+      # Native aarch64 BoringSSL build (cmake) + bindgen (libclang). No cross-compile flags involved.
       - name: install BoringSSL build deps (wreq/boring-sys)
         run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
       - name: install cargo-lambda
