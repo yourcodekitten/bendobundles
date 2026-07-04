@@ -143,7 +143,12 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                 // self-login, so validate/sync/gift can each self-heal a dead session (no human
                 // cookie paste). A fetch miss is non-fatal: the client still works, and a dead
                 // session or gated redeem just parks.
-                let (humble, has_creds) = match (&step_up_username, &password_param, &totp_param) {
+                // Yield the client + its session_store together, so "creds resolved ⇒ can persist a
+                // self-login" is decided in one place (no separate derived bool to keep in sync).
+                // session_store is Some only when we have credentials to log in with; otherwise a
+                // dead session falls back to the old flag-and-ping.
+                let (humble, session_store) = match (&step_up_username, &password_param, &totp_param)
+                {
                     (Some(username), Some(pw_param), Some(totp_p)) => {
                         match (
                             get_secret(&ssm_client, pw_param).await,
@@ -155,25 +160,21 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                                     password,
                                     totp_secret,
                                 )),
-                                true,
+                                Some(SessionStore {
+                                    ssm: ssm_client.clone(),
+                                    cookie_param: cookie_param.clone(),
+                                }),
                             ),
                             _ => {
                                 tracing::warn!(
                                     "humble credentials configured but a secret param did not resolve — proceeding without step-up/self-login"
                                 );
-                                (humble, false)
+                                (humble, None)
                             }
                         }
                     }
-                    _ => (humble, false),
+                    _ => (humble, None),
                 };
-
-                // Self-login can only persist a refreshed session when we actually have credentials
-                // to log in with; otherwise a dead session falls back to the old flag-and-ping.
-                let session_store = has_creds.then(|| SessionStore {
-                    ssm: ssm_client.clone(),
-                    cookie_param: cookie_param.clone(),
-                });
 
                 let deps = Deps {
                     store: Store::new(dynamo_client, table),

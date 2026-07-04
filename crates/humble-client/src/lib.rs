@@ -135,6 +135,24 @@ fn is_login_required(bytes: &[u8]) -> bool {
     )
 }
 
+/// The `/processlogin` auth form, shared by both callers (self-[`HumbleClient::login`] and the
+/// secure-area step-up) so the field set can't drift between them: the four auth fields plus the
+/// three empties humble's SPA always sends, with `goto` steering post-login to the keys area.
+fn processlogin_form<'a>(
+    creds: &'a StepUpCredentials,
+    code: &'a str,
+) -> [(&'static str, &'a str); 7] {
+    [
+        ("access_token", ""),
+        ("access_token_provider_id", ""),
+        ("username", creds.username.as_str()),
+        ("password", creds.password.as_str()),
+        ("code", code),
+        ("goto", "/home/keys"),
+        ("qs", ""),
+    ]
+}
+
 /// Did `/processlogin` accept the step-up? Success is a `200` whose body carries a `goto` and no
 /// `errors` (a rejection returns `{"errors":{"_all":[…]}}`). Verified live 2026-07-04.
 fn processlogin_ok(bytes: &[u8]) -> bool {
@@ -477,8 +495,11 @@ impl HumbleClient {
 
     /// Build a POST carrying humble's double-submit CSRF pair — `csrf_cookie` replayed as BOTH the
     /// cookie and the `csrf-prevention-token` header — plus the same-origin `Origin`/`Referer` a
-    /// browser sends. Every humble write (`/humbler/redeemkey`, `/processlogin`) goes through this
-    /// one builder so the two can't drift: change the dance in one place, both writes move together.
+    /// browser sends. Every write that authenticates with the CURRENT session — the redeem
+    /// (`/humbler/redeemkey`) and the secure-area step-up (`/processlogin`) — goes through this one
+    /// builder so they can't drift on the csrf dance. (A fresh [`login`](Self::login) is the one
+    /// exception: it deliberately sends a bootstrap/anon session cookie, not the current one, so it
+    /// builds its own request — but it shares the `/processlogin` FORM via `processlogin_form`.)
     /// `referer_path` is appended to `base` (e.g. `/home/library`, `/login`).
     fn csrf_write(&self, url: String, csrf: &str, referer_path: &str) -> wreq::RequestBuilder {
         self.http
@@ -749,17 +770,7 @@ impl HumbleClient {
         })?;
         let resp = self
             .csrf_write(format!("{}/processlogin", self.base), &csrf, "/login")
-            // Field shape captured from the live login (2026-07-04): the four auth fields plus the
-            // three empties humble's SPA always sends. `goto` steers post-login to the keys area.
-            .form(&[
-                ("access_token", ""),
-                ("access_token_provider_id", ""),
-                ("username", creds.username.as_str()),
-                ("password", creds.password.as_str()),
-                ("code", code.as_str()),
-                ("goto", "/home/keys"),
-                ("qs", ""),
-            ])
+            .form(&processlogin_form(creds, &code))
             .send()
             .await?;
         let status = resp.status().as_u16();
@@ -819,15 +830,7 @@ impl HumbleClient {
             .header("csrf-prevention-token", &csrf)
             .header("Origin", &self.base)
             .header("Referer", format!("{}/login", self.base))
-            .form(&[
-                ("access_token", ""),
-                ("access_token_provider_id", ""),
-                ("username", creds.username.as_str()),
-                ("password", creds.password.as_str()),
-                ("code", code.as_str()),
-                ("goto", "/home/keys"),
-                ("qs", ""),
-            ])
+            .form(&processlogin_form(creds, &code))
             .send()
             .await?;
         let status = resp.status().as_u16();

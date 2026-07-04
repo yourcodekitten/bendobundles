@@ -166,12 +166,21 @@ async fn refresh_session(deps: &Deps) -> bool {
                     tracing::info!(
                         "session self-heal: logged in and persisted a fresh humble cookie"
                     );
+                    // Ping ONCE per heal so a silently-dying session is still visible. Before
+                    // self-login every dead cookie pinged; now a heal is otherwise invisible, and
+                    // the operator would lose the early-warning trend (rate-limit / TOTP drift /
+                    // an impending new-device challenge) until self-login finally hard-fails.
+                    ping(deps, SESSION_HEALED_MSG).await;
                     true
                 }
                 Err(e) => {
                     // The in-memory client already holds the new session (login swapped it in), so
-                    // THIS invoke still works; only the persistence failed. Warn, don't fail.
+                    // THIS invoke still works; only the persistence failed. But without the write,
+                    // every future cold start re-reads the dead cookie and re-logs-in — a silent
+                    // "login every invoke" that feeds humble's bot-detection. Ping so it's not
+                    // buried in CloudWatch.
                     tracing::warn!(error = %e, "session self-heal: logged in but persisting to SSM failed");
+                    ping(deps, SESSION_PERSIST_FAILED_MSG).await;
                     true
                 }
             }
@@ -408,10 +417,11 @@ async fn gamekeys_selfheal(deps: &Deps) -> Result<Vec<String>, HumbleError> {
 /// walks every order and upserts each key's `Game` via the guarded sync-upsert. Every exit path
 /// persists a `SyncState` — the caller holds the run marker, so this must always report.
 async fn run_sync(deps: &Deps) {
-    tracing::info!("sync started (reconcile, then order walk)");
-    // Reconcile parked claims BEFORE the walk — humble is the source of truth for both.
-    reconcile(deps).await;
-
+    tracing::info!("sync started (ensure session, reconcile, then order walk)");
+    // Acquire the library FIRST — this is the self-heal point (a dead session logs in + persists).
+    // It MUST come before reconcile: reconcile reads humble per-order, so on a session that died
+    // since the last run, running it first would Unauthorized-skip every claim and recover nothing.
+    // Healing here means reconcile runs against a live session in the SAME sync.
     let gamekeys = match gamekeys_selfheal(deps).await {
         Ok(k) => k,
         // Dead AND self-login couldn't fix it (or isn't configured) → genuine attention needed.
@@ -432,6 +442,9 @@ async fn run_sync(deps: &Deps) {
             return;
         }
     };
+
+    // Reconcile parked claims against humble truth — now with a session known-good from the read above.
+    reconcile(deps).await;
 
     let mut games_written = 0u32;
     let mut orders_failed = 0u32;
@@ -559,6 +572,21 @@ async fn reconcile(deps: &Deps) {
                 .store
                 .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
                 .await;
+            // Ping every compensate. Self-login keeps the session alive 24/7, so this
+            // still-unverified arm now runs autonomously on every sync — the dead-cookie stall that
+            // used to force a human to look is gone. Until the arm is verified (does humble mark a
+            // gift-generated key redeemed?), a ping is the checkpoint: if a compensate ever re-lists
+            // a key that was actually gifted, the operator sees it here instead of on a double-gift.
+            ping(
+                deps,
+                &format!(
+                    "reconcile compensated parked claim {} ({} / {}) as not-redeemed — slot returned, \
+                     game re-listed. If this key was in fact gifted, that's a double-list; the \
+                     not-redeemed→compensate arm is still unverified (plan-2 receipt).",
+                    claim.id, order.bundle_name, key.human_name
+                ),
+            )
+            .await;
         }
     }
 }
@@ -571,13 +599,19 @@ async fn reconcile(deps: &Deps) {
 /// cookie state — the cookie's validity is unknown, and writing `cookie_ok=false` on a 429
 /// would be wrong. Only `Unauthorized` (after a self-login attempt) is a definitive dead signal.
 async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
-    let result = gamekeys_selfheal(deps).await;
-    tracing::info!(
-        ok = result.is_ok(),
-        "cookie validation (gamekeys read, self-heal on dead)"
-    );
-    match result {
-        Ok(_) => {
+    // Report health from the HEAL outcome, not a retry read. A successful login inside
+    // refresh_session IS proof of a good session, so on a dead cookie we don't re-read (which could
+    // hit a transient 429 right after the two extra login requests and leave cookie_ok stale-false
+    // even though the session is now fine).
+    let healthy: Option<bool> = match deps.humble.gamekeys().await {
+        Ok(_) => Some(true),
+        Err(HumbleError::Unauthorized) => Some(refresh_session(deps).await),
+        // Transient (rate-limited / API / network): validity unknown — leave SyncState untouched.
+        Err(_) => None,
+    };
+    tracing::info!(?healthy, "cookie validation (self-heal on dead)");
+    match healthy {
+        Some(ok) => {
             let mut st = deps
                 .store
                 .get_sync_state()
@@ -585,31 +619,22 @@ async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            st.cookie_ok = true;
+            st.cookie_ok = ok;
             let _ = deps.store.put_sync_state(&st).await;
-            FulfillResponse::CookieStatus { ok: true }
+            FulfillResponse::CookieStatus { ok }
         }
-        Err(HumbleError::Unauthorized) => {
-            let mut st = deps
-                .store
-                .get_sync_state()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            st.cookie_ok = false;
-            let _ = deps.store.put_sync_state(&st).await;
-            FulfillResponse::CookieStatus { ok: false }
-        }
-        // Transient errors: rate-limited, API errors, network issues.
-        // Do NOT touch SyncState — cookie validity is unknown.
-        Err(_) => FulfillResponse::Error {
+        None => FulfillResponse::Error {
             message: "humble unreachable — cookie state unknown, try again".into(),
         },
     }
 }
 
 const COOKIE_DEAD_MSG: &str = "humble session cookie is DEAD — paste a fresh one in admin";
+const SESSION_HEALED_MSG: &str = "humble session had died and self-login refreshed it automatically (no paste needed). If these \
+     recur often, the account may be trending toward a rate-limit or new-device challenge.";
+const SESSION_PERSIST_FAILED_MSG: &str = "humble self-login worked but writing the refreshed cookie to SSM FAILED — the session is fine \
+     this run, but every invoke will re-login until the write succeeds (check the fulfillment \
+     ssm:PutParameter grant / SSM health).";
 
 /// Persist a sync-run summary, preserving nothing from prior runs (a run fully describes itself).
 async fn persist_sync(deps: &Deps, ok: bool, cookie_ok: bool, games_written: u32, message: &str) {
