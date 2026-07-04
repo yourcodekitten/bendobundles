@@ -1327,6 +1327,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 
@@ -1941,6 +1942,8 @@ dependencies = [
  "time",
  "tokio",
  "tower 0.4.13",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

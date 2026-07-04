@@ -4,6 +4,13 @@ use public_api::{Invoker, LambdaInvoker, router};
 
 #[tokio::main]
 async fn main() {
+    // Send tracing to stdout → CloudWatch. Without this the claim path is a
+    // black box in prod (the lambda emits only runtime START/END lines).
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .init();
+
     let table = std::env::var("TABLE_NAME").expect("TABLE_NAME must be set");
     let fn_name = std::env::var("FULFILLMENT_FN").expect("FULFILLMENT_FN must be set");
 
