@@ -107,6 +107,19 @@ fn header_str(headers: &reqwest::header::HeaderMap, name: &str) -> String {
         .to_string()
 }
 
+/// Read a redirect `Location` for logging, keeping only host+path — everything from the first
+/// `?` or `#` is dropped. A 302 target is attacker-influenced-adjacent surface: if humble's
+/// login redirect ever grows a `?return_to=` (or similar) echoing request data, an
+/// allowlist-by-name still logs its value. Dropping the query/fragment makes that permanently
+/// impossible while keeping the one bit we want — which path it redirects to. (OMBB, PR#14.)
+fn location_str(headers: &reqwest::header::HeaderMap) -> String {
+    let raw = header_str(headers, "location");
+    match raw.split(['?', '#']).next() {
+        Some(base) if !base.is_empty() => base.to_string(),
+        _ => raw,
+    }
+}
+
 /// Collapse a response body into a single-line, length-bounded preview safe to log: control
 /// characters (newlines, tabs, the trailing-tab humble sometimes emits) become spaces, and the
 /// result is capped. Enough to tell a Cloudflare HTML challenge from a short humble-app JSON
@@ -391,7 +404,7 @@ impl HumbleClient {
                 // fields name which one WITHOUT leaking anything — a 403/302 body is humble's
                 // error/challenge page, never our cookie or a gift token.
                 let content_type = header_str(resp.headers(), "content-type");
-                let location = header_str(resp.headers(), "location");
+                let location = location_str(resp.headers());
                 let cf_mitigated = header_str(resp.headers(), "cf-mitigated");
                 let server = header_str(resp.headers(), "server");
                 let body_preview = match resp.bytes().await {
@@ -421,7 +434,37 @@ impl HumbleClient {
 
 #[cfg(test)]
 mod signature_tests {
-    use super::body_signature;
+    use super::{body_signature, location_str};
+    use reqwest::header::HeaderMap;
+
+    fn headers_with_location(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("location", value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn location_keeps_host_and_path_only() {
+        // absolute URL: scheme+host+path survive, query + fragment do not.
+        assert_eq!(
+            location_str(&headers_with_location(
+                "https://www.humblebundle.com/login?return_to=/secret&t=abc#frag"
+            )),
+            "https://www.humblebundle.com/login"
+        );
+        // relative redirect: path survives, query dropped.
+        assert_eq!(
+            location_str(&headers_with_location("/verify?email=leak@example.com")),
+            "/verify"
+        );
+        // no query/fragment: unchanged.
+        assert_eq!(location_str(&headers_with_location("/login")), "/login");
+    }
+
+    #[test]
+    fn location_absent_is_dash() {
+        assert_eq!(location_str(&HeaderMap::new()), "-");
+    }
 
     #[test]
     fn collapses_multiline_html_to_one_bounded_line() {
