@@ -1,5 +1,5 @@
 use dynamo::Store;
-use fulfillment::{Deps, FulfillRequest, FulfillResponse, handle};
+use fulfillment::{Deps, FulfillRequest, FulfillResponse, SessionStore, handle};
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
 
@@ -138,41 +138,49 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     }
                 };
 
-                // Attach secure-area step-up ONLY for a gift redeem, and only when configured AND
-                // both secrets resolve. Gating on the op means Sync/ValidateCookie never decrypt the
-                // humble password/TOTP (they can't hit the gate), shrinking how often the secrets
-                // are read. A fetch miss here is non-fatal: the client still works and a gated redeem
-                // parks with a step-up-failed ping — never a crashed invoke.
-                let is_gift = matches!(req, FulfillRequest::Gift { .. });
-                let humble = match (is_gift, &step_up_username, &password_param, &totp_param) {
-                    (true, Some(username), Some(pw_param), Some(totp_p)) => {
+                // Attach the humble credentials whenever configured AND both secrets resolve. Needed
+                // on EVERY op now: the client uses them for the secure-area step-up AND for
+                // self-login, so validate/sync/gift can each self-heal a dead session (no human
+                // cookie paste). A fetch miss is non-fatal: the client still works, and a dead
+                // session or gated redeem just parks.
+                let (humble, has_creds) = match (&step_up_username, &password_param, &totp_param) {
+                    (Some(username), Some(pw_param), Some(totp_p)) => {
                         match (
                             get_secret(&ssm_client, pw_param).await,
                             get_secret(&ssm_client, totp_p).await,
                         ) {
-                            (Some(password), Some(totp_secret)) => {
+                            (Some(password), Some(totp_secret)) => (
                                 humble.with_step_up(StepUpCredentials::new(
                                     username.clone(),
                                     password,
                                     totp_secret,
-                                ))
-                            }
+                                )),
+                                true,
+                            ),
                             _ => {
                                 tracing::warn!(
-                                    "step-up configured but a secret param did not resolve — proceeding without step-up"
+                                    "humble credentials configured but a secret param did not resolve — proceeding without step-up/self-login"
                                 );
-                                humble
+                                (humble, false)
                             }
                         }
                     }
-                    _ => humble,
+                    _ => (humble, false),
                 };
+
+                // Self-login can only persist a refreshed session when we actually have credentials
+                // to log in with; otherwise a dead session falls back to the old flag-and-ping.
+                let session_store = has_creds.then(|| SessionStore {
+                    ssm: ssm_client.clone(),
+                    cookie_param: cookie_param.clone(),
+                });
 
                 let deps = Deps {
                     store: Store::new(dynamo_client, table),
                     humble,
                     webhook_url,
                     http: http_client,
+                    session_store,
                 };
 
                 handle(&deps, req).await

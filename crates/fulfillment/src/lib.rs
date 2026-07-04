@@ -101,6 +101,9 @@ pub fn gift_decision(outcome: &Result<GiftUrl, HumbleError>) -> Decision {
             // the key is not burned — park, never compensate. The Park executor pings a distinct,
             // correctly-labeled alert so a persistent step-up failure doesn't loop silently.
             HumbleError::SecureAreaStepUpFailed { .. } => Decision::Park,
+            // login() is the session self-heal path, never a redeem outcome — but the match is
+            // exhaustive, so classify it: a login failure means no session, so park (never burn).
+            HumbleError::LoginFailed { .. } => Decision::Park,
             // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
             // only reconcile against humble truth can tell. Park — never compensate blind.
             HumbleError::RedeemRefused(_) => Decision::Park,
@@ -119,6 +122,65 @@ pub struct Deps {
     pub humble: HumbleClient,
     pub webhook_url: Option<String>,
     pub http: reqwest::Client,
+    /// SSM client + the humble-cookie parameter name, so the app can self-heal its own session:
+    /// on a dead session it logs in (via `humble.login()`) and persists the fresh cookie here,
+    /// replacing the human cookie-paste flow. `None` when self-login credentials aren't configured
+    /// (then a dead session falls back to the old flag-and-ping behavior).
+    pub session_store: Option<SessionStore>,
+}
+
+/// Where a self-refreshed humble session is persisted, so the next cold start reads it back.
+pub struct SessionStore {
+    pub ssm: aws_sdk_ssm::Client,
+    pub cookie_param: String,
+}
+
+/// Try to self-heal a dead humble session: log in fresh and persist the new cookie to SSM. Returns
+/// `true` if a usable session is now in place. A no-op returning `false` when self-login isn't
+/// configured (no credentials / no session store) — callers then keep the old dead-cookie behavior.
+///
+/// This path never touches a key: a login authenticates the SESSION, it does not redeem, so the
+/// burns-once invariant is untouched. Failures are logged and surface as `false` (park, never burn).
+async fn refresh_session(deps: &Deps) -> bool {
+    let Some(store) = deps.session_store.as_ref() else {
+        return false;
+    };
+    match deps.humble.login().await {
+        Ok(new_session) => {
+            // Persist so the next invoke's cold start reads a live session instead of re-logging in.
+            match store
+                .ssm
+                .put_parameter()
+                .name(&store.cookie_param)
+                .value(&new_session)
+                .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
+                // Match the terraform-declared Advanced tier: a humble session can exceed the 4 KB
+                // Standard cap, and NOT pinning it here would either reject a large session or
+                // silently downgrade the param (drift vs terraform's tier = "Advanced").
+                .tier(aws_sdk_ssm::types::ParameterTier::Advanced)
+                .overwrite(true)
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        "session self-heal: logged in and persisted a fresh humble cookie"
+                    );
+                    true
+                }
+                Err(e) => {
+                    // The in-memory client already holds the new session (login swapped it in), so
+                    // THIS invoke still works; only the persistence failed. Warn, don't fail.
+                    tracing::warn!(error = %e, "session self-heal: logged in but persisting to SSM failed");
+                    true
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "session self-heal: login failed");
+            false
+        }
+    }
 }
 
 /// Dispatch a fulfillment request. Never panics; every arm returns a typed response.
@@ -325,6 +387,23 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
     FulfillResponse::SyncDone
 }
 
+/// List the humble gamekeys, self-healing a dead session ONCE before giving up: on `Unauthorized`,
+/// log in fresh + persist the new cookie, then retry. The single "read the library, re-logging in
+/// if the session died" entry point — used by both sync and cookie-validation. Returns
+/// `Unauthorized` only when the session is dead AND self-login couldn't fix it (or isn't configured).
+async fn gamekeys_selfheal(deps: &Deps) -> Result<Vec<String>, HumbleError> {
+    match deps.humble.gamekeys().await {
+        Err(HumbleError::Unauthorized) => {
+            if refresh_session(deps).await {
+                deps.humble.gamekeys().await
+            } else {
+                Err(HumbleError::Unauthorized)
+            }
+        }
+        other => other,
+    }
+}
+
 /// The sync walk. Runs [`reconcile`] first (parked-claim recovery against humble truth), then
 /// walks every order and upserts each key's `Game` via the guarded sync-upsert. Every exit path
 /// persists a `SyncState` — the caller holds the run marker, so this must always report.
@@ -333,8 +412,9 @@ async fn run_sync(deps: &Deps) {
     // Reconcile parked claims BEFORE the walk — humble is the source of truth for both.
     reconcile(deps).await;
 
-    let gamekeys = match deps.humble.gamekeys().await {
+    let gamekeys = match gamekeys_selfheal(deps).await {
         Ok(k) => k,
+        // Dead AND self-login couldn't fix it (or isn't configured) → genuine attention needed.
         Err(HumbleError::Unauthorized) => {
             ping(deps, COOKIE_DEAD_MSG).await;
             persist_sync(deps, false, false, 0, "humble session cookie is dead").await;
@@ -483,15 +563,19 @@ async fn reconcile(deps: &Deps) {
     }
 }
 
-/// Validate the stored humble session cookie by making a cheap authenticated call, and record the
-/// result in `SyncState.cookie_ok`.
+/// Validate the humble session by making a cheap authenticated call, self-healing a dead session
+/// (log in + persist a fresh cookie) before reporting, and record the result in `SyncState.cookie_ok`.
+/// With self-login configured this is what keeps the session alive with no human paste.
 ///
 /// Transient errors (rate-limited, API errors, network failures) do NOT update the persisted
 /// cookie state — the cookie's validity is unknown, and writing `cookie_ok=false` on a 429
-/// would be wrong. Only `Unauthorized` is a definitive dead-cookie signal.
+/// would be wrong. Only `Unauthorized` (after a self-login attempt) is a definitive dead signal.
 async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
-    let result = deps.humble.gamekeys().await;
-    tracing::info!(ok = result.is_ok(), "cookie validation (gamekeys read)");
+    let result = gamekeys_selfheal(deps).await;
+    tracing::info!(
+        ok = result.is_ok(),
+        "cookie validation (gamekeys read, self-heal on dead)"
+    );
     match result {
         Ok(_) => {
             let mut st = deps
@@ -566,6 +650,16 @@ mod tests {
         let c = ping_content("cookie is DEAD");
         assert!(c.starts_with("🐱 bendobundles: "));
         assert!(c.contains("cookie is DEAD"));
+    }
+
+    #[test]
+    fn login_failure_parks_never_compensates() {
+        // login() is the session self-heal path, not a redeem outcome — but if it ever reached the
+        // gift ladder, it must PARK (no session ⇒ no redeem ⇒ never a burn).
+        let outcome = Err(HumbleError::LoginFailed {
+            reason: "/processlogin returned status 403 without a goto".into(),
+        });
+        assert_eq!(gift_decision(&outcome), Decision::Park);
     }
 
     #[test]

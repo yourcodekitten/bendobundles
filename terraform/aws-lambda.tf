@@ -38,6 +38,13 @@ module "lambda_fulfillment" {
           # The cookie plus, when step-up is enabled, the password + TOTP seed.
           Resource = concat([aws_ssm_parameter.humble_cookie.arn], local.humble_step_up_param_arns)
         }],
+        # Self-login writes the refreshed session back to the cookie param (replaces the human
+        # cookie-paste flow). Scoped to the cookie param only — never the password/TOTP seeds.
+        [{
+          Effect   = "Allow"
+          Action   = ["ssm:PutParameter"]
+          Resource = [aws_ssm_parameter.humble_cookie.arn]
+        }],
         local.discord_webhook_param_arn == null ? [] : [{
           Effect   = "Allow"
           Action   = ["ssm:GetParameter"]

@@ -111,6 +111,8 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         humble: humble_at(humble_uri),
         webhook_url,
         http: reqwest::Client::new(),
+        // No self-login in these handler tests — a dead session keeps the flag-and-ping path.
+        session_store: None,
     }
 }
 
