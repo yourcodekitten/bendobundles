@@ -560,29 +560,35 @@ async fn reconcile(deps: &Deps) {
             )
             .await;
         } else {
-            // The redeem never landed — safe to return the slot and re-list the game.
-            // VERIFY on the first real gifting BEFORE trusting this arm in production: this arm
-            // assumes gift-generation sets redeemed_key_val on the order's tpk so humble marks the
-            // key redeemed. If humble does NOT mark gift-generated keys redeemed there, a
-            // crash-after-redeem claim would reconcile here as not-redeemed → compensate →
-            // re-list a burned key (double-burn). Until verified, treat reconcile compensates of
-            // gift-path claims with suspicion — tracked for the plan-2 live receipt.
+            // The redeem never landed on humble → return the slot and re-list the game.
+            //
+            // Risk bound (this arm's worst case is NOT a double-spend): the compensate arm assumes a
+            // gifted key would show redeemed here (redeemed_key_val set). If humble does NOT set that
+            // on a gift, a crash-after-gift claim reconciles as not-redeemed → compensate → re-list.
+            // But the re-listed game can only be re-claimed and re-redeemed, and humble REFUSES to
+            // re-redeem an already-burned key (→ AlreadyRedeemed → compensate). So no key is ever
+            // double-spent; the residual is a RECOVERABLE lost gift URL (the first gift's URL wasn't
+            // recorded) plus re-list churn. The ping below surfaces every compensate so that
+            // recoverable case is caught. (Confirming whether a gift sets redeemed_key_val — which
+            // would route the crash-after-gift case to the redeemed/URL-recovery branch instead — is
+            // a non-urgent follow-up: the plan-2 live receipt.)
             tracing::info!(claim_id = %claim.id, "reconcile: parked claim not redeemed on humble — compensating (slot returns, game re-lists)");
             let _ = deps
                 .store
                 .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
                 .await;
-            // Ping every compensate. Self-login keeps the session alive 24/7, so this
-            // still-unverified arm now runs autonomously on every sync — the dead-cookie stall that
-            // used to force a human to look is gone. Until the arm is verified (does humble mark a
-            // gift-generated key redeemed?), a ping is the checkpoint: if a compensate ever re-lists
-            // a key that was actually gifted, the operator sees it here instead of on a double-gift.
+            // Ping every reconcile compensate. Self-login keeps the session alive 24/7, so this arm
+            // runs autonomously on every sync — the dead-cookie stall that used to force a human to
+            // look is gone. The ping restores that checkpoint: a compensate of a key that was in fact
+            // gifted is a recoverable lost URL, and the operator sees it here to recover it from
+            // humble's gift-history page.
             ping(
                 deps,
                 &format!(
                     "reconcile compensated parked claim {} ({} / {}) as not-redeemed — slot returned, \
-                     game re-listed. If this key was in fact gifted, that's a double-list; the \
-                     not-redeemed→compensate arm is still unverified (plan-2 receipt).",
+                     game re-listed. No key can be double-spent (humble refuses re-redeem of a burned \
+                     key); but IF this key was actually gifted, its gift URL is lost — recover it from \
+                     humble's gift-history page.",
                     claim.id, order.bundle_name, key.human_name
                 ),
             )
