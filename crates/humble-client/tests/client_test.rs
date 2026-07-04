@@ -378,6 +378,52 @@ async fn captured_token_rejection_reports_csrf_not_minted() {
 }
 
 #[tokio::test]
+async fn rejection_with_html_challenge_body_still_types_cleanly() {
+    // The diagnostic logging reads response headers and DRAINS the 403 body to classify it
+    // (Cloudflare HTML challenge vs humble-app JSON). This proves that extra work never alters
+    // the contract: a 403 carrying a full HTML body + a cf-mitigated header still returns the
+    // same typed RedeemAuthRejected the empty-body path does. (The preview itself is unit-tested
+    // in lib.rs::signature_tests — here we only guard the error path around it.)
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("set-cookie", "csrf_cookie=srv-t0k3n; Path=/; Secure"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .append_header("content-type", "text/html; charset=UTF-8")
+                .append_header("cf-mitigated", "challenge")
+                .set_body_string(
+                    "<!DOCTYPE html>\n<html><head><title>Just a moment...</title></head>\n\
+                     <body>Attention Required! | Cloudflare</body></html>",
+                ),
+        )
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam", 0)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            humble_client::HumbleError::RedeemAuthRejected {
+                status: 403,
+                csrf_minted: false
+            }
+        ),
+        "an HTML-challenge 403 must still type as RedeemAuthRejected, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn ambiguous_redeem_is_typed() {
     // success=true but NO giftkey: humble claims it worked yet handed back nothing. The key may
     // have burned server-side — this must be its own typed outcome, never AlreadyRedeemed.
