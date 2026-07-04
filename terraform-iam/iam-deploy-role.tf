@@ -78,10 +78,12 @@ data "aws_iam_policy_document" "deploy" {
   # ── IAM — manage the app's roles, CONTAINED by the permissions boundary ─────
   # Naming-scope alone does not contain this: PutRolePolicy on an app execution
   # role + UpdateFunctionCode + invoke = account admin. Split by escalation
-  # potential — reads and deletions ride the name scope; anything that GRANTS
-  # power additionally requires the target role to carry the kitten-app-boundary
-  # (created WITH it, for CreateRole), so effective permissions can never exceed
-  # the boundary no matter what policy gets attached.
+  # potential into three statements: reads/tags and deletions ride the name scope
+  # (below); setting a boundary is condition-locked to the kitten-app-boundary
+  # (IamAppRolesSetBoundary); and policy/trust mutations ride the name scope but
+  # are contained by the boundary every app role already carries — a boundary caps
+  # effective permissions no matter what policy is attached. (PutRolePolicy cannot
+  # be boundary-conditioned: AWS doesn't populate iam:PermissionsBoundary for it.)
   statement {
     sid    = "IamAppRolesRead"
     effect = "Allow"
@@ -105,15 +107,16 @@ data "aws_iam_policy_document" "deploy" {
     ]
     resources = ["arn:aws:iam::${local.account}:role/${local.app_prefix}*"]
   }
+  # BOUNDARY-SETTING actions: a new app role can only be BORN carrying the
+  # kitten-app-boundary, and an existing role's boundary can only ever be SET to
+  # it. AWS populates the iam:PermissionsBoundary request key for exactly these
+  # two actions, so the condition is enforceable here — this is the statement that
+  # guarantees every app role is boundaried.
   statement {
-    sid    = "IamAppRolesGrowBounded"
+    sid    = "IamAppRolesSetBoundary"
     effect = "Allow"
     actions = [
       "iam:CreateRole",
-      "iam:PutRolePolicy",
-      "iam:AttachRolePolicy",
-      "iam:UpdateAssumeRolePolicy",
-      # For migrating the already-deployed app roles under the boundary.
       "iam:PutRolePermissionsBoundary",
     ]
     resources = ["arn:aws:iam::${local.account}:role/${local.app_prefix}*"]
@@ -122,6 +125,27 @@ data "aws_iam_policy_document" "deploy" {
       variable = "iam:PermissionsBoundary"
       values   = [aws_iam_policy.app_boundary.arn]
     }
+  }
+  # POLICY-MUTATION actions: update an existing app role's inline/attached policies
+  # or trust. These CANNOT carry the iam:PermissionsBoundary condition — AWS does
+  # not populate that key for them, so bundling them with CreateRole (as this once
+  # did) silently DENIED all three: no deploy could update an app role's policy
+  # (caught live on the 2026-07-04 fulfillment deploy — iam:PutRolePolicy 403).
+  # Containment does NOT rest on this condition; it rests on the boundary the roles
+  # already carry (set via IamAppRolesSetBoundary at create time / migration): a
+  # permissions boundary caps a role's EFFECTIVE permissions no matter what policy
+  # is attached, so a wider inline policy cannot escalate past the ceiling. Resource
+  # scope (app_prefix*) + the NeverTouchKittenIam Deny floor still exclude this
+  # stack's own identities. (Prereq: all app roles boundaried — done 2026-07-04.)
+  statement {
+    sid    = "IamAppRolesMutatePolicies"
+    effect = "Allow"
+    actions = [
+      "iam:PutRolePolicy",
+      "iam:AttachRolePolicy",
+      "iam:UpdateAssumeRolePolicy",
+    ]
+    resources = ["arn:aws:iam::${local.account}:role/${local.app_prefix}*"]
   }
   # PassRole only into the services this stack actually hands roles to.
   statement {
