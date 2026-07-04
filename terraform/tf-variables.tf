@@ -57,6 +57,12 @@ variable "humble_username" {
   description = "Humble account username (email) for secure-area step-up. Null disables step-up (a gated gift redeem parks). Not a secret — the password + TOTP seed live in SSM SecureStrings."
 }
 
+variable "lambda_permissions_boundary_arn" {
+  type        = string
+  default     = null
+  description = "ARN of the IAM permissions boundary to set on all three lambda execution roles. Set to the kitten-app-boundary policy ARN so the least-privilege deploy role can safely manage the roles' inline policies (a boundary caps effective permissions regardless of attached policy). Null leaves the roles unbounded. Passed as a variable — the deploy role is explicitly denied GetPolicy on the kitten-* boundary, so it cannot be looked up via a data source."
+}
+
 variable "sync_schedule_expression" {
   type        = string
   default     = "cron(0 9 * * ? *)" # 09:00 UTC daily = pre-dawn US-East

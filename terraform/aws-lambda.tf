@@ -1,7 +1,7 @@
 # ── fulfillment — the ONLY component that can read the humble session ────────
 module "lambda_fulfillment" {
   source  = "bendoerr-terraform-modules/lambda/aws"
-  version = "0.3.0"
+  version = "0.4.0"
   context = module.context.shared
   name    = "fulfillment"
 
@@ -10,8 +10,11 @@ module "lambda_fulfillment" {
   handler       = "bootstrap"
   runtime       = "provided.al2023"
   architectures = ["arm64"]
-  memory_size   = 256
-  timeout       = 900 # first sync backfills ~15 years of orders, paced
+  # Cap the exec role's effective permissions so the least-privilege deploy role can safely
+  # manage its inline policies (see var.lambda_permissions_boundary_arn). Null = unbounded.
+  permissions_boundary = var.lambda_permissions_boundary_arn
+  memory_size          = 256
+  timeout              = 900 # first sync backfills ~15 years of orders, paced
 
   environment_variables = merge(
     {
@@ -48,7 +51,7 @@ module "lambda_fulfillment" {
 # ── public-api — friend surface; ZERO ssm access (trust boundary) ────────────
 module "lambda_public_api" {
   source  = "bendoerr-terraform-modules/lambda/aws"
-  version = "0.3.0"
+  version = "0.4.0"
   context = module.context.shared
   name    = "public-api"
 
@@ -57,8 +60,11 @@ module "lambda_public_api" {
   handler       = "bootstrap"
   runtime       = "provided.al2023"
   architectures = ["arm64"]
-  memory_size   = 256
-  timeout       = 29 # API Gateway's integration ceiling; gift invoke must fit inside
+  # Cap the exec role's effective permissions so the least-privilege deploy role can safely
+  # manage its inline policies (see var.lambda_permissions_boundary_arn). Null = unbounded.
+  permissions_boundary = var.lambda_permissions_boundary_arn
+  memory_size          = 256
+  timeout              = 29 # API Gateway's integration ceiling; gift invoke must fit inside
 
   environment_variables = {
     TABLE_NAME     = aws_dynamodb_table.this.name
@@ -79,7 +85,7 @@ module "lambda_public_api" {
 # ── admin-api — ben surface ───────────────────────────────────────────────────
 module "lambda_admin_api" {
   source  = "bendoerr-terraform-modules/lambda/aws"
-  version = "0.3.0"
+  version = "0.4.0"
   context = module.context.shared
   name    = "admin-api"
 
@@ -88,8 +94,11 @@ module "lambda_admin_api" {
   handler       = "bootstrap"
   runtime       = "provided.al2023"
   architectures = ["arm64"]
-  memory_size   = 256
-  timeout       = 29
+  # Cap the exec role's effective permissions so the least-privilege deploy role can safely
+  # manage its inline policies (see var.lambda_permissions_boundary_arn). Null = unbounded.
+  permissions_boundary = var.lambda_permissions_boundary_arn
+  memory_size          = 256
+  timeout              = 29
 
   environment_variables = {
     TABLE_NAME          = aws_dynamodb_table.this.name
