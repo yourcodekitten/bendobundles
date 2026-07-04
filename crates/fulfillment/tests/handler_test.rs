@@ -33,7 +33,10 @@ fn gift_decision_ladder_is_exhaustive_and_safe() {
     // Auth-layer rejection of the redeem WRITE parks plainly: the cookie may be fine (reads own
     // the cookie-health signal), so no cookie_ok flip and no dead-cookie ping from this path.
     assert!(matches!(
-        gift_decision(&Err(E::RedeemAuthRejected(403))),
+        gift_decision(&Err(E::RedeemAuthRejected {
+            status: 403,
+            csrf_minted: false
+        })),
         Decision::Park
     ));
     assert!(matches!(
@@ -284,12 +287,14 @@ async fn dead_cookie_parks_flags_and_pings_without_leaking_cookie() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Redeem auth-rejection path: a 403 on the redeem WRITE parks plainly — the cookie may be fine
-// (live 2026-07-04 capture: redeem 403 while sync walked the whole library on the same cookie),
-// so cookie_ok must stay true and NO dead-cookie ping fires. Reads own the cookie-health signal.
+// Redeem auth-rejection path: a 403 on the redeem WRITE parks — the cookie may be fine (live
+// 2026-07-04 capture: redeem 403 while sync walked the whole library on the same cookie), so
+// cookie_ok must stay true and the DEAD-COOKIE ping must not fire. But it is NOT silent: a
+// distinct, correctly-labeled ping fires instead — without one, a persistent rejection loops
+// invisibly (park → reconcile re-lists → re-claim → reject, daily).
 // ---------------------------------------------------------------------------------------------
 #[tokio::test]
-async fn redeem_auth_rejection_parks_without_flag_or_ping() {
+async fn redeem_auth_rejection_parks_and_pings_distinctly_without_flag() {
     let Some(store) = store_or_skip("gift-authreject").await else {
         return;
     };
@@ -336,11 +341,29 @@ async fn redeem_auth_rejection_parks_without_flag_or_ping() {
     let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
     assert_eq!(claim.state, ClaimState::Pending);
 
-    // and NOBODY got pinged about a dead cookie.
+    // exactly ONE ping, correctly labeled: names the auth-layer block (and, since this test
+    // mounts no preflight GET, the failed csrf capture), NOT cookie death — and never leaks
+    // the cookie value.
     let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a redeem auth-rejection must ping distinctly — silence hides the re-list loop"
+    );
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("auth layer"), "ping must name the real cause");
+    assert!(body.contains("c1"), "ping must carry the claim id");
     assert!(
-        reqs.is_empty(),
-        "no ping may fire on a redeem auth-rejection"
+        body.contains("capture FAILED"),
+        "with no preflight cookie the ping must surface the minted-fallback signal"
+    );
+    assert!(
+        !body.contains("DEAD") && !body.contains("paste a fresh one"),
+        "ping must not carry the dead-cookie message"
+    );
+    assert!(
+        !body.contains(COOKIE),
+        "ping body leaked the session cookie"
     );
 }
 

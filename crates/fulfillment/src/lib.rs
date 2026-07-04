@@ -92,7 +92,10 @@ pub fn gift_decision(outcome: &Result<GiftUrl, HumbleError>) -> Decision {
             // Auth/CSRF-layer rejection of the WRITE. The cookie may be perfectly healthy (live
             // 2026-07-04 capture: redeem 403 while sync read the whole library) — reads own the
             // cookie-health signal, so park WITHOUT flipping cookie_ok or pinging cookie-death.
-            HumbleError::RedeemAuthRejected(_) => Decision::Park,
+            // (The Park executor still pings for this variant — a distinct, correctly-labeled
+            // alert — because otherwise a persistent rejection loops silently: park → daily
+            // reconcile compensates → re-list → re-claim → reject again, with no operator signal.)
+            HumbleError::RedeemAuthRejected { .. } => Decision::Park,
             // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
             // only reconcile against humble truth can tell. Park — never compensate blind.
             HumbleError::RedeemRefused(_) => Decision::Park,
@@ -243,9 +246,35 @@ async fn handle_gift(
                 Err(HumbleError::RedeemRefused(_)) => "refused",
                 Err(HumbleError::AmbiguousRedeem) => "ambiguous",
                 Err(HumbleError::RateLimited) => "rate-limited",
-                Err(HumbleError::RedeemAuthRejected(_)) => "redeem-auth-rejected",
+                Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
                 _ => "transient",
             };
+            // A redeem-auth rejection gets its own correctly-labeled ping: without one, a
+            // persistent rejection is invisible (park → reconcile compensates → re-list →
+            // re-claim → reject, daily, gifting nothing). Message carries claim id + machine
+            // name only — never a key, cookie, or csrf value.
+            if let Err(HumbleError::RedeemAuthRejected {
+                status,
+                csrf_minted,
+            }) = &outcome
+            {
+                let csrf_note = if *csrf_minted {
+                    "csrf capture FAILED (minted fallback used) — the preflight isn't yielding a cookie"
+                } else {
+                    "humble rejected its own captured csrf token — the write dance needs a look"
+                };
+                ping(
+                    deps,
+                    &format!(
+                        "gift redeem for claim {claim_id} ({machine_name}) was blocked at \
+                         humble's auth layer (status {status}). {csrf_note}. The session cookie \
+                         is fine (reads work) — re-pasting won't help. The claim is parked; \
+                         reconcile will re-list the key if unredeemed, so this repeats on the \
+                         next claim until the write path is fixed."
+                    ),
+                )
+                .await;
+            }
             FulfillResponse::Parked {
                 reason: format!("humble call inconclusive: park for reconcile ({detail})"),
             }

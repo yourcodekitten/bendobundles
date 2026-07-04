@@ -309,7 +309,8 @@ async fn redeem_auth_rejection_is_typed_not_cookie_death() {
     // A 403 on the redeem WRITE is an auth/CSRF-layer rejection, NOT proof the session cookie is
     // dead (reads may still work fine). It must be its own variant so fulfillment doesn't fire
     // the dead-cookie alarm. Live signature captured 2026-07-04: redeem POST 403 while sync
-    // walked the full library on the same cookie.
+    // walked the full library on the same cookie. The preflight here offers no csrf_cookie, so
+    // the error must also report csrf_minted=true — a capture failure is its own signal.
     for status in [401u16, 403, 302] {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -328,10 +329,52 @@ async fn redeem_auth_rejection_is_typed_not_cookie_death() {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, humble_client::HumbleError::RedeemAuthRejected(s) if s == status),
-            "status {status} must map to RedeemAuthRejected, got {err:?}"
+            matches!(
+                err,
+                humble_client::HumbleError::RedeemAuthRejected {
+                    status: s,
+                    csrf_minted: true
+                } if s == status
+            ),
+            "status {status} must map to RedeemAuthRejected with csrf_minted=true, got {err:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn captured_token_rejection_reports_csrf_not_minted() {
+    // When the preflight DID capture humble's own csrf_cookie and the write still bounces,
+    // csrf_minted must be false — that distinguishes "humble rejected its own token" (dance is
+    // wrong some other way) from "we never got a token to replay" (capture is broken).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("set-cookie", "csrf_cookie=srv-t0k3n; Path=/; Secure"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam", 0)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            humble_client::HumbleError::RedeemAuthRejected {
+                status: 403,
+                csrf_minted: false
+            }
+        ),
+        "captured-token rejection must report csrf_minted=false, got {err:?}"
+    );
 }
 
 #[tokio::test]
