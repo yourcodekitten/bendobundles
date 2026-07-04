@@ -30,6 +30,12 @@ fn gift_decision_ladder_is_exhaustive_and_safe() {
         gift_decision(&Err(E::Unauthorized)),
         Decision::ParkCookieDead
     ));
+    // Auth-layer rejection of the redeem WRITE parks plainly: the cookie may be fine (reads own
+    // the cookie-health signal), so no cookie_ok flip and no dead-cookie ping from this path.
+    assert!(matches!(
+        gift_decision(&Err(E::RedeemAuthRejected(403))),
+        Decision::Park
+    ));
     assert!(matches!(
         gift_decision(&Err(E::AmbiguousRedeem)),
         Decision::Park

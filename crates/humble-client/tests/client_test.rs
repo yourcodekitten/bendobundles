@@ -214,6 +214,126 @@ async fn html_200_is_unauthorized() {
     assert!(matches!(err, humble_client::HumbleError::Unauthorized));
 }
 
+/// Matches when the `csrf-prevention-token` header value equals the `csrf_cookie` value inside
+/// the `cookie` header (the double-submit invariant), regardless of what the value is.
+struct DoubleSubmitPairMatches;
+
+impl wiremock::Match for DoubleSubmitPairMatches {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        let header_val = request
+            .headers
+            .get("csrf-prevention-token")
+            .and_then(|v| v.to_str().ok());
+        let cookie_val = request
+            .headers
+            .get("cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| {
+                c.split(';')
+                    .map(str::trim)
+                    .find_map(|kv| kv.strip_prefix("csrf_cookie="))
+            });
+        match (header_val, cookie_val) {
+            (Some(h), Some(c)) => !h.is_empty() && h == c,
+            _ => false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn redeem_sends_double_submit_csrf_captured_from_preflight() {
+    let server = MockServer::start().await;
+    // Preflight page GET: humble sets the csrf_cookie alongside the session it was given.
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(header("cookie", "_simpleauth_sess=sekrit"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("set-cookie", "csrf_cookie=srv-t0k3n; Path=/; Secure"),
+        )
+        .mount(&server)
+        .await;
+    // The redeem POST must replay humble's own token as BOTH cookie and header.
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .and(header("csrf-prevention-token", "srv-t0k3n"))
+        .and(header(
+            "cookie",
+            "_simpleauth_sess=sekrit; csrf_cookie=srv-t0k3n",
+        ))
+        .and(body_string_contains("gift=true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "giftkey": "g1ftt0k3n"
+        })))
+        .mount(&server)
+        .await;
+
+    let gift = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "stardew_valley_steam", 3)
+        .await
+        .unwrap();
+    assert_eq!(gift.0, "https://www.humblebundle.com/gift?key=g1ftt0k3n");
+}
+
+#[tokio::test]
+async fn redeem_mints_double_submit_pair_when_preflight_sets_no_cookie() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    // No csrf_cookie offered — the client must mint one and keep header == cookie anyway.
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .and(DoubleSubmitPairMatches)
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "giftkey": "g1ftt0k3n"
+        })))
+        .mount(&server)
+        .await;
+
+    let gift = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "stardew_valley_steam", 0)
+        .await
+        .unwrap();
+    assert_eq!(gift.0, "https://www.humblebundle.com/gift?key=g1ftt0k3n");
+}
+
+#[tokio::test]
+async fn redeem_auth_rejection_is_typed_not_cookie_death() {
+    // A 403 on the redeem WRITE is an auth/CSRF-layer rejection, NOT proof the session cookie is
+    // dead (reads may still work fine). It must be its own variant so fulfillment doesn't fire
+    // the dead-cookie alarm. Live signature captured 2026-07-04: redeem POST 403 while sync
+    // walked the full library on the same cookie.
+    for status in [401u16, 403, 302] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/humbler/redeemkey"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .redeem_as_gift("AAAAbbbbCCCC", "some_product_steam", 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, humble_client::HumbleError::RedeemAuthRejected(s) if s == status),
+            "status {status} must map to RedeemAuthRejected, got {err:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn ambiguous_redeem_is_typed() {
     // success=true but NO giftkey: humble claims it worked yet handed back nothing. The key may

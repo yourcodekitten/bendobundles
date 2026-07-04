@@ -85,8 +85,14 @@ pub fn gift_decision(outcome: &Result<GiftUrl, HumbleError>) -> Decision {
         Err(err) => match err {
             // The ONE definitive "key is gone" signal from humble → safe to compensate.
             HumbleError::AlreadyRedeemed => Decision::Compensate,
-            // Dead cookie: park + flag + ping (handled in the ParkCookieDead executor).
+            // Dead cookie: park + flag + ping (handled in the ParkCookieDead executor). Only the
+            // 200-with-HTML login interstitial maps here now — the one redeem response shape
+            // that positively identifies a stale session.
             HumbleError::Unauthorized => Decision::ParkCookieDead,
+            // Auth/CSRF-layer rejection of the WRITE. The cookie may be perfectly healthy (live
+            // 2026-07-04 capture: redeem 403 while sync read the whole library) — reads own the
+            // cookie-health signal, so park WITHOUT flipping cookie_ok or pinging cookie-death.
+            HumbleError::RedeemAuthRejected(_) => Decision::Park,
             // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
             // only reconcile against humble truth can tell. Park — never compensate blind.
             HumbleError::RedeemRefused(_) => Decision::Park,

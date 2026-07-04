@@ -22,6 +22,12 @@ impl std::fmt::Debug for SessionCookie {
 pub enum HumbleError {
     #[error("session cookie rejected — needs a fresh paste")]
     Unauthorized,
+    /// The redeem WRITE was rejected at the auth/CSRF layer (401/403/302 on the POST). This is
+    /// NOT proof the session cookie is dead — the live 2026-07-04 capture showed the redeem POST
+    /// 403ing while the same cookie walked the full library on reads. Reads own the cookie-health
+    /// signal; this variant must never trip the dead-cookie alarm.
+    #[error("humble rejected the redeem write at the auth/CSRF layer (status {0})")]
+    RedeemAuthRejected(u16),
     #[error("humble rate-limited us")]
     RateLimited,
     #[error("key already redeemed on humble")]
@@ -185,17 +191,63 @@ impl HumbleClient {
         })
     }
 
+    /// Fetch the value for humble's double-submit CSRF pair. A page GET (sent with the session
+    /// cookie) makes humble set `csrf_cookie`; the redeem POST must replay that value as BOTH
+    /// the `csrf_cookie` cookie and the `csrf-prevention-token` header. If no cookie is offered
+    /// (or the preflight fails), mint a value — with a pure double-submit check only the
+    /// cookie/header MATCH matters, and a wrong guess costs the same 403 we'd get anyway.
+    async fn csrf_token(&self) -> String {
+        let preflight = self
+            .http
+            .get(format!("{}/", self.base))
+            .header("Cookie", format!("_simpleauth_sess={}", self.cookie.0))
+            .send()
+            .await;
+        match preflight {
+            Ok(resp) => {
+                for sc in resp.headers().get_all("set-cookie") {
+                    let Ok(s) = sc.to_str() else { continue };
+                    if let Some(rest) = s.trim_start().strip_prefix("csrf_cookie=") {
+                        let val = rest.split(';').next().unwrap_or("").trim();
+                        if !val.is_empty() {
+                            tracing::info!("csrf preflight: captured csrf_cookie from humble");
+                            return val.to_string();
+                        }
+                    }
+                }
+                tracing::info!(
+                    status = resp.status().as_u16(),
+                    "csrf preflight: no csrf_cookie offered — minting a double-submit pair"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "csrf preflight GET failed — minting a double-submit pair");
+            }
+        }
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
     pub async fn redeem_as_gift(
         &self,
         gamekey: &str,
         machine_name: &str,
         keyindex: u32,
     ) -> Result<GiftUrl, HumbleError> {
+        let csrf = self.csrf_token().await;
         let resp = self
             .http
             .post(format!("{}/humbler/redeemkey", self.base))
-            .header("Cookie", format!("_simpleauth_sess={}", self.cookie.0))
-            .header("X-Requested-By", "hb_android_app")
+            // Browser-shaped write, mirroring the proven redeemer flow (FailSpy's
+            // humble-steam-key-redeemer): double-submit csrf_cookie + csrf-prevention-token
+            // header, same-origin Origin/Referer, and NO X-Requested-By — the android-app header
+            // belongs to the read API, not the browser-surface /humbler/ endpoints.
+            .header(
+                "Cookie",
+                format!("_simpleauth_sess={}; csrf_cookie={csrf}", self.cookie.0),
+            )
+            .header("csrf-prevention-token", &csrf)
+            .header("Origin", &self.base)
+            .header("Referer", format!("{}/home/library", self.base))
             // keyindex now passes the tpk's true index; we pass the position in the order's
             // key list. if humble actually selects by keytype=<machine_name>, this index is
             // redundant. VERIFY on the first real gifting of a non-first key in an order
@@ -256,15 +308,15 @@ impl HumbleClient {
                 }
             }
             401 | 403 | 302 => {
-                // The redeem POST got an auth/redirect rejection. If reads work
-                // (sync succeeds) but this fires, the cookie is fine and the
-                // WRITE needs something we're not sending — most likely a CSRF
-                // token. This is the signature to look for on first gifting.
+                // Auth/redirect rejection of the WRITE even though we now send the CSRF pair.
+                // Typed separately from Unauthorized so callers never read this as cookie
+                // death — a genuinely stale session surfaces as the 200-with-HTML interstitial
+                // (decode_body → Unauthorized) or as read failures, both owned by the read paths.
                 tracing::warn!(
                     status,
-                    "humble redeem returned auth/redirect — likely a missing write credential (CSRF?), NOT necessarily a dead cookie"
+                    "humble rejected the redeem write despite the CSRF pair — inspect the dance, do not blame the cookie"
                 );
-                Err(HumbleError::Unauthorized)
+                Err(HumbleError::RedeemAuthRejected(status))
             }
             429 => Err(HumbleError::RateLimited),
             s => Err(HumbleError::Api(s)),
