@@ -96,6 +96,11 @@ pub fn gift_decision(outcome: &Result<GiftUrl, HumbleError>) -> Decision {
             // alert — because otherwise a persistent rejection loops silently: park → daily
             // reconcile compensates → re-list → re-claim → reject again, with no operator signal.)
             HumbleError::RedeemAuthRejected { .. } => Decision::Park,
+            // Secure-area step-up never completed (bad password/TOTP, locked account, or humble
+            // still gating). A gated redeem returns `login_required` BEFORE touching the key, so
+            // the key is not burned — park, never compensate. The Park executor pings a distinct,
+            // correctly-labeled alert so a persistent step-up failure doesn't loop silently.
+            HumbleError::SecureAreaStepUpFailed { .. } => Decision::Park,
             // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
             // only reconcile against humble truth can tell. Park — never compensate blind.
             HumbleError::RedeemRefused(_) => Decision::Park,
@@ -247,8 +252,24 @@ async fn handle_gift(
                 Err(HumbleError::AmbiguousRedeem) => "ambiguous",
                 Err(HumbleError::RateLimited) => "rate-limited",
                 Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
+                Err(HumbleError::SecureAreaStepUpFailed { .. }) => "secure-area-step-up-failed",
                 _ => "transient",
             };
+            // A step-up failure gets its own ping: like the auth-rejection case, a persistent
+            // failure would otherwise loop silently (park → reconcile → re-list → re-claim →
+            // fail). The reason string carries no secret (it names the failure class only).
+            if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
+                ping(
+                    deps,
+                    &format!(
+                        "gift redeem for claim {claim_id} ({machine_name}) needed humble's \
+                         secure-area step-up and it did not complete: {reason}. Check the humble \
+                         password + TOTP seed in SSM (or the account may be locked / rate-limited). \
+                         The key was NOT redeemed — the claim is parked and will re-list on reconcile."
+                    ),
+                )
+                .await;
+            }
             // A redeem-auth rejection gets its own correctly-labeled ping: without one, a
             // persistent rejection is invisible (park → reconcile compensates → re-list →
             // re-claim → reject, daily, gifting nothing). Message carries claim id + machine
@@ -545,6 +566,16 @@ mod tests {
         let c = ping_content("cookie is DEAD");
         assert!(c.starts_with("🐱 bendobundles: "));
         assert!(c.contains("cookie is DEAD"));
+    }
+
+    #[test]
+    fn secure_area_step_up_failure_parks_never_compensates() {
+        // The key is not burned behind a step-up gate — this MUST park (reconcile re-lists it),
+        // never compensate (which would only be safe on a definitive AlreadyRedeemed).
+        let outcome = Err(HumbleError::SecureAreaStepUpFailed {
+            reason: "humble /processlogin returned status 403 without a goto".into(),
+        });
+        assert_eq!(gift_decision(&outcome), Decision::Park);
     }
 
     #[test]

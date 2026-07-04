@@ -33,6 +33,51 @@ resource "aws_ssm_parameter" "humble_cookie" {
   }
 }
 
+# Humble secure-area step-up secrets — the account password and the app-TOTP
+# base32 seed. Humble gates key reveal/redeem/gift behind a fresh-password
+# re-auth that the session cookie alone can't pass; fulfillment reads these to
+# POST /processlogin and elevate the session before a gift redeem.
+#
+# Value ownership mirrors humble_cookie: terraform owns the CONTAINER, the value
+# is set OUT OF BAND (ben's terminal / kitten-deploy PutParameter) and NEVER in
+# code or state-by-us. Both are pre-existing (created out of band on 2026-07-04),
+# so the import blocks below adopt them on the first apply; ignore_changes keeps
+# the real secret from being reset to the placeholder. Standard tier: both values
+# are well under 4 KB.
+resource "aws_ssm_parameter" "humble_password" {
+  name  = "/${module.label_param.id}/humble-password"
+  type  = "SecureString"
+  value = "UNSET"
+  tags  = module.label_param.tags
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+resource "aws_ssm_parameter" "humble_totp_secret" {
+  name  = "/${module.label_param.id}/humble-totp-secret"
+  type  = "SecureString"
+  value = "UNSET"
+  tags  = module.label_param.tags
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
+# Adopt the out-of-band params into state on the first apply. Idempotent — a
+# no-op once each is in state, safe to leave in place (prune in a later cleanup).
+import {
+  to = aws_ssm_parameter.humble_password
+  id = "/${module.label_param.id}/humble-password"
+}
+
+import {
+  to = aws_ssm_parameter.humble_totp_secret
+  id = "/${module.label_param.id}/humble-totp-secret"
+}
+
 resource "aws_ssm_parameter" "discord_webhook" {
   count = var.discord_webhook_url == null ? 0 : 1
   name  = "/${module.label_param.id}/discord-webhook"
@@ -44,4 +89,16 @@ resource "aws_ssm_parameter" "discord_webhook" {
 locals {
   discord_webhook_param_name = var.discord_webhook_url == null ? null : aws_ssm_parameter.discord_webhook[0].name
   discord_webhook_param_arn  = var.discord_webhook_url == null ? null : aws_ssm_parameter.discord_webhook[0].arn
+
+  # Secure-area step-up is opt-in via humble_username: null → the whole feature is
+  # off (no env vars, no extra SSM grant) and a gated redeem parks as before.
+  humble_step_up_env = var.humble_username == null ? {} : {
+    HUMBLE_USERNAME       = var.humble_username
+    HUMBLE_PASSWORD_PARAM = aws_ssm_parameter.humble_password.name
+    HUMBLE_TOTP_PARAM     = aws_ssm_parameter.humble_totp_secret.name
+  }
+  humble_step_up_param_arns = var.humble_username == null ? [] : [
+    aws_ssm_parameter.humble_password.arn,
+    aws_ssm_parameter.humble_totp_secret.arn,
+  ]
 }

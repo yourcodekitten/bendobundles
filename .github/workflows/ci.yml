@@ -26,6 +26,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # wreq's TLS impersonation pulls boring-sys, which compiles BoringSSL (cmake)
+      # and generates bindings (libclang). ubuntu-latest usually has these, but pin
+      # them explicitly so a runner-image change can't silently break the build.
+      - name: install BoringSSL build deps (wreq/boring-sys)
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
@@ -72,6 +77,9 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      # wreq → boring-sys needs cmake (BoringSSL) + libclang (bindgen). See the test job.
+      - name: install BoringSSL build deps (wreq/boring-sys)
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev
       - name: install cargo-lambda
         run: pip3 install cargo-lambda
       - run: |
