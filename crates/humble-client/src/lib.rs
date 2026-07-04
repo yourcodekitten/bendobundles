@@ -97,6 +97,42 @@ struct RedeemResponse {
     errormsg: Option<String>,
 }
 
+/// Read one response header as an owned `String`, or `"-"` when absent/unprintable. Kept small
+/// so the diagnostic log line on a redeem rejection stays flat and greppable.
+fn header_str(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// Collapse a response body into a single-line, length-bounded preview safe to log: control
+/// characters (newlines, tabs, the trailing-tab humble sometimes emits) become spaces, and the
+/// result is capped. Enough to tell a Cloudflare HTML challenge from a short humble-app JSON
+/// refusal without dumping a whole page into CloudWatch.
+fn body_signature(bytes: &[u8]) -> String {
+    const MAX: usize = 300;
+    let text = String::from_utf8_lossy(bytes);
+    // Control chars → spaces, then collapse every whitespace run to one space, so the preview is
+    // one clean line regardless of the source's formatting.
+    let despaced: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = despaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "<empty>".to_string();
+    }
+    // Truncate and mark by CHARACTER count (never bytes — a mid-codepoint cut would panic).
+    let out: String = collapsed.chars().take(MAX).collect();
+    if collapsed.chars().count() > MAX {
+        format!("{out}…")
+    } else {
+        out
+    }
+}
+
 /// Decode a response body as JSON. On serde failure, detect HTML login interstitials
 /// (humble sometimes serves a 200 with HTML when the session cookie is stale) and surface
 /// them as Unauthorized rather than a confusing Parse error.
@@ -345,9 +381,31 @@ impl HumbleClient {
                 // Typed separately from Unauthorized so callers never read this as cookie
                 // death — a genuinely stale session surfaces as the 200-with-HTML interstitial
                 // (decode_body → Unauthorized) or as read failures, both owned by the read paths.
+                //
+                // DIAGNOSTIC: the first live redeem on the CSRF fix (2026-07-04) captured
+                // humble's OWN csrf_cookie and still 403'd — so double-submit *match* is not the
+                // gate. The remaining suspects fail differently in the RESPONSE, not the status:
+                // a Cloudflare bot-block returns an HTML challenge (content-type text/html, a
+                // `cf-mitigated` header, body starting `<`); a humble-app CSRF/session refusal
+                // returns short JSON or a `location` redirect to a login/verify path. These
+                // fields name which one WITHOUT leaking anything — a 403/302 body is humble's
+                // error/challenge page, never our cookie or a gift token.
+                let content_type = header_str(resp.headers(), "content-type");
+                let location = header_str(resp.headers(), "location");
+                let cf_mitigated = header_str(resp.headers(), "cf-mitigated");
+                let server = header_str(resp.headers(), "server");
+                let body_preview = match resp.bytes().await {
+                    Ok(b) => body_signature(&b),
+                    Err(e) => format!("<body read failed: {e}>"),
+                };
                 tracing::warn!(
                     status,
                     csrf_minted,
+                    content_type,
+                    location,
+                    cf_mitigated,
+                    server,
+                    body_preview,
                     "humble rejected the redeem write despite the CSRF pair — inspect the dance, do not blame the cookie"
                 );
                 Err(HumbleError::RedeemAuthRejected {
@@ -358,5 +416,53 @@ impl HumbleClient {
             429 => Err(HumbleError::RateLimited),
             s => Err(HumbleError::Api(s)),
         }
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::body_signature;
+
+    #[test]
+    fn collapses_multiline_html_to_one_bounded_line() {
+        let html =
+            b"<!DOCTYPE html>\n<html>\n\t<body>Attention Required! Cloudflare</body>\n</html>";
+        let sig = body_signature(html);
+        assert!(
+            !sig.contains('\n') && !sig.contains('\t'),
+            "must be single-line: {sig:?}"
+        );
+        assert!(
+            sig.starts_with("<!DOCTYPE html>"),
+            "preview keeps the leading marker: {sig:?}"
+        );
+        assert!(sig.contains("Cloudflare"));
+    }
+
+    #[test]
+    fn truncates_and_marks_long_bodies() {
+        let long = vec![b'x'; 1000];
+        let sig = body_signature(&long);
+        assert!(
+            sig.chars().count() <= 301,
+            "capped near MAX (+ ellipsis): {}",
+            sig.chars().count()
+        );
+        assert!(
+            sig.ends_with('…'),
+            "over-length bodies get an ellipsis: {sig:?}"
+        );
+    }
+
+    #[test]
+    fn empty_body_is_labeled() {
+        assert_eq!(body_signature(b""), "<empty>");
+        assert_eq!(body_signature(b"   \n\t  "), "<empty>");
+    }
+
+    #[test]
+    fn short_json_passes_through_readable() {
+        let sig = body_signature(br#"{"error":"csrf token invalid"}"#);
+        assert_eq!(sig, r#"{"error":"csrf token invalid"}"#);
     }
 }
