@@ -196,11 +196,20 @@ data "aws_iam_policy_document" "deploy" {
   # above is a silent no-grant (caught live on the first kitten deploy,
   # 2026-07-04: terraform refresh of every managed param 403'd). It exposes
   # parameter METADATA only; values stay behind the scoped GetParameter.
+  # Resource-scoping is off the table but condition-scoping is not: the
+  # region condition keeps enumeration to the one region the live failure
+  # demonstrated a need for, instead of a whole-account targeting map.
   statement {
     sid       = "SsmDescribeUnscopeable"
     effect    = "Allow"
     actions   = ["ssm:DescribeParameters"]
     resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [local.region]
+    }
   }
 
   # ── EventBridge (the daily-sync rule) ───────────────────────────────────────
