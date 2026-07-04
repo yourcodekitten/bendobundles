@@ -243,6 +243,7 @@ async fn handle_gift(
                 Err(HumbleError::RedeemRefused(_)) => "refused",
                 Err(HumbleError::AmbiguousRedeem) => "ambiguous",
                 Err(HumbleError::RateLimited) => "rate-limited",
+                Err(HumbleError::RedeemAuthRejected(_)) => "redeem-auth-rejected",
                 _ => "transient",
             };
             FulfillResponse::Parked {
