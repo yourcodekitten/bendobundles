@@ -38,13 +38,23 @@ resource "aws_ssm_parameter" "humble_cookie" {
 # re-auth that the session cookie alone can't pass; fulfillment reads these to
 # POST /processlogin and elevate the session before a gift redeem.
 #
-# Value ownership mirrors humble_cookie: terraform owns the CONTAINER, the value
-# is set OUT OF BAND (ben's terminal / kitten-deploy PutParameter) and NEVER in
-# code or state-by-us. Both are pre-existing (created out of band on 2026-07-04),
-# so the import blocks below adopt them on the first apply; ignore_changes keeps
-# the real secret from being reset to the placeholder. Standard tier: both values
-# are well under 4 KB.
+# Gated on humble_username (same shape as discord_webhook): with the feature off,
+# NOTHING is created and nothing sits in state. Value ownership mirrors
+# humble_cookie: terraform owns the CONTAINER, the value is set OUT OF BAND
+# (kitten-deploy PutParameter) and NEVER in code or state-by-us; ignore_changes
+# keeps the real secret from being reset to the placeholder. Standard tier.
+#
+# NO import {} blocks: an unconditional import hard-fails `terraform plan`
+# ("Cannot import non-existent remote object") in any account where the params
+# weren't hand-created — fresh env, second region, DR rebuild — because it
+# preempts the create path, and CI only runs `validate` so the break is invisible
+# until a live plan. Where the params already exist out of band (prod, created
+# 2026-07-04), adopt them with a ONE-TIME CLI import during deploy:
+#   terraform import 'aws_ssm_parameter.humble_password[0]'    /<param-prefix>/humble-password
+#   terraform import 'aws_ssm_parameter.humble_totp_secret[0]' /<param-prefix>/humble-totp-secret
+# A fresh account with humble_username set just creates them at "UNSET".
 resource "aws_ssm_parameter" "humble_password" {
+  count = var.humble_username == null ? 0 : 1
   name  = "/${module.label_param.id}/humble-password"
   type  = "SecureString"
   value = "UNSET"
@@ -56,6 +66,7 @@ resource "aws_ssm_parameter" "humble_password" {
 }
 
 resource "aws_ssm_parameter" "humble_totp_secret" {
+  count = var.humble_username == null ? 0 : 1
   name  = "/${module.label_param.id}/humble-totp-secret"
   type  = "SecureString"
   value = "UNSET"
@@ -64,18 +75,6 @@ resource "aws_ssm_parameter" "humble_totp_secret" {
   lifecycle {
     ignore_changes = [value]
   }
-}
-
-# Adopt the out-of-band params into state on the first apply. Idempotent — a
-# no-op once each is in state, safe to leave in place (prune in a later cleanup).
-import {
-  to = aws_ssm_parameter.humble_password
-  id = "/${module.label_param.id}/humble-password"
-}
-
-import {
-  to = aws_ssm_parameter.humble_totp_secret
-  id = "/${module.label_param.id}/humble-totp-secret"
 }
 
 resource "aws_ssm_parameter" "discord_webhook" {
@@ -91,14 +90,15 @@ locals {
   discord_webhook_param_arn  = var.discord_webhook_url == null ? null : aws_ssm_parameter.discord_webhook[0].arn
 
   # Secure-area step-up is opt-in via humble_username: null → the whole feature is
-  # off (no env vars, no extra SSM grant) and a gated redeem parks as before.
+  # off (no params, no env vars, no extra SSM grant) and a gated redeem parks as
+  # before. Non-null → the count-gated params exist at [0].
   humble_step_up_env = var.humble_username == null ? {} : {
     HUMBLE_USERNAME       = var.humble_username
-    HUMBLE_PASSWORD_PARAM = aws_ssm_parameter.humble_password.name
-    HUMBLE_TOTP_PARAM     = aws_ssm_parameter.humble_totp_secret.name
+    HUMBLE_PASSWORD_PARAM = aws_ssm_parameter.humble_password[0].name
+    HUMBLE_TOTP_PARAM     = aws_ssm_parameter.humble_totp_secret[0].name
   }
   humble_step_up_param_arns = var.humble_username == null ? [] : [
-    aws_ssm_parameter.humble_password.arn,
-    aws_ssm_parameter.humble_totp_secret.arn,
+    aws_ssm_parameter.humble_password[0].arn,
+    aws_ssm_parameter.humble_totp_secret[0].arn,
   ]
 }

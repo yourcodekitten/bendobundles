@@ -3,8 +3,12 @@ use fulfillment::{Deps, FulfillRequest, FulfillResponse, handle};
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
 
-/// Fetch one decrypted SSM SecureString. Returns `None` (with a warn) on any error or empty value —
-/// callers decide whether that's fatal. The value is a secret: never logged, only the param NAME.
+/// Fetch one decrypted SSM SecureString. Returns `None` (with a warn) on any error, an empty value,
+/// or the `"UNSET"` placeholder that terraform seeds these containers with — so a param that exists
+/// but was never given a real value out-of-band reads as unconfigured, NOT as a credential. Without
+/// this, `Some("UNSET")` would attach as the password and every gated redeem would POST a wrong
+/// password + bogus TOTP to the live account (lockout / rate-limit risk). The value is a secret:
+/// never logged, only the param NAME.
 async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
     match client
         .get_parameter()
@@ -16,7 +20,7 @@ async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> Option<String>
         Ok(out) => out
             .parameter()
             .and_then(|p| p.value())
-            .filter(|v| !v.is_empty())
+            .filter(|v| !v.is_empty() && *v != "UNSET")
             .map(str::to_string),
         Err(e) => {
             tracing::warn!(error = %e, param, "SSM get_parameter (secret) failed");
@@ -134,11 +138,14 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     }
                 };
 
-                // Attach secure-area step-up when configured AND both secrets resolve. A fetch miss
-                // here is non-fatal: the client keeps working for reads/sync/validate and a gated
-                // redeem simply parks with a step-up-failed ping — never a crashed invoke.
-                let humble = match (&step_up_username, &password_param, &totp_param) {
-                    (Some(username), Some(pw_param), Some(totp_p)) => {
+                // Attach secure-area step-up ONLY for a gift redeem, and only when configured AND
+                // both secrets resolve. Gating on the op means Sync/ValidateCookie never decrypt the
+                // humble password/TOTP (they can't hit the gate), shrinking how often the secrets
+                // are read. A fetch miss here is non-fatal: the client still works and a gated redeem
+                // parks with a step-up-failed ping — never a crashed invoke.
+                let is_gift = matches!(req, FulfillRequest::Gift { .. });
+                let humble = match (is_gift, &step_up_username, &password_param, &totp_param) {
+                    (true, Some(username), Some(pw_param), Some(totp_p)) => {
                         match (
                             get_secret(&ssm_client, pw_param).await,
                             get_secret(&ssm_client, totp_p).await,
