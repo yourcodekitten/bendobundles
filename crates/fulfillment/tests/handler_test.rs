@@ -30,6 +30,15 @@ fn gift_decision_ladder_is_exhaustive_and_safe() {
         gift_decision(&Err(E::Unauthorized)),
         Decision::ParkCookieDead
     ));
+    // Auth-layer rejection of the redeem WRITE parks plainly: the cookie may be fine (reads own
+    // the cookie-health signal), so no cookie_ok flip and no dead-cookie ping from this path.
+    assert!(matches!(
+        gift_decision(&Err(E::RedeemAuthRejected {
+            status: 403,
+            csrf_minted: false
+        })),
+        Decision::Park
+    ));
     assert!(matches!(
         gift_decision(&Err(E::AmbiguousRedeem)),
         Decision::Park
@@ -224,8 +233,10 @@ async fn already_redeemed_compensates_and_relists() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Dead cookie path: humble 401 → park + flag cookie_ok=false + discord ping. The ping body must
-// carry the human message and must NEVER contain the session cookie value.
+// Dead cookie path: the 200-with-HTML login interstitial — the ONE redeem response shape that
+// positively identifies a stale session — → park + flag cookie_ok=false + discord ping. The ping
+// body must carry the human message and must NEVER contain the session cookie value. A bare
+// 401/403/302 on the redeem POST is NOT this path (see the redeem-auth-rejection test below).
 // ---------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn dead_cookie_parks_flags_and_pings_without_leaking_cookie() {
@@ -237,7 +248,11 @@ async fn dead_cookie_parks_flags_and_pings_without_leaking_cookie() {
     let humble = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/humbler/redeemkey"))
-        .respond_with(ResponseTemplate::new(401))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<!DOCTYPE html><html>login</html>")
+                .append_header("content-type", "text/html"),
+        )
         .mount(&humble)
         .await;
 
@@ -265,6 +280,87 @@ async fn dead_cookie_parks_flags_and_pings_without_leaking_cookie() {
     let body = String::from_utf8(reqs[0].body.clone()).unwrap();
     assert!(body.contains("bendobundles"));
     assert!(body.to_lowercase().contains("cookie"));
+    assert!(
+        !body.contains(COOKIE),
+        "ping body leaked the session cookie"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Redeem auth-rejection path: a 403 on the redeem WRITE parks — the cookie may be fine (live
+// 2026-07-04 capture: redeem 403 while sync walked the whole library on the same cookie), so
+// cookie_ok must stay true and the DEAD-COOKIE ping must not fire. But it is NOT silent: a
+// distinct, correctly-labeled ping fires instead — without one, a persistent rejection loops
+// invisibly (park → reconcile re-lists → re-claim → reject, daily).
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn redeem_auth_rejection_parks_and_pings_distinctly_without_flag() {
+    let Some(store) = store_or_skip("gift-authreject").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+
+    // A healthy sync state — the redeem 403 must not clobber it.
+    let healthy = SyncState {
+        last_run_epoch: 1_800_000_000,
+        ok: true,
+        cookie_ok: true,
+        games_written: 5,
+        message: "all good".into(),
+    };
+    store.put_sync_state(&healthy).await.unwrap();
+
+    let humble = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&humble)
+        .await;
+
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    let resp = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+    let FulfillResponse::Parked { reason } = resp else {
+        panic!("expected Parked, got {resp:?}");
+    };
+    assert!(
+        reason.contains("redeem-auth-rejected"),
+        "park reason must name the auth rejection, got: {reason}"
+    );
+
+    // cookie NOT flagged dead — the write-layer rejection is not the cookie's fault.
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(st.cookie_ok, "redeem 403 must not flip cookie_ok");
+
+    // claim stays pending for reconcile.
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+
+    // exactly ONE ping, correctly labeled: names the auth-layer block (and, since this test
+    // mounts no preflight GET, the failed csrf capture), NOT cookie death — and never leaks
+    // the cookie value.
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "a redeem auth-rejection must ping distinctly — silence hides the re-list loop"
+    );
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("auth layer"), "ping must name the real cause");
+    assert!(body.contains("c1"), "ping must carry the claim id");
+    assert!(
+        body.contains("capture FAILED"),
+        "with no preflight cookie the ping must surface the minted-fallback signal"
+    );
+    assert!(
+        !body.contains("DEAD") && !body.contains("paste a fresh one"),
+        "ping must not carry the dead-cookie message"
+    );
     assert!(
         !body.contains(COOKIE),
         "ping body leaked the session cookie"
