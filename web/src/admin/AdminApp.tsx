@@ -34,6 +34,16 @@ export function AdminApp() {
     fetchStatus();
   }, [fetchStatus]);
 
+  // While a sync run is live, poll — fulfillment writes SyncState only at the END of a run,
+  // so without polling the card would show the previous run's result until a manual reload.
+  // Polling stops on its own: run completion deletes the marker, so `running` flips false.
+  const syncRunning = status?.sync_run?.running === true;
+  useEffect(() => {
+    if (!syncRunning) return;
+    const id = setInterval(fetchStatus, 5000);
+    return () => clearInterval(id);
+  }, [syncRunning, fetchStatus]);
+
   // Show the banner only when cookie_ok is explicitly false — null (no sync yet)
   // does not trigger the banner.
   const cookieAttentionNeeded = status?.sync?.cookie_ok === false;

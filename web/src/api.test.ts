@@ -375,6 +375,7 @@ describe('adminStatus', () => {
         games_written: 42,
         message: 'sync completed',
       },
+      sync_run: null,
       game_counts: { available: 10, pending: 2, gifted: 1 },
     };
 
@@ -599,46 +600,51 @@ describe('adminRevoke', () => {
 });
 
 describe('adminSync', () => {
-  it('returns {games_written, orders_failed} extraction on success', async () => {
-    const mockData = { games_written: 42, orders_failed: 3 };
+  it('resolves (void) on a 202 fire-and-forget accept', async () => {
     const mockResponse = {
       ok: true,
-      status: 200,
-      json: vi.fn().mockResolvedValue(mockData),
+      status: 202,
+      json: vi.fn().mockResolvedValue({ status: 'started' }),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    const result = await adminSync();
-
-    expect(result).toEqual({ games_written: 42, orders_failed: 3 });
+    await expect(adminSync()).resolves.toBeUndefined();
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/sync', {
       method: 'POST',
     });
+    // fire-and-forget: no body is read, no counts are extracted
+    expect(mockResponse.json).not.toHaveBeenCalled();
   });
 
-  it('throws Error with message on 500 with empty body', async () => {
+  it('resolves on a 202 whose body is malformed — fire-and-forget must never parse the body', async () => {
+    // THE contract this PR locks in: the 202 is a pure ack. If adminSync ever starts reading
+    // the body, this malformed-JSON response makes that regression fail loudly.
+    const mockResponse = {
+      ok: true,
+      status: 202,
+      json: vi.fn().mockRejectedValue(new SyntaxError('Unexpected token < in JSON')),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).resolves.toBeUndefined();
+    expect(mockResponse.json).not.toHaveBeenCalled();
+  });
+
+  // Full message strings on purpose: this copy is user-facing (Ops renders err.message
+  // verbatim), so a copy regression here is a UI regression, not a cosmetic one.
+  it('throws the exact start-failure message on a 500', async () => {
     const mockResponse = {
       status: 500,
       ok: false,
-      json: vi.fn().mockRejectedValue(new Error('invalid json')),
+      json: vi.fn(),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
+    await expect(adminSync()).rejects.toThrow('couldn’t start sync — try again');
+    expect(mockResponse.json).not.toHaveBeenCalled();
   });
 
-  it('throws the same message on 200 with a malformed body (json catch branch)', async () => {
-    const mockResponse = {
-      ok: true,
-      status: 200,
-      json: vi.fn().mockRejectedValue(new SyntaxError('unexpected token')),
-    };
-    mockFetch.mockResolvedValueOnce(mockResponse);
-
-    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
-  });
-
-  it('throws Error with message on non-ok status before attempting json', async () => {
+  it('throws the exact start-failure message on a 502 (bad gateway is not special)', async () => {
     const mockResponse = {
       status: 502,
       ok: false,
@@ -646,8 +652,19 @@ describe('adminSync', () => {
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    await expect(adminSync()).rejects.toThrow('sync failed — check status panel');
-    // Verify json() was not called since we guard before it
+    await expect(adminSync()).rejects.toThrow('couldn’t start sync — try again');
+    expect(mockResponse.json).not.toHaveBeenCalled();
+  });
+
+  it('throws the exact already-running message on a 409', async () => {
+    const mockResponse = {
+      status: 409,
+      ok: false,
+      json: vi.fn(),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminSync()).rejects.toThrow('a sync is already running — watch the status card');
     expect(mockResponse.json).not.toHaveBeenCalled();
   });
 
