@@ -193,7 +193,9 @@ Lambda then logs in on its own and persists the session to the `humble-cookie` p
 
 Break-glass (or if self-login is off): write a browser-captured `_simpleauth_sess` cookie value
 into the `humble-cookie` param directly (`aws ssm put-parameter --overwrite --type SecureString`).
-This session is what the fulfillment Lambda uses to fetch key inventory.
+`--overwrite` preserves the container's Advanced tier that terraform sets; only if you ever
+delete-and-recreate the param do you also need `--tier Advanced` (a self-login session can exceed
+the 4 KB Standard cap). This session is what the fulfillment Lambda uses to fetch key inventory.
 
 **2. Trigger a manual sync**
 
