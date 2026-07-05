@@ -178,15 +178,22 @@ export TF_VAR_discord_webhook_url='https://discord.com/api/webhooks/...'  # opti
 | `route53_profile` | `null` | AWS profile for the Route53 account if different from the main account |
 | `sync_schedule_expression` | `cron(0 9 * * ? *)` | EventBridge schedule for daily Humble sync (09:00 UTC = pre-dawn US-East) |
 | `discord_webhook_url` | `null` | Omit entirely to disable cookie-death pings |
+| `humble_username` | `null` | Enables self-login: creates the `humble-password` / `humble-totp-secret` param containers (values set out of band) so fulfillment logs in and maintains its own session |
 
 ---
 
 ## After first deploy
 
-**1. Paste the humble cookie**
+**1. Seed the humble session**
 
-Log into `/admin` with the password you hashed in bootstrap. Under Ops, paste the Humble Bundle
-session cookie. This is what the fulfillment Lambda uses to fetch key inventory.
+With `humble_username` set, put the real account password and TOTP seed into the
+`humble-password` / `humble-totp-secret` SSM params (they're created at `UNSET`; overwrite them
+via the AWS console/CLI — never through terraform, so they stay out of state). The fulfillment
+Lambda then logs in on its own and persists the session to the `humble-cookie` param.
+
+Break-glass (or if self-login is off): write a browser-captured `_simpleauth_sess` cookie value
+into the `humble-cookie` param directly (`aws ssm put-parameter --overwrite --type SecureString`).
+This session is what the fulfillment Lambda uses to fetch key inventory.
 
 **2. Trigger a manual sync**
 
@@ -215,8 +222,9 @@ multi-key Humble order with a real recipient:
   redeemed); admin panel shows the parked order for manual intervention.
 - [ ] **Gift URL renders and copies on a real phone** — open the gift link on an actual mobile
   device; the landing page renders; the copy-to-clipboard button works.
-- [ ] **Cookie-death Discord ping fires** — let the Humble cookie expire (or force it via the
-  admin panel) with `discord_webhook_url` set; confirm the ping arrives in the configured channel.
+- [ ] **Cookie-death Discord ping fires** — let the Humble session expire (or force it by
+  overwriting the `humble-cookie` param with garbage) with `discord_webhook_url` set; confirm the
+  self-heal/dead-session ping arrives in the configured channel.
 
 ---
 

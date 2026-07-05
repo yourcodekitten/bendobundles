@@ -61,12 +61,6 @@ export type AdminLink = {
   created_at: string;
 };
 
-export type CookieResult = {
-  ok: boolean;
-  restored_previous?: boolean;
-  inconclusive?: boolean;
-};
-
 export type StatusView = {
   sync:
     | {
@@ -273,17 +267,6 @@ export async function adminLinkClaims(token: string): Promise<AdminClaimView[]> 
   const response = await fetch(`/admin/api/links/${token}/claims`);
   await checkOk(response, 'claims');
   return (await response.json()) as AdminClaimView[];
-}
-
-export async function adminPasteCookie(cookie: string): Promise<CookieResult> {
-  const response = await fetch('/admin/api/cookie', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ cookie }),
-  });
-
-  await checkUnauthorized(response);
-  return await response.json();
 }
 
 // Sync-now is fire-and-forget: the server returns 202 the moment the backfill

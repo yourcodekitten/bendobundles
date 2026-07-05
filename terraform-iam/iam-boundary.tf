@@ -68,7 +68,7 @@ data "aws_iam_policy_document" "app_boundary" {
     ]
   }
 
-  # SSM — app-namespace parameters (cookie read, cookie paste, hash read).
+  # SSM — app-namespace parameters (cookie read, self-login cookie persist, hash read).
   statement {
     sid    = "SsmAppParams"
     effect = "Allow"

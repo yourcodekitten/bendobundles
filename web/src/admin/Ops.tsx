@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useOutletContext } from 'react-router-dom';
-import { adminPasteCookie, adminSync } from '../api';
+import { adminSync } from '../api';
 import { withAuth } from './withAuth';
 import type { AdminOutletContext } from './AdminApp';
 
@@ -23,46 +23,12 @@ export function Ops() {
   const navigate = useNavigate();
   // status is owned by AdminApp (single copy of the server state); refreshStatus
   // triggers its re-fetch so the banner AND this card update immediately after
-  // cookie paste or sync, without waiting for the next route navigation.
+  // sync, without waiting for the next route navigation.
   const { status, refreshStatus } = useOutletContext<AdminOutletContext>();
-
-  // Cookie panel
-  const [cookieValue, setCookieValue] = useState('');
-  const [cookieMsg, setCookieMsg] = useState<string | null>(null);
-  const [cookieLoading, setCookieLoading] = useState(false);
 
   // Sync panel
   const [syncing, setSyncing] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string | null>(null);
-
-  const handleCookieSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const val = cookieValue;
-    // Clear state before dispatching — value must not linger in component state
-    // during the async operation. Same clear-before-await pattern as Login.tsx.
-    setCookieValue('');
-    setCookieMsg(null);
-    setCookieLoading(true);
-    withAuth(() => adminPasteCookie(val), navigate)
-      .then((result) => {
-        if (result.ok) {
-          setCookieMsg('cookie validated ✓');
-        } else if (result.restored_previous) {
-          setCookieMsg('that cookie failed validation — kept your previous one');
-        } else if (result.inconclusive) {
-          setCookieMsg('humble unreachable — cookie state unknown, try again');
-        } else {
-          setCookieMsg('cookie failed validation');
-        }
-        refreshStatus();
-      })
-      .catch(() => {
-        // withAuth handles 401 → login redirect; other errors swallowed
-      })
-      .finally(() => {
-        setCookieLoading(false);
-      });
-  };
 
   // True while the server says a sync run is live. This is what disables the button for the
   // WHOLE backfill (the 202 lands ~1s after click; local `syncing` alone would re-enable it
@@ -110,36 +76,6 @@ export function Ops() {
 
   return (
     <div className="flex flex-col gap-8">
-      {/* ── Cookie panel ────────────────────────────────────────────────── */}
-      <section className="flex flex-col gap-3 rounded bg-zinc-900 p-4">
-        <h2 className="text-sm font-medium text-zinc-300">session cookie</h2>
-        <form onSubmit={handleCookieSubmit} className="flex flex-col gap-3">
-          <label className="text-xs text-zinc-400" htmlFor="cookie-input">
-            humble session cookie
-          </label>
-          <input
-            id="cookie-input"
-            type="password"
-            value={cookieValue}
-            onChange={(e) => setCookieValue(e.target.value)}
-            autoComplete="off"
-            className="rounded border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100"
-          />
-          <button
-            type="submit"
-            disabled={cookieLoading}
-            className="w-fit rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600 disabled:opacity-50"
-          >
-            {cookieLoading ? 'validating…' : 'submit'}
-          </button>
-          {cookieMsg !== null && (
-            <p role="status" className="text-sm text-zinc-300">
-              {cookieMsg}
-            </p>
-          )}
-        </form>
-      </section>
-
       {/* ── Sync panel ──────────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3 rounded bg-zinc-900 p-4">
         <h2 className="text-sm font-medium text-zinc-300">sync</h2>

@@ -102,8 +102,9 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     };
                 };
 
-                // Per-invoke SSM cookie fetch — freshness beats latency; an admin paste takes
-                // effect on the very next claim, no warm-container staleness.
+                // Per-invoke SSM cookie fetch — freshness beats latency; a self-login persist
+                // (or a manual SSM update) takes effect on the very next claim, no
+                // warm-container staleness.
                 let cookie_value = match ssm_client
                     .get_parameter()
                     .name(&cookie_param)
@@ -140,8 +141,8 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 
                 // Attach the humble credentials whenever configured AND both secrets resolve. Needed
                 // on EVERY op now: the client uses them for the secure-area step-up AND for
-                // self-login, so validate/sync can self-heal a dead session with no human cookie
-                // paste (the gift path deliberately does NOT self-heal yet — a dead session on a
+                // self-login, so validate/sync can self-heal a dead session with no human
+                // intervention (the gift path deliberately does NOT self-heal yet — a dead session on a
                 // redeem parks; wiring its own heal is a tracked follow-up). A fetch miss is
                 // non-fatal: the client still works, and a dead session or gated redeem just parks.
                 // Yield the client + its session_store together, so "creds resolved ⇒ can persist a

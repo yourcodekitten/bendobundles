@@ -5,7 +5,6 @@ import {
   adminLogin,
   adminCatalog,
   adminLinkClaims,
-  adminPasteCookie,
   adminStatus,
   adminSetHidden,
   adminCreateLink,
@@ -16,7 +15,6 @@ import {
   FetchFailed,
   Unauthorized,
   type ClaimResult,
-  type CookieResult,
   type StatusView,
   type AdminGame,
   type AdminLink,
@@ -330,38 +328,6 @@ describe('adminLinkClaims', () => {
     mockFetch.mockResolvedValueOnce(mockResponse);
 
     await expect(adminLinkClaims('token')).rejects.toThrow(/failed to load claims/);
-  });
-});
-
-describe('adminPasteCookie', () => {
-  it('returns ok result passthrough', async () => {
-    const mockResult: CookieResult = { ok: true };
-    const mockResponse = {
-      ok: true,
-      status: 200,
-      json: vi.fn().mockResolvedValue(mockResult),
-    };
-    mockFetch.mockResolvedValueOnce(mockResponse);
-
-    const result = await adminPasteCookie('cookie_value');
-
-    expect(result).toEqual(mockResult);
-    expect(result).not.toHaveProperty('restored_previous');
-    expect(mockFetch).toHaveBeenCalledWith('/admin/api/cookie', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cookie: 'cookie_value' }),
-    });
-  });
-
-  it('throws Unauthorized on 401', async () => {
-    const mockResponse = {
-      status: 401,
-      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
-    };
-    mockFetch.mockResolvedValueOnce(mockResponse);
-
-    await expect(adminPasteCookie('cookie')).rejects.toBeInstanceOf(Unauthorized);
   });
 });
 

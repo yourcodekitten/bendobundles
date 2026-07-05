@@ -174,7 +174,7 @@ fn processlogin_ok(bytes: &[u8]) -> bool {
 
 #[derive(Debug, thiserror::Error)]
 pub enum HumbleError {
-    #[error("session cookie rejected — needs a fresh paste")]
+    #[error("session cookie rejected — the humble session is dead")]
     Unauthorized,
     /// The redeem WRITE was rejected at the auth/CSRF layer (401/403/302 on the POST). This is
     /// NOT proof the session cookie is dead — the live 2026-07-04 capture showed the redeem POST
@@ -546,7 +546,7 @@ impl HumbleClient {
                 if self.step_up.is_none() {
                     // Gate positively identified, but step-up isn't configured. Do NOT reuse
                     // RedeemAuthRejected: its ping blames the CSRF dance ("humble rejected its own
-                    // token, re-pasting won't help"), which misdirects the operator when the real
+                    // token, a session refresh won't help"), which misdirects the operator when the real
                     // fix is enabling step-up (set humble_username). Same Park decision, honest
                     // reason. (This is also NOT the pre-PR behavior — a 200 `login_required` body
                     // used to be a silent Parse-error park with no ping at all.)

@@ -360,7 +360,7 @@ async fn redeem_auth_rejection_parks_and_pings_distinctly_without_flag() {
         "with no preflight cookie the ping must surface the minted-fallback signal"
     );
     assert!(
-        !body.contains("DEAD") && !body.contains("paste a fresh one"),
+        !body.contains("DEAD") && !body.contains("break-glass"),
         "ping must not carry the dead-cookie message"
     );
     assert!(
