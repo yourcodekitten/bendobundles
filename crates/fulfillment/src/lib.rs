@@ -39,7 +39,7 @@ pub enum FulfillRequest {
     /// MANUAL-INVOKE-ONLY diagnostic since the cookie-paste teardown. Its only in-app sender was
     /// admin-api's paste-validate (removed with the paste flow); EventBridge fires `Sync`, which
     /// already self-heals + reports `cookie_ok` on cadence. Reach this by a hand-run
-    /// `aws lambda invoke '{"result":"validate_cookie"}'` — kept as a break-glass probe, NOT a
+    /// `aws lambda invoke '{"op":"validate_cookie"}'` — kept as a break-glass probe, NOT a
     /// scheduled healthcheck. (A dedicated EventBridge validate schedule for a cheap mid-day heal
     /// is a tracked follow-up, deliberately out of this teardown.)
     ValidateCookie,
