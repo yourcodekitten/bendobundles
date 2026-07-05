@@ -379,11 +379,12 @@ async fn captured_token_rejection_reports_csrf_not_minted() {
 
 #[tokio::test]
 async fn rejection_with_html_challenge_body_still_types_cleanly() {
-    // The diagnostic logging reads response headers and DRAINS the 403 body to classify it
-    // (Cloudflare HTML challenge vs humble-app JSON). This proves that extra work never alters
-    // the contract: a 403 carrying a full HTML body + a cf-mitigated header still returns the
-    // same typed RedeemAuthRejected the empty-body path does. (The preview itself is unit-tested
-    // in lib.rs::signature_tests — here we only guard the error path around it.)
+    // The rejection arm reads allowlisted headers and DRAINS the 403 body to classify it
+    // (`login_required` step-up vs a real rejection) — the body content itself is never logged;
+    // the PR#14 body_preview diagnostic was retired once the Cloudflare diagnosis was confirmed.
+    // This proves the classification work never alters the contract: a 403 carrying a full HTML
+    // body + a cf-mitigated header still returns the same typed RedeemAuthRejected the
+    // empty-body path does.
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/"))

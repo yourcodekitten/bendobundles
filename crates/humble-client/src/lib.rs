@@ -300,32 +300,6 @@ fn location_str(headers: &wreq::header::HeaderMap) -> String {
     }
 }
 
-/// Collapse a response body into a single-line, length-bounded preview safe to log: control
-/// characters (newlines, tabs, the trailing-tab humble sometimes emits) become spaces, and the
-/// result is capped. Enough to tell a Cloudflare HTML challenge from a short humble-app JSON
-/// refusal without dumping a whole page into CloudWatch.
-fn body_signature(bytes: &[u8]) -> String {
-    const MAX: usize = 300;
-    let text = String::from_utf8_lossy(bytes);
-    // Control chars → spaces, then collapse every whitespace run to one space, so the preview is
-    // one clean line regardless of the source's formatting.
-    let despaced: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let collapsed = despaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        return "<empty>".to_string();
-    }
-    // Truncate and mark by CHARACTER count (never bytes — a mid-codepoint cut would panic).
-    let out: String = collapsed.chars().take(MAX).collect();
-    if collapsed.chars().count() > MAX {
-        format!("{out}…")
-    } else {
-        out
-    }
-}
-
 /// Decode a response body as JSON. On serde failure, detect HTML login interstitials
 /// (humble sometimes serves a 200 with HTML when the session cookie is stale) and surface
 /// them as Unauthorized rather than a confusing Parse error.
@@ -686,14 +660,21 @@ impl HumbleClient {
                 // death — a genuinely stale session surfaces as the 200-with-HTML interstitial
                 // (decode_body → Unauthorized) or as read failures, both owned by the read paths.
                 //
-                // DIAGNOSTIC: the first live redeem on the CSRF fix (2026-07-04) captured
-                // humble's OWN csrf_cookie and still 403'd — so double-submit *match* is not the
-                // gate. The remaining suspects fail differently in the RESPONSE, not the status:
-                // a Cloudflare bot-block returns an HTML challenge (content-type text/html, a
-                // `cf-mitigated` header, body starting `<`); a humble-app CSRF/session refusal
-                // returns short JSON or a `location` redirect to a login/verify path. These
-                // fields name which one WITHOUT leaking anything — a 403/302 body is humble's
-                // error/challenge page, never our cookie or a gift token.
+                // The PR#14 body_preview diagnostic used to live here. What it found, in order:
+                // the double-submit CSRF match was live-exonerated first (so DON'T re-suspect the
+                // pair if 403s recur), then the mystery 403s pinned to a Cloudflare bot-challenge
+                // (cf-mitigated: challenge, HTML body) on 2026-07-04. The wreq-based CF bypass
+                // fixed it, and the preview was retired per the review's expiry rule.
+                // No path in this crate logs RAW response-body bytes; the only body-derived TEXT
+                // logged anywhere is humble's own parsed refusal `errormsg` in the success=false
+                // arm above (reviewed as safe — `processlogin_ok` also derives a 1-bit `ok` from
+                // the body, which leaks nothing). The header fields below stay: allowlisted by
+                // NAME, non-sensitive by nature (content-type / query-stripped location /
+                // cf-mitigated / server). A CHALLENGE-type CF recurrence names itself via
+                // `cf-mitigated`; a BLOCK-type CF 403 carries no such header and is
+                // header-ambiguous with a humble-app HTML refusal — if that pair ever needs
+                // splitting again, restore the PR#14 preview from git history rather than
+                // guessing. `set-cookie` is never logged.
                 let content_type = header_str(resp.headers(), "content-type");
                 let location = location_str(resp.headers());
                 let cf_mitigated = header_str(resp.headers(), "cf-mitigated");
@@ -701,12 +682,16 @@ impl HumbleClient {
                 // Raw location (query intact, unlike the logged `location`) so we can spot humble's
                 // `?reason=secureArea` step-up redirect — a gated-but-live session, NOT a rejection.
                 let raw_location = header_str(resp.headers(), "location");
-                // Keep the read Result: a mid-read failure must stay DISTINGUISHABLE from an empty
-                // body. Collapsing both to `unwrap_or_default()` would let a dropped read of a
-                // `login_required` body be misclassified as a plain auth rejection (no step-up),
-                // and log an empty preview with no hint the read failed.
-                let body_read = resp.bytes().await;
-                let login_required_body = matches!(&body_read, Ok(b) if is_login_required(b));
+                // A mid-read failure still parks as a rejection (a dropped `login_required` body
+                // yields login_required_body=false → RedeemAuthRejected, same as before) — the
+                // match doesn't change that behavior, it keeps the failure VISIBLE: body_read_err
+                // records why the read failed (timeout vs reset vs decode) so the log distinguishes
+                // it from a genuinely empty body. The error text is wreq transport metadata, never
+                // response-body content.
+                let (login_required_body, body_read_err) = match resp.bytes().await {
+                    Ok(b) => (is_login_required(&b), None),
+                    Err(e) => (false, Some(e.to_string())),
+                };
                 // Secure-area gate on a healthy session shows up here two ways: a 302 to
                 // `/login?reason=secureArea` (header-only, survives a body-read failure), or a
                 // 401/403 carrying a `login_required` JSON body. Either is a step-up trigger, not a
@@ -719,10 +704,7 @@ impl HumbleClient {
                     );
                     return Ok(RedeemStep::StepUpNeeded { status });
                 }
-                let body_preview = match &body_read {
-                    Ok(b) => body_signature(b),
-                    Err(e) => format!("<body read failed: {e}>"),
-                };
+                let body_read_err = body_read_err.as_deref().unwrap_or("-");
                 tracing::warn!(
                     status,
                     csrf_minted,
@@ -730,7 +712,7 @@ impl HumbleClient {
                     location,
                     cf_mitigated,
                     server,
-                    body_preview,
+                    body_read_err,
                     "humble rejected the redeem write despite the CSRF pair — inspect the dance, do not blame the cookie"
                 );
                 Err(HumbleError::RedeemAuthRejected {
@@ -872,8 +854,8 @@ impl HumbleClient {
 }
 
 #[cfg(test)]
-mod signature_tests {
-    use super::{body_signature, location_str};
+mod location_tests {
+    use super::location_str;
     use wreq::header::HeaderMap;
 
     fn headers_with_location(value: &str) -> HeaderMap {
@@ -903,49 +885,6 @@ mod signature_tests {
     #[test]
     fn location_absent_is_dash() {
         assert_eq!(location_str(&HeaderMap::new()), "-");
-    }
-
-    #[test]
-    fn collapses_multiline_html_to_one_bounded_line() {
-        let html =
-            b"<!DOCTYPE html>\n<html>\n\t<body>Attention Required! Cloudflare</body>\n</html>";
-        let sig = body_signature(html);
-        assert!(
-            !sig.contains('\n') && !sig.contains('\t'),
-            "must be single-line: {sig:?}"
-        );
-        assert!(
-            sig.starts_with("<!DOCTYPE html>"),
-            "preview keeps the leading marker: {sig:?}"
-        );
-        assert!(sig.contains("Cloudflare"));
-    }
-
-    #[test]
-    fn truncates_and_marks_long_bodies() {
-        let long = vec![b'x'; 1000];
-        let sig = body_signature(&long);
-        assert!(
-            sig.chars().count() <= 301,
-            "capped near MAX (+ ellipsis): {}",
-            sig.chars().count()
-        );
-        assert!(
-            sig.ends_with('…'),
-            "over-length bodies get an ellipsis: {sig:?}"
-        );
-    }
-
-    #[test]
-    fn empty_body_is_labeled() {
-        assert_eq!(body_signature(b""), "<empty>");
-        assert_eq!(body_signature(b"   \n\t  "), "<empty>");
-    }
-
-    #[test]
-    fn short_json_passes_through_readable() {
-        let sig = body_signature(br#"{"error":"csrf token invalid"}"#);
-        assert_eq!(sig, r#"{"error":"csrf token invalid"}"#);
     }
 }
 
