@@ -280,6 +280,26 @@ data "aws_iam_policy_document" "deploy" {
       "arn:aws:logs:${local.region}:${local.account}:log-group:API-Gateway-Execution-Logs_*",
     ]
   }
+  # The API Gateway ACCESS-log group is named by the apigateway module as
+  # /aws/apigateway/<label>-access-logs — a path NONE of the three patterns
+  # above match, so refreshing it 403'd on logs:ListTagsForResource in real
+  # deploys and forced -refresh=false (which masked a partial-apply drift
+  # once). READ-ONLY on purpose: this PR is the read-gap pass. The same
+  # pattern-miss also blocks WRITES to that group (retention changes / delete
+  # through terraform will still 403) — that is a separate follow-up decision,
+  # not something to smuggle into a read fix. Legacy ListTagsLogGroup rides
+  # along to mirror the new/old tag-API pairing the statement above uses.
+  statement {
+    sid    = "LogsReadApigwAccessLogs"
+    effect = "Allow"
+    actions = [
+      "logs:ListTagsForResource",
+      "logs:ListTagsLogGroup",
+    ]
+    resources = [
+      "arn:aws:logs:${local.region}:${local.account}:log-group:/aws/apigateway/${local.app_prefix}*",
+    ]
+  }
 
   # ── Route53 — validation + alias records in the site's zone ─────────────────
   statement {
@@ -343,6 +363,16 @@ data "aws_iam_policy_document" "deploy" {
       "cloudfront:GetFunction",
       "cloudfront:PublishFunction",
       "cloudfront:AssociateAlias",
+      # The site module's data.aws_cloudfront_cache_policy lookup (by name,
+      # "Managed-CachingOptimized") runs at EVERY plan: the provider pages
+      # ListCachePolicies to resolve the id, then GetCachePolicy to read it.
+      # Without both, the refresh 403s and plans only survive under
+      # -refresh=false — the flag that masked a real partial-apply drift once.
+      # ListCachePolicies is a list-type action evaluated against * (like
+      # ssm:DescribeParameters above); this statement is already resources=["*"].
+      # Both are pure reads of AWS-managed policy definitions, no secret values.
+      "cloudfront:ListCachePolicies",
+      "cloudfront:GetCachePolicy",
     ]
     resources = ["*"]
   }
