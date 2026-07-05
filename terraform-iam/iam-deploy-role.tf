@@ -255,7 +255,8 @@ data "aws_iam_policy_document" "deploy" {
   }
 
   # ── CloudWatch Logs — describe on * (unscopeable), mutation on the stack's
-  # groups: app-prefixed (lambda) + API-Gateway-Execution-Logs_* (named by AWS).
+  # groups: app-prefixed (lambda) + API-Gateway-Execution-Logs_* (named by AWS),
+  # + read-only tag reads on the /aws/apigateway access-log group (below).
   statement {
     sid       = "LogsDescribe"
     effect    = "Allow"
@@ -284,7 +285,7 @@ data "aws_iam_policy_document" "deploy" {
   # /aws/apigateway/<label>-access-logs — a path NONE of the three patterns
   # above match, so refreshing it 403'd on logs:ListTagsForResource in real
   # deploys and forced -refresh=false (which masked a partial-apply drift
-  # once). READ-ONLY on purpose: this PR is the read-gap pass. The same
+  # once). READ-ONLY on purpose — this statement closes a read gap only. The same
   # pattern-miss also blocks WRITES to that group (retention changes / delete
   # through terraform will still 403) — that is a separate follow-up decision,
   # not something to smuggle into a read fix. Legacy ListTagsLogGroup rides
@@ -374,18 +375,19 @@ data "aws_iam_policy_document" "deploy" {
   # "Managed-CachingOptimized") runs at EVERY plan: the provider pages
   # ListCachePolicies to resolve the id, then GetCachePolicy to read it.
   # Without both, the refresh 403s and plans only survive under
-  # -refresh=false — the flag that masked a real partial-apply drift once.
-  # ListCachePolicies is a list-type action evaluated only against * (like
-  # ssm:DescribeParameters above), so it lives in its own statement per this
-  # file's pattern for unscopeable list actions (LambdaList / LogsDescribe /
-  # SsmDescribeUnscopeable) — folding it into a statement that later gets
-  # resource-scoped would silently turn it into a no-grant. Both are pure
-  # reads of AWS-managed policy definitions, no secret values. REMOVABLE the
-  # day the upstream cloudfront-and-s3-origin module pins the managed policy
-  # ID (it already does exactly that for the response-headers policy) and
-  # this repo upgrades past the name-lookup.
+  # -refresh=false (see LogsReadApigwAccessLogs for why that flag is banned).
+  # ListCachePolicies is a list-type action evaluated only against *, so it
+  # lives in its own statement per this file's pattern for unscopeable
+  # list-type actions — folding it into a statement that later gets
+  # resource-scoped would silently turn it into a no-grant. GetCachePolicy IS
+  # scopeable but stays on * because scoping it means hard-coding an
+  # AWS-managed policy UUID here. Both are pure reads of AWS-managed policy
+  # definitions, no secret values. REMOVABLE the day the upstream
+  # cloudfront-and-s3-origin module pins the managed policy ID (it already
+  # does exactly that for the response-headers policy) and this repo
+  # upgrades past the name-lookup.
   statement {
-    sid    = "CloudFrontListUnscopeable"
+    sid    = "CloudFrontCachePolicyRead"
     effect = "Allow"
     actions = [
       "cloudfront:GetCachePolicy",
