@@ -311,20 +311,12 @@ async fn handle_gift(
     // A heal ran mid-gift: record the DURABLE cookie truth now, the same bookkeeping the sync
     // walk does (`Persisted` ⇒ SSM holds a live cookie ⇒ cookie_ok=true; `Unpersisted` ⇒ the
     // durable cookie is still the dead one ⇒ false — the persist-failure ping already fired).
-    // The ParkCookieDead arm below owns its own always-false write, so skip it here rather
-    // than double-write on that path.
+    // The ParkCookieDead arm below owns its own cookie_ok write, so skip it here rather than
+    // double-write on that path.
     if let Some(h) = heal
         && decision != Decision::ParkCookieDead
     {
-        let mut st = deps
-            .store
-            .get_sync_state()
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        st.cookie_ok = h.durable();
-        let _ = deps.store.put_sync_state(&st).await;
+        set_cookie_ok(deps, h.durable()).await;
     }
     match decision {
         Decision::Record => match outcome {
@@ -380,15 +372,7 @@ async fn handle_gift(
         },
         // dead cookie: park + flag cookie state + ping. Friend sees "processing".
         Decision::ParkCookieDead => {
-            let mut st = deps
-                .store
-                .get_sync_state()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            st.cookie_ok = false;
-            let _ = deps.store.put_sync_state(&st).await;
+            set_cookie_ok(deps, false).await;
             // With self-login configured, reaching this arm means the IN-LINE heal already ran
             // and could not produce a working session — either the login itself failed (its
             // failure-reason ping fired from `refresh_session`) or, pathologically, a successful
@@ -819,6 +803,30 @@ const SESSION_HEALED_MSG: &str = "humble session had died and self-login refresh
 const SESSION_PERSIST_FAILED_MSG: &str = "humble self-login worked but writing the refreshed cookie to SSM FAILED — the session is fine \
      this run, but every invoke will re-login until the write succeeds (check the fulfillment \
      ssm:PutParameter grant / SSM health).";
+
+/// Flip ONLY `cookie_ok` on the persisted `SyncState`, leaving the rest of the run summary
+/// (last_run_epoch / ok / games_written / message) intact. Used by the gift path (post-heal) and
+/// the ParkCookieDead arm, which learn cookie health OUTSIDE a sync run and must not fabricate the
+/// rest of the summary.
+///
+/// A transient `get_sync_state` error SKIPS the write rather than defaulting: collapsing an error
+/// to `SyncState::default()` and writing it back would clobber the real last-run metadata (the
+/// admin dashboard's last-run/games-written/message) to zeroes over a momentary DynamoDB blip. A
+/// genuinely-absent state (`Ok(None)`) still seeds from default — that's the correct first-write.
+async fn set_cookie_ok(deps: &Deps, cookie_ok: bool) {
+    match deps.store.get_sync_state().await {
+        Ok(existing) => {
+            let mut st = existing.unwrap_or_default();
+            st.cookie_ok = cookie_ok;
+            let _ = deps.store.put_sync_state(&st).await;
+        }
+        Err(e) => {
+            // Don't clobber real metadata on a read blip; the health signal isn't worth losing the
+            // run summary. cookie_ok self-corrects on the next sync/validate.
+            tracing::warn!(error = ?e, cookie_ok, "set_cookie_ok: get_sync_state failed — skipping the flag write to avoid clobbering the run summary");
+        }
+    }
+}
 
 /// Persist a sync-run summary, preserving nothing from prior runs (a run fully describes itself).
 async fn persist_sync(deps: &Deps, ok: bool, cookie_ok: bool, games_written: u32, message: &str) {
