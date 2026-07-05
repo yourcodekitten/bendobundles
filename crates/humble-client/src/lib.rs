@@ -660,15 +660,16 @@ impl HumbleClient {
                 // death — a genuinely stale session surfaces as the 200-with-HTML interstitial
                 // (decode_body → Unauthorized) or as read failures, both owned by the read paths.
                 //
-                // The PR#14 body_preview diagnostic used to live here; it pinned the mystery
-                // 403s on Cloudflare's bot-block (cf-mitigated: challenge, HTML body) on
-                // 2026-07-04 — after first live-exonerating the double-submit CSRF match, so
-                // don't re-suspect the pair if 403s recur — the wreq-based CF bypass fixed it,
-                // and the preview was retired per the review's expiry rule. No path in this
-                // crate logs RAW response-body bytes (the one body-derived field anywhere is
-                // humble's own parsed refusal `errormsg` in the success=false arm above,
-                // reviewed as safe). The header fields below stay: allowlisted by NAME,
-                // non-sensitive by nature (content-type / query-stripped location /
+                // The PR#14 body_preview diagnostic used to live here. What it found, in order:
+                // the double-submit CSRF match was live-exonerated first (so DON'T re-suspect the
+                // pair if 403s recur), then the mystery 403s pinned to a Cloudflare bot-challenge
+                // (cf-mitigated: challenge, HTML body) on 2026-07-04. The wreq-based CF bypass
+                // fixed it, and the preview was retired per the review's expiry rule.
+                // No path in this crate logs RAW response-body bytes; the only body-derived TEXT
+                // logged anywhere is humble's own parsed refusal `errormsg` in the success=false
+                // arm above (reviewed as safe — `processlogin_ok` also derives a 1-bit `ok` from
+                // the body, which leaks nothing). The header fields below stay: allowlisted by
+                // NAME, non-sensitive by nature (content-type / query-stripped location /
                 // cf-mitigated / server). A CHALLENGE-type CF recurrence names itself via
                 // `cf-mitigated`; a BLOCK-type CF 403 carries no such header and is
                 // header-ambiguous with a humble-app HTML refusal — if that pair ever needs
@@ -681,11 +682,12 @@ impl HumbleClient {
                 // Raw location (query intact, unlike the logged `location`) so we can spot humble's
                 // `?reason=secureArea` step-up redirect — a gated-but-live session, NOT a rejection.
                 let raw_location = header_str(resp.headers(), "location");
-                // A mid-read failure must stay DISTINGUISHABLE from an empty body: a dropped
-                // read of a `login_required` body misclassifies as a plain auth rejection (no
-                // step-up). The match keeps that structural, and the captured error text makes
-                // the failure diagnosable (timeout vs reset vs decode) — it is wreq transport
-                // metadata, never response-body content.
+                // A mid-read failure still parks as a rejection (a dropped `login_required` body
+                // yields login_required_body=false → RedeemAuthRejected, same as before) — the
+                // match doesn't change that behavior, it keeps the failure VISIBLE: body_read_err
+                // records why the read failed (timeout vs reset vs decode) so the log distinguishes
+                // it from a genuinely empty body. The error text is wreq transport metadata, never
+                // response-body content.
                 let (login_required_body, body_read_err) = match resp.bytes().await {
                     Ok(b) => (is_login_required(&b), None),
                     Err(e) => (false, Some(e.to_string())),
