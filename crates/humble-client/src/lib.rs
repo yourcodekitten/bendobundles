@@ -202,6 +202,13 @@ pub enum HumbleError {
     /// failure is visible. `reason` NEVER contains the password, the TOTP seed, or a session value.
     #[error("humble self-login failed: {reason}")]
     LoginFailed { reason: String },
+    /// A Humble Choice `choosecontent` write (the pick-spend that precedes the redeem) did not
+    /// succeed — humble returned `success=false` (already chosen, no picks left, not offered) or a
+    /// non-200. A choose only SPENDS a pick on `success=true`, so this variant always means the
+    /// pick was NOT spent; the caller parks and does not proceed to the redeem. `reason` is
+    /// humble's own refusal text or a status, never a secret value.
+    #[error("humble choosecontent failed: {reason}")]
+    ChooseFailed { reason: String },
     #[error("humble rate-limited us")]
     RateLimited,
     #[error("key already redeemed on humble")]
@@ -263,6 +270,16 @@ struct RedeemResponse {
     giftkey: Option<String>,
     #[serde(default)]
     errormsg: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChooseResponse {
+    // Same as RedeemResponse: a 200 body missing `success` is a parse error, not a silent failure.
+    success: bool,
+    #[serde(default)]
+    errormsg: Option<String>,
+    // humble also returns `force_refresh: true`; we don't act on it (the caller re-reads the order
+    // to see the newly-claimed key), so it's intentionally not deserialized.
 }
 
 /// The positive outcome of a single redeem attempt. Failures come back as `Err(HumbleError)`;
@@ -551,6 +568,105 @@ impl HumbleClient {
                     }
                 }
             }
+        }
+    }
+
+    /// Spend a monthly Humble Choice pick: claim `chosen` game(s) from the Choice month identified
+    /// by `gamekey`. This is the FIRST of the two Choice writes — it moves a game from "offered" to
+    /// "claimed" and SPENDS a pick (real, one-shot value). It never touches a key; the redeemable
+    /// key is minted by the subsequent `/humbler/redeemkey` (which [`redeem_as_gift`] already
+    /// implements) with `keytype = <machine_name>_choice_steam` and `key = gamekey`.
+    ///
+    /// `is_gift = true` claims into a giftable form (redeem then with `gift=true` for a gift URL);
+    /// `false` self-claims into the library. Returns `Ok(())` only on `success=true`.
+    ///
+    /// SAFETY (pick-spend-once, mirrors burns-once): a pick is only spent when humble answers
+    /// `success=true`. Every failure path here — `Unauthorized` (the 200-with-HTML login
+    /// interstitial: session dead, request never reached the choose handler), `ChooseFailed`
+    /// (`success=false` or a non-200), `RateLimited`, `Network` — provably did NOT spend a pick, so
+    /// the caller may park and retry cleanly. The caller MUST still guard against re-choosing a game
+    /// already claimed (check the order's `all_tpks` / `contentChoicesMade` first), because a
+    /// *successful* re-choose would spend a second pick.
+    ///
+    /// `POST /humbler/choosecontent` — form: `gamekey`, `parent_identifier=initial`,
+    /// `chosen_identifiers[]` (repeated per game), `is_gift`. Response `{success, force_refresh}`.
+    pub async fn choose_content(
+        &self,
+        gamekey: &str,
+        chosen: &[&str],
+        is_gift: bool,
+    ) -> Result<(), HumbleError> {
+        // Same csrf dance as the redeem write (double-submit pair, prefer humble's token, mint as a
+        // tracked fallback so a systematic capture failure surfaces instead of a silent 403).
+        let (csrf, csrf_minted) = match self.csrf_token().await {
+            Some(t) => (t, false),
+            None => {
+                tracing::warn!(
+                    "csrf capture failed — minting a double-submit fallback for choosecontent"
+                );
+                (uuid::Uuid::new_v4().simple().to_string(), true)
+            }
+        };
+        // `chosen_identifiers[]` is an array field — repeat the key once per game.
+        let mut form: Vec<(&str, String)> = vec![
+            ("gamekey", gamekey.to_string()),
+            ("parent_identifier", "initial".to_string()),
+        ];
+        form.extend(
+            chosen
+                .iter()
+                .map(|m| ("chosen_identifiers[]", (*m).to_string())),
+        );
+        if is_gift {
+            form.push(("is_gift", "true".to_string()));
+        }
+        let resp = self
+            .csrf_write(
+                format!("{}/humbler/choosecontent", self.base),
+                &csrf,
+                "/membership",
+            )
+            .form(&form)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        tracing::info!(
+            status,
+            gamekey,
+            is_gift,
+            n_chosen = chosen.len(),
+            csrf_minted,
+            "humble choosecontent POST response"
+        );
+        match status {
+            200 => {
+                let bytes = resp.bytes().await?;
+                // A dead session returns the 200-with-HTML login interstitial (same as reads/redeem)
+                // — the choose handler never ran, so no pick was spent. Surface as Unauthorized.
+                if is_login_required(&bytes) {
+                    return Err(HumbleError::Unauthorized);
+                }
+                let body: ChooseResponse = decode_body(&bytes)?;
+                if body.success {
+                    Ok(())
+                } else {
+                    let reason = body
+                        .errormsg
+                        .unwrap_or_else(|| "choosecontent returned success=false".to_string());
+                    tracing::warn!(reason, "humble choosecontent refused (success=false)");
+                    Err(HumbleError::ChooseFailed { reason })
+                }
+            }
+            // No pick is spent on a rejected choose — park and let the caller retry.
+            401 | 403 | 302 => Err(HumbleError::ChooseFailed {
+                reason: format!(
+                    "choosecontent rejected at the auth/redirect layer (status {status})"
+                ),
+            }),
+            429 => Err(HumbleError::RateLimited),
+            s => Err(HumbleError::ChooseFailed {
+                reason: format!("choosecontent unexpected status {s}"),
+            }),
         }
     }
 

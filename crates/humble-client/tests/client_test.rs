@@ -214,6 +214,135 @@ async fn html_200_is_unauthorized() {
     assert!(matches!(err, humble_client::HumbleError::Unauthorized));
 }
 
+// ── Humble Choice: choose_content (the pick-spend that precedes the redeem) ──────────────────────
+
+#[tokio::test]
+async fn choose_content_gift_sends_the_right_form() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .and(body_string_contains("gamekey=UZz2zYTdsC5HfCYp"))
+        .and(body_string_contains("parent_identifier=initial"))
+        // `chosen_identifiers[]` url-encodes to `chosen_identifiers%5B%5D`.
+        .and(body_string_contains(
+            "chosen_identifiers%5B%5D=octopathtravelerii",
+        ))
+        .and(body_string_contains("is_gift=true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "force_refresh": true
+        })))
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .await
+        .choose_content("UZz2zYTdsC5HfCYp", &["octopathtravelerii"], true)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn choose_content_self_claim_omits_is_gift() {
+    let server = MockServer::start().await;
+    // The self-claim form must NOT carry is_gift — a mount that requires its absence proves it.
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .and(body_string_contains(
+            "chosen_identifiers%5B%5D=cookservedelicious3",
+        ))
+        .and(NoIsGift)
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "force_refresh": true
+        })))
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .await
+        .choose_content("f3rpTVdNuy7EBtvm", &["cookservedelicious3"], false)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn choose_content_multiple_games_repeat_the_field() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .and(body_string_contains("chosen_identifiers%5B%5D=relicta"))
+        .and(body_string_contains("chosen_identifiers%5B%5D=levelhead"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "force_refresh": true
+        })))
+        .mount(&server)
+        .await;
+
+    client(&server)
+        .await
+        .choose_content("gk123", &["relicta", "levelhead"], true)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn choose_content_refused_is_typed_and_spends_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "errormsg": "No choices remaining for this month."
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choose_content("gk123", &["somegame"], true)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        humble_client::HumbleError::ChooseFailed { ref reason }
+            if reason == "No choices remaining for this month."
+    ));
+}
+
+#[tokio::test]
+async fn choose_content_dead_session_is_unauthorized() {
+    let server = MockServer::start().await;
+    // A dead session answers the choose POST with the login-required gate — no pick is spent.
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "error_id": "login_required"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choose_content("gk123", &["somegame"], true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Unauthorized));
+}
+
+/// Matches only when the request body does NOT contain `is_gift` — for asserting the self-claim
+/// form omits it (wiremock has no built-in negative body matcher).
+struct NoIsGift;
+
+impl wiremock::Match for NoIsGift {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        !std::str::from_utf8(&request.body)
+            .map(|b| b.contains("is_gift"))
+            .unwrap_or(false)
+    }
+}
+
 /// Matches when the `csrf-prevention-token` header value equals the `csrf_cookie` value inside
 /// the `cookie` header (the double-submit invariant), regardless of what the value is.
 struct DoubleSubmitPairMatches;

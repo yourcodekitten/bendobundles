@@ -110,6 +110,10 @@ pub fn gift_decision(outcome: &Result<GiftUrl, HumbleError>) -> Decision {
             // login() is the session self-heal path, never a redeem outcome — but the match is
             // exhaustive, so classify it: a login failure means no session, so park (never burn).
             HumbleError::LoginFailed { .. } => Decision::Park,
+            // choose_content (the Choice pick-spend) is handled BEFORE the redeem in the Choice
+            // orchestration, so this never actually reaches a redeem decision — but the match is
+            // exhaustive. A ChooseFailed provably spent no pick, so park (never compensate).
+            HumbleError::ChooseFailed { .. } => Decision::Park,
             // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
             // only reconcile against humble truth can tell. Park — never compensate blind.
             HumbleError::RedeemRefused(_) => Decision::Park,

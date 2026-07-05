@@ -12,8 +12,10 @@ opens a claim link, fulfillment turns one of Ben's available Choice games into a
 gift URL durably. Secondarily, surface Ben's **unclaimed** Choice games so there's inventory to gift
 (discovery found many unspent picks across 2019–2021 months).
 
-Non-goals (this pass): a self-claim-everything button, choice-month browsing UI beyond what gifting needs,
-and anything that auto-spends picks without an explicit trigger.
+Scope (Ben, 2026-07-05): **both gifting and self-claim** (self-claim avoids the email-lookup + clicks that
+gifting-to-self costs). Non-goals (this pass): bulk-claiming the older 2019–2021 stale-pick backlog (build
+the mechanism, circle back), and anything that auto-spends picks without an explicit trigger (a friend's
+claim or an explicit self-claim).
 
 ## 2. What discovery proved (the flow)
 
@@ -139,18 +141,22 @@ Design rules that fall out:
 4. **Live receipt**: one Ben-authorized real Choice gift, proving the between-writes recovery.
 5. UI/admin surfacing as needed.
 
-## 7. Open decisions (for Ben)
+## 7. Decisions (resolved by Ben 2026-07-05)
 
-1. **Scope:** gift-only (my recommendation — it's what bendobundles is for), or also self-claim / a
-   "claim my stale picks" tool? Gift-only keeps the pick-spend always tied to a real friend claim.
-2. **Auto-discovery vs opt-in:** should sync enumerate ALL Choice months every run (heavier — many months,
-   pagination), or only recent/active + an on-demand backfill? Leaning: recent + active on the cron,
-   backfill on demand.
-3. **`Game` model extension shape** for claimable-vs-claimed (§4.3) — smallest change that lets fulfillment
-   branch correctly.
-4. **Pick budget policy:** if a month has `choices_remaining=0` but offered games remain, they're
-   ungiftable (no picks) — surface as such, or hide? (Recommend: show, marked "no picks left".)
-5. **First-receipt game:** which real Choice game Ben wants to use for the live between-writes proof.
+1. **Scope: BOTH gift AND self-claim.** Self-claim is worth it — it avoids the email-lookup + several
+   button clicks that gifting-to-self needs. The older stale-pick backlog (retroactive claims in 2019–2021
+   months) is **deferred** — build the mechanism, circle back to bulk-claiming those later.
+2. **Auto-discover ALL months** ("Auto-Discover those mother fuckers"). Sync enumerates every Choice month,
+   not just recent/active. (Pagination handled in discovery.)
+3. **`Game` model extension: approved** as proposed (§4.3) — the claimable-vs-claimed descriptor.
+4. **Pick budget policy: confirm-then-hide-but-list.** Ben is verifying that `choices_remaining=0` truly
+   means no claims left (checking April 2023 / August 2023, both `cr=0`). Once confirmed: a `cr=0` month's
+   games are **not offered for gifting**, but **still listed in the admin view with a status**.
+5. **First-receipt games (Ben-authorized, real):** he wants the resulting gift URLs / keys returned after
+   testing —
+   - **January 2026** → Nice Day for Fishing
+   - **June 2026** → Construction Simulator
+   - **October 2025** → Hotel Renovator
 
 ## 8. Verification
 
