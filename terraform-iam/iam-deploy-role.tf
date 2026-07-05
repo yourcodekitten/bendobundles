@@ -255,7 +255,8 @@ data "aws_iam_policy_document" "deploy" {
   }
 
   # ── CloudWatch Logs — describe on * (unscopeable), mutation on the stack's
-  # groups: app-prefixed (lambda) + API-Gateway-Execution-Logs_* (named by AWS).
+  # groups: app-prefixed (lambda) + API-Gateway-Execution-Logs_* (named by AWS),
+  # + read-only tag reads on the /aws/apigateway access-log group (below).
   statement {
     sid       = "LogsDescribe"
     effect    = "Allow"
@@ -278,6 +279,30 @@ data "aws_iam_policy_document" "deploy" {
       "arn:aws:logs:${local.region}:${local.account}:log-group:/aws/lambda/${local.app_prefix}*",
       "arn:aws:logs:${local.region}:${local.account}:log-group:${local.app_prefix}*",
       "arn:aws:logs:${local.region}:${local.account}:log-group:API-Gateway-Execution-Logs_*",
+    ]
+  }
+  # The API Gateway ACCESS-log group is named by the apigateway module as
+  # /aws/apigateway/<label>-access-logs — a path NONE of the three patterns
+  # above match, so refreshing it 403'd on logs:ListTagsForResource in real
+  # deploys and forced -refresh=false (which masked a partial-apply drift
+  # once). READ-ONLY on purpose — this statement closes a read gap only. The same
+  # pattern-miss also blocks WRITES to that group (retention changes / delete
+  # through terraform will still 403) — that is a separate follow-up decision,
+  # not something to smuggle into a read fix. Legacy ListTagsLogGroup rides
+  # along to mirror the new/old tag-API pairing the statement above uses.
+  # COUPLING: this pattern is only right while terraform-iam's app_prefix and
+  # the app stack's label inputs (namespace/environment) resolve to the same
+  # string from their INDEPENDENT tfvars — nothing enforces it; if the stacks
+  # ever diverge, this grant silently stops matching and the 403 returns.
+  statement {
+    sid    = "LogsReadApigwAccessLogs"
+    effect = "Allow"
+    actions = [
+      "logs:ListTagsForResource",
+      "logs:ListTagsLogGroup",
+    ]
+    resources = [
+      "arn:aws:logs:${local.region}:${local.account}:log-group:/aws/apigateway/${local.app_prefix}*",
     ]
   }
 
@@ -343,6 +368,30 @@ data "aws_iam_policy_document" "deploy" {
       "cloudfront:GetFunction",
       "cloudfront:PublishFunction",
       "cloudfront:AssociateAlias",
+    ]
+    resources = ["*"]
+  }
+  # The site module's data.aws_cloudfront_cache_policy lookup (by name,
+  # "Managed-CachingOptimized") runs at EVERY plan: the provider pages
+  # ListCachePolicies to resolve the id, then GetCachePolicy to read it.
+  # Without both, the refresh 403s and plans only survive under
+  # -refresh=false (see LogsReadApigwAccessLogs for why that flag is banned).
+  # ListCachePolicies is a list-type action evaluated only against *, so it
+  # lives in its own statement per this file's pattern for unscopeable
+  # list-type actions — folding it into a statement that later gets
+  # resource-scoped would silently turn it into a no-grant. GetCachePolicy IS
+  # scopeable but stays on * because scoping it means hard-coding an
+  # AWS-managed policy UUID here. Both are pure reads of AWS-managed policy
+  # definitions, no secret values. REMOVABLE the day the upstream
+  # cloudfront-and-s3-origin module pins the managed policy ID (it already
+  # does exactly that for the response-headers policy) and this repo
+  # upgrades past the name-lookup.
+  statement {
+    sid    = "CloudFrontCachePolicyRead"
+    effect = "Allow"
+    actions = [
+      "cloudfront:GetCachePolicy",
+      "cloudfront:ListCachePolicies",
     ]
     resources = ["*"]
   }
