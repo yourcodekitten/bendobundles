@@ -101,6 +101,9 @@ pub fn gift_decision(outcome: &Result<GiftUrl, HumbleError>) -> Decision {
             // the key is not burned — park, never compensate. The Park executor pings a distinct,
             // correctly-labeled alert so a persistent step-up failure doesn't loop silently.
             HumbleError::SecureAreaStepUpFailed { .. } => Decision::Park,
+            // login() is the session self-heal path, never a redeem outcome — but the match is
+            // exhaustive, so classify it: a login failure means no session, so park (never burn).
+            HumbleError::LoginFailed { .. } => Decision::Park,
             // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
             // only reconcile against humble truth can tell. Park — never compensate blind.
             HumbleError::RedeemRefused(_) => Decision::Park,
@@ -119,6 +122,119 @@ pub struct Deps {
     pub humble: HumbleClient,
     pub webhook_url: Option<String>,
     pub http: reqwest::Client,
+    /// SSM client + the humble-cookie parameter name, so the app can self-heal its own session:
+    /// on a dead session it logs in (via `humble.login()`) and persists the fresh cookie here,
+    /// replacing the human cookie-paste flow. `None` when self-login credentials aren't configured
+    /// (then a dead session falls back to the old flag-and-ping behavior).
+    pub session_store: Option<SessionStore>,
+}
+
+/// Where a self-refreshed humble session is persisted, so the next cold start reads it back.
+pub struct SessionStore {
+    pub ssm: aws_sdk_ssm::Client,
+    pub cookie_param: String,
+}
+
+/// Outcome of a session self-heal attempt. Split so callers can tell "this invoke can keep
+/// working" (the in-memory session is live) apart from "the DURABLE cookie in SSM is healthy" —
+/// after a persist failure those disagree, and persisting `cookie_ok=true` on the former would
+/// report a healthy cookie while the next invoke reads the dead one back from SSM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heal {
+    /// Login succeeded AND the fresh cookie is persisted to SSM: fully healthy.
+    Persisted,
+    /// Login succeeded (this invoke's in-memory session works) but the SSM persist failed —
+    /// the durable cookie is still the dead one.
+    Unpersisted,
+    /// Self-login isn't configured, or the login itself failed.
+    Failed,
+}
+
+impl Heal {
+    /// This invoke holds a working session (durability aside) — safe to retry the failed read.
+    fn usable(self) -> bool {
+        !matches!(self, Heal::Failed)
+    }
+    /// The cookie in SSM is known-good — the most persisted `cookie_ok` is allowed to claim.
+    fn durable(self) -> bool {
+        matches!(self, Heal::Persisted)
+    }
+}
+
+/// Try to self-heal a dead humble session: log in fresh and persist the new cookie to SSM. Returns
+/// a [`Heal`] so callers can distinguish in-memory health from durable (SSM) health. A no-op
+/// returning `Heal::Failed` when self-login isn't configured (no credentials / no session store) —
+/// callers then keep the old dead-cookie behavior.
+///
+/// This path never touches a key: a login authenticates the SESSION, it does not redeem, so the
+/// burns-once invariant is untouched. Failures are logged and surface as `Failed` (park, never burn).
+async fn refresh_session(deps: &Deps) -> Heal {
+    let Some(store) = deps.session_store.as_ref() else {
+        return Heal::Failed;
+    };
+    let mut attempt = deps.humble.login().await;
+    if let Err(HumbleError::LoginFailed { reason }) = &attempt {
+        // A TOTP code may be single-use server-side (RFC 6238 recommends it): a concurrent
+        // invoke's heal, or a step-up that just fired, can already have spent this 30s window's
+        // code — making this failure a collision, not a credential problem. Retry ONCE in the
+        // next window so humble's reuse behavior is moot. Cadence is ~1 heal/day, so the ≤31s
+        // stall is cheap; a genuine credential failure just fails again and pings below.
+        tracing::warn!(%reason, "self-login failed — retrying once after the TOTP window rolls");
+        let elapsed = OffsetDateTime::now_utc().unix_timestamp().rem_euclid(30);
+        tokio::time::sleep(std::time::Duration::from_secs((31 - elapsed) as u64)).await;
+        attempt = deps.humble.login().await;
+    }
+    match attempt {
+        Ok(new_session) => {
+            // Persist so the next invoke's cold start reads a live session instead of re-logging in.
+            match store
+                .ssm
+                .put_parameter()
+                .name(&store.cookie_param)
+                .value(&new_session)
+                .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
+                // Pin the terraform-declared Advanced tier. An untiered overwrite would KEEP an
+                // existing Advanced tier (AWS can't downgrade a param on overwrite — that's why the
+                // tier-less admin-api paste writer is fine), but pinning also guarantees a >4 KB
+                // session lands even if the param were somehow still Standard (fresh env).
+                .tier(aws_sdk_ssm::types::ParameterTier::Advanced)
+                .overwrite(true)
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        "session self-heal: logged in and persisted a fresh humble cookie"
+                    );
+                    // Ping ONCE per heal so a silently-dying session is still visible. Before
+                    // self-login every dead cookie pinged; now a heal is otherwise invisible, and
+                    // the operator would lose the early-warning trend (rate-limit / TOTP drift /
+                    // an impending new-device challenge) until self-login finally hard-fails.
+                    ping(deps, SESSION_HEALED_MSG).await;
+                    Heal::Persisted
+                }
+                Err(e) => {
+                    // The in-memory client already holds the new session (login swapped it in), so
+                    // THIS invoke still works; only the persistence failed. But without the write,
+                    // every invoke re-reads the dead cookie and re-logs-in (main rebuilds the
+                    // client from SSM per invoke) — a silent "login every invoke" that feeds
+                    // humble's bot-detection. Ping so it's not buried in CloudWatch.
+                    tracing::warn!(error = %e, "session self-heal: logged in but persisting to SSM failed");
+                    ping(deps, SESSION_PERSIST_FAILED_MSG).await;
+                    Heal::Unpersisted
+                }
+            }
+        }
+        Err(e) => {
+            // Surface the failure CLASS in the alert (TOTP drift vs captcha vs new-device each
+            // have a different remediation) — otherwise callers ping only the generic
+            // COOKIE_DEAD_MSG and the root cause lives buried in CloudWatch while the operator
+            // re-pastes forever. LoginFailed reasons carry statuses/labels, never secret values.
+            tracing::warn!(error = ?e, "session self-heal: login failed");
+            ping(deps, &format!("humble self-login FAILED ({e}) — session still dead; a cookie paste in admin is the break-glass")).await;
+            Heal::Failed
+        }
+    }
 }
 
 /// Dispatch a fulfillment request. Never panics; every arm returns a typed response.
@@ -239,7 +355,17 @@ async fn handle_gift(
                 .unwrap_or_default();
             st.cookie_ok = false;
             let _ = deps.store.put_sync_state(&st).await;
-            ping(deps, COOKIE_DEAD_MSG).await;
+            // With self-login configured, "paste a fresh one" is the wrong instruction — the next
+            // scheduled validate/sync heals on its own (then pings SESSION_HEALED_MSG and flips
+            // cookie_ok back), so instructing a paste here would whipsaw the operator. The gift
+            // path healing IN-LINE (instead of parking until that next run) is the tracked
+            // follow-up; this only makes the ping truthful meanwhile.
+            let msg = if deps.session_store.is_some() {
+                COOKIE_DEAD_SELFHEAL_MSG
+            } else {
+                COOKIE_DEAD_MSG
+            };
+            ping(deps, msg).await;
             FulfillResponse::Parked {
                 reason: "humble session needs attention".into(),
             }
@@ -325,26 +451,77 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
     FulfillResponse::SyncDone
 }
 
+/// Run a humble read through the ONE heal-then-retry-once ladder: on `Unauthorized`, self-heal
+/// (when `allow_heal`) and retry the read exactly once. The heal outcome rides ALONGSIDE the
+/// result instead of being folded into it, so durability survives the error path too — a heal
+/// whose retry then hits a transient error (a 429 right after the login's extra requests) must
+/// not let a caller go on asserting a healthy durable cookie. `None` means no heal was attempted
+/// (the read didn't hit `Unauthorized`, or the cap disallowed one).
+///
+/// Every self-healing read shares this ladder — the listing, the reconcile pass, the order walk,
+/// and (future follow-up) the gift path — so their durability bookkeeping can't diverge again.
+/// [`handle_validate_cookie`] deliberately stays OUT: its no-retry, report-from-the-heal shape
+/// is documented there.
+async fn selfheal_read<T, F, Fut>(
+    deps: &Deps,
+    allow_heal: bool,
+    op: F,
+) -> (Option<Heal>, Result<T, HumbleError>)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, HumbleError>>,
+{
+    match op().await {
+        Err(HumbleError::Unauthorized) if allow_heal => {
+            let heal = refresh_session(deps).await;
+            let result = if heal.usable() {
+                op().await
+            } else {
+                Err(HumbleError::Unauthorized)
+            };
+            (Some(heal), result)
+        }
+        other => (None, other),
+    }
+}
+
 /// The sync walk. Runs [`reconcile`] first (parked-claim recovery against humble truth), then
 /// walks every order and upserts each key's `Game` via the guarded sync-upsert. Every exit path
 /// persists a `SyncState` — the caller holds the run marker, so this must always report.
 async fn run_sync(deps: &Deps) {
-    tracing::info!("sync started (reconcile, then order walk)");
-    // Reconcile parked claims BEFORE the walk — humble is the source of truth for both.
-    reconcile(deps).await;
-
-    let gamekeys = match deps.humble.gamekeys().await {
+    tracing::info!("sync started (ensure session, reconcile, then order walk)");
+    // Acquire the library FIRST — this is the self-heal point (a dead session logs in + persists).
+    // It MUST come before reconcile: reconcile reads humble per-order, so on a session that died
+    // since the last run, running it first would Unauthorized-skip every claim and recover nothing.
+    // Healing here means reconcile runs against a live session in the SAME sync.
+    let (listing_heal, listing) = selfheal_read(deps, true, || deps.humble.gamekeys()).await;
+    // ONE heal per sync run, total (listing + reconcile + walk). Uncapped, a single order URL
+    // that persistently 403s with a live session — or an alternating die/heal pathology — would
+    // turn one walk into up to N password+TOTP logins from the Lambda IP, exactly the
+    // bot-detection profile self-login must avoid. A second `Unauthorized` after the run's heal
+    // falls through to flag + ping + stop, as before self-login existed.
+    let mut healed_this_run = listing_heal.is_some();
+    // Persisted `cookie_ok` claims the DURABLE (SSM) cookie is valid. The LATEST heal's
+    // durability is always the current SSM truth (`Persisted` is only returned after a
+    // successful overwrite), so it replaces — never merely degrades — the running value.
+    let mut cookie_ok = listing_heal.is_none_or(Heal::durable);
+    let gamekeys = match listing {
         Ok(k) => k,
+        // Dead AND self-login couldn't fix it (or isn't configured) → genuine attention needed.
         Err(HumbleError::Unauthorized) => {
             ping(deps, COOKIE_DEAD_MSG).await;
             persist_sync(deps, false, false, 0, "humble session cookie is dead").await;
             return;
         }
         Err(e) => {
+            // Transient listing failure: reconcile doesn't need the listing, so parked-claim
+            // recovery still runs this pass (it ran unconditionally before this ordering) —
+            // a day's 429 on the listing shouldn't also cost a day of claim recovery.
+            reconcile(deps, &mut healed_this_run, &mut cookie_ok).await;
             persist_sync(
                 deps,
                 false,
-                true,
+                cookie_ok,
                 0,
                 &format!("sync failed listing orders: {e}"),
             )
@@ -353,15 +530,28 @@ async fn run_sync(deps: &Deps) {
         }
     };
 
+    // Reconcile parked claims against humble truth — now with a session known-good from the read above.
+    reconcile(deps, &mut healed_this_run, &mut cookie_ok).await;
+
     let mut games_written = 0u32;
     let mut orders_failed = 0u32;
-    let mut cookie_ok = true;
 
     'orders: for gamekey in gamekeys {
         tokio::time::sleep(SYNC_PACE).await;
-        let order = match deps.humble.order(&gamekey).await {
+        // Session died mid-walk → the shared ladder heals (if the run's one heal is unspent) and
+        // retries this order once. Without it, a mid-walk death would ping "paste a fresh one"
+        // even when self-login is configured and would have healed it on the very next run.
+        let (heal, read) =
+            selfheal_read(deps, !healed_this_run, || deps.humble.order(&gamekey)).await;
+        if let Some(h) = heal {
+            healed_this_run = true;
+            cookie_ok = h.durable();
+        }
+        let order = match read {
             Ok(o) => o,
-            // Dead cookie anywhere → flag + ping + stop early (the rest would only fail too).
+            // Still dead after the run's heal (or none possible) → flag + ping + stop early;
+            // a paste IS the right break-glass once self-login itself has failed (the failure
+            // reason was already pinged inside refresh_session).
             Err(HumbleError::Unauthorized) => {
                 cookie_ok = false;
                 ping(deps, COOKIE_DEAD_MSG).await;
@@ -411,7 +601,10 @@ async fn run_sync(deps: &Deps) {
     let msg = if cookie_ok {
         format!("sync ok: {games_written} written, {orders_failed} order(s) failed")
     } else {
-        "humble session cookie is dead".to_string()
+        // Covers both a hard-dead session and a heal whose SSM persist failed — either way the
+        // DURABLE cookie can't be trusted; the pings that already fired carry the specifics.
+        "humble session cookie is dead (or a refreshed one could not be persisted — see pings)"
+            .to_string()
     };
     // ok = run completed with a live cookie AND no order-level failures.
     // cookie_ok tracks session health independently of order success rate.
@@ -431,8 +624,12 @@ async fn run_sync(deps: &Deps) {
 ///   URL. This endpoint can't recover the URL → ping ben (claim id + game context, never a key
 ///   value) and leave the claim pending: loud, human-owned recovery via humble's gift-history page.
 /// - key **not redeemed** → the redeem never landed → `compensate_claim` (slot + game return).
-/// - humble fetch error → skip; the next pass retries.
-async fn reconcile(deps: &Deps) {
+/// - transient humble fetch error → skip that claim; the next pass retries.
+/// - session dead mid-pass → self-heal via the shared ladder (respecting the caller's
+///   once-per-run cap via `healed_this_run`); if still dead, stop the pass LOUDLY (warn +
+///   `cookie_ok=false`) instead of silently skipping every remaining claim — the caller's order
+///   walk hits the same dead session moments later and pings.
+async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool) {
     let claims = match deps.store.list_pending_claims().await {
         Ok(c) => c,
         Err(_) => return, // can't read pending claims this pass — try again next time.
@@ -446,9 +643,24 @@ async fn reconcile(deps: &Deps) {
         let Some((gamekey, machine_name)) = claim.game_id.split_once(':') else {
             continue;
         };
-        let order = match deps.humble.order(gamekey).await {
+        let (heal, read) =
+            selfheal_read(deps, !*healed_this_run, || deps.humble.order(gamekey)).await;
+        if let Some(h) = heal {
+            *healed_this_run = true;
+            *cookie_ok = h.durable();
+        }
+        let order = match read {
             Ok(o) => o,
-            Err(_) => continue, // transient / auth — skip, reconcile again next pass.
+            Err(HumbleError::Unauthorized) => {
+                // Dead and the run's heal is spent (or failed): every remaining claim would fail
+                // identically — stop loudly rather than skip them one by one in silence.
+                *cookie_ok = false;
+                tracing::warn!(
+                    "reconcile: session dead mid-pass — abandoning remaining parked claims until next sync"
+                );
+                return;
+            }
+            Err(_) => continue, // transient — skip this claim, reconcile again next pass.
         };
         let Some(key) = order.keys.iter().find(|k| k.machine_name == machine_name) else {
             continue;
@@ -467,33 +679,68 @@ async fn reconcile(deps: &Deps) {
             )
             .await;
         } else {
-            // The redeem never landed — safe to return the slot and re-list the game.
-            // VERIFY on the first real gifting BEFORE trusting this arm in production: this arm
-            // assumes gift-generation sets redeemed_key_val on the order's tpk so humble marks the
-            // key redeemed. If humble does NOT mark gift-generated keys redeemed there, a
-            // crash-after-redeem claim would reconcile here as not-redeemed → compensate →
-            // re-list a burned key (double-burn). Until verified, treat reconcile compensates of
-            // gift-path claims with suspicion — tracked for the plan-2 live receipt.
+            // The redeem never landed on humble → return the slot and re-list the game.
+            //
+            // Risk bound (this arm's worst case is NOT a double-spend): the compensate arm assumes a
+            // gifted key would show redeemed here (redeemed_key_val set). If humble does NOT set that
+            // on a gift, a crash-after-gift claim reconciles as not-redeemed → compensate → re-list.
+            // But the re-listed game can only be re-claimed and re-redeemed, and humble REFUSES to
+            // re-redeem an already-burned key (→ AlreadyRedeemed → compensate). So no key is ever
+            // double-spent; the residual is a RECOVERABLE lost gift URL (the first gift's URL wasn't
+            // recorded) plus re-list churn. The ping below surfaces every compensate so that
+            // recoverable case is caught. (Confirming whether a gift sets redeemed_key_val — which
+            // would route the crash-after-gift case to the redeemed/URL-recovery branch instead — is
+            // a non-urgent follow-up: the plan-2 live receipt.)
             tracing::info!(claim_id = %claim.id, "reconcile: parked claim not redeemed on humble — compensating (slot returns, game re-lists)");
             let _ = deps
                 .store
                 .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
                 .await;
+            // Ping every reconcile compensate. Self-login keeps the session alive 24/7, so this arm
+            // runs autonomously on every sync — the dead-cookie stall that used to force a human to
+            // look is gone. The ping restores that checkpoint: a compensate of a key that was in fact
+            // gifted is a recoverable lost URL, and the operator sees it here to recover it from
+            // humble's gift-history page.
+            ping(
+                deps,
+                &format!(
+                    "reconcile compensated parked claim {} ({} / {}) as not-redeemed — slot returned, \
+                     game re-listed. No key can be double-spent (humble refuses re-redeem of a burned \
+                     key); but IF this key was actually gifted, its gift URL is lost — recover it from \
+                     humble's gift-history page.",
+                    claim.id, order.bundle_name, key.human_name
+                ),
+            )
+            .await;
         }
     }
 }
 
-/// Validate the stored humble session cookie by making a cheap authenticated call, and record the
-/// result in `SyncState.cookie_ok`.
+/// Validate the humble session by making a cheap authenticated call, self-healing a dead session
+/// (log in + persist a fresh cookie) before reporting, and record the result in `SyncState.cookie_ok`.
+/// With self-login configured this is what keeps the session alive with no human paste.
 ///
 /// Transient errors (rate-limited, API errors, network failures) do NOT update the persisted
 /// cookie state — the cookie's validity is unknown, and writing `cookie_ok=false` on a 429
-/// would be wrong. Only `Unauthorized` is a definitive dead-cookie signal.
+/// would be wrong. Only `Unauthorized` (after a self-login attempt) is a definitive dead signal.
 async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
-    let result = deps.humble.gamekeys().await;
-    tracing::info!(ok = result.is_ok(), "cookie validation (gamekeys read)");
-    match result {
-        Ok(_) => {
+    // Report health from the HEAL outcome, not a retry read. A successful login inside
+    // refresh_session IS proof of a good session, so on a dead cookie we don't re-read (which could
+    // hit a transient 429 right after the two extra login requests and leave cookie_ok stale-false
+    // even though the session is now fine). But only a DURABLE heal may report healthy: after
+    // login-ok-but-persist-failed, SSM still holds the dead cookie — and main rebuilds the client
+    // from SSM per invoke — so persisting cookie_ok=true would disagree with the very cookie the
+    // next invoke reads (a gift would park with a "cookie is DEAD" ping minutes after validate
+    // said healthy). The persist-failure ping already fired inside refresh_session.
+    let healthy: Option<bool> = match deps.humble.gamekeys().await {
+        Ok(_) => Some(true),
+        Err(HumbleError::Unauthorized) => Some(refresh_session(deps).await.durable()),
+        // Transient (rate-limited / API / network): validity unknown — leave SyncState untouched.
+        Err(_) => None,
+    };
+    tracing::info!(?healthy, "cookie validation (self-heal on dead)");
+    match healthy {
+        Some(ok) => {
             let mut st = deps
                 .store
                 .get_sync_state()
@@ -501,31 +748,24 @@ async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            st.cookie_ok = true;
+            st.cookie_ok = ok;
             let _ = deps.store.put_sync_state(&st).await;
-            FulfillResponse::CookieStatus { ok: true }
+            FulfillResponse::CookieStatus { ok }
         }
-        Err(HumbleError::Unauthorized) => {
-            let mut st = deps
-                .store
-                .get_sync_state()
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            st.cookie_ok = false;
-            let _ = deps.store.put_sync_state(&st).await;
-            FulfillResponse::CookieStatus { ok: false }
-        }
-        // Transient errors: rate-limited, API errors, network issues.
-        // Do NOT touch SyncState — cookie validity is unknown.
-        Err(_) => FulfillResponse::Error {
+        None => FulfillResponse::Error {
             message: "humble unreachable — cookie state unknown, try again".into(),
         },
     }
 }
 
 const COOKIE_DEAD_MSG: &str = "humble session cookie is DEAD — paste a fresh one in admin";
+const COOKIE_DEAD_SELFHEAL_MSG: &str = "humble session died during a gift redeem — claim parked; self-login will heal the session \
+     on the next scheduled sync/validate (no paste needed unless self-login itself keeps failing).";
+const SESSION_HEALED_MSG: &str = "humble session had died and self-login refreshed it automatically (no paste needed). If these \
+     recur often, the account may be trending toward a rate-limit or new-device challenge.";
+const SESSION_PERSIST_FAILED_MSG: &str = "humble self-login worked but writing the refreshed cookie to SSM FAILED — the session is fine \
+     this run, but every invoke will re-login until the write succeeds (check the fulfillment \
+     ssm:PutParameter grant / SSM health).";
 
 /// Persist a sync-run summary, preserving nothing from prior runs (a run fully describes itself).
 async fn persist_sync(deps: &Deps, ok: bool, cookie_ok: bool, games_written: u32, message: &str) {
@@ -566,6 +806,16 @@ mod tests {
         let c = ping_content("cookie is DEAD");
         assert!(c.starts_with("🐱 bendobundles: "));
         assert!(c.contains("cookie is DEAD"));
+    }
+
+    #[test]
+    fn login_failure_parks_never_compensates() {
+        // login() is the session self-heal path, not a redeem outcome — but if it ever reached the
+        // gift ladder, it must PARK (no session ⇒ no redeem ⇒ never a burn).
+        let outcome = Err(HumbleError::LoginFailed {
+            reason: "/processlogin returned status 403 without a goto".into(),
+        });
+        assert_eq!(gift_decision(&outcome), Decision::Park);
     }
 
     #[test]

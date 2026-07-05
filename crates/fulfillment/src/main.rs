@@ -1,5 +1,5 @@
 use dynamo::Store;
-use fulfillment::{Deps, FulfillRequest, FulfillResponse, handle};
+use fulfillment::{Deps, FulfillRequest, FulfillResponse, SessionStore, handle};
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
 
@@ -138,34 +138,45 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     }
                 };
 
-                // Attach secure-area step-up ONLY for a gift redeem, and only when configured AND
-                // both secrets resolve. Gating on the op means Sync/ValidateCookie never decrypt the
-                // humble password/TOTP (they can't hit the gate), shrinking how often the secrets
-                // are read. A fetch miss here is non-fatal: the client still works and a gated redeem
-                // parks with a step-up-failed ping — never a crashed invoke.
-                let is_gift = matches!(req, FulfillRequest::Gift { .. });
-                let humble = match (is_gift, &step_up_username, &password_param, &totp_param) {
-                    (true, Some(username), Some(pw_param), Some(totp_p)) => {
-                        match (
-                            get_secret(&ssm_client, pw_param).await,
-                            get_secret(&ssm_client, totp_p).await,
+                // Attach the humble credentials whenever configured AND both secrets resolve. Needed
+                // on EVERY op now: the client uses them for the secure-area step-up AND for
+                // self-login, so validate/sync can self-heal a dead session with no human cookie
+                // paste (the gift path deliberately does NOT self-heal yet — a dead session on a
+                // redeem parks; wiring its own heal is a tracked follow-up). A fetch miss is
+                // non-fatal: the client still works, and a dead session or gated redeem just parks.
+                // Yield the client + its session_store together, so "creds resolved ⇒ can persist a
+                // self-login" is decided in one place (no separate derived bool to keep in sync).
+                // session_store is Some only when we have credentials to log in with; otherwise a
+                // dead session falls back to the old flag-and-ping.
+                let (humble, session_store) = match (&step_up_username, &password_param, &totp_param)
+                {
+                    (Some(username), Some(pw_param), Some(totp_p)) => {
+                        // The two fetches are independent and run on every invoke (including the
+                        // synchronous admin-validate and friend-facing gift paths) — overlap them.
+                        match tokio::join!(
+                            get_secret(&ssm_client, pw_param),
+                            get_secret(&ssm_client, totp_p),
                         ) {
-                            (Some(password), Some(totp_secret)) => {
+                            (Some(password), Some(totp_secret)) => (
                                 humble.with_step_up(StepUpCredentials::new(
                                     username.clone(),
                                     password,
                                     totp_secret,
-                                ))
-                            }
+                                )),
+                                Some(SessionStore {
+                                    ssm: ssm_client.clone(),
+                                    cookie_param: cookie_param.clone(),
+                                }),
+                            ),
                             _ => {
                                 tracing::warn!(
-                                    "step-up configured but a secret param did not resolve — proceeding without step-up"
+                                    "humble credentials configured but a secret param did not resolve — proceeding without step-up/self-login"
                                 );
-                                humble
+                                (humble, None)
                             }
                         }
                     }
-                    _ => humble,
+                    _ => (humble, None),
                 };
 
                 let deps = Deps {
@@ -173,6 +184,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     humble,
                     webhook_url,
                     http: http_client,
+                    session_store,
                 };
 
                 handle(&deps, req).await

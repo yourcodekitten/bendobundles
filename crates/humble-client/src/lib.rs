@@ -105,6 +105,22 @@ fn decode_b32_secret(seed: &str) -> Result<Vec<u8>, String> {
     Ok(key)
 }
 
+/// Extract a named cookie's value from a response's `set-cookie` headers (first non-empty match).
+/// Used to capture `csrf_cookie` and `_simpleauth_sess` humble sets during the login bootstrap.
+fn extract_set_cookie(headers: &wreq::header::HeaderMap, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    for sc in headers.get_all("set-cookie") {
+        let Ok(s) = sc.to_str() else { continue };
+        if let Some(rest) = s.trim_start().strip_prefix(&prefix) {
+            let val = rest.split(';').next().unwrap_or("").trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Does a redeem response body carry humble's `login_required` gate marker? A gated (but healthy)
 /// session returns this before the key is touched — the signal to step up and retry, not to fail.
 fn is_login_required(bytes: &[u8]) -> bool {
@@ -117,6 +133,24 @@ fn is_login_required(bytes: &[u8]) -> bool {
         serde_json::from_slice::<GateProbe>(bytes),
         Ok(GateProbe { error_id: Some(e) }) if e == "login_required"
     )
+}
+
+/// The `/processlogin` auth form, shared by both callers (self-[`HumbleClient::login`] and the
+/// secure-area step-up) so the field set can't drift between them: the four auth fields plus the
+/// three empties humble's SPA always sends, with `goto` steering post-login to the keys area.
+fn processlogin_form<'a>(
+    creds: &'a StepUpCredentials,
+    code: &'a str,
+) -> [(&'static str, &'a str); 7] {
+    [
+        ("access_token", ""),
+        ("access_token_provider_id", ""),
+        ("username", creds.username.as_str()),
+        ("password", creds.password.as_str()),
+        ("code", code),
+        ("goto", "/home/keys"),
+        ("qs", ""),
+    ]
 }
 
 /// Did `/processlogin` accept the step-up? Success is a `200` whose body carries a `goto` and no
@@ -162,6 +196,12 @@ pub enum HumbleError {
     /// computed code.
     #[error("secure-area step-up did not complete: {reason}")]
     SecureAreaStepUpFailed { reason: String },
+    /// A fresh self-login (`GET /` bootstrap → `/processlogin`) did not yield a usable session —
+    /// bad credentials/TOTP, a login challenge (captcha / new-device), or no session cookie in the
+    /// response. The caller keeps the prior session (if any) and surfaces this so a persistent
+    /// failure is visible. `reason` NEVER contains the password, the TOTP seed, or a session value.
+    #[error("humble self-login failed: {reason}")]
+    LoginFailed { reason: String },
     #[error("humble rate-limited us")]
     RateLimited,
     #[error("key already redeemed on humble")]
@@ -307,7 +347,10 @@ fn decode_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Humble
 pub struct HumbleClient {
     http: wreq::Client,
     base: String,
-    cookie: SessionCookie,
+    /// The session token, interior-mutable so a self-[`login`](Self::login) can swap in a freshly
+    /// minted session in place without rebuilding the client (and losing its connection pool).
+    /// Held as the raw `_simpleauth_sess` value; `RwLock` because reads far outnumber the rare swap.
+    cookie: std::sync::RwLock<String>,
     /// Optional secure-area step-up credentials. `None` on the read-only / cookie-validate paths
     /// (they never gift); `Some` on the fulfillment lambda, which reads them from SSM per-invoke.
     /// Absent → a gated redeem parks exactly as it did before this module existed.
@@ -327,7 +370,7 @@ impl HumbleClient {
         Ok(Self {
             http,
             base: base_url.trim_end_matches('/').to_string(),
-            cookie,
+            cookie: std::sync::RwLock::new(cookie.0),
             step_up: None,
         })
     }
@@ -342,7 +385,13 @@ impl HumbleClient {
     /// The session cookie header value shared by every authenticated call — one builder so the
     /// read and write paths can never drift on how they authenticate.
     fn session_cookie(&self) -> String {
-        format!("_simpleauth_sess={}", self.cookie.0)
+        // A poisoned lock only means a prior panic mid-swap; the value itself is still a valid
+        // string, so recover it rather than propagating the panic into every request.
+        let sess = self
+            .cookie
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        format!("_simpleauth_sess={sess}")
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(
@@ -427,17 +476,7 @@ impl HumbleClient {
                 return None;
             }
         };
-        let mut captured = None;
-        for sc in resp.headers().get_all("set-cookie") {
-            let Ok(s) = sc.to_str() else { continue };
-            if let Some(rest) = s.trim_start().strip_prefix("csrf_cookie=") {
-                let val = rest.split(';').next().unwrap_or("").trim();
-                if !val.is_empty() {
-                    captured = Some(val.to_string());
-                    break;
-                }
-            }
-        }
+        let captured = extract_set_cookie(resp.headers(), "csrf_cookie");
         let status = resp.status().as_u16();
         // Drain the body so the connection returns to the pool — the redeem POST follows
         // immediately and shouldn't pay a fresh TCP+TLS handshake on the friend-facing path.
@@ -456,19 +495,35 @@ impl HumbleClient {
 
     /// Build a POST carrying humble's double-submit CSRF pair — `csrf_cookie` replayed as BOTH the
     /// cookie and the `csrf-prevention-token` header — plus the same-origin `Origin`/`Referer` a
-    /// browser sends. Every humble write (`/humbler/redeemkey`, `/processlogin`) goes through this
-    /// one builder so the two can't drift: change the dance in one place, both writes move together.
+    /// browser sends. Every write goes through this dance; the ONLY thing that varies is which
+    /// session rides the Cookie header: writes authenticating with the CURRENT session (the redeem,
+    /// the secure-area step-up) use [`csrf_write`](Self::csrf_write), while a fresh
+    /// [`login`](Self::login) passes its bootstrap/anon session (or none) explicitly. One builder,
+    /// so a humble-side change to the dance can't silently break just one caller.
     /// `referer_path` is appended to `base` (e.g. `/home/library`, `/login`).
-    fn csrf_write(&self, url: String, csrf: &str, referer_path: &str) -> wreq::RequestBuilder {
+    fn csrf_write_as(
+        &self,
+        url: String,
+        csrf: &str,
+        referer_path: &str,
+        session_cookie: Option<&str>,
+    ) -> wreq::RequestBuilder {
+        let cookie = match session_cookie {
+            Some(sess) => format!("{sess}; csrf_cookie={csrf}"),
+            None => format!("csrf_cookie={csrf}"),
+        };
         self.http
             .post(url)
-            .header(
-                "Cookie",
-                format!("{}; csrf_cookie={csrf}", self.session_cookie()),
-            )
+            .header("Cookie", cookie)
             .header("csrf-prevention-token", csrf)
             .header("Origin", &self.base)
             .header("Referer", format!("{}{referer_path}", self.base))
+    }
+
+    /// [`csrf_write_as`](Self::csrf_write_as) with the client's CURRENT session — what every
+    /// established-session write (redeem, step-up) uses.
+    fn csrf_write(&self, url: String, csrf: &str, referer_path: &str) -> wreq::RequestBuilder {
+        self.csrf_write_as(url, csrf, referer_path, Some(&self.session_cookie()))
     }
 
     /// Redeem a key as a gift, transparently clearing humble's secure-area step-up when it gates
@@ -728,17 +783,7 @@ impl HumbleClient {
         })?;
         let resp = self
             .csrf_write(format!("{}/processlogin", self.base), &csrf, "/login")
-            // Field shape captured from the live login (2026-07-04): the four auth fields plus the
-            // three empties humble's SPA always sends. `goto` steers post-login to the keys area.
-            .form(&[
-                ("access_token", ""),
-                ("access_token_provider_id", ""),
-                ("username", creds.username.as_str()),
-                ("password", creds.password.as_str()),
-                ("code", code.as_str()),
-                ("goto", "/home/keys"),
-                ("qs", ""),
-            ])
+            .form(&processlogin_form(creds, &code))
             .send()
             .await?;
         let status = resp.status().as_u16();
@@ -754,6 +799,75 @@ impl HumbleClient {
                 reason: format!("humble /processlogin returned status {status} without a goto"),
             })
         }
+    }
+
+    /// Perform a fresh self-login and return a newly-minted authenticated `_simpleauth_sess`, so the
+    /// app can manage its own humble session instead of a human pasting a cookie. Bootstraps an
+    /// anonymous session + csrf via `GET /`, then POSTs `/processlogin` with the account password +
+    /// a current app-TOTP. That POST is itself a password+2FA authentication, so the resulting
+    /// session is born secure-area-elevated.
+    ///
+    /// This crate stays free of any storage/AWS concern: `login` only returns the new session value
+    /// — the CALLER persists it (e.g. to SSM) and rebuilds the client with it. Verified live
+    /// 2026-07-04: a cold login returns `200 {goto}` with no captcha/new-device friction and the
+    /// minted session reads the authenticated order list.
+    pub async fn login(&self) -> Result<String, HumbleError> {
+        let creds = self
+            .step_up
+            .as_ref()
+            .ok_or_else(|| HumbleError::LoginFailed {
+                reason: "no credentials configured".into(),
+            })?;
+        // 1) Bootstrap with NO session cookie: humble sets an anonymous _simpleauth_sess + a
+        //    csrf_cookie on the root GET. Both feed the login POST.
+        let boot = self.http.get(format!("{}/", self.base)).send().await?;
+        let csrf = extract_set_cookie(boot.headers(), "csrf_cookie").ok_or_else(|| {
+            HumbleError::LoginFailed {
+                reason: "bootstrap GET / offered no csrf_cookie".into(),
+            }
+        })?;
+        let anon = extract_set_cookie(boot.headers(), "_simpleauth_sess");
+        let _ = boot.bytes().await; // drain so the connection returns to the pool
+        // 2) Authenticate that session. Double-submit csrf (cookie + header), same as a write.
+        let code = totp_now(&creds.totp_secret).map_err(|reason| HumbleError::LoginFailed {
+            reason: format!("TOTP: {reason}"),
+        })?;
+        // Same csrf dance as every other write, but riding the BOOTSTRAP session (not the
+        // client's current, dead one) — csrf_write_as keeps the header shape shared.
+        let boot_session = anon.as_ref().map(|a| format!("_simpleauth_sess={a}"));
+        let resp = self
+            .csrf_write_as(
+                format!("{}/processlogin", self.base),
+                &csrf,
+                "/login",
+                boot_session.as_deref(),
+            )
+            .form(&processlogin_form(creds, &code))
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        // The authenticated session is humble's rotated cookie if it set a new one, else the anon
+        // session (now authenticated). Capture the rotation BEFORE draining the body.
+        let rotated = extract_set_cookie(resp.headers(), "_simpleauth_sess");
+        // NEVER log the body — a /processlogin response can echo account/session state.
+        let bytes = resp.bytes().await.unwrap_or_default();
+        let ok = status == 200 && processlogin_ok(&bytes);
+        tracing::info!(status, ok, "humble self-login (/processlogin) response");
+        if !ok {
+            return Err(HumbleError::LoginFailed {
+                reason: format!("/processlogin returned status {status} without a goto"),
+            });
+        }
+        let session = rotated.or(anon).ok_or_else(|| HumbleError::LoginFailed {
+            reason: "login succeeded but no session cookie was captured".into(),
+        })?;
+        // Swap the freshly-authenticated session into the client IN PLACE so every subsequent call
+        // uses it — the caller also gets it back to persist (e.g. to SSM) for the next cold start.
+        *self
+            .cookie
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session.clone();
+        Ok(session)
     }
 }
 
@@ -908,6 +1022,43 @@ mod step_up_tests {
             br#"{"goto":"/home/keys","errors":{"_all":["nope"]}}"#
         ));
         assert!(!processlogin_ok(b"{}"));
+    }
+
+    #[test]
+    fn extract_set_cookie_pulls_the_named_value() {
+        use super::extract_set_cookie;
+        use wreq::header::HeaderMap;
+        let mut h = HeaderMap::new();
+        h.append(
+            "set-cookie",
+            "csrf_cookie=abc123; Path=/; HttpOnly".parse().unwrap(),
+        );
+        h.append(
+            "set-cookie",
+            "_simpleauth_sess=SESSVAL; Path=/; Secure; SameSite=Lax"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            extract_set_cookie(&h, "csrf_cookie").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            extract_set_cookie(&h, "_simpleauth_sess").as_deref(),
+            Some("SESSVAL")
+        );
+        // absent + empty-valued cookies both yield None (never a bogus empty session)
+        assert_eq!(extract_set_cookie(&h, "nope"), None);
+        let mut e = HeaderMap::new();
+        e.append("set-cookie", "_simpleauth_sess=; Path=/".parse().unwrap());
+        assert_eq!(extract_set_cookie(&e, "_simpleauth_sess"), None);
+        // prefix-collision safety: "csrf_cookie_x" must NOT match a query for "csrf_cookie"
+        let mut c = HeaderMap::new();
+        c.append(
+            "set-cookie",
+            "csrf_cookie_extra=zzz; Path=/".parse().unwrap(),
+        );
+        assert_eq!(extract_set_cookie(&c, "csrf_cookie"), None);
     }
 
     #[test]
