@@ -289,6 +289,10 @@ data "aws_iam_policy_document" "deploy" {
   # through terraform will still 403) — that is a separate follow-up decision,
   # not something to smuggle into a read fix. Legacy ListTagsLogGroup rides
   # along to mirror the new/old tag-API pairing the statement above uses.
+  # COUPLING: this pattern is only right while terraform-iam's app_prefix and
+  # the app stack's label inputs (namespace/environment) resolve to the same
+  # string from their INDEPENDENT tfvars — nothing enforces it; if the stacks
+  # ever diverge, this grant silently stops matching and the 403 returns.
   statement {
     sid    = "LogsReadApigwAccessLogs"
     effect = "Allow"
@@ -363,16 +367,29 @@ data "aws_iam_policy_document" "deploy" {
       "cloudfront:GetFunction",
       "cloudfront:PublishFunction",
       "cloudfront:AssociateAlias",
-      # The site module's data.aws_cloudfront_cache_policy lookup (by name,
-      # "Managed-CachingOptimized") runs at EVERY plan: the provider pages
-      # ListCachePolicies to resolve the id, then GetCachePolicy to read it.
-      # Without both, the refresh 403s and plans only survive under
-      # -refresh=false — the flag that masked a real partial-apply drift once.
-      # ListCachePolicies is a list-type action evaluated against * (like
-      # ssm:DescribeParameters above); this statement is already resources=["*"].
-      # Both are pure reads of AWS-managed policy definitions, no secret values.
-      "cloudfront:ListCachePolicies",
+    ]
+    resources = ["*"]
+  }
+  # The site module's data.aws_cloudfront_cache_policy lookup (by name,
+  # "Managed-CachingOptimized") runs at EVERY plan: the provider pages
+  # ListCachePolicies to resolve the id, then GetCachePolicy to read it.
+  # Without both, the refresh 403s and plans only survive under
+  # -refresh=false — the flag that masked a real partial-apply drift once.
+  # ListCachePolicies is a list-type action evaluated only against * (like
+  # ssm:DescribeParameters above), so it lives in its own statement per this
+  # file's pattern for unscopeable list actions (LambdaList / LogsDescribe /
+  # SsmDescribeUnscopeable) — folding it into a statement that later gets
+  # resource-scoped would silently turn it into a no-grant. Both are pure
+  # reads of AWS-managed policy definitions, no secret values. REMOVABLE the
+  # day the upstream cloudfront-and-s3-origin module pins the managed policy
+  # ID (it already does exactly that for the response-headers policy) and
+  # this repo upgrades past the name-lookup.
+  statement {
+    sid    = "CloudFrontListUnscopeable"
+    effect = "Allow"
+    actions = [
       "cloudfront:GetCachePolicy",
+      "cloudfront:ListCachePolicies",
     ]
     resources = ["*"]
   }
