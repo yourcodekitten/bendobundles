@@ -140,9 +140,10 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 
                 // Attach the humble credentials whenever configured AND both secrets resolve. Needed
                 // on EVERY op now: the client uses them for the secure-area step-up AND for
-                // self-login, so validate/sync/gift can each self-heal a dead session (no human
-                // cookie paste). A fetch miss is non-fatal: the client still works, and a dead
-                // session or gated redeem just parks.
+                // self-login, so validate/sync can self-heal a dead session with no human cookie
+                // paste (the gift path deliberately does NOT self-heal yet — a dead session on a
+                // redeem parks; wiring its own heal is a tracked follow-up). A fetch miss is
+                // non-fatal: the client still works, and a dead session or gated redeem just parks.
                 // Yield the client + its session_store together, so "creds resolved ⇒ can persist a
                 // self-login" is decided in one place (no separate derived bool to keep in sync).
                 // session_store is Some only when we have credentials to log in with; otherwise a
@@ -150,9 +151,11 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                 let (humble, session_store) = match (&step_up_username, &password_param, &totp_param)
                 {
                     (Some(username), Some(pw_param), Some(totp_p)) => {
-                        match (
-                            get_secret(&ssm_client, pw_param).await,
-                            get_secret(&ssm_client, totp_p).await,
+                        // The two fetches are independent and run on every invoke (including the
+                        // synchronous admin-validate and friend-facing gift paths) — overlap them.
+                        match tokio::join!(
+                            get_secret(&ssm_client, pw_param),
+                            get_secret(&ssm_client, totp_p),
                         ) {
                             (Some(password), Some(totp_secret)) => (
                                 humble.with_step_up(StepUpCredentials::new(

@@ -495,22 +495,35 @@ impl HumbleClient {
 
     /// Build a POST carrying humble's double-submit CSRF pair — `csrf_cookie` replayed as BOTH the
     /// cookie and the `csrf-prevention-token` header — plus the same-origin `Origin`/`Referer` a
-    /// browser sends. Every write that authenticates with the CURRENT session — the redeem
-    /// (`/humbler/redeemkey`) and the secure-area step-up (`/processlogin`) — goes through this one
-    /// builder so they can't drift on the csrf dance. (A fresh [`login`](Self::login) is the one
-    /// exception: it deliberately sends a bootstrap/anon session cookie, not the current one, so it
-    /// builds its own request — but it shares the `/processlogin` FORM via `processlogin_form`.)
+    /// browser sends. Every write goes through this dance; the ONLY thing that varies is which
+    /// session rides the Cookie header: writes authenticating with the CURRENT session (the redeem,
+    /// the secure-area step-up) use [`csrf_write`](Self::csrf_write), while a fresh
+    /// [`login`](Self::login) passes its bootstrap/anon session (or none) explicitly. One builder,
+    /// so a humble-side change to the dance can't silently break just one caller.
     /// `referer_path` is appended to `base` (e.g. `/home/library`, `/login`).
-    fn csrf_write(&self, url: String, csrf: &str, referer_path: &str) -> wreq::RequestBuilder {
+    fn csrf_write_as(
+        &self,
+        url: String,
+        csrf: &str,
+        referer_path: &str,
+        session_cookie: Option<&str>,
+    ) -> wreq::RequestBuilder {
+        let cookie = match session_cookie {
+            Some(sess) => format!("{sess}; csrf_cookie={csrf}"),
+            None => format!("csrf_cookie={csrf}"),
+        };
         self.http
             .post(url)
-            .header(
-                "Cookie",
-                format!("{}; csrf_cookie={csrf}", self.session_cookie()),
-            )
+            .header("Cookie", cookie)
             .header("csrf-prevention-token", csrf)
             .header("Origin", &self.base)
             .header("Referer", format!("{}{referer_path}", self.base))
+    }
+
+    /// [`csrf_write_as`](Self::csrf_write_as) with the client's CURRENT session — what every
+    /// established-session write (redeem, step-up) uses.
+    fn csrf_write(&self, url: String, csrf: &str, referer_path: &str) -> wreq::RequestBuilder {
+        self.csrf_write_as(url, csrf, referer_path, Some(&self.session_cookie()))
     }
 
     /// Redeem a key as a gift, transparently clearing humble's secure-area step-up when it gates
@@ -819,17 +832,16 @@ impl HumbleClient {
         let code = totp_now(&creds.totp_secret).map_err(|reason| HumbleError::LoginFailed {
             reason: format!("TOTP: {reason}"),
         })?;
-        let cookie = match &anon {
-            Some(a) => format!("_simpleauth_sess={a}; csrf_cookie={csrf}"),
-            None => format!("csrf_cookie={csrf}"),
-        };
+        // Same csrf dance as every other write, but riding the BOOTSTRAP session (not the
+        // client's current, dead one) — csrf_write_as keeps the header shape shared.
+        let boot_session = anon.as_ref().map(|a| format!("_simpleauth_sess={a}"));
         let resp = self
-            .http
-            .post(format!("{}/processlogin", self.base))
-            .header("Cookie", cookie)
-            .header("csrf-prevention-token", &csrf)
-            .header("Origin", &self.base)
-            .header("Referer", format!("{}/login", self.base))
+            .csrf_write_as(
+                format!("{}/processlogin", self.base),
+                &csrf,
+                "/login",
+                boot_session.as_deref(),
+            )
             .form(&processlogin_form(creds, &code))
             .send()
             .await?;

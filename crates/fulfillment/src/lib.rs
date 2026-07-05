@@ -135,15 +135,42 @@ pub struct SessionStore {
     pub cookie_param: String,
 }
 
+/// Outcome of a session self-heal attempt. Split so callers can tell "this invoke can keep
+/// working" (the in-memory session is live) apart from "the DURABLE cookie in SSM is healthy" —
+/// after a persist failure those disagree, and persisting `cookie_ok=true` on the former would
+/// report a healthy cookie while the next invoke reads the dead one back from SSM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Heal {
+    /// Login succeeded AND the fresh cookie is persisted to SSM: fully healthy.
+    Persisted,
+    /// Login succeeded (this invoke's in-memory session works) but the SSM persist failed —
+    /// the durable cookie is still the dead one.
+    Unpersisted,
+    /// Self-login isn't configured, or the login itself failed.
+    Failed,
+}
+
+impl Heal {
+    /// This invoke holds a working session (durability aside) — safe to retry the failed read.
+    fn usable(self) -> bool {
+        !matches!(self, Heal::Failed)
+    }
+    /// The cookie in SSM is known-good — the most persisted `cookie_ok` is allowed to claim.
+    fn durable(self) -> bool {
+        matches!(self, Heal::Persisted)
+    }
+}
+
 /// Try to self-heal a dead humble session: log in fresh and persist the new cookie to SSM. Returns
-/// `true` if a usable session is now in place. A no-op returning `false` when self-login isn't
-/// configured (no credentials / no session store) — callers then keep the old dead-cookie behavior.
+/// a [`Heal`] so callers can distinguish in-memory health from durable (SSM) health. A no-op
+/// returning `Heal::Failed` when self-login isn't configured (no credentials / no session store) —
+/// callers then keep the old dead-cookie behavior.
 ///
 /// This path never touches a key: a login authenticates the SESSION, it does not redeem, so the
-/// burns-once invariant is untouched. Failures are logged and surface as `false` (park, never burn).
-async fn refresh_session(deps: &Deps) -> bool {
+/// burns-once invariant is untouched. Failures are logged and surface as `Failed` (park, never burn).
+async fn refresh_session(deps: &Deps) -> Heal {
     let Some(store) = deps.session_store.as_ref() else {
-        return false;
+        return Heal::Failed;
     };
     match deps.humble.login().await {
         Ok(new_session) => {
@@ -154,9 +181,10 @@ async fn refresh_session(deps: &Deps) -> bool {
                 .name(&store.cookie_param)
                 .value(&new_session)
                 .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
-                // Match the terraform-declared Advanced tier: a humble session can exceed the 4 KB
-                // Standard cap, and NOT pinning it here would either reject a large session or
-                // silently downgrade the param (drift vs terraform's tier = "Advanced").
+                // Pin the terraform-declared Advanced tier. An untiered overwrite would KEEP an
+                // existing Advanced tier (AWS can't downgrade a param on overwrite — that's why the
+                // tier-less admin-api paste writer is fine), but pinning also guarantees a >4 KB
+                // session lands even if the param were somehow still Standard (fresh env).
                 .tier(aws_sdk_ssm::types::ParameterTier::Advanced)
                 .overwrite(true)
                 .send()
@@ -171,23 +199,28 @@ async fn refresh_session(deps: &Deps) -> bool {
                     // the operator would lose the early-warning trend (rate-limit / TOTP drift /
                     // an impending new-device challenge) until self-login finally hard-fails.
                     ping(deps, SESSION_HEALED_MSG).await;
-                    true
+                    Heal::Persisted
                 }
                 Err(e) => {
                     // The in-memory client already holds the new session (login swapped it in), so
                     // THIS invoke still works; only the persistence failed. But without the write,
-                    // every future cold start re-reads the dead cookie and re-logs-in — a silent
-                    // "login every invoke" that feeds humble's bot-detection. Ping so it's not
-                    // buried in CloudWatch.
+                    // every invoke re-reads the dead cookie and re-logs-in (main rebuilds the
+                    // client from SSM per invoke) — a silent "login every invoke" that feeds
+                    // humble's bot-detection. Ping so it's not buried in CloudWatch.
                     tracing::warn!(error = %e, "session self-heal: logged in but persisting to SSM failed");
                     ping(deps, SESSION_PERSIST_FAILED_MSG).await;
-                    true
+                    Heal::Unpersisted
                 }
             }
         }
         Err(e) => {
+            // Surface the failure CLASS in the alert (TOTP drift vs captcha vs new-device each
+            // have a different remediation) — otherwise callers ping only the generic
+            // COOKIE_DEAD_MSG and the root cause lives buried in CloudWatch while the operator
+            // re-pastes forever. LoginFailed reasons carry statuses/labels, never secret values.
             tracing::warn!(error = ?e, "session self-heal: login failed");
-            false
+            ping(deps, &format!("humble self-login FAILED ({e}) — session still dead; a cookie paste in admin is the break-glass")).await;
+            Heal::Failed
         }
     }
 }
@@ -397,19 +430,22 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
 }
 
 /// List the humble gamekeys, self-healing a dead session ONCE before giving up: on `Unauthorized`,
-/// log in fresh + persist the new cookie, then retry. The single "read the library, re-logging in
-/// if the session died" entry point — used by both sync and cookie-validation. Returns
+/// log in fresh + persist the new cookie, then retry. Returns the keys plus whether the DURABLE
+/// (SSM) cookie is known-good — `false` only when the heal worked in-memory but its persist
+/// failed, so callers don't record a healthy cookie the next invoke can't actually read. Returns
 /// `Unauthorized` only when the session is dead AND self-login couldn't fix it (or isn't configured).
-async fn gamekeys_selfheal(deps: &Deps) -> Result<Vec<String>, HumbleError> {
+async fn gamekeys_selfheal(deps: &Deps) -> Result<(Vec<String>, bool), HumbleError> {
     match deps.humble.gamekeys().await {
+        Ok(keys) => Ok((keys, true)),
         Err(HumbleError::Unauthorized) => {
-            if refresh_session(deps).await {
-                deps.humble.gamekeys().await
+            let heal = refresh_session(deps).await;
+            if heal.usable() {
+                Ok((deps.humble.gamekeys().await?, heal.durable()))
             } else {
                 Err(HumbleError::Unauthorized)
             }
         }
-        other => other,
+        Err(e) => Err(e),
     }
 }
 
@@ -422,8 +458,8 @@ async fn run_sync(deps: &Deps) {
     // It MUST come before reconcile: reconcile reads humble per-order, so on a session that died
     // since the last run, running it first would Unauthorized-skip every claim and recover nothing.
     // Healing here means reconcile runs against a live session in the SAME sync.
-    let gamekeys = match gamekeys_selfheal(deps).await {
-        Ok(k) => k,
+    let (gamekeys, cookie_durable) = match gamekeys_selfheal(deps).await {
+        Ok(pair) => pair,
         // Dead AND self-login couldn't fix it (or isn't configured) → genuine attention needed.
         Err(HumbleError::Unauthorized) => {
             ping(deps, COOKIE_DEAD_MSG).await;
@@ -448,17 +484,40 @@ async fn run_sync(deps: &Deps) {
 
     let mut games_written = 0u32;
     let mut orders_failed = 0u32;
-    let mut cookie_ok = true;
+    // Persisted `cookie_ok` claims the DURABLE (SSM) cookie is valid, so it starts from the
+    // self-heal's durability, not a blanket true (a heal whose persist failed leaves SSM stale).
+    let mut cookie_ok = cookie_durable;
 
     'orders: for gamekey in gamekeys {
         tokio::time::sleep(SYNC_PACE).await;
         let order = match deps.humble.order(&gamekey).await {
             Ok(o) => o,
-            // Dead cookie anywhere → flag + ping + stop early (the rest would only fail too).
+            // Session died mid-walk — self-heal and retry this order once, same as the walk's
+            // start. Without this, a mid-walk death would ping "paste a fresh one" even when
+            // self-login is configured and would have healed it on the very next run.
             Err(HumbleError::Unauthorized) => {
-                cookie_ok = false;
-                ping(deps, COOKIE_DEAD_MSG).await;
-                break 'orders;
+                let heal = refresh_session(deps).await;
+                cookie_ok = cookie_ok && heal.durable();
+                let retried = if heal.usable() {
+                    deps.humble.order(&gamekey).await
+                } else {
+                    Err(HumbleError::Unauthorized)
+                };
+                match retried {
+                    Ok(o) => o,
+                    // Still dead after the heal (or none possible) → flag + ping + stop early;
+                    // a paste IS the right break-glass once self-login itself has failed (the
+                    // failure reason was already pinged inside refresh_session).
+                    Err(HumbleError::Unauthorized) => {
+                        cookie_ok = false;
+                        ping(deps, COOKIE_DEAD_MSG).await;
+                        break 'orders;
+                    }
+                    Err(_) => {
+                        orders_failed += 1;
+                        continue;
+                    }
+                }
             }
             Err(_) => {
                 orders_failed += 1;
@@ -504,7 +563,10 @@ async fn run_sync(deps: &Deps) {
     let msg = if cookie_ok {
         format!("sync ok: {games_written} written, {orders_failed} order(s) failed")
     } else {
-        "humble session cookie is dead".to_string()
+        // Covers both a hard-dead session and a heal whose SSM persist failed — either way the
+        // DURABLE cookie can't be trusted; the pings that already fired carry the specifics.
+        "humble session cookie is dead (or a refreshed one could not be persisted — see pings)"
+            .to_string()
     };
     // ok = run completed with a live cookie AND no order-level failures.
     // cookie_ok tracks session health independently of order success rate.
@@ -608,10 +670,14 @@ async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
     // Report health from the HEAL outcome, not a retry read. A successful login inside
     // refresh_session IS proof of a good session, so on a dead cookie we don't re-read (which could
     // hit a transient 429 right after the two extra login requests and leave cookie_ok stale-false
-    // even though the session is now fine).
+    // even though the session is now fine). But only a DURABLE heal may report healthy: after
+    // login-ok-but-persist-failed, SSM still holds the dead cookie — and main rebuilds the client
+    // from SSM per invoke — so persisting cookie_ok=true would disagree with the very cookie the
+    // next invoke reads (a gift would park with a "cookie is DEAD" ping minutes after validate
+    // said healthy). The persist-failure ping already fired inside refresh_session.
     let healthy: Option<bool> = match deps.humble.gamekeys().await {
         Ok(_) => Some(true),
-        Err(HumbleError::Unauthorized) => Some(refresh_session(deps).await),
+        Err(HumbleError::Unauthorized) => Some(refresh_session(deps).await.durable()),
         // Transient (rate-limited / API / network): validity unknown — leave SyncState untouched.
         Err(_) => None,
     };
