@@ -662,12 +662,18 @@ impl HumbleClient {
                 //
                 // The PR#14 body_preview diagnostic used to live here; it pinned the mystery
                 // 403s on Cloudflare's bot-block (cf-mitigated: challenge, HTML body) on
-                // 2026-07-04, the wreq-based CF bypass fixed it, and the preview was retired
-                // per the review's expiry rule — no path in this crate logs response-body
-                // content. The header fields below stay: allowlisted by NAME, non-sensitive by
-                // nature (content-type / query-stripped location / cf-mitigated / server), and
-                // a recurrence of `cf-mitigated` here instantly names a CF-bypass regression
-                // without reading a single body byte. `set-cookie` is never logged.
+                // 2026-07-04 — after first live-exonerating the double-submit CSRF match, so
+                // don't re-suspect the pair if 403s recur — the wreq-based CF bypass fixed it,
+                // and the preview was retired per the review's expiry rule. No path in this
+                // crate logs RAW response-body bytes (the one body-derived field anywhere is
+                // humble's own parsed refusal `errormsg` in the success=false arm above,
+                // reviewed as safe). The header fields below stay: allowlisted by NAME,
+                // non-sensitive by nature (content-type / query-stripped location /
+                // cf-mitigated / server). A CHALLENGE-type CF recurrence names itself via
+                // `cf-mitigated`; a BLOCK-type CF 403 carries no such header and is
+                // header-ambiguous with a humble-app HTML refusal — if that pair ever needs
+                // splitting again, restore the PR#14 preview from git history rather than
+                // guessing. `set-cookie` is never logged.
                 let content_type = header_str(resp.headers(), "content-type");
                 let location = location_str(resp.headers());
                 let cf_mitigated = header_str(resp.headers(), "cf-mitigated");
@@ -675,12 +681,15 @@ impl HumbleClient {
                 // Raw location (query intact, unlike the logged `location`) so we can spot humble's
                 // `?reason=secureArea` step-up redirect — a gated-but-live session, NOT a rejection.
                 let raw_location = header_str(resp.headers(), "location");
-                // Keep the read Result: a mid-read failure must stay DISTINGUISHABLE from an empty
-                // body. Collapsing both to `unwrap_or_default()` would let a dropped read of a
-                // `login_required` body be misclassified as a plain auth rejection (no step-up)
-                // with no hint the read failed — `body_read_failed` below keeps that observable.
-                let body_read = resp.bytes().await;
-                let login_required_body = matches!(&body_read, Ok(b) if is_login_required(b));
+                // A mid-read failure must stay DISTINGUISHABLE from an empty body: a dropped
+                // read of a `login_required` body misclassifies as a plain auth rejection (no
+                // step-up). The match keeps that structural, and the captured error text makes
+                // the failure diagnosable (timeout vs reset vs decode) — it is wreq transport
+                // metadata, never response-body content.
+                let (login_required_body, body_read_err) = match resp.bytes().await {
+                    Ok(b) => (is_login_required(&b), None),
+                    Err(e) => (false, Some(e.to_string())),
+                };
                 // Secure-area gate on a healthy session shows up here two ways: a 302 to
                 // `/login?reason=secureArea` (header-only, survives a body-read failure), or a
                 // 401/403 carrying a `login_required` JSON body. Either is a step-up trigger, not a
@@ -693,7 +702,7 @@ impl HumbleClient {
                     );
                     return Ok(RedeemStep::StepUpNeeded { status });
                 }
-                let body_read_failed = body_read.is_err();
+                let body_read_err = body_read_err.as_deref().unwrap_or("-");
                 tracing::warn!(
                     status,
                     csrf_minted,
@@ -701,7 +710,7 @@ impl HumbleClient {
                     location,
                     cf_mitigated,
                     server,
-                    body_read_failed,
+                    body_read_err,
                     "humble rejected the redeem write despite the CSRF pair — inspect the dance, do not blame the cookie"
                 );
                 Err(HumbleError::RedeemAuthRejected {
