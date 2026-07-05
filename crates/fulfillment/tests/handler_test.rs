@@ -6,8 +6,10 @@
 
 use domain::{ClaimState, GameStatus, Link, game_id};
 use dynamo::{Store, SyncState};
-use fulfillment::{Decision, Deps, FulfillRequest, FulfillResponse, gift_decision, handle};
-use humble_client::{HumbleClient, SessionCookie};
+use fulfillment::{
+    Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, gift_decision, handle,
+};
+use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use time::OffsetDateTime;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -440,6 +442,342 @@ async fn validate_cookie_unauthorized_flags_dead() {
     assert_eq!(resp, FulfillResponse::CookieStatus { ok: false });
     let st = deps.store.get_sync_state().await.unwrap().unwrap();
     assert!(!st.cookie_ok, "cookie_ok must be false after Unauthorized");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gift in-line self-heal scaffolding: a Deps with self-login configured (step-up credentials on
+// the client + a SessionStore pointed at a mock SSM), so a dead session on a redeem heals and
+// retries in-line instead of parking.
+// ---------------------------------------------------------------------------------------------
+
+/// Any valid base32 seed works — the mock `/processlogin` never checks the code (RFC 6238 test
+/// vector seed, same one humble-client's unit tests use).
+const TOTP_SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+async fn ssm_at(uri: &str) -> aws_sdk_ssm::Client {
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(uri)
+        .region("us-east-1")
+        .test_credentials()
+        .load()
+        .await;
+    aws_sdk_ssm::Client::new(&config)
+}
+
+async fn deps_with_selfheal(
+    store: Store,
+    humble_uri: &str,
+    webhook_url: Option<String>,
+    ssm_uri: &str,
+) -> Deps {
+    Deps {
+        store,
+        humble: humble_at(humble_uri).with_step_up(StepUpCredentials::new(
+            "bot@example.com".into(),
+            "hunter2".into(),
+            TOTP_SEED.into(),
+        )),
+        webhook_url,
+        http: reqwest::Client::new(),
+        session_store: Some(SessionStore {
+            ssm: ssm_at(ssm_uri).await,
+            cookie_param: "/bendobundles/humble-cookie".into(),
+        }),
+    }
+}
+
+/// Mock SSM that accepts any PutParameter (AWS JSON 1.1 shape).
+async fn mock_ssm() -> MockServer {
+    let ssm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"Version":1,"Tier":"Advanced"}"#,
+            "application/x-amz-json-1.1",
+        ))
+        .mount(&ssm)
+        .await;
+    ssm
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dead session + self-login configured: the gift path heals IN-LINE and retries the redeem once —
+// the friend gets their URL on this very request instead of parking until the next scheduled run.
+// Burn-safety: the first attempt's 200-with-HTML interstitial is humble's session check answering
+// BEFORE the redeem handler runs, so the key was provably untouched and the healed retry is the
+// first attempt that can burn it (see `selfheal_once` in the fulfillment crate).
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn dead_session_gift_heals_inline_and_succeeds() {
+    let Some(store) = store_or_skip("gift-heal-ok").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+
+    let humble = MockServer::start().await;
+    // GET / serves BOTH the redeem csrf preflight and the login bootstrap: offer a csrf_cookie
+    // and an anonymous session, exactly what `login()` needs.
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("set-cookie", "csrf_cookie=csrfval; Path=/")
+                .append_header("set-cookie", "_simpleauth_sess=ANONSESS; Path=/"),
+        )
+        .mount(&humble)
+        .await;
+    // First redeem: the 200-with-HTML login interstitial — the ONE dead-session redeem shape.
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<!DOCTYPE html><html>login</html>")
+                .append_header("content-type", "text/html"),
+        )
+        .up_to_n_times(1)
+        .mount(&humble)
+        .await;
+    // After the heal: the retry succeeds.
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "giftkey": "GIFTTOKEN"
+        })))
+        .mount(&humble)
+        .await;
+    // Self-login: /processlogin accepts and rotates the session.
+    Mock::given(method("POST"))
+        .and(path("/processlogin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"goto": "/home/keys"}))
+                .append_header("set-cookie", "_simpleauth_sess=NEWSESS; Path=/"),
+        )
+        .mount(&humble)
+        .await;
+
+    let ssm = mock_ssm().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps_with_selfheal(store, &humble.uri(), Some(discord.uri()), &ssm.uri()).await;
+    let resp = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+
+    // The friend saw a gift URL, not a park.
+    let expected_url = "https://www.humblebundle.com/gift?key=GIFTTOKEN";
+    assert_eq!(
+        resp,
+        FulfillResponse::GiftUrl {
+            url: expected_url.into()
+        }
+    );
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Fulfilled);
+    assert_eq!(claim.gift_url.as_deref(), Some(expected_url));
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Gifted);
+
+    // The heal persisted the rotated session to SSM — exactly once.
+    let ssm_reqs = ssm.received_requests().await.unwrap();
+    assert_eq!(ssm_reqs.len(), 1, "exactly one SSM PutParameter");
+    let ssm_body = String::from_utf8(ssm_reqs[0].body.clone()).unwrap();
+    assert!(
+        ssm_body.contains("NEWSESS"),
+        "the persisted cookie must be the rotated session"
+    );
+
+    // Durable heal ⇒ cookie_ok=true recorded (the sync-walk bookkeeping, mirrored in-line).
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(st.cookie_ok, "a persisted heal must record cookie_ok=true");
+
+    // Exactly TWO redeem POSTs — the ladder's retry is bounded at once.
+    let redeems = humble
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/humbler/redeemkey")
+        .count();
+    assert_eq!(redeems, 2, "exactly one heal-retry of the redeem");
+
+    // One ping: the healed notice — never the dead, anon, or fresh session value.
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "a heal pings once (the healed notice)");
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("self-login refreshed"));
+    assert!(
+        !body.contains(COOKIE) && !body.contains("NEWSESS") && !body.contains("ANONSESS"),
+        "ping body leaked a session value"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dead session + self-login configured, but the heal FAILS → the pre-selfheal park semantics,
+// with truthful messaging: the self-login failure ping fires first (from refresh_session), then
+// the parked ping tells the operator the in-line heal already lost (paste = break-glass).
+// NOTE: refresh_session retries a failed login once after the TOTP window rolls, so this test
+// sleeps up to ~31s of wall clock — the price of exercising the real retry path against real
+// sockets (tokio's paused clock would fast-forward the AWS SDK's request timeouts mid-flight).
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn dead_session_gift_heal_failure_parks_flags_and_pings() {
+    let Some(store) = store_or_skip("gift-heal-fail").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+
+    let humble = MockServer::start().await;
+    // GET / offers NO csrf_cookie: the redeem preflight mints a fallback (fine), but the login
+    // bootstrap REQUIRES one — so the in-line heal fails, both attempts.
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&humble)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<!DOCTYPE html><html>login</html>")
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&humble)
+        .await;
+
+    let ssm = mock_ssm().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps_with_selfheal(store, &humble.uri(), Some(discord.uri()), &ssm.uri()).await;
+    let resp = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+    assert!(matches!(resp, FulfillResponse::Parked { .. }));
+
+    // Pre-selfheal park semantics, unchanged: claim pending, cookie flagged dead.
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(!st.cookie_ok);
+
+    // No login succeeded ⇒ nothing was persisted to SSM.
+    assert!(ssm.received_requests().await.unwrap().is_empty());
+
+    // ONE redeem POST only — a failed heal must never retry the write.
+    let redeems = humble
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/humbler/redeemkey")
+        .count();
+    assert_eq!(redeems, 1, "no redeem retry without a usable heal");
+
+    // Two pings, in order: the self-login failure (with its reason), then the parked notice
+    // that points back at it — and neither leaks the session cookie.
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2, "failure ping + parked ping");
+    let first = String::from_utf8(reqs[0].body.clone()).unwrap();
+    let second = String::from_utf8(reqs[1].body.clone()).unwrap();
+    assert!(
+        first.contains("self-login FAILED"),
+        "first ping must name the self-login failure: {first}"
+    );
+    assert!(
+        second.contains("could not revive") && second.contains("break-glass"),
+        "parked ping must say the in-line heal already lost: {second}"
+    );
+    assert!(
+        !second.contains("next scheduled"),
+        "parked ping must not promise a scheduled heal that already failed: {second}"
+    );
+    assert!(!first.contains(COOKIE) && !second.contains(COOKIE));
+}
+
+// ---------------------------------------------------------------------------------------------
+// RedeemAuthRejected must NOT trigger the heal — even with self-login fully configured. A
+// CSRF-layer 403 comes from a LIVE session (healing fixes nothing) and, unlike Unauthorized, is
+// not proof the redeem handler was never reached — so the ladder must not touch it: no login,
+// no SSM write, no redeem retry, cookie_ok untouched.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn redeem_auth_rejection_never_triggers_selfheal() {
+    let Some(store) = store_or_skip("gift-authreject-noheal").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+    let healthy = SyncState {
+        last_run_epoch: 1_800_000_000,
+        ok: true,
+        cookie_ok: true,
+        games_written: 5,
+        message: "all good".into(),
+    };
+    store.put_sync_state(&healthy).await.unwrap();
+
+    let humble = MockServer::start().await;
+    // A working csrf preflight, so a login WOULD succeed if (wrongly) attempted — the
+    // no-/processlogin assertion below is what proves it never was.
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200).append_header("set-cookie", "csrf_cookie=csrfval; Path=/"),
+        )
+        .mount(&humble)
+        .await;
+    // Plain 403 on the write: no secureArea redirect, no login_required body → RedeemAuthRejected.
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&humble)
+        .await;
+
+    let ssm = mock_ssm().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps_with_selfheal(store, &humble.uri(), Some(discord.uri()), &ssm.uri()).await;
+    let resp = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+    let FulfillResponse::Parked { reason } = resp else {
+        panic!("expected Parked, got {resp:?}");
+    };
+    assert!(reason.contains("redeem-auth-rejected"));
+
+    // The heal ladder never engaged: no login, no SSM write, no redeem retry.
+    let humble_reqs = humble.received_requests().await.unwrap();
+    assert!(
+        humble_reqs.iter().all(|r| r.url.path() != "/processlogin"),
+        "a CSRF-layer rejection must never trigger self-login"
+    );
+    assert_eq!(
+        humble_reqs
+            .iter()
+            .filter(|r| r.url.path() == "/humbler/redeemkey")
+            .count(),
+        1,
+        "RedeemAuthRejected must never be retried"
+    );
+    assert!(ssm.received_requests().await.unwrap().is_empty());
+
+    // Park semantics unchanged: claim pending, cookie_ok NOT flipped.
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(st.cookie_ok, "redeem 403 must not flip cookie_ok");
+
+    // One ping: the auth-layer one, not a cookie-death or self-login message.
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("auth layer"));
+    assert!(!body.contains("self-login") && !body.contains("DEAD"));
 }
 
 /// Success from humble during ValidateCookie → CookieStatus{ok:true} and SyncState updated.

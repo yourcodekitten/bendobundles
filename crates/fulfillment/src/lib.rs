@@ -287,10 +287,19 @@ async fn handle_gift(
     machine_name: &str,
     keyindex: u32,
 ) -> FulfillResponse {
-    let outcome = deps
-        .humble
-        .redeem_as_gift(gamekey, machine_name, keyindex)
-        .await;
+    // The redeem rides the shared heal ladder: on a dead session (`Unauthorized`) with self-login
+    // configured, heal IN-LINE and retry the redeem once — the friend gets their gift now instead
+    // of parking until the next scheduled sync/validate. Burn-safety of retrying this WRITE is
+    // argued on [`selfheal_once`] (Unauthorized precedes any key touch); every other failure keeps
+    // its park/compensate semantics below. Composition with `redeem_as_gift`'s INTERNAL step-up
+    // retry stays bounded: at most two outer attempts, each making at most two redeem POSTs, and
+    // only ever after outcomes that prove the key untouched — no loop, no second burn window.
+    // (A fresh self-login is born secure-area-elevated, so the healed retry normally needs no
+    // step-up at all.)
+    let (heal, outcome) = selfheal_once(deps, deps.session_store.is_some(), || {
+        deps.humble.redeem_as_gift(gamekey, machine_name, keyindex)
+    })
+    .await;
     // Log the mapped outcome (never the gift URL/token). On a park, this names
     // which HumbleError variant drove it — pairs with humble-client's status log.
     if let Err(e) = &outcome {
@@ -298,7 +307,26 @@ async fn handle_gift(
     } else {
         tracing::info!(claim_id, game_id, "gift redeem returned a URL");
     }
-    match gift_decision(&outcome) {
+    let decision = gift_decision(&outcome);
+    // A heal ran mid-gift: record the DURABLE cookie truth now, the same bookkeeping the sync
+    // walk does (`Persisted` ⇒ SSM holds a live cookie ⇒ cookie_ok=true; `Unpersisted` ⇒ the
+    // durable cookie is still the dead one ⇒ false — the persist-failure ping already fired).
+    // The ParkCookieDead arm below owns its own always-false write, so skip it here rather
+    // than double-write on that path.
+    if let Some(h) = heal
+        && decision != Decision::ParkCookieDead
+    {
+        let mut st = deps
+            .store
+            .get_sync_state()
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        st.cookie_ok = h.durable();
+        let _ = deps.store.put_sync_state(&st).await;
+    }
+    match decision {
         Decision::Record => match outcome {
             Ok(GiftUrl(url)) => {
                 // URL durable BEFORE returning — the invariant.
@@ -361,11 +389,12 @@ async fn handle_gift(
                 .unwrap_or_default();
             st.cookie_ok = false;
             let _ = deps.store.put_sync_state(&st).await;
-            // With self-login configured, the break-glass instruction is the wrong one — the next
-            // scheduled sync heals on its own (then pings SESSION_HEALED_MSG and flips
-            // cookie_ok back), so telling the operator to touch SSM here would whipsaw them. The
-            // gift path healing IN-LINE (instead of parking until that next run) is the tracked
-            // follow-up; this only makes the ping truthful meanwhile.
+            // With self-login configured, reaching this arm means the IN-LINE heal already ran
+            // and could not produce a working session — either the login itself failed (its
+            // failure-reason ping fired from `refresh_session`) or, pathologically, a successful
+            // login's retry still came back `Unauthorized` (the heal-outcome ping fired either
+            // way). So no scheduled run will magically fix this; the paste IS the break-glass,
+            // and the message says so instead of promising a heal that already lost.
             let msg = if deps.session_store.is_some() {
                 COOKIE_DEAD_SELFHEAL_MSG
             } else {
@@ -457,18 +486,32 @@ async fn handle_sync(deps: &Deps) -> FulfillResponse {
     FulfillResponse::SyncDone
 }
 
-/// Run a humble read through the ONE heal-then-retry-once ladder: on `Unauthorized`, self-heal
-/// (when `allow_heal`) and retry the read exactly once. The heal outcome rides ALONGSIDE the
+/// Run a humble call through the ONE heal-then-retry-once ladder: on `Unauthorized`, self-heal
+/// (when `allow_heal`) and retry the call exactly once. The heal outcome rides ALONGSIDE the
 /// result instead of being folded into it, so durability survives the error path too — a heal
 /// whose retry then hits a transient error (a 429 right after the login's extra requests) must
 /// not let a caller go on asserting a healthy durable cookie. `None` means no heal was attempted
-/// (the read didn't hit `Unauthorized`, or the cap disallowed one).
+/// (the call didn't hit `Unauthorized`, or the cap disallowed one).
 ///
-/// Every self-healing read shares this ladder — the listing, the reconcile pass, the order walk,
-/// and (future follow-up) the gift path — so their durability bookkeeping can't diverge again.
+/// Membership rule (why this ladder may carry a WRITE): an op belongs on this ladder iff its
+/// `Unauthorized` outcome PROVES the op had no effect. Reads qualify trivially. The gift redeem —
+/// the one write here — qualifies because humble rejects a dead-session redeem at the AUTH layer
+/// before the key is touched: the only redeem outcome that maps to `Unauthorized` is the
+/// 200-with-HTML login interstitial (`decode_body` in humble-client), which is the session check
+/// answering instead of the redeem handler. So an `Unauthorized` redeem provably did not burn the
+/// key, and the healed retry is the first attempt that can — the same reasoning as the step-up
+/// retry inside `redeem_as_gift` ("a gated redeem returns `login_required` BEFORE touching the
+/// key"). No other redeem failure may ride this ladder: `RedeemAuthRejected` is a CSRF-layer
+/// rejection on a LIVE session (a heal fixes nothing), and `AmbiguousRedeem` / `RedeemRefused` /
+/// network errors can follow a request that REACHED the redeem handler — retrying any of those
+/// could burn a key twice. Because the ladder retries on `Unauthorized` and nothing else, that
+/// boundary holds by construction; a login itself never touches keys (see [`refresh_session`]).
+///
+/// Every self-healing humble call shares this ladder — the listing, the reconcile pass, the order
+/// walk, and the gift redeem — so their durability bookkeeping can't diverge again.
 /// [`handle_validate_cookie`] deliberately stays OUT: its no-retry, report-from-the-heal shape
 /// is documented there.
-async fn selfheal_read<T, F, Fut>(
+async fn selfheal_once<T, F, Fut>(
     deps: &Deps,
     allow_heal: bool,
     op: F,
@@ -500,7 +543,7 @@ async fn run_sync(deps: &Deps) {
     // It MUST come before reconcile: reconcile reads humble per-order, so on a session that died
     // since the last run, running it first would Unauthorized-skip every claim and recover nothing.
     // Healing here means reconcile runs against a live session in the SAME sync.
-    let (listing_heal, listing) = selfheal_read(deps, true, || deps.humble.gamekeys()).await;
+    let (listing_heal, listing) = selfheal_once(deps, true, || deps.humble.gamekeys()).await;
     // ONE heal per sync run, total (listing + reconcile + walk). Uncapped, a single order URL
     // that persistently 403s with a live session — or an alternating die/heal pathology — would
     // turn one walk into up to N password+TOTP logins from the Lambda IP, exactly the
@@ -549,7 +592,7 @@ async fn run_sync(deps: &Deps) {
         // break-glass even when self-login is configured and would have healed it on the very
         // next run.
         let (heal, read) =
-            selfheal_read(deps, !healed_this_run, || deps.humble.order(&gamekey)).await;
+            selfheal_once(deps, !healed_this_run, || deps.humble.order(&gamekey)).await;
         if let Some(h) = heal {
             healed_this_run = true;
             cookie_ok = h.durable();
@@ -651,7 +694,7 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             continue;
         };
         let (heal, read) =
-            selfheal_read(deps, !*healed_this_run, || deps.humble.order(gamekey)).await;
+            selfheal_once(deps, !*healed_this_run, || deps.humble.order(gamekey)).await;
         if let Some(h) = heal {
             *healed_this_run = true;
             *cookie_ok = h.durable();
@@ -768,8 +811,9 @@ async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
 const COOKIE_DEAD_MSG: &str = "humble session cookie is DEAD and self-login could not heal it (not configured, or failed — \
      a failure pings separately with the reason) — break-glass: update the humble-cookie SSM \
      param directly (AWS console/CLI, SecureString overwrite).";
-const COOKIE_DEAD_SELFHEAL_MSG: &str = "humble session died during a gift redeem — claim parked; self-login will heal the session \
-     on the next scheduled sync (no action needed unless self-login itself keeps failing).";
+const COOKIE_DEAD_SELFHEAL_MSG: &str = "humble session died during a gift redeem and the in-line self-heal could not revive it — \
+     claim parked for reconcile (the self-login ping just before this one has the details); \
+     break-glass: update the humble-cookie SSM param directly (AWS console/CLI, SecureString overwrite).";
 const SESSION_HEALED_MSG: &str = "humble session had died and self-login refreshed it automatically (no action needed). If these \
      recur often, the account may be trending toward a rate-limit or new-device challenge.";
 const SESSION_PERSIST_FAILED_MSG: &str = "humble self-login worked but writing the refreshed cookie to SSM FAILED — the session is fine \

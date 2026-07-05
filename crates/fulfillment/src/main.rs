@@ -141,9 +141,8 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 
                 // Attach the humble credentials whenever configured AND both secrets resolve. Needed
                 // on EVERY op now: the client uses them for the secure-area step-up AND for
-                // self-login, so validate/sync can self-heal a dead session with no human
-                // intervention (the gift path deliberately does NOT self-heal yet — a dead session on a
-                // redeem parks; wiring its own heal is a tracked follow-up). A fetch miss is
+                // self-login, so validate/sync — and the gift path, in-line — can self-heal a dead
+                // session with no human cookie paste. A fetch miss is
                 // non-fatal: the client still works, and a dead session or gated redeem just parks.
                 // Yield the client + its session_store together, so "creds resolved ⇒ can persist a
                 // self-login" is decided in one place (no separate derived bool to keep in sync).
