@@ -126,15 +126,16 @@ describe('AdminApp banner — humble session attention', () => {
     });
   });
 
-  it('banner text is "humble session needs attention — paste a fresh cookie in ops"', async () => {
+  it('banner text points at self-login and the SSM break-glass, not the retired paste flow', async () => {
     vi.mocked(adminStatus).mockResolvedValue(cookieBadStatus);
     renderAdminWithChild(<div>content</div>);
 
     await waitFor(() => {
       expect(
-        screen.getByText(/humble session needs attention — paste a fresh cookie in ops/i),
+        screen.getByText(/humble session needs attention — self-login retries on the next sync/i),
       ).toBeInTheDocument();
     });
+    expect(screen.getByText(/update the humble-cookie SSM param directly/i)).toBeInTheDocument();
   });
 
   it('does NOT show banner when cookie_ok is true', async () => {

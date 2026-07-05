@@ -6,7 +6,7 @@ import { Ops } from './Ops';
 import type { StatusView } from '../api';
 
 vi.mock('../api');
-import { adminPasteCookie, adminSync } from '../api';
+import { adminSync } from '../api';
 
 // Provides the Outlet context that Ops requires without needing the real AdminApp.
 // Using <Outlet context={...} /> (react-router-dom) is the canonical approach
@@ -45,85 +45,6 @@ describe('Ops', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-  });
-
-  describe('cookie panel — result copy variants', () => {
-    it('shows "cookie validated ✓" when result.ok is true', async () => {
-      const user = userEvent.setup();
-      vi.mocked(adminPasteCookie).mockResolvedValue({ ok: true });
-      renderOps();
-
-      await user.type(screen.getByLabelText(/humble session cookie/i), 'valid-cookie');
-      await user.click(screen.getByRole('button', { name: /submit/i }));
-
-      await waitFor(() => {
-        expect(screen.getByText('cookie validated ✓')).toBeInTheDocument();
-      });
-    });
-
-    it('shows "that cookie failed validation — kept your previous one" when !ok && restored_previous', async () => {
-      const user = userEvent.setup();
-      vi.mocked(adminPasteCookie).mockResolvedValue({ ok: false, restored_previous: true });
-      renderOps();
-
-      await user.type(screen.getByLabelText(/humble session cookie/i), 'bad-cookie');
-      await user.click(screen.getByRole('button', { name: /submit/i }));
-
-      await waitFor(() => {
-        expect(
-          screen.getByText('that cookie failed validation — kept your previous one'),
-        ).toBeInTheDocument();
-      });
-    });
-
-    it('shows "humble unreachable — cookie state unknown, try again" when !ok && inconclusive', async () => {
-      const user = userEvent.setup();
-      vi.mocked(adminPasteCookie).mockResolvedValue({ ok: false, inconclusive: true });
-      renderOps();
-
-      await user.type(screen.getByLabelText(/humble session cookie/i), 'some-cookie');
-      await user.click(screen.getByRole('button', { name: /submit/i }));
-
-      await waitFor(() => {
-        expect(
-          screen.getByText('humble unreachable — cookie state unknown, try again'),
-        ).toBeInTheDocument();
-      });
-    });
-
-    it('shows "cookie failed validation" when !ok with no other flags set', async () => {
-      const user = userEvent.setup();
-      vi.mocked(adminPasteCookie).mockResolvedValue({ ok: false });
-      renderOps();
-
-      await user.type(screen.getByLabelText(/humble session cookie/i), 'bad-cookie');
-      await user.click(screen.getByRole('button', { name: /submit/i }));
-
-      await waitFor(() => {
-        expect(screen.getByText('cookie failed validation')).toBeInTheDocument();
-      });
-    });
-
-    it('clears input after submit and value is absent from DOM', async () => {
-      const user = userEvent.setup();
-      vi.mocked(adminPasteCookie).mockResolvedValue({ ok: true });
-      renderOps();
-
-      const input = screen.getByLabelText(/humble session cookie/i) as HTMLInputElement;
-      await user.type(input, 'supersecretcookievalue');
-      expect(input.value).toBe('supersecretcookievalue');
-
-      await user.click(screen.getByRole('button', { name: /submit/i }));
-
-      await waitFor(() => {
-        expect(screen.getByText('cookie validated ✓')).toBeInTheDocument();
-      });
-
-      // Field must be cleared
-      expect(input.value).toBe('');
-      // Value must not appear anywhere in the DOM (not echoed into text, attrs, etc.)
-      expect(document.body.innerHTML).not.toContain('supersecretcookievalue');
-    });
   });
 
   describe('sync panel', () => {
@@ -406,20 +327,6 @@ describe('Ops', () => {
   });
 
   describe('outlet context — refreshStatus callback', () => {
-    it('calls refreshStatus after cookie submit', async () => {
-      const user = userEvent.setup();
-      const refreshStatus = vi.fn();
-      vi.mocked(adminPasteCookie).mockResolvedValue({ ok: true });
-      renderOps({ refreshStatus });
-
-      await user.type(screen.getByLabelText(/humble session cookie/i), 'cookie');
-      await user.click(screen.getByRole('button', { name: /submit/i }));
-
-      await waitFor(() => {
-        expect(refreshStatus).toHaveBeenCalled();
-      });
-    });
-
     it('calls refreshStatus after sync is accepted', async () => {
       const user = userEvent.setup();
       const refreshStatus = vi.fn();

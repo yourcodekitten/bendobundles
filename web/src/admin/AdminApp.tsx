@@ -27,8 +27,8 @@ export function AdminApp() {
       .catch(() => {});
   }, [navigate]);
 
-  // Fetch once on mount. Status only changes on cookie-paste or sync, and both
-  // paths already call refreshStatus() — refetching per route change would run
+  // Fetch once on mount. Status only changes on sync, and that path already
+  // calls refreshStatus() — refetching per route change would run
   // handle_status's full-table Scan on every tab switch for nothing.
   useEffect(() => {
     fetchStatus();
@@ -68,7 +68,8 @@ export function AdminApp() {
           aria-label="humble session needs attention"
           className="bg-red-900 px-6 py-3 text-sm text-red-100"
         >
-          humble session needs attention — paste a fresh cookie in ops
+          humble session needs attention — self-login retries on the next sync; if it keeps
+          failing, update the humble-cookie SSM param directly (AWS console/CLI)
         </div>
       )}
 

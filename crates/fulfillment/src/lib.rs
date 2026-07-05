@@ -36,6 +36,12 @@ pub enum FulfillRequest {
         keyindex: u32,
     },
     Sync,
+    /// MANUAL-INVOKE-ONLY diagnostic since the cookie-paste teardown. Its only in-app sender was
+    /// admin-api's paste-validate (removed with the paste flow); EventBridge fires `Sync`, which
+    /// already self-heals + reports `cookie_ok` on cadence. Reach this by a hand-run
+    /// `aws lambda invoke '{"op":"validate_cookie"}'` — kept as a break-glass probe, NOT a
+    /// scheduled healthcheck. (A dedicated EventBridge validate schedule for a cheap mid-day heal
+    /// is a tracked follow-up, deliberately out of this teardown.)
     ValidateCookie,
 }
 
@@ -194,9 +200,9 @@ async fn refresh_session(deps: &Deps) -> Heal {
                 .value(&new_session)
                 .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
                 // Pin the terraform-declared Advanced tier. An untiered overwrite would KEEP an
-                // existing Advanced tier (AWS can't downgrade a param on overwrite — that's why the
-                // tier-less admin-api paste writer is fine), but pinning also guarantees a >4 KB
-                // session lands even if the param were somehow still Standard (fresh env).
+                // existing Advanced tier (AWS can't downgrade a param on overwrite), but pinning
+                // also guarantees a >4 KB session lands even if the param were somehow still
+                // Standard (fresh env).
                 .tier(aws_sdk_ssm::types::ParameterTier::Advanced)
                 .overwrite(true)
                 .send()
@@ -229,9 +235,9 @@ async fn refresh_session(deps: &Deps) -> Heal {
             // Surface the failure CLASS in the alert (TOTP drift vs captcha vs new-device each
             // have a different remediation) — otherwise callers ping only the generic
             // COOKIE_DEAD_MSG and the root cause lives buried in CloudWatch while the operator
-            // re-pastes forever. LoginFailed reasons carry statuses/labels, never secret values.
+            // flails blind. LoginFailed reasons carry statuses/labels, never secret values.
             tracing::warn!(error = ?e, "session self-heal: login failed");
-            ping(deps, &format!("humble self-login FAILED ({e}) — session still dead; a cookie paste in admin is the break-glass")).await;
+            ping(deps, &format!("humble self-login FAILED ({e}) — session still dead; break-glass: update the humble-cookie SSM param directly (AWS console/CLI)")).await;
             Heal::Failed
         }
     }
@@ -355,10 +361,10 @@ async fn handle_gift(
                 .unwrap_or_default();
             st.cookie_ok = false;
             let _ = deps.store.put_sync_state(&st).await;
-            // With self-login configured, "paste a fresh one" is the wrong instruction — the next
-            // scheduled validate/sync heals on its own (then pings SESSION_HEALED_MSG and flips
-            // cookie_ok back), so instructing a paste here would whipsaw the operator. The gift
-            // path healing IN-LINE (instead of parking until that next run) is the tracked
+            // With self-login configured, the break-glass instruction is the wrong one — the next
+            // scheduled sync heals on its own (then pings SESSION_HEALED_MSG and flips
+            // cookie_ok back), so telling the operator to touch SSM here would whipsaw them. The
+            // gift path healing IN-LINE (instead of parking until that next run) is the tracked
             // follow-up; this only makes the ping truthful meanwhile.
             let msg = if deps.session_store.is_some() {
                 COOKIE_DEAD_SELFHEAL_MSG
@@ -415,9 +421,9 @@ async fn handle_gift(
                     &format!(
                         "gift redeem for claim {claim_id} ({machine_name}) was blocked at \
                          humble's auth layer (status {status}). {csrf_note}. The session cookie \
-                         is fine (reads work) — re-pasting won't help. The claim is parked; \
-                         reconcile will re-list the key if unredeemed, so this repeats on the \
-                         next claim until the write path is fixed."
+                         is fine (reads work) — refreshing the session won't help. The claim is \
+                         parked; reconcile will re-list the key if unredeemed, so this repeats on \
+                         the next claim until the write path is fixed."
                     ),
                 )
                 .await;
@@ -539,8 +545,9 @@ async fn run_sync(deps: &Deps) {
     'orders: for gamekey in gamekeys {
         tokio::time::sleep(SYNC_PACE).await;
         // Session died mid-walk → the shared ladder heals (if the run's one heal is unspent) and
-        // retries this order once. Without it, a mid-walk death would ping "paste a fresh one"
-        // even when self-login is configured and would have healed it on the very next run.
+        // retries this order once. Without it, a mid-walk death would ping the dead-cookie
+        // break-glass even when self-login is configured and would have healed it on the very
+        // next run.
         let (heal, read) =
             selfheal_read(deps, !healed_this_run, || deps.humble.order(&gamekey)).await;
         if let Some(h) = heal {
@@ -550,8 +557,8 @@ async fn run_sync(deps: &Deps) {
         let order = match read {
             Ok(o) => o,
             // Still dead after the run's heal (or none possible) → flag + ping + stop early;
-            // a paste IS the right break-glass once self-login itself has failed (the failure
-            // reason was already pinged inside refresh_session).
+            // the manual SSM update IS the right break-glass once self-login itself has failed
+            // (the failure reason was already pinged inside refresh_session).
             Err(HumbleError::Unauthorized) => {
                 cookie_ok = false;
                 ping(deps, COOKIE_DEAD_MSG).await;
@@ -718,7 +725,7 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
 
 /// Validate the humble session by making a cheap authenticated call, self-healing a dead session
 /// (log in + persist a fresh cookie) before reporting, and record the result in `SyncState.cookie_ok`.
-/// With self-login configured this is what keeps the session alive with no human paste.
+/// With self-login configured this is what keeps the session alive with no human intervention.
 ///
 /// Transient errors (rate-limited, API errors, network failures) do NOT update the persisted
 /// cookie state — the cookie's validity is unknown, and writing `cookie_ok=false` on a 429
@@ -758,10 +765,12 @@ async fn handle_validate_cookie(deps: &Deps) -> FulfillResponse {
     }
 }
 
-const COOKIE_DEAD_MSG: &str = "humble session cookie is DEAD — paste a fresh one in admin";
+const COOKIE_DEAD_MSG: &str = "humble session cookie is DEAD and self-login could not heal it (not configured, or failed — \
+     a failure pings separately with the reason) — break-glass: update the humble-cookie SSM \
+     param directly (AWS console/CLI, SecureString overwrite).";
 const COOKIE_DEAD_SELFHEAL_MSG: &str = "humble session died during a gift redeem — claim parked; self-login will heal the session \
-     on the next scheduled sync/validate (no paste needed unless self-login itself keeps failing).";
-const SESSION_HEALED_MSG: &str = "humble session had died and self-login refreshed it automatically (no paste needed). If these \
+     on the next scheduled sync (no action needed unless self-login itself keeps failing).";
+const SESSION_HEALED_MSG: &str = "humble session had died and self-login refreshed it automatically (no action needed). If these \
      recur often, the account may be trending toward a rate-limit or new-device challenge.";
 const SESSION_PERSIST_FAILED_MSG: &str = "humble self-login worked but writing the refreshed cookie to SSM FAILED — the session is fine \
      this run, but every invoke will re-login until the write succeeds (check the fulfillment \

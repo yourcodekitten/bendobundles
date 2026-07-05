@@ -16,14 +16,15 @@ resource "aws_ssm_parameter" "admin_hash" {
 }
 
 # Humble session cookie — terraform creates the CONTAINER only; the value is
-# owned by admin-api's paste flow (PutParameter overwrite). Placeholder value
-# fails humble auth cleanly until ben pastes a real cookie in /admin/ops.
+# owned by fulfillment's self-login (PutParameter overwrite on every heal).
+# Placeholder value fails humble auth cleanly until the first self-login lands
+# (or an operator PutParameters a session out of band as break-glass).
 resource "aws_ssm_parameter" "humble_cookie" {
   name  = "/${module.label_param.id}/humble-cookie"
   type  = "SecureString"
   value = "UNSET"
-  # Advanced tier lifts the 4 KB Standard cap: the paste flow PutParameters
-  # the raw humble cookie, and an oversized value would ValidationException
+  # Advanced tier lifts the 4 KB Standard cap: self-login PutParameters the
+  # raw humble session, and an oversized value would ValidationException
   # at runtime. Costs $0.05/mo; overwrite keeps the tier.
   tier = "Advanced"
   tags = module.label_param.tags

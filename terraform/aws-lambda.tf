@@ -38,8 +38,9 @@ module "lambda_fulfillment" {
           # The cookie plus, when step-up is enabled, the password + TOTP seed.
           Resource = concat([aws_ssm_parameter.humble_cookie.arn], local.humble_step_up_param_arns)
         }],
-        # Self-login writes the refreshed session back to the cookie param (replaces the human
-        # cookie-paste flow). Scoped to the cookie param only — never the password/TOTP seeds.
+        # Self-login writes the refreshed session back to the cookie param (fulfillment is the
+        # SOLE writer now that the admin cookie-paste flow is retired). Scoped to the cookie
+        # param only — never the password/TOTP seeds.
         [{
           Effect   = "Allow"
           Action   = ["ssm:PutParameter"]
@@ -96,7 +97,7 @@ module "lambda_admin_api" {
   context = module.context.shared
   name    = "admin-api"
 
-  description   = "Admin surface: login, links, hidden toggles, cookie paste, sync-now"
+  description   = "Admin surface: login, links, hidden toggles, sync-now"
   filename      = "${path.module}/artifacts/admin-api.zip"
   handler       = "bootstrap"
   runtime       = "provided.al2023"
@@ -108,10 +109,9 @@ module "lambda_admin_api" {
   timeout              = 29
 
   environment_variables = {
-    TABLE_NAME          = aws_dynamodb_table.this.name
-    FULFILLMENT_FN      = module.lambda_fulfillment.lambda_function_name
-    ADMIN_HASH_PARAM    = aws_ssm_parameter.admin_hash.name
-    HUMBLE_COOKIE_PARAM = aws_ssm_parameter.humble_cookie.name
+    TABLE_NAME       = aws_dynamodb_table.this.name
+    FULFILLMENT_FN   = module.lambda_fulfillment.lambda_function_name
+    ADMIN_HASH_PARAM = aws_ssm_parameter.admin_hash.name
     # See public-api: strips the REST stage prefix so axum's /admin/api/* routes match.
     AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
   }
@@ -119,19 +119,15 @@ module "lambda_admin_api" {
   addl_inline_policies = {
     dynamo             = data.aws_iam_policy_document.dynamo_rw.json
     invoke_fulfillment = data.aws_iam_policy_document.invoke_fulfillment.json
-    # paste flow: snapshot old cookie (Get) + write new (Put); hash: boot read
+    # hash: boot read only. The humble-cookie Get+Put the paste flow needed is gone —
+    # fulfillment's self-login owns that param now.
     ssm = jsonencode({
       Version = "2012-10-17"
       Statement = [
         {
           Effect   = "Allow"
           Action   = ["ssm:GetParameter"]
-          Resource = [aws_ssm_parameter.admin_hash.arn, aws_ssm_parameter.humble_cookie.arn]
-        },
-        {
-          Effect   = "Allow"
-          Action   = ["ssm:PutParameter"]
-          Resource = [aws_ssm_parameter.humble_cookie.arn]
+          Resource = [aws_ssm_parameter.admin_hash.arn]
         }
       ]
     })

@@ -8,7 +8,6 @@
 //! - GET   /admin/api/links              — list all links with used/allowed counts
 //! - POST  /admin/api/links/:token/revoke
 //! - GET   /admin/api/links/:token/claims
-//! - POST  /admin/api/cookie             — paste fresh humble cookie → SSM + validate
 //! - POST  /admin/api/sync               — trigger catalog sync now
 //! - GET   /admin/api/status             — sync state + game counts by status
 //!
@@ -25,7 +24,7 @@ use axum::{
     routing::{get, post},
 };
 use dynamo::{HiddenWrite, Store};
-use fulfillment::{FulfillRequest, FulfillResponse};
+use fulfillment::FulfillRequest;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
@@ -35,28 +34,12 @@ use time::OffsetDateTime;
 /// an api→api crate dependency; the shape is intentionally minimal.
 #[async_trait]
 pub trait AdminInvoker: Send + Sync {
-    /// Synchronous invoke (`RequestResponse`) — caller needs the typed response.
-    /// Used by cookie validation, which is fast.
-    async fn call(&self, req: FulfillRequest) -> Result<FulfillResponse, String>;
-
     /// Fire-and-forget invoke (`Event`) — returns as soon as the request is
     /// accepted, not when the work finishes. Used by sync-now: a full backfill
     /// runs for minutes, far past any HTTP timeout, so it MUST NOT be awaited
-    /// through the request path.
+    /// through the request path. (The blocking `RequestResponse` invoke existed
+    /// only for the retired cookie-paste validate and left with it.)
     async fn fire(&self, req: FulfillRequest) -> Result<(), String>;
-}
-
-/// SSM SecureString reader/writer for the humble session cookie. Separate from aws-sdk-ssm so
-/// tests can inject a mock without pulling in the real SSM SDK.
-#[async_trait]
-pub trait SsmPutter: Send + Sync {
-    /// Overwrite the configured SSM parameter with `value` (SecureString). SECURITY: callers must
-    /// never log or echo `value` — it is the humble session cookie.
-    async fn put_cookie(&self, value: &str) -> Result<(), String>;
-
-    /// Read the current value of the configured SSM parameter. Returns `Ok(None)` if the
-    /// parameter does not exist yet. SECURITY: callers must never log or echo the returned value.
-    async fn get_cookie(&self) -> Result<Option<String>, String>;
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -65,7 +48,6 @@ pub trait SsmPutter: Send + Sync {
 struct AppState {
     store: Arc<Store>,
     invoker: Arc<dyn AdminInvoker>,
-    ssm: Arc<dyn SsmPutter>,
     /// Argon2 PHC string loaded from SSM at lambda boot. Never written to logs.
     admin_hash: String,
 }
@@ -75,16 +57,10 @@ struct AppState {
 /// Build the axum router. `admin_hash` is the argon2 PHC string for the admin password
 /// (loaded from SSM at startup by `main.rs`). All routes except `/login` require a valid
 /// session cookie set by the login endpoint.
-pub fn router(
-    store: Arc<Store>,
-    invoker: Arc<dyn AdminInvoker>,
-    ssm: Arc<dyn SsmPutter>,
-    admin_hash: String,
-) -> Router {
+pub fn router(store: Arc<Store>, invoker: Arc<dyn AdminInvoker>, admin_hash: String) -> Router {
     let state = AppState {
         store,
         invoker,
-        ssm,
         admin_hash,
     };
 
@@ -99,7 +75,6 @@ pub fn router(
         )
         .route("/admin/api/links/:token/revoke", post(handle_revoke_link))
         .route("/admin/api/links/:token/claims", get(handle_link_claims))
-        .route("/admin/api/cookie", post(handle_cookie))
         .route("/admin/api/sync", post(handle_sync))
         .route("/admin/api/status", get(handle_status))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -374,72 +349,6 @@ async fn handle_link_claims(State(s): State<AppState>, Path(token): Path<String>
             (StatusCode::OK, Json(views)).into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
-// ── POST /admin/api/cookie ────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct CookieBody {
-    cookie: String,
-}
-
-/// Paste a fresh humble session cookie. Snapshots the existing value for rollback, writes the
-/// new cookie to SSM (SecureString overwrite), then immediately validates it via the invoker's
-/// `ValidateCookie` op.
-///
-/// - Validation success → `{"ok": true}`.
-/// - Validation definitive failure (CookieStatus{ok:false}) → roll back to snapshot if present,
-///   respond `{"ok": false, "restored_previous": bool}`.
-/// - Validation inconclusive (invoker Error or unexpected variant) → roll back to snapshot too
-///   (the known-good old value is safer than an unverified new one) and respond
-///   `{"ok": false, "inconclusive": true, "restored_previous": bool}`.
-///
-/// SECURITY: the cookie value MUST NOT appear in any log, response body, or error message.
-/// Only its validity (`ok`) is returned. If the initial SSM write fails, 500 is returned.
-async fn handle_cookie(State(s): State<AppState>, Json(body): Json<CookieBody>) -> Response {
-    // Snapshot the current cookie for rollback. Ignore errors (SSM unreachable) → treat as None.
-    let snapshot = s.ssm.get_cookie().await.ok().flatten();
-
-    if s.ssm.put_cookie(&body.cookie).await.is_err() {
-        // Do not echo the cookie value in the error response.
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    // cookie value is no longer needed after SSM write — it's in `body` which will be dropped.
-
-    match s.invoker.call(FulfillRequest::ValidateCookie).await {
-        Ok(FulfillResponse::CookieStatus { ok: true }) => {
-            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
-        }
-        Ok(FulfillResponse::CookieStatus { ok: false }) => {
-            // Definitive failure: roll back to snapshot if one exists.
-            let restored_previous = if let Some(ref old) = snapshot {
-                s.ssm.put_cookie(old).await.is_ok()
-            } else {
-                false
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"ok": false, "restored_previous": restored_previous})),
-            )
-                .into_response()
-        }
-        // Error or unexpected variant: inconclusive (humble unreachable). Roll back too —
-        // the known-good old value is safer than an unverified new one.
-        _ => {
-            let restored_previous = if let Some(ref old) = snapshot {
-                s.ssm.put_cookie(old).await.is_ok()
-            } else {
-                false
-            };
-            (
-                StatusCode::OK,
-                Json(
-                    serde_json::json!({"ok": false, "inconclusive": true, "restored_previous": restored_previous}),
-                ),
-            )
-                .into_response()
-        }
     }
 }
 
