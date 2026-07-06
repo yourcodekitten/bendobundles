@@ -10,8 +10,8 @@
 //! silently rot.
 
 use domain::{Claim, Game, GameStatus};
-use dynamo::{Store, SyncBegin, SyncState, SyncWrite};
-use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order};
+use dynamo::{Store, StoreError, SyncBegin, SyncState, SyncWrite};
+use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order, RevealedKey};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -50,7 +50,7 @@ const CHOICE_DISCOVERY_RECENT_PROBE: usize = 4;
 /// mismatch may be a mid-deploy artifact or an order shape the very next sync corrects.
 const RECONCILE_STUCK_ALERT_AGE: time::Duration = time::Duration::hours(24);
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum FulfillRequest {
     Gift {
@@ -70,6 +70,20 @@ pub enum FulfillRequest {
         #[serde(default)]
         requires_choice: bool,
     },
+    /// Admin self-claim: reveal the key VALUE to Ben (no gift URL). Mirrors `Gift`'s field
+    /// semantics: on `requires_choice=true`, `machine_name` is the OFFERED id and `keyindex` is
+    /// ignored (read off the post-choose order).
+    SelfClaim {
+        claim_id: String,
+        game_id: String,
+        gamekey: String,
+        /// Bundle game: the key's tpk machine_name.
+        machine_name: String,
+        /// Bundle game: the tpk's key index. Meaningless on a choice game.
+        keyindex: u32,
+        #[serde(default)]
+        requires_choice: bool,
+    },
     Sync,
     /// MANUAL-INVOKE-ONLY diagnostic since the cookie-paste teardown. Its only in-app sender was
     /// admin-api's paste-validate (removed with the paste flow); EventBridge fires `Sync`, which
@@ -80,11 +94,16 @@ pub enum FulfillRequest {
     ValidateCookie,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum FulfillResponse {
     GiftUrl {
         url: String,
+    },
+    /// Self-claim success: the revealed key VALUE. Serialized only on the admin-api wire —
+    /// never logged, never in a friend response.
+    RevealedKey {
+        key: String,
     },
     /// definitive: key was already redeemed; claim compensated; friend should pick another
     AlreadyRedeemed,
@@ -119,45 +138,62 @@ pub enum Decision {
     Park,
 }
 
+/// The Err-arm classification shared by [`gift_decision`] and [`reveal_decision`]. Extracted so
+/// the two decision functions can never drift — a new `HumbleError` variant is a compile error
+/// in this one place, not two. No `_` catch-all arm.
+fn gift_error_decision(err: &HumbleError) -> Decision {
+    match err {
+        // The ONE definitive "key is gone" signal from humble → safe to compensate.
+        HumbleError::AlreadyRedeemed => Decision::Compensate,
+        // Dead cookie: park + flag + ping (handled in the ParkCookieDead executor). Only the
+        // 200-with-HTML login interstitial maps here now — the one redeem response shape
+        // that positively identifies a stale session.
+        HumbleError::Unauthorized => Decision::ParkCookieDead,
+        // Auth/CSRF-layer rejection of the WRITE. The cookie may be perfectly healthy (live
+        // 2026-07-04 capture: redeem 403 while sync read the whole library) — reads own the
+        // cookie-health signal, so park WITHOUT flipping cookie_ok or pinging cookie-death.
+        // (The Park executor still pings for this variant — a distinct, correctly-labeled
+        // alert — because otherwise a persistent rejection loops silently: park → daily
+        // reconcile compensates → re-list → re-claim → reject again, with no operator signal.)
+        HumbleError::RedeemAuthRejected { .. } => Decision::Park,
+        // Secure-area step-up never completed (bad password/TOTP, locked account, or humble
+        // still gating). A gated redeem returns `login_required` BEFORE touching the key, so
+        // the key is not burned — park, never compensate. The Park executor pings a distinct,
+        // correctly-labeled alert so a persistent step-up failure doesn't loop silently.
+        HumbleError::SecureAreaStepUpFailed { .. } => Decision::Park,
+        // login() is the session self-heal path, never a redeem outcome — but the match is
+        // exhaustive, so classify it: a login failure means no session, so park (never burn).
+        HumbleError::LoginFailed { .. } => Decision::Park,
+        // choose_content (the Choice pick-spend) is handled BEFORE the redeem in the Choice
+        // orchestration, so this never actually reaches a redeem decision — but the match is
+        // exhaustive. A ChooseFailed provably spent no pick, so park (never compensate).
+        HumbleError::ChooseFailed { .. } => Decision::Park,
+        // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
+        // only reconcile against humble truth can tell. Park — never compensate blind.
+        HumbleError::RedeemRefused(_) => Decision::Park,
+        HumbleError::AmbiguousRedeem => Decision::Park,
+        HumbleError::RateLimited => Decision::Park,
+        HumbleError::Api(_) => Decision::Park,
+        HumbleError::Network(_) => Decision::Park,
+        HumbleError::Parse(_) => Decision::Park,
+    }
+}
+
 /// Map a humble redeem outcome to a [`Decision`]. Pure: no I/O, no panics, exhaustive.
 pub fn gift_decision(outcome: &Result<GiftUrl, HumbleError>) -> Decision {
     match outcome {
         Ok(_) => Decision::Record,
-        Err(err) => match err {
-            // The ONE definitive "key is gone" signal from humble → safe to compensate.
-            HumbleError::AlreadyRedeemed => Decision::Compensate,
-            // Dead cookie: park + flag + ping (handled in the ParkCookieDead executor). Only the
-            // 200-with-HTML login interstitial maps here now — the one redeem response shape
-            // that positively identifies a stale session.
-            HumbleError::Unauthorized => Decision::ParkCookieDead,
-            // Auth/CSRF-layer rejection of the WRITE. The cookie may be perfectly healthy (live
-            // 2026-07-04 capture: redeem 403 while sync read the whole library) — reads own the
-            // cookie-health signal, so park WITHOUT flipping cookie_ok or pinging cookie-death.
-            // (The Park executor still pings for this variant — a distinct, correctly-labeled
-            // alert — because otherwise a persistent rejection loops silently: park → daily
-            // reconcile compensates → re-list → re-claim → reject again, with no operator signal.)
-            HumbleError::RedeemAuthRejected { .. } => Decision::Park,
-            // Secure-area step-up never completed (bad password/TOTP, locked account, or humble
-            // still gating). A gated redeem returns `login_required` BEFORE touching the key, so
-            // the key is not burned — park, never compensate. The Park executor pings a distinct,
-            // correctly-labeled alert so a persistent step-up failure doesn't loop silently.
-            HumbleError::SecureAreaStepUpFailed { .. } => Decision::Park,
-            // login() is the session self-heal path, never a redeem outcome — but the match is
-            // exhaustive, so classify it: a login failure means no session, so park (never burn).
-            HumbleError::LoginFailed { .. } => Decision::Park,
-            // choose_content (the Choice pick-spend) is handled BEFORE the redeem in the Choice
-            // orchestration, so this never actually reaches a redeem decision — but the match is
-            // exhaustive. A ChooseFailed provably spent no pick, so park (never compensate).
-            HumbleError::ChooseFailed { .. } => Decision::Park,
-            // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
-            // only reconcile against humble truth can tell. Park — never compensate blind.
-            HumbleError::RedeemRefused(_) => Decision::Park,
-            HumbleError::AmbiguousRedeem => Decision::Park,
-            HumbleError::RateLimited => Decision::Park,
-            HumbleError::Api(_) => Decision::Park,
-            HumbleError::Network(_) => Decision::Park,
-            HumbleError::Parse(_) => Decision::Park,
-        },
+        Err(err) => gift_error_decision(err),
+    }
+}
+
+/// Reveal ladder decision — [`gift_decision`] typed over the reveal outcome. IDENTICAL
+/// classification (the two must never drift); only the Compensate arm's EXECUTION differs at the
+/// call site (self-claim recovers the key instead of compensating — spec §4).
+pub fn reveal_decision(outcome: &Result<RevealedKey, HumbleError>) -> Decision {
+    match outcome {
+        Ok(_) => Decision::Record,
+        Err(err) => gift_error_decision(err),
     }
 }
 
@@ -424,9 +460,52 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
                 .await
             }
         }
+        FulfillRequest::SelfClaim {
+            claim_id,
+            game_id,
+            gamekey,
+            machine_name,
+            keyindex,
+            requires_choice,
+        } => {
+            tracing::info!(
+                claim_id,
+                game_id,
+                machine_name,
+                keyindex,
+                requires_choice,
+                "fulfillment: self-claim request"
+            );
+            if requires_choice {
+                handle_self_claim_choice(deps, &claim_id, &game_id, &gamekey, &machine_name).await
+            } else {
+                handle_self_claim(deps, &claim_id, &game_id, &gamekey, &machine_name, keyindex)
+                    .await
+            }
+        }
         FulfillRequest::Sync => handle_sync(deps).await,
         FulfillRequest::ValidateCookie => handle_validate_cookie(deps).await,
     }
+}
+
+/// Self-claim choice wrapper — dispatches via [`handle_choice_claim`] with [`ClaimFlavor::SelfClaim`].
+async fn handle_self_claim_choice(
+    deps: &Deps,
+    claim_id: &str,
+    game_id: &str,
+    gamekey: &str,
+    offered_id: &str,
+) -> FulfillResponse {
+    handle_choice_claim(
+        deps,
+        claim_id,
+        domain::SELF_LINK_TOKEN,
+        game_id,
+        gamekey,
+        offered_id,
+        ClaimFlavor::SelfClaim,
+    )
+    .await
 }
 
 /// The gift ladder's side-effecting half. Policy lives in [`gift_decision`]; this executes it.
@@ -600,8 +679,20 @@ async fn handle_gift(
     }
 }
 
-/// The Humble Choice gift orchestration: a TWO-write one-shot that must spend a monthly pick
-/// exactly once. Sibling of [`handle_gift`], dispatched when `requires_choice` is set.
+/// The pick-spend flavor: determines `is_gift` on the choose, the terminal write, and the
+/// already-claimed-AND-redeemed recovery strategy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClaimFlavor {
+    Gift,
+    SelfClaim,
+}
+
+/// The Humble Choice orchestration: a TWO-write one-shot that must spend a monthly pick exactly
+/// once. Sibling of [`handle_gift`] / [`handle_self_claim`], dispatched when `requires_choice` is
+/// set. The three flavor points that differ between Gift and SelfClaim are:
+///  1. `is_gift` on the choose call — `true` for Gift, `false` for SelfClaim.
+///  2. The already-claimed-AND-redeemed pre-check arm — Gift pings human; SelfClaim recovers.
+///  3. The terminal — [`redeem_claimed_tpk`] for Gift, [`reveal_claimed_tpk`] for SelfClaim.
 ///
 /// The whole design turns on ONE durable write ordering: the pre-choose snapshot
 /// ([`Store::record_choice_intent`]) is made durable BEFORE `choosecontent` runs (step 3 before
@@ -613,13 +704,14 @@ async fn handle_gift(
 /// Entry state (like `handle_gift`): `claim_game` already created a durable `Pending` claim with
 /// its reconcile marker, so a crash at ANY step below leaves a claim reconcile will finish — no
 /// extra "park write" is ever needed; parking = returning without fulfilling.
-async fn handle_gift_choice(
+async fn handle_choice_claim(
     deps: &Deps,
     claim_id: &str,
     link_token: &str,
     game_id: &str,
     gamekey: &str,
     offered_id: &str,
+    flavor: ClaimFlavor,
 ) -> FulfillResponse {
     let selfheal = deps.session_store.is_some();
     // One self-login per invoke, total (mirrors run_sync's one-heal-per-run cap): every humble call
@@ -669,29 +761,48 @@ async fn handle_gift_choice(
         .find(|k| k.human_name.eq_ignore_ascii_case(&title))
     {
         if existing.redeemed {
-            tracing::warn!(
-                claim_id,
-                "choice pre-check: game already claimed AND redeemed on humble — human recovery"
-            );
-            ping(
-                deps,
-                &format!(
-                    "choice claim {claim_id} ({title}): this game's pick appears already claimed AND \
-                     redeemed on humble — no re-choose was attempted. Recover the gift URL from \
-                     humble's gift-history page; the claim is parked."
-                ),
-            )
-            .await;
-            return parked_choice("already-claimed-redeemed");
+            return match flavor {
+                ClaimFlavor::Gift => {
+                    tracing::warn!(
+                        claim_id,
+                        "choice pre-check: game already claimed AND redeemed on humble — human recovery"
+                    );
+                    ping(
+                        deps,
+                        &format!(
+                            "choice claim {claim_id} ({title}): this game's pick appears already \
+                             claimed AND redeemed on humble — no re-choose was attempted. Recover \
+                             the gift URL from humble's gift-history page; the claim is parked."
+                        ),
+                    )
+                    .await;
+                    parked_choice("already-claimed-redeemed")
+                }
+                ClaimFlavor::SelfClaim => {
+                    tracing::warn!(
+                        claim_id,
+                        "choice pre-check: game already claimed AND redeemed — recovering key for self-claim"
+                    );
+                    recover_already_redeemed_key(
+                        deps,
+                        claim_id,
+                        game_id,
+                        gamekey,
+                        &existing.machine_name,
+                    )
+                    .await
+                }
+            };
         }
         tracing::info!(
             claim_id,
-            "choice pre-check: pick already spent (tpk present, unredeemed) — resuming to redeem WITHOUT choosing"
+            "choice pre-check: pick already spent (tpk present, unredeemed) — resuming to terminal WITHOUT choosing"
         );
-        // Resume: the pick was already spent; skip the choose entirely and redeem the key that is
-        // already sitting in the order. No intent snapshot needed — nothing new will be chosen.
-        return redeem_claimed_tpk(
+        // Resume: the pick was already spent; skip the choose entirely and run the terminal on the
+        // key already sitting in the order. No intent snapshot needed — nothing new will be chosen.
+        return claimed_tpk_terminal(
             deps,
+            flavor,
             claim_id,
             link_token,
             game_id,
@@ -723,8 +834,9 @@ async fn handle_gift_choice(
     // Bind the chosen slice in-scope: `selfheal_once`'s Fn closure may call twice (heal-retry), so
     // the borrowed slice must outlive both calls.
     let chosen: [&str; 1] = [offered_id];
+    let is_gift = matches!(flavor, ClaimFlavor::Gift);
     let (heal, choose_outcome) = selfheal_once(deps, selfheal && !healed, || {
-        deps.humble.choose_content(gamekey, &chosen, true)
+        deps.humble.choose_content(gamekey, &chosen, is_gift)
     })
     .await;
     let decision = choose_decision(&choose_outcome);
@@ -802,9 +914,10 @@ async fn handle_gift_choice(
         }
     };
 
-    // ── Steps 6 + 7: HUMBLE WRITE 2 — burn the tpk to a gift, record the URL (shared tail). ─────
-    redeem_claimed_tpk(
+    // ── Steps 6 + 7: HUMBLE WRITE 2 — burn the tpk (gift or reveal), record the result (shared tail). ─
+    claimed_tpk_terminal(
         deps,
+        flavor,
         claim_id,
         link_token,
         game_id,
@@ -813,6 +926,53 @@ async fn handle_gift_choice(
         selfheal && !healed,
     )
     .await
+}
+
+/// Gift choice wrapper — thin entry point; behavior-identical to pre-refactor `handle_gift_choice`.
+async fn handle_gift_choice(
+    deps: &Deps,
+    claim_id: &str,
+    link_token: &str,
+    game_id: &str,
+    gamekey: &str,
+    offered_id: &str,
+) -> FulfillResponse {
+    handle_choice_claim(
+        deps,
+        claim_id,
+        link_token,
+        game_id,
+        gamekey,
+        offered_id,
+        ClaimFlavor::Gift,
+    )
+    .await
+}
+
+/// Flavor-dispatched terminal on a claimed tpk — called from the pre-check resume, the happy tail,
+/// and (Task 8) reconcile B2. Gift → [`redeem_claimed_tpk`]; SelfClaim → [`reveal_claimed_tpk`].
+#[allow(clippy::too_many_arguments)] // private dispatcher; params mirror the two terminals it fans into
+async fn claimed_tpk_terminal(
+    deps: &Deps,
+    flavor: ClaimFlavor,
+    claim_id: &str,
+    link_token: &str,
+    game_id: &str,
+    gamekey: &str,
+    tpk: &KeyEntry,
+    allow_heal: bool,
+) -> FulfillResponse {
+    match flavor {
+        ClaimFlavor::Gift => {
+            redeem_claimed_tpk(
+                deps, claim_id, link_token, game_id, gamekey, tpk, allow_heal,
+            )
+            .await
+        }
+        ClaimFlavor::SelfClaim => {
+            reveal_claimed_tpk(deps, claim_id, game_id, gamekey, tpk, allow_heal).await
+        }
+    }
 }
 
 /// The shared "redeem a now-present choice tpk and record its gift URL" tail, called by BOTH the
@@ -958,6 +1118,111 @@ async fn redeem_claimed_tpk(
     }
 }
 
+/// The shared "reveal a now-present choice tpk and record its key value" tail — the self-claim
+/// sibling of [`redeem_claimed_tpk`], called by the happy path and (Task 8) reconcile B2.
+///
+/// Classification reuses [`reveal_decision`]. ONE Choice override vs the plain self-claim path:
+/// a `Compensate`/`AlreadyRedeemed` outcome RECOVERS via [`recover_already_redeemed_key`] instead
+/// of compensating — the monthly pick is already spent, re-listing would strand it, and for a
+/// self-claim the key value IS recoverable from the order's `redeemed_key_val`.
+///
+/// `allow_heal` caps the shared one-heal ladder (same semantics as [`redeem_claimed_tpk`]).
+async fn reveal_claimed_tpk(
+    deps: &Deps,
+    claim_id: &str,
+    game_id: &str,
+    gamekey: &str,
+    tpk: &KeyEntry,
+    allow_heal: bool,
+) -> FulfillResponse {
+    let (heal, outcome) = selfheal_once(deps, allow_heal, || {
+        deps.humble
+            .reveal_key(gamekey, &tpk.machine_name, tpk.keyindex)
+    })
+    .await;
+    if let Err(e) = &outcome {
+        tracing::warn!(claim_id, game_id, error = ?e, "choice self-claim reveal did not return a key");
+    } else {
+        tracing::info!(claim_id, game_id, "choice self-claim reveal returned a key");
+    }
+    let decision = reveal_decision(&outcome);
+    if let Some(h) = heal
+        && decision != Decision::ParkCookieDead
+    {
+        set_cookie_ok(deps, h.durable()).await;
+    }
+    match decision {
+        Decision::Record => match outcome {
+            Ok(RevealedKey(key)) => record_revealed_key(deps, claim_id, game_id, key).await,
+            // reveal_decision guarantees Record ⇒ Ok; unreachable, handled without panic.
+            Err(_) => FulfillResponse::Error {
+                message: "internal: record decision without a revealed key".into(),
+            },
+        },
+        // CHOICE OVERRIDE (§5.3 self-claim variant): the pick is spent — NEVER compensate. For a
+        // self-claim, "already redeemed" means the key already belongs to Ben; recover the value
+        // from the order's redeemed_key_val rather than re-listing.
+        Decision::Compensate => {
+            tracing::warn!(
+                claim_id,
+                game_id,
+                "choice self-claim reveal returned AlreadyRedeemed — recovering key from order (NOT compensating)"
+            );
+            recover_already_redeemed_key(deps, claim_id, game_id, gamekey, &tpk.machine_name).await
+        }
+        Decision::ParkCookieDead => choice_cookie_dead(deps).await,
+        // Ambiguous/refused → park (never compensate blind); distinct pings for the loop-forever
+        // classes, mirroring redeem_claimed_tpk.
+        Decision::Park => {
+            let detail = match &outcome {
+                Err(HumbleError::RedeemRefused(_)) => "refused",
+                Err(HumbleError::AmbiguousRedeem) => "ambiguous",
+                Err(HumbleError::RateLimited) => "rate-limited",
+                Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
+                Err(HumbleError::SecureAreaStepUpFailed { .. }) => "secure-area-step-up-failed",
+                _ => "transient",
+            };
+            if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
+                ping(
+                    deps,
+                    &format!(
+                        "choice self-claim reveal for claim {claim_id} ({}) needed humble's \
+                         secure-area step-up and it did not complete: {reason}. The key was NOT \
+                         revealed — the claim is parked and reconcile will finish it.",
+                        tpk.machine_name
+                    ),
+                )
+                .await;
+            }
+            if let Err(HumbleError::RedeemAuthRejected {
+                status,
+                csrf_minted,
+            }) = &outcome
+            {
+                let csrf_note = if *csrf_minted {
+                    "csrf capture FAILED (minted fallback used) — the preflight isn't yielding a cookie"
+                } else {
+                    "humble rejected its own captured csrf token — the write dance needs a look"
+                };
+                ping(
+                    deps,
+                    &format!(
+                        "choice self-claim reveal for claim {claim_id} ({}) was blocked at \
+                         humble's auth layer (status {status}). {csrf_note}. The session cookie \
+                         is fine (reads work). The claim is parked; reconcile will finish it once \
+                         the write path is fixed.",
+                        tpk.machine_name
+                    ),
+                )
+                .await;
+            }
+            FulfillResponse::Parked {
+                reason: format!("humble call inconclusive: park for reconcile ({detail})"),
+            }
+        }
+    }
+}
+
 /// Park a choice claim after a dead-session signal on one of its order reads / the choose
 /// interstitial: flag `cookie_ok=false`, ping, return Parked — the same treatment `handle_gift`'s
 /// ParkCookieDead arm applies. No pick can have been spent on this path (an `Unauthorized` choose is
@@ -1028,6 +1293,170 @@ fn parked_choice(detail: &str) -> FulfillResponse {
     }
 }
 
+/// The self-claim ladder's side-effecting half — [`handle_gift`]'s reveal sibling. Same heal
+/// composition; two policy differences (spec §4): Record writes `revealed_key` via
+/// `fulfill_self_claim`, and AlreadyRedeemed RECOVERS (re-read order → record `redeemed_key_val`)
+/// instead of compensating — for a self-claim, "already redeemed" means the key already belongs
+/// to Ben and its value is recoverable; compensating would re-list a burned game and lose the key.
+async fn handle_self_claim(
+    deps: &Deps,
+    claim_id: &str,
+    game_id: &str,
+    gamekey: &str,
+    machine_name: &str,
+    keyindex: u32,
+) -> FulfillResponse {
+    let (heal, outcome) = selfheal_once(deps, deps.session_store.is_some(), || {
+        deps.humble.reveal_key(gamekey, machine_name, keyindex)
+    })
+    .await;
+    if let Err(e) = &outcome {
+        tracing::warn!(claim_id, game_id, error = ?e, "self-claim reveal did not return a key");
+    } else {
+        tracing::info!(claim_id, game_id, "self-claim reveal returned a key");
+    }
+    let decision = reveal_decision(&outcome);
+    if let Some(h) = heal
+        && decision != Decision::ParkCookieDead
+    {
+        set_cookie_ok(deps, h.durable()).await;
+    }
+    match decision {
+        Decision::Record => match outcome {
+            Ok(RevealedKey(key)) => record_revealed_key(deps, claim_id, game_id, key).await,
+            Err(_) => FulfillResponse::Error {
+                message: "internal: record decision without a revealed key".into(),
+            },
+        },
+        // Spec §4 recover-then-record: NOT compensate.
+        Decision::Compensate => {
+            recover_already_redeemed_key(deps, claim_id, game_id, gamekey, machine_name).await
+        }
+        Decision::ParkCookieDead => {
+            set_cookie_ok(deps, false).await;
+            let msg = if deps.session_store.is_some() {
+                COOKIE_DEAD_SELFHEAL_MSG
+            } else {
+                COOKIE_DEAD_MSG
+            };
+            ping(deps, msg).await;
+            FulfillResponse::Parked {
+                reason: "humble session needs attention".into(),
+            }
+        }
+        Decision::Park => {
+            let detail = match &outcome {
+                Err(HumbleError::RedeemRefused(_)) => "refused",
+                Err(HumbleError::AmbiguousRedeem) => "ambiguous",
+                Err(HumbleError::RateLimited) => "rate-limited",
+                Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
+                Err(HumbleError::SecureAreaStepUpFailed { .. }) => "secure-area-step-up-failed",
+                _ => "transient",
+            };
+            if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
+                ping(
+                    deps,
+                    &format!(
+                        "self-claim reveal for claim {claim_id} ({machine_name}) needed humble's \
+                     secure-area step-up and it did not complete: {reason}. The key was NOT \
+                     revealed — the claim is parked and reconcile will finish it."
+                    ),
+                )
+                .await;
+            }
+            FulfillResponse::Parked {
+                reason: format!("self-claim reveal inconclusive: park for reconcile ({detail})"),
+            }
+        }
+    }
+}
+
+/// Durable-first record of a revealed key + the RevealedKey response. Shared by the happy path
+/// and the recover path.
+async fn record_revealed_key(
+    deps: &Deps,
+    claim_id: &str,
+    game_id: &str,
+    key: String,
+) -> FulfillResponse {
+    match deps.store.fulfill_self_claim(claim_id, game_id, &key).await {
+        Ok(()) => FulfillResponse::RevealedKey { key },
+        Err(e) => {
+            // Key exists but recording failed — loud, human decides. NEVER retry the reveal.
+            // The ping names the claim, NEVER the key value.
+            ping(deps, &format!(
+                "self-claim fulfill failed for claim {claim_id}: {e} — the key was revealed but \
+                 not recorded; it is still readable in humble's library keys page."
+            )).await;
+            FulfillResponse::Error {
+                message: "key revealed but recording failed — flagged for ben".into(),
+            }
+        }
+    }
+}
+
+/// AlreadyRedeemed recovery (spec §4): the key's value sits in the order's
+/// `keys[].redeemed_key_val`. Re-read, match the tpk by machine_name, record.
+/// Fallback when no value is present (e.g. the key was actually gifted away — gift-redeems may
+/// not set redeemed_key_val): PARK + ping, never guess, never compensate blind.
+async fn recover_already_redeemed_key(
+    deps: &Deps,
+    claim_id: &str,
+    game_id: &str,
+    gamekey: &str,
+    machine_name: &str,
+) -> FulfillResponse {
+    let order = match deps.humble.order(gamekey).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(claim_id, error = ?e, "self-claim recover: order re-read failed — parking");
+            return FulfillResponse::Parked {
+                reason: "recover re-read failed: park for reconcile".into(),
+            };
+        }
+    };
+    let tpk = order.keys.iter().find(|k| k.machine_name == machine_name);
+    match tpk.and_then(|k| k.redeemed_key_val.clone()) {
+        Some(val) => {
+            tracing::info!(
+                claim_id,
+                "self-claim recover: redeemed_key_val present — recording"
+            );
+            record_revealed_key(deps, claim_id, game_id, val).await
+        }
+        None => {
+            ping(
+                deps,
+                &format!(
+                    "self-claim {claim_id} ({machine_name}): humble says already-redeemed but the \
+                 order carries no key value — it may have been gifted out-of-band. Parked for \
+                 review; nothing was compensated."
+                ),
+            )
+            .await;
+            FulfillResponse::Parked {
+                reason: "already-redeemed with no recoverable key value".into(),
+            }
+        }
+    }
+}
+
+/// Dispatch [`compensate_claim`](Store::compensate_claim) or
+/// [`compensate_self_claim`](Store::compensate_self_claim) based on the claim's link token.
+/// SELF claims have no link-meta item; the gift path needs the token to locate the link record.
+/// Used by every reconcile arm that proves no pick was spent (bundle not-redeemed, choice A, B1).
+async fn compensate_any(deps: &Deps, claim: &domain::Claim) -> Result<(), StoreError> {
+    if claim.link_token == domain::SELF_LINK_TOKEN {
+        deps.store
+            .compensate_self_claim(&claim.id, &claim.game_id)
+            .await
+    } else {
+        deps.store
+            .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
+            .await
+    }
+}
+
 /// The choice branch of [`reconcile`]. Called for an aged `Pending` claim whose game
 /// `requires_choice`, with a fresh `order`. Decides PURELY from the intent snapshot + the order
 /// diff — it must NEVER call `choose_content` on any branch, and must not even take the offered id
@@ -1037,13 +1466,10 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
     match &claim.choice_pre_tpks {
         // A. No snapshot ⇒ the intent write never landed ⇒ choose was NEVER attempted (write order
         // §2.3) ⇒ pick NOT spent ⇒ compensate (slot returns, game re-lists). Same shape as the
-        // bundle "not redeemed → compensate" arm.
+        // bundle "not redeemed → compensate" arm. SELF uses compensate_self_claim (no link-meta).
         None => {
             tracing::info!(claim_id = %claim.id, "reconcile(choice): no intent snapshot — choose never ran, compensating (no pick spent)");
-            let _ = deps
-                .store
-                .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
-                .await;
+            let _ = compensate_any(deps, claim).await;
             ping(
                 deps,
                 &format!(
@@ -1059,13 +1485,10 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
             // commit ⇒ pick NOT spent ⇒ compensate. Hard backstop against a mis-decided ambiguous
             // choose: a re-list → re-claim → re-choose of the same game is REFUSED by humble
             // ("already chosen" → ChooseFailed → park), so no pick is ever double-spent — the
-            // residual is churn + pings, never value.
+            // residual is churn + pings, never value. SELF uses compensate_self_claim (no link-meta).
             TpkPick::None => {
                 tracing::info!(claim_id = %claim.id, "reconcile(choice): snapshot present, no new tpk — choose did not commit, compensating (no pick spent)");
-                let _ = deps
-                    .store
-                    .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
-                    .await;
+                let _ = compensate_any(deps, claim).await;
                 ping(
                     deps,
                     &format!(
@@ -1079,13 +1502,24 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                 .await;
             }
             // B2. Unique new tpk, NOT redeemed ⇒ pick SPENT, key not yet burned (crash between the
-            // two writes) ⇒ redeem it and complete the claim FROM RECONCILE — never choosing.
+            // two writes) ⇒ complete the claim FROM RECONCILE — never choosing.
+            // Gift → redeem as gift URL; SELF → reveal and record key value.
             // allow_heal=false: this pass's order read just proved the session live; a dead-session
-            // redeem here simply leaves the claim Pending for the next sync (which heals + retries).
+            // call here simply leaves the claim Pending for the next sync (which heals + retries).
             TpkPick::Unique(tpk) if !tpk.redeemed => {
-                tracing::info!(claim_id = %claim.id, "reconcile(choice): pick spent, key present + unredeemed — redeeming from reconcile (NO choose)");
-                let resp = redeem_claimed_tpk(
+                let flavor = if claim.link_token == domain::SELF_LINK_TOKEN {
+                    ClaimFlavor::SelfClaim
+                } else {
+                    ClaimFlavor::Gift
+                };
+                tracing::info!(
+                    claim_id = %claim.id,
+                    is_self = claim.link_token == domain::SELF_LINK_TOKEN,
+                    "reconcile(choice): pick spent, key present + unredeemed — completing from reconcile (NO choose)"
+                );
+                let resp = claimed_tpk_terminal(
                     deps,
+                    flavor,
                     &claim.id,
                     &claim.link_token,
                     &claim.game_id,
@@ -1095,31 +1529,47 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                 )
                 .await;
                 match resp {
-                    FulfillResponse::GiftUrl { .. } => {
+                    FulfillResponse::GiftUrl { .. } | FulfillResponse::RevealedKey { .. } => {
                         tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
                     }
                     other => {
                         // Any non-success just leaves the claim Pending for the next pass (the
                         // executor already pinged the loud classes / handled AlreadyRedeemed → B3).
-                        tracing::warn!(claim_id = %claim.id, ?other, "reconcile(choice): redeem did not complete — claim stays pending for the next pass");
+                        tracing::warn!(claim_id = %claim.id, ?other, "reconcile(choice): terminal did not complete — claim stays pending for the next pass");
                     }
                 }
             }
-            // B3. Unique new tpk, ALREADY redeemed ⇒ pick spent AND key burned, URL unrecorded
-            // (crash after write 2, or ben self-redeemed) ⇒ leave Pending + human-recover ping,
-            // verbatim the existing bundle redeemed arm. NEVER a key value in the ping.
-            TpkPick::Unique(_tpk) => {
-                tracing::warn!(claim_id = %claim.id, "reconcile(choice): key present but already redeemed — human recovery (URL unrecorded)");
-                ping(
-                    deps,
-                    &format!(
-                        "choice claim {} ({}) shows its key already redeemed on humble but no gift \
-                         URL was recorded — recover it manually from humble's gift-history page. \
-                         Claim left pending.",
-                        claim.id, game.title
-                    ),
-                )
-                .await;
+            // B3. Unique new tpk, ALREADY redeemed ⇒ pick spent AND key burned/revealed.
+            // Gift: URL unrecorded — leave Pending + human-recover ping (NEVER a key value).
+            // SELF: key value may be recoverable from the order's redeemed_key_val; attempt
+            //       recover_already_redeemed_key so the claim can complete autonomously.
+            TpkPick::Unique(tpk) => {
+                if claim.link_token == domain::SELF_LINK_TOKEN {
+                    tracing::warn!(
+                        claim_id = %claim.id,
+                        "reconcile(choice): self-claim key already redeemed — recovering key from order"
+                    );
+                    let _ = recover_already_redeemed_key(
+                        deps,
+                        &claim.id,
+                        &claim.game_id,
+                        &order.gamekey,
+                        &tpk.machine_name,
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(claim_id = %claim.id, "reconcile(choice): key present but already redeemed — human recovery (URL unrecorded)");
+                    ping(
+                        deps,
+                        &format!(
+                            "choice claim {} ({}) shows its key already redeemed on humble but no gift \
+                             URL was recorded — recover it manually from humble's gift-history page. \
+                             Claim left pending.",
+                            claim.id, game.title
+                        ),
+                    )
+                    .await;
+                }
             }
             // B4. Two-or-more new tpks the title can't split (concurrent sibling on this month) ⇒
             // leave Pending + a distinct ping. A human decides; the next pass retries once the
@@ -1620,20 +2070,44 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             continue;
         };
         if key.redeemed {
-            tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
-            // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message
-            // carries claim id + human game context only — NEVER a key value.
-            ping(
-                deps,
-                &format!(
-                    "parked claim {} ({} / {}) shows redeemed on humble but no gift URL was \
-                     recorded — recover manually via humble's gift-history page",
-                    claim.id, order.bundle_name, key.human_name
-                ),
-            )
-            .await;
+            if claim.link_token == domain::SELF_LINK_TOKEN {
+                // SELF: the key value may be recoverable from the order's redeemed_key_val.
+                // recover_already_redeemed_key re-reads the order, extracts the value, and
+                // records it — completing the claim autonomously. NEVER a key value in logs.
+                tracing::warn!(
+                    claim_id = %claim.id,
+                    "reconcile: self-claim parked shows redeemed on humble — recovering key from order"
+                );
+                let _ = recover_already_redeemed_key(
+                    deps,
+                    &claim.id,
+                    &claim.game_id,
+                    gamekey,
+                    machine_name,
+                )
+                .await;
+            } else {
+                tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
+                // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message
+                // carries claim id + human game context only — NEVER a key value.
+                ping(
+                    deps,
+                    &format!(
+                        "parked claim {} ({} / {}) shows redeemed on humble but no gift URL was \
+                         recorded — recover manually via humble's gift-history page",
+                        claim.id, order.bundle_name, key.human_name
+                    ),
+                )
+                .await;
+            }
+        } else if claim.link_token == domain::SELF_LINK_TOKEN {
+            // SELF: the reveal never landed — attempt a late reveal (plan B1, allow_heal=false).
+            // A race where the key was actually burned hits AlreadyRedeemed inside
+            // reveal_claimed_tpk → recover_already_redeemed_key safely; no double-spend is possible.
+            tracing::info!(claim_id = %claim.id, "reconcile: self-claim parked, not redeemed on humble — revealing (plan B1)");
+            let _ = reveal_claimed_tpk(deps, &claim.id, &claim.game_id, gamekey, key, false).await;
         } else {
-            // The redeem never landed on humble → return the slot and re-list the game.
+            // Gift: the redeem/reveal never landed on humble → return the slot and re-list the game.
             //
             // Risk bound (this arm's worst case is NOT a double-spend): the compensate arm assumes a
             // gifted key would show redeemed here (redeemed_key_val set). If humble does NOT set that
@@ -1645,11 +2119,8 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             // recoverable case is caught. (Confirming whether a gift sets redeemed_key_val — which
             // would route the crash-after-gift case to the redeemed/URL-recovery branch instead — is
             // a non-urgent follow-up: the plan-2 live receipt.)
-            tracing::info!(claim_id = %claim.id, "reconcile: parked claim not redeemed on humble — compensating (slot returns, game re-lists)");
-            let _ = deps
-                .store
-                .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
-                .await;
+            tracing::info!(claim_id = %claim.id, "reconcile: parked gift claim not redeemed on humble — compensating (slot returns, game re-lists)");
+            let _ = compensate_any(deps, &claim).await;
             // Ping every reconcile compensate. Self-login keeps the session alive 24/7, so this arm
             // runs autonomously on every sync — the dead-cookie stall that used to force a human to
             // look is gone. The ping restores that checkpoint: a compensate of a key that was in fact
@@ -1933,6 +2404,7 @@ mod tests {
                 expired: false,
                 giftable: !redeemed,
                 keyindex: 0,
+                redeemed_key_val: None,
             }
         }
         fn order(keys: Vec<KeyEntry>) -> Order {

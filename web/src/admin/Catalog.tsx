@@ -1,6 +1,14 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { adminCatalog, adminSetHidden, type AdminGame } from '../api';
+import {
+  adminCatalog,
+  adminSetHidden,
+  adminSelfClaim,
+  adminSelfClaims,
+  type AdminGame,
+  type SelfClaimResult,
+  type SelfClaimView,
+} from '../api';
 import { withAuth } from './withAuth';
 import { titleColorClass } from '../titleColor';
 
@@ -38,6 +46,12 @@ export function Catalog() {
   // Per-row inline error for toggle refusals (mid-claim 409 from server)
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
 
+  // Self-claim state
+  const [armedId, setArmedId] = useState<string | null>(null);
+  const [claiming, setClaiming] = useState<string | null>(null);
+  const [result, setResult] = useState<{ gameId: string; r: SelfClaimResult } | null>(null);
+  const [selfClaims, setSelfClaims] = useState<SelfClaimView[]>([]);
+
   const load = useCallback(() => {
     setState({ phase: 'loading' });
     // withAuth re-throws non-Unauthorized errors → .catch sets error state
@@ -46,9 +60,32 @@ export function Catalog() {
       .catch(() => setState({ phase: 'error' }));
   }, [navigate]);
 
+  const loadSelfClaims = useCallback(() => {
+    withAuth(() => adminSelfClaims(), navigate)
+      .then((claims) => setSelfClaims(claims))
+      .catch(() => {
+        // non-critical — fail silently, list stays stale
+      });
+  }, [navigate]);
+
   useEffect(() => {
     load();
-  }, [load]);
+    loadSelfClaims();
+  }, [load, loadSelfClaims]);
+
+  const handleSelfClaim = async (g: AdminGame) => {
+    if (armedId !== g.id) {
+      setArmedId(g.id);
+      return;
+    }
+    setArmedId(null);
+    setClaiming(g.id);
+    const r = await withAuth(() => adminSelfClaim(g.id), navigate);
+    setClaiming(null);
+    setResult({ gameId: g.id, r });
+    load();
+    loadSelfClaims();
+  };
 
   const handleToggle = (game: AdminGame) => {
     if (state.phase !== 'loaded') return;
@@ -154,71 +191,192 @@ export function Catalog() {
       <div className="space-y-1">
         {filtered.map((game) => {
           const rowErr = rowErrors[game.id];
+          const isArmed = armedId === game.id;
+          const isClaiming = claiming === game.id;
+          const rowResult = result?.gameId === game.id ? result.r : null;
+          // TS narrowing caveat: alias r before branching
+          const r = rowResult;
           return (
-            <div
-              key={game.id}
-              className="flex flex-wrap items-center gap-3 rounded bg-zinc-900 px-4 py-3"
-            >
-              {/* Artwork thumbnail — colored fallback when url absent */}
-              {game.artwork_url !== null ? (
-                <img
-                  src={game.artwork_url}
-                  alt={game.title}
-                  className="h-10 w-16 flex-shrink-0 rounded object-cover"
-                />
-              ) : (
-                <div
-                  className={`h-10 w-16 flex-shrink-0 rounded ${titleColorClass(game.title)}`}
-                  aria-hidden="true"
-                />
-              )}
+            <div key={game.id} className="space-y-1">
+              <div className="flex flex-wrap items-center gap-3 rounded bg-zinc-900 px-4 py-3">
+                {/* Artwork thumbnail — colored fallback when url absent */}
+                {game.artwork_url !== null ? (
+                  <img
+                    src={game.artwork_url}
+                    alt={game.title}
+                    className="h-10 w-16 flex-shrink-0 rounded object-cover"
+                  />
+                ) : (
+                  <div
+                    className={`h-10 w-16 flex-shrink-0 rounded ${titleColorClass(game.title)}`}
+                    aria-hidden="true"
+                  />
+                )}
 
-              {/* Title + bundle */}
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-medium">{game.title}</p>
-                <p className="truncate text-xs text-zinc-400">{game.bundle}</p>
+                {/* Title + bundle */}
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium">{game.title}</p>
+                  <p className="truncate text-xs text-zinc-400">{game.bundle}</p>
+                </div>
+
+                {/* key_type */}
+                <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300">
+                  {game.key_type}
+                </span>
+
+                {/* Status badge with exact plan color mapping */}
+                <span
+                  className={`rounded px-2 py-0.5 text-xs font-medium ${statusBadgeClass(game.status)}`}
+                >
+                  {game.status}
+                </span>
+
+                {/* Giftable chip — only shown when true */}
+                {game.giftable && (
+                  <span className="rounded bg-violet-900 px-2 py-0.5 text-xs text-violet-200">
+                    giftable
+                  </span>
+                )}
+
+                {/* Self-claim button — available games only, arm/confirm two-step */}
+                {game.status === 'available' && (
+                  <button
+                    type="button"
+                    disabled={isClaiming}
+                    onClick={() => void handleSelfClaim(game)}
+                    className={`rounded px-3 py-1 text-xs ${
+                      isArmed
+                        ? 'bg-emerald-700 text-emerald-100 hover:bg-emerald-600'
+                        : 'bg-zinc-700 hover:bg-zinc-600'
+                    } disabled:opacity-50`}
+                  >
+                    {isArmed
+                      ? game.requires_choice
+                        ? 'confirm? spends 1 pick'
+                        : 'confirm?'
+                      : isClaiming
+                        ? 'claiming…'
+                        : 'claim for me'}
+                  </button>
+                )}
+
+                {/* Hidden toggle switch */}
+                <label className="flex cursor-pointer items-center gap-1.5">
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    aria-label={`hide ${game.title}`}
+                    checked={game.hidden}
+                    onChange={() => handleToggle(game)}
+                    className="h-4 w-4 cursor-pointer accent-zinc-500"
+                  />
+                  <span className="text-xs text-zinc-400">hidden</span>
+                </label>
+
+                {/* Inline toggle error — shown when server refuses (e.g. mid-claim) */}
+                {rowErr !== undefined && (
+                  <p className="w-full text-xs text-red-400">{rowErr}</p>
+                )}
               </div>
 
-              {/* key_type */}
-              <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300">
-                {game.key_type}
-              </span>
-
-              {/* Status badge with exact plan color mapping */}
-              <span
-                className={`rounded px-2 py-0.5 text-xs font-medium ${statusBadgeClass(game.status)}`}
-              >
-                {game.status}
-              </span>
-
-              {/* Giftable chip — only shown when true */}
-              {game.giftable && (
-                <span className="rounded bg-violet-900 px-2 py-0.5 text-xs text-violet-200">
-                  giftable
-                </span>
+              {/* Result panel — dismissible, per-row */}
+              {r?.kind === 'revealed' && (
+                <div className="rounded bg-emerald-950 p-3 text-sm">
+                  <span className="select-all font-mono">{r.key}</span>
+                  <button
+                    type="button"
+                    onClick={() => void navigator.clipboard.writeText(r.key)}
+                    className="ml-2 rounded bg-zinc-700 px-2 py-1 text-xs"
+                  >
+                    copy
+                  </button>
+                  {r.keyType === 'steam' && (
+                    <a
+                      href={`https://store.steampowered.com/account/registerkey?key=${encodeURIComponent(r.key)}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="ml-2 rounded bg-blue-700 px-2 py-1 text-xs"
+                    >
+                      redeem on steam
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setResult(null)}
+                    className="ml-2 text-xs text-zinc-400"
+                  >
+                    dismiss
+                  </button>
+                </div>
               )}
-
-              {/* Hidden toggle switch */}
-              <label className="flex cursor-pointer items-center gap-1.5">
-                <input
-                  type="checkbox"
-                  role="switch"
-                  aria-label={`hide ${game.title}`}
-                  checked={game.hidden}
-                  onChange={() => handleToggle(game)}
-                  className="h-4 w-4 cursor-pointer accent-zinc-500"
-                />
-                <span className="text-xs text-zinc-400">hidden</span>
-              </label>
-
-              {/* Inline toggle error — shown when server refuses (e.g. mid-claim) */}
-              {rowErr !== undefined && (
-                <p className="w-full text-xs text-red-400">{rowErr}</p>
+              {r?.kind === 'processing' && (
+                <div className="rounded bg-amber-950 p-3 text-sm">
+                  reveal is processing — the key will appear under self-claims below.
+                  <button
+                    type="button"
+                    onClick={() => setResult(null)}
+                    className="ml-2 text-xs"
+                  >
+                    dismiss
+                  </button>
+                </div>
+              )}
+              {r?.kind === 'refused' && (
+                <div className="rounded bg-red-950 p-3 text-sm">
+                  {r.message}
+                  <button
+                    type="button"
+                    onClick={() => setResult(null)}
+                    className="ml-2 text-xs"
+                  >
+                    dismiss
+                  </button>
+                </div>
               )}
             </div>
           );
         })}
       </div>
+
+      {/* Self-claims section */}
+      {selfClaims.length > 0 && (
+        <div className="mt-8">
+          <h2 className="mb-3 text-sm font-medium text-zinc-300">your self-claims</h2>
+          <div className="space-y-2">
+            {selfClaims.map((sc) => (
+              <div
+                key={sc.game_id}
+                className="flex flex-wrap items-center gap-3 rounded bg-zinc-900 px-4 py-3 text-sm"
+              >
+                <span className="font-mono text-xs text-zinc-400">{sc.game_id}</span>
+                <span
+                  className={`rounded px-2 py-0.5 text-xs font-medium ${
+                    sc.state === 'fulfilled'
+                      ? 'bg-green-700 text-green-100'
+                      : sc.state === 'compensated'
+                        ? 'bg-slate-600 text-slate-100'
+                        : 'bg-amber-700 text-amber-100'
+                  }`}
+                >
+                  {sc.state}
+                </span>
+                {sc.revealed_key !== null && (
+                  <>
+                    <span className="select-all font-mono text-xs">{sc.revealed_key}</span>
+                    <button
+                      type="button"
+                      onClick={() => void navigator.clipboard.writeText(sc.revealed_key!)}
+                      className="rounded bg-zinc-700 px-2 py-1 text-xs"
+                    >
+                      copy
+                    </button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

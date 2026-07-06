@@ -17,8 +17,9 @@
 - `revealed_key` must NEVER appear in any log line, ping, or friend-facing response. Logs may name key *identifiers* (machine_name, keyindex, claim_id) — never key *values*.
 - The reserved token is the literal `SELF` (`domain::SELF_LINK_TOKEN`). `/api/l/SELF` must stay a byte-identical 404.
 - Reconcile must NEVER call `choose_content` — the existing merge-gate test discipline extends to all SELF paths.
-- Do not build boring-sys locally from scratch (box lacks clang); run `cargo test -p <crate>` per-crate (cached artifacts), push and let CI verify the full matrix.
-- moto/dynamodb-local port for tests: the suite manages its own; kitten's manual moto port is 8155 (siblings own 8123).
+- **All work happens on branch `kitten/self-claim`** — verify `git branch --show-current` before ANY commit (plan-review M5: this binds every task, not just Task 12).
+- Cargo on this box: prefix EVERY cargo command with `BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/aarch64-linux-gnu/13/include"` (boring-sys2 bindgen needs it). Run `cargo test -p <crate>` per-crate; CI verifies the full matrix.
+- **Store-backed tests SKIP silently without a local DynamoDB** (plan-review B2 — a skipped test reads as PASS, forging the TDD gate). Before any store-backed Step 2/Step 4: ensure kitten's private moto is up (`~/.local/bin/moto_server -p 8155` in the background; probe `curl -s -o /dev/null -w '%{http_code}' http://localhost:8155` → 200) and prefix the test command with `DYNAMODB_LOCAL_URL=http://localhost:8155` — with the var set, an unreachable store PANICS ("refusing to skip") instead of skipping, which is the honest gate. Never trust a store-backed green produced without that env var.
 
 ---
 
@@ -109,6 +110,17 @@ async fn reveal_key_success_true_but_no_key_is_ambiguous() {
 ```
 
 NOTE: match the *actual* login-interstitial detection — read `is_login_required` (crates/humble-client/src/lib.rs:143) and reuse whatever body the existing `redeem_as_gift` unauthorized-test uses, rather than the HTML sketched above. Same for `test_client` — reuse the file's existing constructor helper verbatim (name may differ; grep `fn test_client` / how redeem tests build the client).
+
+FIFTH test (plan-review M3 — without it, the `is_login_required`/StepUpNeeded branch in `reveal_once` is deletable with all tests green): mount the `login_required` JSON body (copy it from the existing redeem/choose step-up tests, ~client_test.rs:325) on a client with NO step-up configured, and assert `reveal_key` returns `Err(HumbleError::SecureAreaStepUpFailed { .. })`:
+
+```rust
+#[tokio::test]
+async fn reveal_key_step_up_gate_without_creds_is_step_up_failed() {
+    // 200 + login_required body (the secure-area gate) + no step-up configured
+    // → SecureAreaStepUpFailed, key NOT burned. Body copied from the redeem step-up tests.
+    // assert!(matches!(out, Err(HumbleError::SecureAreaStepUpFailed { .. })));
+}
+```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -413,7 +425,7 @@ async fn gift_vs_self_claim_race_single_winner() {
 }
 ```
 
-NOTE: `test_store` / `sample_game` / `sample_link` — use the file's real helper names (grep the existing claim_game tests; adjust ids/fields to the real `Game` constructor used there).
+NOTE: the file's REAL helpers are `store_or_skip(name) -> Option<Store>` (early-return on None), `game(n, listable) -> Game` (id = `game_id("gk{n}", "mn")` — match your claimed ids to that!), and `link(token)`; AttributeValue via the `schema::s` idiom in places. Adapt the sketches to those names.
 
 - [ ] **Step 2: Verify failure** — `cargo test -p dynamo self_claim 2>&1 | tail -5` → compile FAIL (`claim_game_self` missing).
 
@@ -723,7 +735,7 @@ git add crates/dynamo && git commit -S -m "feat(dynamo): compensate_self_claim �
 - Test: `crates/fulfillment/tests/handler_test.rs`
 
 **Interfaces:**
-- Consumes: `humble_client::{RevealedKey, HumbleError}`, `store.fulfill_self_claim` / `compensate_self_claim` (Tasks 4-5), `selfheal_once`, `set_cookie_ok`, `ping`.
+- Consumes: `humble_client::{RevealedKey, HumbleError}`, `store.fulfill_self_claim` (Task 4), `selfheal_once`, `set_cookie_ok`, `ping`. (`compensate_self_claim` is Task 8's — no Task-6 path calls it; recover-then-record replaced the Compensate execution.)
 - Produces:
   - `FulfillRequest::SelfClaim { claim_id: String, game_id: String, gamekey: String, machine_name: String, keyindex: u32, requires_choice: bool }`
   - `FulfillResponse::RevealedKey { key: String }`
@@ -798,6 +810,28 @@ async fn self_claim_ambiguous_failure_parks_never_compensates() {
 ```
 
 Write the small `mount_*` / `self_claim_req` helpers in the test file following its existing mock-mount helpers. **Every helper that asserts on the reveal POST also asserts the body contains no `gift=` pair.**
+
+ALSO add the spec §7 log-scrubbing test (plan-review M2 — construction-by-discipline is not a gate; this test is):
+
+```rust
+#[tokio::test]
+async fn revealed_key_value_never_appears_in_logs_or_pings() {
+    // Capture ALL tracing output for the happy path AND the recover path with a known key
+    // string, then assert the key value appears in no captured line. The ping sink must be
+    // capturable too — check how the test harness fakes the discord webhook (Deps carries the
+    // ping target); use a recording mock and include its bodies in the assertion.
+    let key = "AAAA-BBBB-CCCC";
+    // tracing_subscriber::fmt().with_writer(<shared Vec<u8> writer>) — or the crate's existing
+    // log-capture helper if handler_test.rs already has one (grep for `with_writer`/`TestWriter`).
+    // run: happy-path self-claim (mount_reveal_success(key)) + recover path
+    //      (mount_reveal_already_redeemed + order with redeemed_key_val=key)
+    // assert: !captured_logs.contains(key) && ping_bodies.iter().all(|b| !b.contains(key))
+    // assert positively that logs DID capture something (the reveal info line) so the test
+    // can't pass vacuously on an empty capture.
+}
+```
+
+Implement it as REAL assertions (the sketch names the required properties; the harness details are the implementer's to wire — an empty-capture pass is a defect).
 
 - [ ] **Step 2: Verify failure** — `cargo test -p fulfillment self_claim 2>&1 | tail -5` → compile FAIL.
 
@@ -1034,7 +1068,51 @@ enum ClaimFlavor {
 - `is_gift = matches!(flavor, ClaimFlavor::Gift)` on the `choose_content` call (:727).
 - The two terminal call sites (:693 pre-check resume, :806 happy tail) call `claimed_tpk_terminal(deps, flavor, …)` which dispatches to `redeem_claimed_tpk` or `reveal_claimed_tpk`.
 - The pre-check's already-claimed-AND-redeemed arm (:671-686): for `SelfClaim`, instead of the human-recovery ping, call Task 6's `recover_already_redeemed_key` (the value is recoverable for self-claims).
-- Public wrappers keep the old entry points: `handle_gift_choice(…)` calls `handle_choice_claim(…, ClaimFlavor::Gift)`; new `handle_self_claim_choice(…)` passes `SELF_LINK_TOKEN` and `ClaimFlavor::SelfClaim` (and replaces Task 6's stub).
+- Public wrappers keep the old entry points (exact shapes, per plan-review M4 — do not invent different ones):
+
+```rust
+async fn handle_choice_claim(
+    deps: &Deps,
+    claim_id: &str,
+    link_token: &str,
+    game_id: &str,
+    gamekey: &str,
+    offered_id: &str,
+    flavor: ClaimFlavor,
+) -> FulfillResponse { /* the current handle_gift_choice body, with the three flavor points */ }
+
+async fn handle_gift_choice(
+    deps: &Deps, claim_id: &str, link_token: &str, game_id: &str, gamekey: &str, offered_id: &str,
+) -> FulfillResponse {
+    handle_choice_claim(deps, claim_id, link_token, game_id, gamekey, offered_id, ClaimFlavor::Gift).await
+}
+
+async fn handle_self_claim_choice(
+    deps: &Deps, claim_id: &str, game_id: &str, gamekey: &str, offered_id: &str,
+) -> FulfillResponse {
+    handle_choice_claim(deps, claim_id, domain::SELF_LINK_TOKEN, game_id, gamekey, offered_id, ClaimFlavor::SelfClaim).await
+}
+
+/// The flavor-dispatched terminal on a claimed tpk — called from the pre-check resume (:693),
+/// the happy tail (:806), and (Task 8) reconcile B2.
+async fn claimed_tpk_terminal(
+    deps: &Deps,
+    flavor: ClaimFlavor,
+    claim_id: &str,
+    link_token: &str,
+    game_id: &str,
+    gamekey: &str,
+    tpk: &KeyEntry,          // ← use the order key-entry type redeem_claimed_tpk already takes
+    allow_heal: bool,
+) -> FulfillResponse {
+    match flavor {
+        ClaimFlavor::Gift => redeem_claimed_tpk(deps, claim_id, link_token, game_id, gamekey, tpk, allow_heal).await,
+        ClaimFlavor::SelfClaim => reveal_claimed_tpk(deps, claim_id, game_id, gamekey, tpk, allow_heal).await,
+    }
+}
+```
+
+  `handle_self_claim_choice` replaces Task 6's stub. The pre-check's already-claimed-AND-redeemed arm and the choose call are the other two flavor points (below).
 
 `reveal_claimed_tpk` is `redeem_claimed_tpk`'s (:832) structural copy: `reveal_key(gamekey, tpk.machine_name, tpk.keyindex)` via the same `selfheal_once(allow_heal)` composition, classified by `reveal_decision`, Record → `record_revealed_key`, Compensate-class → `recover_already_redeemed_key` (NOT park-for-human — the self-claim difference), everything else mirroring the redeem sibling's arms. Read `redeem_claimed_tpk`'s full body first and mirror arm-for-arm.
 
@@ -1109,13 +1187,12 @@ git add crates/fulfillment && git commit -S -m "feat(fulfillment): choice self-c
 - Consumes: `claim.link_token == domain::SELF_LINK_TOKEN` as the discriminator; `reveal_claimed_tpk` (Task 7), `compensate_self_claim`, `recover_already_redeemed_key`, `record_revealed_key`.
 - Produces: reconcile handles parked self-claims per the spec §4 terminal table. No new public API.
 
-**The terminal table to implement (spec §4):** read `reconcile` (:1554+) and `reconcile_choice_claim` (:1036) first; at each terminal call-site branch on the discriminator:
+**The terminal table to implement (CORRECTED per plan-review B1):** read `reconcile` (:1554+, bundle arms at :1601-1671) and `reconcile_choice_claim` (:1036) first. The actual bundle reconcile has exactly TWO arms keyed on `tpk.redeemed` — the earlier three-row bundle table described a reconcile that doesn't exist. Branch each terminal call-site on the discriminator:
 
 | Branch | Gift terminal (existing) | SELF terminal |
 |---|---|---|
-| bundle: tpk unredeemed | `redeem_as_gift` → fulfill | `reveal_claimed_tpk` (allow_heal=false) |
-| bundle: tpk already redeemed | ping human | `recover_already_redeemed_key` |
-| bundle: provably never redeemed | `compensate_claim` | `compensate_self_claim` |
+| bundle: tpk NOT redeemed | `compensate_claim` (re-list; a late gift URL has no waiting recipient) | **`reveal_claimed_tpk(allow_heal=false)`** — DECIDED (B1/Q3): a late reveal is exactly what Ben wants; if it races an earlier ambiguous burn, AlreadyRedeemed routes through `recover_already_redeemed_key` safely |
+| bundle: tpk already redeemed | ping human (gift URL unrecoverable) | `recover_already_redeemed_key` |
 | choice A (no snapshot) | `compensate_claim` | `compensate_self_claim` |
 | choice B1 (no new tpk) | `compensate_claim` | `compensate_self_claim` |
 | choice B2 (new tpk unredeemed) | `redeem_claimed_tpk(false)` | `reveal_claimed_tpk(false)` |
@@ -1296,9 +1373,18 @@ async fn catalog_exposes_requires_choice() {
 
 #[tokio::test]
 async fn gift_link_claims_still_hide_gift_url() {
-    // The scoped invariant: AdminClaimView (gift surface) is UNCHANGED — no gift_url, no revealed_key.
-    // Reuse the existing handle_link_claims test and additionally assert the JSON has no
-    // "gift_url"/"revealed_key" keys.
+    // The scoped invariant: AdminClaimView (gift surface) is UNCHANGED — no key material.
+    let (app, store, _) = test_app_with_call_invoker(
+        fulfillment::FulfillResponse::RevealedKey { key: "unused".into() },
+    ).await;
+    // Seed a gift link + fulfilled claim exactly like the existing handle_link_claims test does
+    // (reuse its seeding helper/steps), with a real gift_url on the claim.
+    let resp = authed_get(&app, "/admin/api/links/tok-inv/claims").await;
+    assert_eq!(resp.status(), 200);
+    let raw = body_string(resp).await; // raw JSON text, not a typed parse
+    assert!(!raw.contains("gift_url"), "gift surface must not carry gift_url: {raw}");
+    assert!(!raw.contains("revealed_key"), "gift surface must not carry revealed_key: {raw}");
+    assert!(raw.contains("issued"), "sanity: the response is the AdminClaimView shape");
 }
 ```
 
@@ -1526,18 +1612,47 @@ it('adminSelfClaims lists claims', async () => {
 In `Catalog.test.tsx` (follow its existing render/mocking pattern):
 
 ```typescript
+// (Real code per plan-review M6 — adapt the mocking/render scaffolding to Catalog.test.tsx's
+// existing pattern for adminCatalog/adminSetHidden mocks; the assertions below are the contract.)
+
 it('self-claim is two-step: arm then confirm, loud on choice games', async () => {
-  // render catalog with one available requires_choice game; click "claim for me" → button
-  // becomes "confirm? spends 1 pick"; click again → adminSelfClaim called once.
+  vi.mocked(api.adminCatalog).mockResolvedValue([
+    { ...gameFixture, id: 'gk:choice1', title: 'Choicey', status: 'available', requires_choice: true },
+  ]);
+  vi.mocked(api.adminSelfClaim).mockResolvedValue({ kind: 'processing' });
+  render(<Catalog />); // via the file's usual router/outlet wrapper
+  const btn = await screen.findByRole('button', { name: /claim for me/i });
+  fireEvent.click(btn);
+  expect(api.adminSelfClaim).not.toHaveBeenCalled();          // armed, not fired
+  expect(screen.getByRole('button', { name: /confirm\? spends 1 pick/i })).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: /confirm\? spends 1 pick/i }));
+  await waitFor(() => expect(api.adminSelfClaim).toHaveBeenCalledTimes(1));
+  expect(api.adminSelfClaim).toHaveBeenCalledWith('gk:choice1');
 });
 
 it('revealed key panel shows copy box and steam register link for steam keys', async () => {
-  // adminSelfClaim resolves { kind:'revealed', key:'AAAA', keyType:'steam' } → expect an
-  // <a href="https://store.steampowered.com/account/registerkey?key=AAAA"> and the key text.
+  vi.mocked(api.adminCatalog).mockResolvedValue([
+    { ...gameFixture, id: 'gk:s1', status: 'available', requires_choice: false, key_type: 'steam' },
+  ]);
+  vi.mocked(api.adminSelfClaim).mockResolvedValue({ kind: 'revealed', key: 'AAAA-BBBB', keyType: 'steam' });
+  render(<Catalog />);
+  fireEvent.click(await screen.findByRole('button', { name: /claim for me/i }));
+  fireEvent.click(screen.getByRole('button', { name: /confirm\?/i }));
+  expect(await screen.findByText('AAAA-BBBB')).toBeInTheDocument();
+  const link = screen.getByRole('link', { name: /redeem on steam/i });
+  expect(link).toHaveAttribute('href', 'https://store.steampowered.com/account/registerkey?key=AAAA-BBBB');
 });
 
 it('non-steam reveal shows key without the steam button', async () => {
-  // keyType 'gog' → key text present, no registerkey link.
+  vi.mocked(api.adminCatalog).mockResolvedValue([
+    { ...gameFixture, id: 'gk:g1', status: 'available', requires_choice: false, key_type: 'gog' },
+  ]);
+  vi.mocked(api.adminSelfClaim).mockResolvedValue({ kind: 'revealed', key: 'GOG-KEY-1', keyType: 'gog' });
+  render(<Catalog />);
+  fireEvent.click(await screen.findByRole('button', { name: /claim for me/i }));
+  fireEvent.click(screen.getByRole('button', { name: /confirm\?/i }));
+  expect(await screen.findByText('GOG-KEY-1')).toBeInTheDocument();
+  expect(screen.queryByRole('link', { name: /redeem on steam/i })).not.toBeInTheDocument();
 });
 ```
 
@@ -1623,7 +1738,7 @@ async function handleSelfClaim(g: AdminGame) {
 }
 ```
 
-Result panel (rendered under the row / as a dismissible strip):
+Result panel (rendered under the row / as a dismissible strip). Two adaptations vs the sketch below (plan-review minors): there is no shared `copyToClipboard` helper — use `navigator.clipboard.writeText(...)` inline like Links.tsx:174; and TypeScript narrowing does not flow through `result?.r.kind === 'revealed' && result.r.key` — alias first (`const r = result?.r;` then branch on `r?.kind`).
 
 ```tsx
 {result?.r.kind === 'revealed' && (
@@ -1686,6 +1801,14 @@ Ben's standing instruction (2026-07-06): do the whole thing — build → merge 
 - [ ] **Step 8: report ONCE** to Ben on discord: deployed + tested + live, with the receipts.
 
 ---
+
+## Plan-Review Amendments (Ben's cold-subagent review, 2026-07-06 ~14:32 EDT — applied in-place)
+
+- **B1**: Task 8's bundle terminal rows rewritten to the code's two real arms (keyed on `tpk.redeemed`); SELF + not-redeemed = **reveal** (Q3 decided). Spec §4 table corrected identically.
+- **B2**: Global Constraints now carry the real dynamodb-local/moto instructions + the `DYNAMODB_LOCAL_URL` forge-proofing. Tasks 3/4's initial greens were vacuous; both re-verified against live moto (task 4 needed a real fix — test game-id mismatch).
+- **M1**: durable-first ordering test added (Task 4 fix wave, `05ac200`). **M2**: log-scrub test added to Task 6. **M3**: step-up-gate test added to Task 1 (fix wave). **M4**: Task 7 signatures/wrappers now concrete. **M5**: branch rule moved into Global Constraints. **M6**: Task 11 Catalog tests written out. Minors: Task 9 invariant test written out, Task 11 clipboard/narrowing notes, Task 3/5 real helper names.
+- **Deliberate divergence, labeled**: spec §2 sketches `RevealedKey { key, key_type }`; the plan ships `RevealedKey(pub String)` and sources `key_type` from the Game record in admin-api — the redeemkey response carries no key_type. The plan is correct; do not "fix" it back toward the spec.
+- **Task 12 references**: `state/JOURNAL.md`, `state/decisions.md`, "HR#1" live in kitten's private workspace repo (`~/code-kitten`), not this repo — they bind kitten (the controller), not cold executors. Execution is pinned to kitten's box (Q1: yes — deploy roles, GPG key, and secrets only exist there). Q2 confirmed: `flip_game_from_pending` maps an already-flipped CCF to `Ok(())` (dynamo lib.rs, idempotent no-op arm).
 
 ## Self-Review Notes (already applied)
 

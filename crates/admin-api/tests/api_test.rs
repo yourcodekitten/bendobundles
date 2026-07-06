@@ -14,9 +14,9 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use domain::{Game, GameStatus, Link, game_id};
+use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
 use dynamo::Store;
-use fulfillment::FulfillRequest;
+use fulfillment::{FulfillRequest, FulfillResponse};
 use time::macros::datetime;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -111,6 +111,11 @@ impl AdminInvoker for MockAdminInvoker {
     async fn fire(&self, req: FulfillRequest) -> Result<(), String> {
         *self.fired.lock().await = Some(serde_json::to_value(&req).unwrap());
         Ok(())
+    }
+
+    async fn call(&self, _req: FulfillRequest) -> Result<FulfillResponse, String> {
+        // fire-only mock: call is not expected in sync/fire tests
+        Err("MockAdminInvoker::call not implemented — use MockCallInvoker".into())
     }
 }
 
@@ -230,6 +235,45 @@ async fn no_session_cookie_on_protected_route_returns_401() {
     let admin_hash = test_admin_hash("pw");
 
     let req = Request::get("/admin/api/catalog")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router(store, invoker, admin_hash)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// POST /admin/api/games/:id/self-claim without session cookie → 401.
+#[tokio::test]
+async fn no_session_cookie_on_self_claim_returns_401() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash("pw");
+
+    let req = Request::post("/admin/api/games/some-id/self-claim")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+
+    let resp = router(store, invoker, admin_hash)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// GET /admin/api/claims/self without session cookie → 401.
+#[tokio::test]
+async fn no_session_cookie_on_claims_self_returns_401() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash("pw");
+
+    let req = Request::get("/admin/api/claims/self")
         .body(Body::empty())
         .unwrap();
 
@@ -759,6 +803,7 @@ async fn link_claims_redact_gift_url_to_issued_bool() {
             gift_url: Some("https://humble.example/gift?key=SECRET".into()),
             created_at: datetime!(2026-07-03 14:00 UTC),
             choice_pre_tpks: None,
+            revealed_key: None,
         })
         .await
         .unwrap();
@@ -910,4 +955,289 @@ async fn sync_now_fires_past_stale_run_marker() {
 
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(mock.last_fired().await, Some(FulfillRequest::Sync));
+}
+
+// ── Self-claim test infrastructure ────────────────────────────────────────────
+
+/// Fixed password used by test_app_with_call_invoker and its authed_* helpers.
+const TEST_ADMIN_PW: &str = "sc-test-admin-pw";
+
+/// Mock invoker that supports both fire (no-op) and call (returns a configured response,
+/// logging every call request). Unlike MockAdminInvoker, this one is built for the
+/// self-claim endpoint which needs synchronous RequestResponse invocations.
+struct MockCallInvoker {
+    response: FulfillResponse,
+    log: Arc<std::sync::Mutex<Vec<FulfillRequest>>>,
+}
+
+#[async_trait]
+impl AdminInvoker for MockCallInvoker {
+    async fn fire(&self, _req: FulfillRequest) -> Result<(), String> {
+        Ok(()) // no-op — self-claim tests don't trigger fire
+    }
+
+    async fn call(&self, req: FulfillRequest) -> Result<FulfillResponse, String> {
+        self.log.lock().unwrap().push(req);
+        Ok(self.response.clone())
+    }
+}
+
+/// Build a fully-wired app + fresh DynamoDB table + invoker log, all sharing the same state.
+/// Uses a UUID-based table name so concurrent tests don't collide.
+/// Panics if DYNAMODB_LOCAL_URL is set but dynamo-local is unreachable.
+async fn test_app_with_call_invoker(
+    response: FulfillResponse,
+) -> (
+    axum::Router,
+    Arc<Store>,
+    Arc<std::sync::Mutex<Vec<FulfillRequest>>>,
+) {
+    // Use a UUID-derived table name for per-call isolation.
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let store = store_or_skip(&format!("sc{}", &uid[..10]))
+        .await
+        .expect("DYNAMODB_LOCAL_URL must be set and dynamo-local reachable for self-claim tests");
+    let log = Arc::new(std::sync::Mutex::new(Vec::<FulfillRequest>::new()));
+    let mock: Arc<dyn AdminInvoker> = Arc::new(MockCallInvoker {
+        response,
+        log: Arc::clone(&log),
+    });
+    let admin_hash = test_admin_hash(TEST_ADMIN_PW);
+    let app = router(Arc::clone(&store), mock, admin_hash);
+    (app, store, log)
+}
+
+/// Produce a Game with the given `id` (format `"gamekey:machine_name"`), Available status, steam key.
+fn sample_game(id: &str) -> Game {
+    let mut parts = id.splitn(2, ':');
+    let gamekey = parts.next().unwrap_or(id).to_string();
+    let machine_name = parts.next().unwrap_or("mn").to_string();
+    Game {
+        id: id.to_string(),
+        title: format!("Sample Game {id}"),
+        bundle: "Test Bundle".into(),
+        gamekey,
+        machine_name,
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+    }
+}
+
+/// Write an Available game to the store.
+async fn seed_available_game(store: &Arc<Store>, id: &str, title: &str) {
+    let mut g = sample_game(id);
+    g.title = title.to_string();
+    store.put_game(&g).await.unwrap();
+}
+
+/// Login via the app's /admin/api/login endpoint and return the session token.
+async fn get_session(app: &axum::Router) -> String {
+    let req = Request::post("/admin/api/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"password": TEST_ADMIN_PW})).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "authed helper: login must succeed"
+    );
+    resp.headers()
+        .get(axum::http::header::SET_COOKIE)
+        .expect("login must set a cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("session=")
+        .expect("Set-Cookie must start with 'session='")
+        .to_string()
+}
+
+async fn authed_post(app: &axum::Router, path: &str, body: &str) -> axum::response::Response {
+    let session = get_session(app).await;
+    let req = Request::post(path)
+        .header("content-type", "application/json")
+        .header("cookie", format!("session={session}"))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
+async fn authed_get(app: &axum::Router, path: &str) -> axum::response::Response {
+    let session = get_session(app).await;
+    let req = Request::get(path)
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap()
+}
+
+/// Extract the response body as a raw String (for invariant substring checks).
+async fn body_string(resp: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).expect("response body must be valid UTF-8")
+}
+
+// ── Self-claim tests ───────────────────────────────────────────────────────────
+
+/// POST /admin/api/games/:id/self-claim with a mock that returns RevealedKey:
+/// - Returns 200 with {revealed_key, key_type}
+/// - The intake actually happened (claims_for_link(SELF_LINK_TOKEN) has the claim)
+/// - The invoke carried the correct game identifiers
+#[tokio::test]
+async fn self_claim_endpoint_intakes_invokes_and_returns_key() {
+    let (app, store, invoker_log) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "K-123".into(),
+    })
+    .await;
+    seed_available_game(&store, "gkJ:mnJ", "Endpoint Game").await;
+
+    let resp = authed_post(&app, "/admin/api/games/gkJ:mnJ/self-claim", "{}").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = body_json(resp).await;
+    assert_eq!(body["revealed_key"], "K-123");
+    assert_eq!(body["key_type"], "steam");
+
+    // Intake really happened:
+    let claims = store
+        .claims_for_link(domain::SELF_LINK_TOKEN)
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+
+    // The invoke carried the right identifiers:
+    let sent = invoker_log.lock().unwrap().clone();
+    assert!(
+        matches!(&sent[0], FulfillRequest::SelfClaim { game_id, .. } if game_id == "gkJ:mnJ"),
+        "first call must be SelfClaim for gkJ:mnJ, got: {:?}",
+        sent.first()
+    );
+}
+
+/// POST /admin/api/games/:id/self-claim on a Pending game → 409 (game not available).
+#[tokio::test]
+async fn self_claim_endpoint_409s_when_game_pending() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+    let mut g = sample_game("gkK:mnK");
+    g.status = GameStatus::Pending;
+    store.put_game(&g).await.unwrap();
+
+    let resp = authed_post(&app, "/admin/api/games/gkK:mnK/self-claim", "{}").await;
+    assert_eq!(resp.status(), 409);
+}
+
+/// POST /admin/api/games/:id/self-claim when mock returns Parked → 202 processing.
+#[tokio::test]
+async fn self_claim_endpoint_202_on_parked() {
+    let (app, store, _) =
+        test_app_with_call_invoker(FulfillResponse::Parked { reason: "x".into() }).await;
+    seed_available_game(&store, "gkL:mnL", "Parked Game").await;
+
+    let resp = authed_post(&app, "/admin/api/games/gkL:mnL/self-claim", "{}").await;
+    assert_eq!(resp.status(), 202);
+}
+
+/// GET /admin/api/claims/self returns fulfilled self-claims including their revealed_key.
+/// Crucially: does NOT 404 even though LINK#SELF has no META item (handle_link_claims would 404).
+#[tokio::test]
+async fn claims_self_lists_revealed_keys_without_link_precheck() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+    seed_available_game(&store, "gkM:mnM", "Listed Game").await;
+    store
+        .claim_game_self("gkM:mnM", "c-l1", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    store
+        .fulfill_self_claim("c-l1", "gkM:mnM", "LIST-KEY")
+        .await
+        .unwrap();
+
+    let resp = authed_get(&app, "/admin/api/claims/self").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = body_json(resp).await;
+    assert_eq!(body[0]["revealed_key"], "LIST-KEY");
+}
+
+/// GET /admin/api/catalog includes requires_choice on each game view.
+#[tokio::test]
+async fn catalog_exposes_requires_choice() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+    let mut g = sample_game("gkN:mnN");
+    g.requires_choice = true;
+    store.put_game(&g).await.unwrap();
+
+    let resp = authed_get(&app, "/admin/api/catalog").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = body_json(resp).await;
+    // find our game in the list
+    let game = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == "gkN:mnN")
+        .expect("gkN:mnN must be in catalog");
+    assert_eq!(game["requires_choice"], true);
+}
+
+/// The gift-claims surface (GET /admin/api/links/:token/claims → AdminClaimView) must NEVER
+/// expose gift_url or revealed_key — raw-JSON substring check, not a typed parse.
+/// Regression guard: a new SelfClaimView with revealed_key must not bleed into this endpoint.
+#[tokio::test]
+async fn gift_link_claims_still_hide_gift_url() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+    // Seed a gift link + fulfilled claim with a real gift_url (same pattern as link_claims_redact_gift_url_to_issued_bool)
+    store.create_link(&test_link("tok-inv")).await.unwrap();
+    store
+        .put_claim(&Claim {
+            id: "c-inv-1".into(),
+            link_token: "tok-inv".into(),
+            game_id: "g-inv-1".into(),
+            state: ClaimState::Fulfilled,
+            gift_url: Some("https://humble.example/gift?key=SECRETINV".into()),
+            created_at: datetime!(2026-07-04 00:00 UTC),
+            choice_pre_tpks: None,
+            revealed_key: None,
+        })
+        .await
+        .unwrap();
+
+    let resp = authed_get(&app, "/admin/api/links/tok-inv/claims").await;
+    assert_eq!(resp.status(), 200);
+    let raw = body_string(resp).await;
+    assert!(
+        !raw.contains("gift_url"),
+        "gift surface must not carry gift_url: {raw}"
+    );
+    assert!(
+        !raw.contains("revealed_key"),
+        "gift surface must not carry revealed_key: {raw}"
+    );
+    assert!(
+        raw.contains("issued"),
+        "sanity: the response is the AdminClaimView shape: {raw}"
+    );
 }

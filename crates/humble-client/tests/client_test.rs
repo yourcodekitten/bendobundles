@@ -1302,3 +1302,105 @@ async fn ambiguous_redeem_is_typed() {
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::AmbiguousRedeem));
 }
+
+// ── reveal_key (no-gift self-claim sibling of redeem_as_gift) ────────────────────────────────────
+
+#[tokio::test]
+async fn reveal_key_success_returns_key_and_omits_gift_param() {
+    let server = MockServer::start().await;
+    // Assert the form body: keytype/key/keyindex present, `gift` ABSENT.
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .and(body_string_contains("keytype=stardew_valley_steam"))
+        .and(body_string_contains("keyindex=0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"key":"AAAA-BBBB-CCCC","success":true}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let out = client(&server)
+        .await
+        .reveal_key("GAMEKEY123", "stardew_valley_steam", 0)
+        .await;
+    assert_eq!(
+        out.unwrap(),
+        humble_client::RevealedKey("AAAA-BBBB-CCCC".into())
+    );
+    // gift-param absence: fetch the received request and assert.
+    let reqs = server.received_requests().await.unwrap();
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(
+        !body.contains("gift="),
+        "reveal must not send the gift param: {body}"
+    );
+}
+
+#[tokio::test]
+async fn reveal_key_already_redeemed_is_typed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"success":false,"errormsg":"This key has already been redeemed."}"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::AlreadyRedeemed)
+    ));
+}
+
+#[tokio::test]
+async fn reveal_key_login_interstitial_is_unauthorized() {
+    // 200-with-HTML login interstitial = dead session = Unauthorized (heal-ladder eligible).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<html><body>log in to continue</body></html>"),
+        )
+        .mount(&server)
+        .await;
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(out, Err(humble_client::HumbleError::Unauthorized)));
+}
+
+#[tokio::test]
+async fn reveal_key_success_true_but_no_key_is_ambiguous() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"success":true}"#))
+        .mount(&server)
+        .await;
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::AmbiguousRedeem)
+    ));
+}
+
+#[tokio::test]
+async fn reveal_key_step_up_gate_without_creds_is_step_up_failed() {
+    // 200 + the login_required gate body, client WITHOUT step-up configured
+    // → SecureAreaStepUpFailed (key NOT burned).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "error_id": "login_required"
+        })))
+        .mount(&server)
+        .await;
+
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::SecureAreaStepUpFailed { .. })
+    ));
+}

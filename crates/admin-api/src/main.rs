@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use admin_api::{AdminInvoker, router};
 use async_trait::async_trait;
-use fulfillment::FulfillRequest;
+use fulfillment::{FulfillRequest, FulfillResponse};
 
 // ── Real AdminInvoker ─────────────────────────────────────────────────────────
 
@@ -36,6 +36,23 @@ impl AdminInvoker for RealAdminInvoker {
             .await
             .map_err(|e| format!("{e:?}"))?;
         Ok(())
+    }
+
+    async fn call(&self, req: FulfillRequest) -> Result<FulfillResponse, String> {
+        let payload = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .invoke()
+            .function_name(&self.fn_name)
+            .invocation_type(aws_sdk_lambda::types::InvocationType::RequestResponse)
+            .payload(aws_sdk_lambda::primitives::Blob::new(payload))
+            .send()
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let blob = resp
+            .payload()
+            .ok_or_else(|| "no payload in lambda response".to_string())?;
+        serde_json::from_slice(blob.as_ref()).map_err(|e| e.to_string())
     }
 }
 

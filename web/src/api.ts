@@ -41,6 +41,20 @@ export type AdminGame = {
   status: string;
   claim_id: string | null;
   artwork_url: string | null;
+  requires_choice: boolean;
+};
+
+export type SelfClaimResult =
+  | { kind: 'revealed'; key: string; keyType: string }
+  | { kind: 'processing' }
+  | { kind: 'refused'; message: string }
+  | { kind: 'error' };
+
+export type SelfClaimView = {
+  game_id: string;
+  state: 'pending' | 'fulfilled' | 'compensated';
+  revealed_key: string | null;
+  created_at: string;
 };
 
 // Redacted admin view of a claim — the friend's one-time gift URL is a bearer
@@ -327,4 +341,39 @@ export async function adminStatus(): Promise<StatusView> {
   const response = await fetch('/admin/api/status');
   await checkOk(response, 'status');
   return await response.json();
+}
+
+export async function adminSelfClaim(gameId: string): Promise<SelfClaimResult> {
+  let response: Response;
+  try {
+    response = await fetch(`/admin/api/games/${encodeURIComponent(gameId)}/self-claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+  } catch {
+    return { kind: 'error' };
+  }
+  if (response.status === 401) throw new Unauthorized();
+  try {
+    if (response.status === 200) {
+      const b = await response.json();
+      return { kind: 'revealed', key: b.revealed_key, keyType: b.key_type };
+    }
+    if (response.status === 202) return { kind: 'processing' };
+    if (response.status === 409 || response.status === 410) {
+      const b = await response.json();
+      return { kind: 'refused', message: b.error ?? 'refused' };
+    }
+  } catch {
+    return { kind: 'error' };
+  }
+  return { kind: 'error' };
+}
+
+export async function adminSelfClaims(): Promise<SelfClaimView[]> {
+  const response = await fetch('/admin/api/claims/self');
+  if (response.status === 401) throw new Unauthorized();
+  if (!response.ok) throw new FetchFailed();
+  return response.json();
 }

@@ -1,5 +1,5 @@
 use aws_sdk_dynamodb::types::AttributeValue;
-use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
+use domain::{Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
     ClaimTxError, HiddenWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin, SyncState, SyncWrite,
     sync_run_is_live,
@@ -118,6 +118,7 @@ async fn link_and_claim_roundtrip() {
         gift_url: None,
         created_at: datetime!(2026-07-02 01:00 UTC),
         choice_pre_tpks: None,
+        revealed_key: None,
     };
     store.put_claim(&claim).await.unwrap();
     assert_eq!(store.get_claim("tok1", "c1").await.unwrap().unwrap(), claim);
@@ -875,4 +876,190 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
     assert_eq!(l.claims_used, 2);
     assert!(!l.revoked);
     assert_eq!(l.expires_at, None);
+}
+
+#[tokio::test]
+async fn self_claim_intake_accepts_non_giftable_and_hidden() {
+    let Some(store) = store_or_skip("sc-nongiftable").await else {
+        return;
+    };
+    // A game that is available but NOT listable: giftable=false AND hidden=true — no gsi1pk.
+    // claim_game would reject this (gsi1pk absent); claim_game_self must accept it.
+    let mut g = game(1, false); // giftable=false
+    g.hidden = true;
+    store.put_game(&g).await.unwrap();
+
+    store
+        .claim_game_self(
+            &game_id("gk1", "mn"),
+            "claim-1",
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("non-giftable+hidden must be self-claimable");
+
+    let after = store
+        .get_game(&game_id("gk1", "mn"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.status, GameStatus::Pending);
+    assert_eq!(after.claim_id.as_deref(), Some("claim-1"));
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "claim-1")
+        .await
+        .unwrap()
+        .expect("claim recorded under LINK#SELF");
+    assert_eq!(claim.state, ClaimState::Pending);
+    assert_eq!(claim.link_token, SELF_LINK_TOKEN);
+}
+
+#[tokio::test]
+async fn self_claim_intake_single_winner_on_race() {
+    let Some(store) = store_or_skip("sc-race").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let gid = game_id("gk1", "mn");
+    let now = time::OffsetDateTime::now_utc();
+    // Sequential calls: first wins, second refuses on the status condition.
+    let a = store.claim_game_self(&gid, "claim-a", now).await;
+    let b = store.claim_game_self(&gid, "claim-b", now).await;
+    assert!(a.is_ok());
+    assert!(matches!(b, Err(ClaimTxError::GameUnavailable)));
+}
+
+#[tokio::test]
+async fn gift_vs_self_claim_race_single_winner() {
+    let Some(store) = store_or_skip("sc-gift-vs-self").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let lnk = link("tok-race");
+    store.create_link(&lnk).await.unwrap();
+    let gid = game_id("gk1", "mn");
+    let now = time::OffsetDateTime::now_utc();
+    // Gift claim wins first…
+    store
+        .claim_game("tok-race", &gid, "claim-g", now)
+        .await
+        .unwrap();
+    // …self-claim then refuses on the same status condition.
+    let s = store.claim_game_self(&gid, "claim-s", now).await;
+    assert!(matches!(s, Err(ClaimTxError::GameUnavailable)));
+}
+
+#[tokio::test]
+async fn fulfill_self_claim_writes_key_then_flips_ben_redeemed() {
+    let Some(store) = store_or_skip("sc-fulfill-1").await else {
+        return;
+    };
+    let gid = game_id("gk2", "mn");
+    store.put_game(&game(2, true)).await.unwrap();
+    store
+        .claim_game_self(&gid, "c-f1", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    store
+        .fulfill_self_claim("c-f1", &gid, "AAAA-BBBB-CCCC")
+        .await
+        .unwrap();
+
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "c-f1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.state, ClaimState::Fulfilled);
+    assert_eq!(claim.revealed_key.as_deref(), Some("AAAA-BBBB-CCCC"));
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::BenRedeemed);
+}
+
+#[tokio::test]
+async fn fulfill_self_claim_is_idempotent_on_retry() {
+    let Some(store) = store_or_skip("sc-fulfill-2").await else {
+        return;
+    };
+    let gid = game_id("gk3", "mn");
+    store.put_game(&game(3, true)).await.unwrap();
+    store
+        .claim_game_self(&gid, "c-f2", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    store.fulfill_self_claim("c-f2", &gid, "K1").await.unwrap();
+    // Second call: no error, state unchanged.
+    store.fulfill_self_claim("c-f2", &gid, "K1").await.unwrap();
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "c-f2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.revealed_key.as_deref(), Some("K1"));
+}
+
+#[tokio::test]
+async fn fulfill_self_claim_never_flips_when_claim_lost_to_compensate() {
+    // durable-first pin: write-1 (claim key write) must precede write-2 (game flip). Make
+    // write-1 fail permanently — claim already Compensated ⇒ pending marker consumed and the
+    // recheck sees a non-Fulfilled state ⇒ fulfill errors — and assert the game NEVER flipped.
+    let Some(store) = store_or_skip("sc-fulfill-3").await else {
+        return;
+    };
+    let gid = game_id("gk4", "mn");
+    store.put_game(&game(4, true)).await.unwrap();
+    store
+        .claim_game_self(&gid, "c-f3", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let mut c = store
+        .get_claim(SELF_LINK_TOKEN, "c-f3")
+        .await
+        .unwrap()
+        .unwrap();
+    c.state = ClaimState::Compensated; // consumes the gsi2pk pending marker via claim_item
+    store.put_claim(&c).await.unwrap();
+
+    let res = store.fulfill_self_claim("c-f3", &gid, "LATE-KEY").await;
+    assert!(res.is_err(), "fulfill must lose loudly to compensate");
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_ne!(
+        g.status,
+        GameStatus::BenRedeemed,
+        "game must NOT flip when write-1 failed"
+    );
+}
+
+#[tokio::test]
+async fn compensate_self_claim_succeeds_with_no_link_meta_item() {
+    let Some(store) = store_or_skip("sc-comp-1").await else {
+        return;
+    };
+    let gid = game_id("gk5", "mn");
+    store.put_game(&game(5, true)).await.unwrap();
+    store
+        .claim_game_self(&gid, "c-c1", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    // The gift-path compensate MUST fail here (pins WHY the variant exists)…
+    let wrong = store.compensate_claim(SELF_LINK_TOKEN, "c-c1", &gid).await;
+    assert!(
+        wrong.is_err(),
+        "gift compensate must cancel on the absent LINK META"
+    );
+
+    // …and the SELF variant must succeed: claim compensated, game re-listed.
+    store.compensate_self_claim("c-c1", &gid).await.unwrap();
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "c-c1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.state, ClaimState::Compensated);
+    let game = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Available);
+    assert_eq!(game.claim_id, None);
 }
