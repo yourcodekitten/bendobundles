@@ -85,6 +85,19 @@ pub struct Claim {
     pub gift_url: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Pre-choose snapshot of the month order's tpk `machine_name`s, taken and made durable BEFORE
+    /// the `choosecontent` write (the crash-recovery hinge). Only ever set on a Humble Choice
+    /// claim, by [`Store::record_choice_intent`](../dynamo). Its presence/absence is load-bearing
+    /// for reconcile:
+    /// - `None` ⇒ the intent write never landed ⇒ `choosecontent` was provably NEVER attempted ⇒
+    ///   the monthly pick is NOT spent ⇒ reconcile may safely compensate.
+    /// - `Some(pre)` ⇒ a choose MAY have run; reconcile decides purely from the order diff
+    ///   (`order.keys \ pre`), never from the choose error and never by re-choosing.
+    ///
+    /// `#[serde(default)]`: every pre-existing stored claim (and every non-choice claim) reads back
+    /// as `None`, which is correct — none of them ever recorded a choose intent.
+    #[serde(default)]
+    pub choice_pre_tpks: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -415,6 +428,48 @@ mod tests {
         let back: Game = serde_json::from_str(&json).unwrap();
         assert!(back.requires_choice);
         assert_eq!(back, g);
+    }
+
+    #[test]
+    fn claim_choice_pre_tpks_defaults_none_when_absent() {
+        // A claim stored before choice_pre_tpks existed: the field is absent from the body JSON.
+        // #[serde(default)] must read it back as None (never an error), so every legacy/bundle
+        // claim round-trips — and reconcile reads None as "choose provably never ran".
+        let claim = Claim {
+            id: "c1".into(),
+            link_token: "tok".into(),
+            game_id: game_id("gk", "mn"),
+            state: ClaimState::Pending,
+            gift_url: None,
+            created_at: datetime!(2026-07-02 00:00 UTC),
+            choice_pre_tpks: None,
+        };
+        let mut json = serde_json::to_value(&claim).unwrap();
+        json.as_object_mut().unwrap().remove("choice_pre_tpks");
+        assert!(json.get("choice_pre_tpks").is_none(), "field stripped");
+        let back: Claim = serde_json::from_value(json).unwrap();
+        assert_eq!(back.choice_pre_tpks, None);
+        assert_eq!(back, claim);
+    }
+
+    #[test]
+    fn claim_choice_pre_tpks_roundtrips_some() {
+        let claim = Claim {
+            id: "c1".into(),
+            link_token: "tok".into(),
+            game_id: game_id("gk", "octopathtravelerii"),
+            state: ClaimState::Pending,
+            gift_url: None,
+            created_at: datetime!(2026-07-02 00:00 UTC),
+            choice_pre_tpks: Some(vec!["already_owned_choice_steam".into()]),
+        };
+        let json = serde_json::to_string(&claim).unwrap();
+        let back: Claim = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.choice_pre_tpks.as_deref(),
+            Some(&["already_owned_choice_steam".to_string()][..])
+        );
+        assert_eq!(back, claim);
     }
 
     #[test]

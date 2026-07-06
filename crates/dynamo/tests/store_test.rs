@@ -117,6 +117,7 @@ async fn link_and_claim_roundtrip() {
         state: ClaimState::Pending,
         gift_url: None,
         created_at: datetime!(2026-07-02 01:00 UTC),
+        choice_pre_tpks: None,
     };
     store.put_claim(&claim).await.unwrap();
     assert_eq!(store.get_claim("tok1", "c1").await.unwrap().unwrap(), claim);

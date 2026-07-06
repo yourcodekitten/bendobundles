@@ -487,6 +487,9 @@ impl Store {
             state: ClaimState::Pending,
             gift_url: None,
             created_at: now,
+            // A choice intent snapshot is recorded LATER (record_choice_intent), only on a Choice
+            // claim and only after the pre-read — never at intake.
+            choice_pre_tpks: None,
         };
         let av_s = |v: &str| aws_sdk_dynamodb::types::AttributeValue::S(v.to_string());
 
@@ -692,6 +695,51 @@ impl Store {
             Err(sdk_err) => {
                 if is_ccf_put(&sdk_err) {
                     Ok(()) // already flipped / ownership moved: idempotent no-op
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
+    /// Record a Humble Choice claim's pre-choose intent snapshot (the order's tpk `machine_name`s
+    /// captured BEFORE the `choosecontent` write) so a crash between the two Choice writes is
+    /// recoverable. This is the crash-recovery hinge: it MUST become durable before `choose_content`
+    /// runs, so that reconcile can read the snapshot's presence to decide whether a pick could have
+    /// been spent (see [`domain::Claim::choice_pre_tpks`]).
+    ///
+    /// A conditional put gated on `attribute_exists(gsi2pk)` — the pending marker, the SAME gate
+    /// `fulfill_claim` / `compensate_claim` race for. It writes the same `Pending` claim back (only
+    /// `choice_pre_tpks` changes), so the marker survives and `state` stays `Pending`. A failed
+    /// condition means the claim is no longer pending (already fulfilled/compensated) — recording an
+    /// intent on it is meaningless and a sign the caller raced its own reconcile, so surface it loud
+    /// (`Corrupt`) and let the caller park rather than proceed to a choose on a settled claim.
+    pub async fn record_choice_intent(
+        &self,
+        link_token: &str,
+        claim_id: &str,
+        pre_tpks: Vec<String>,
+    ) -> Result<(), StoreError> {
+        let mut claim = self
+            .get_claim(link_token, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("record_choice_intent: claim missing"))?;
+        claim.choice_pre_tpks = Some(pre_tpks);
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(&claim)))
+            .condition_expression("attribute_exists(gsi2pk)")
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Err(StoreError::Corrupt(
+                        "record_choice_intent: claim no longer pending — refusing to choose",
+                    ))
                 } else {
                     Err(StoreError::Aws(format!("{sdk_err:?}")))
                 }
