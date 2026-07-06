@@ -131,12 +131,19 @@ pub(crate) struct SubProductsPage {
 
 #[derive(Deserialize)]
 pub(crate) struct SubProductWire {
-    pub gamekey: String,
+    // Optional: the `subscription_products_with_gamekeys` list can include a product with NO gamekey
+    // (e.g. an active/pending month not yet assigned one). Such a product has no order to redeem
+    // against, so `choice_months` skips it — but the field MUST be optional or the whole page parse
+    // fails on it (observed live: `missing field \`gamekey\``), taking down the entire month walk.
+    #[serde(default)]
+    pub gamekey: Option<String>,
     #[serde(default)]
     pub title: String,
-    #[serde(rename = "productUrlPath")]
+    // Defaulted so a gamekey-less product still deserializes (we skip it before using these); without
+    // the default a missing rename-field would fail the page parse before we can skip the product.
+    #[serde(default, rename = "productUrlPath")]
     pub product_url_path: String,
-    #[serde(rename = "productMachineName")]
+    #[serde(default, rename = "productMachineName")]
     pub product_machine_name: String,
     #[serde(default, rename = "usesChoices")]
     pub uses_choices: bool,

@@ -932,6 +932,43 @@ async fn choice_months_single_page_no_cursor_stops() {
     assert_eq!(months[0].product_machine_name, "may_2021_choice");
 }
 
+// A product with NO `gamekey` (an active/pending month not yet assigned one) must NOT fail the whole
+// page parse — it is skipped, and the other months still parse. Observed live: one such product made
+// the entire month walk return `Parse("missing field \`gamekey\`")`, so discovery wrote nothing.
+#[tokio::test]
+async fn choice_months_skips_product_without_gamekey() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [
+                {
+                    // No "gamekey" — an active/pending month. Must be skipped, not fatal.
+                    "title": "Active Month", "productUrlPath": "active-month",
+                    "productMachineName": "active_month_choice", "usesChoices": true,
+                    "isActiveContent": true, "canRedeemGames": false,
+                    "contentChoiceData": { "game_data": { "somegame": { "title": "Some Game" } } }
+                },
+                {
+                    "gamekey": "gkReal", "title": "June 2026", "productUrlPath": "june-2026",
+                    "productMachineName": "june_2026_choice", "usesChoices": true,
+                    "isActiveContent": false, "canRedeemGames": true,
+                    "contentChoiceData": { "game_data": { "construction_simulator": { "title": "Construction Simulator" } } }
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    // The whole walk must succeed (not a Parse error), yielding only the gamekey-bearing month.
+    let walk = client(&server).await.choice_months(10).await.unwrap();
+    assert!(walk.complete);
+    assert_eq!(walk.months.len(), 1, "the gamekey-less product is skipped");
+    assert_eq!(walk.months[0].gamekey, "gkReal");
+    assert_eq!(walk.months[0].product_machine_name, "june_2026_choice");
+}
+
 #[tokio::test]
 async fn choice_months_max_pages_bounds_a_nonstop_cursor() {
     let server = MockServer::start().await;
