@@ -429,3 +429,43 @@ async fn unknown_route_is_404() {
     let resp = router(store, mock).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// Reserved token SELF → 404 with byte-identical body to unknown token
+/// (no enumeration oracle, no special indication of reserved status).
+#[tokio::test]
+async fn self_reserved_token_is_a_plain_404() {
+    let Some(store) = store_or_skip("self-404").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    let req_self = Request::get("/api/l/SELF").body(Body::empty()).unwrap();
+    let resp_self = router(Arc::clone(&store), mock.clone())
+        .oneshot(req_self)
+        .await
+        .unwrap();
+
+    let req_other = Request::get("/api/l/nonexistent0000000000000000000000000000000000000000000000000000")
+        .body(Body::empty())
+        .unwrap();
+    let resp_other = router(Arc::clone(&store), mock.clone())
+        .oneshot(req_other)
+        .await
+        .unwrap();
+
+    assert_eq!(resp_self.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp_other.status(), StatusCode::NOT_FOUND);
+
+    let bytes_self = axum::body::to_bytes(resp_self.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let bytes_other = axum::body::to_bytes(resp_other.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes_self, bytes_other,
+        "SELF and unknown token must return byte-identical 404 (no oracle)"
+    );
+}

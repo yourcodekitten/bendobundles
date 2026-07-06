@@ -246,6 +246,45 @@ async fn no_session_cookie_on_protected_route_returns_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// POST /admin/api/games/:id/self-claim without session cookie → 401.
+#[tokio::test]
+async fn no_session_cookie_on_self_claim_returns_401() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash("pw");
+
+    let req = Request::post("/admin/api/games/some-id/self-claim")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+
+    let resp = router(store, invoker, admin_hash)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// GET /admin/api/claims/self without session cookie → 401.
+#[tokio::test]
+async fn no_session_cookie_on_claims_self_returns_401() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash("pw");
+
+    let req = Request::get("/admin/api/claims/self")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router(store, invoker, admin_hash)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 // ── Store-backed tests ─────────────────────────────────────────────────────────
 
 /// Login with correct password → Set-Cookie with 64-char session token; subsequent authed
