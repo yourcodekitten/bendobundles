@@ -1660,6 +1660,98 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// GUARD (divergence a): the game row is missing at fulfillment → park BEFORE any humble call.
+// The title read is the first step of handle_gift_choice; a miss must fail-safe (park, zero spend),
+// never fail-dangerous. No game seeded → get_game returns None.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn choice_get_game_missing_parks_without_spending() {
+    let Some(store) = store_or_skip("choice-game-missing").await else {
+        return;
+    };
+    // Deliberately seed NOTHING — the very first step (get_game for the title) returns None.
+    let humble = MockServer::start().await; // zero mocks: any humble call 404s and is counted.
+    let gid = game_id("gk", OFFERED_ID);
+
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, choice_gift_req(&gid, "gk", OFFERED_ID)).await;
+
+    assert!(
+        matches!(resp, FulfillResponse::Parked { .. }),
+        "game missing at fulfillment must park, got {resp:?}"
+    );
+    let reqs = humble.received_requests().await.unwrap();
+    // The proof it fails-safe: it parked BEFORE touching humble at all — no pick spent, no redeem.
+    assert!(
+        reqs.is_empty(),
+        "game-missing parks before any humble call, got: {reqs:?}"
+    );
+    assert_eq!(
+        count_path(&reqs, "/humbler/choosecontent"),
+        0,
+        "game-missing: no pick spent"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// GUARD: the intent write (step 3) hits its `attribute_exists(gsi2pk)` condition on a settled claim
+// → Corrupt → park, and choose (step 4) is NEVER reached. This is the gate that stops a re-choose on
+// a claim that already settled (a stale retry racing its own reconcile). Settle the claim out-of-band
+// so its pending marker is gone, then drive a Gift through the pre-write steps.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn choice_intent_write_on_settled_claim_refuses_to_choose() {
+    let Some(store) = store_or_skip("choice-intent-ccf").await else {
+        return;
+    };
+    let gid = seed_pending_choice_claim(
+        &store,
+        "gk",
+        OFFERED_ID,
+        TITLE,
+        OffsetDateTime::now_utc(),
+        None,
+    )
+    .await;
+    // Settle it out-of-band: compensate drops the gsi2pk pending marker (state → Compensated).
+    store.compensate_claim("tok1", "c1", &gid).await.unwrap();
+
+    let humble = MockServer::start().await;
+    // Pre-read shows no tpk (pick not spent) so the flow proceeds all the way to the intent write.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
+        )
+        .mount(&humble)
+        .await;
+    // NOTE: deliberately NO /humbler/choosecontent mock — a settled claim must NEVER be chosen for.
+
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, choice_gift_req(&gid, "gk", OFFERED_ID)).await;
+
+    assert!(
+        matches!(resp, FulfillResponse::Parked { .. }),
+        "intent write on a settled claim must park, got {resp:?}"
+    );
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/humbler/choosecontent"),
+        0,
+        "THE intent gate: a settled claim must never reach choosecontent"
+    );
+    assert_eq!(
+        count_path(&reqs, "/humbler/redeemkey"),
+        0,
+        "settled claim: no redeem either"
+    );
+    // The failed intent write does not resurrect or re-settle the claim — it stays Compensated.
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Compensated);
+}
+
+// -------------------------------------------------------------------------------------------------
 // choose fails (success=false: no picks / already chosen / refused) → park, no spend, distinct ping.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
