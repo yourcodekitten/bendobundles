@@ -517,11 +517,223 @@ async fn choice_month_parses_offered_games_and_state() {
     assert_eq!(
         games,
         vec![
-            ("darksidersgenesis", "Darksiders Genesis"),
-            ("metroexodus", "Metro Exodus"),
+            ("calico", "Calico"),
+            ("darksiders_genesis", "Darksiders Genesis"),
+            ("essays_on_empathy", "Essays on Empathy"),
+            ("fury_unleashed", "Fury Unleashed"),
+            ("horace", "Horace"),
+            ("just_die_already", "Just Die Already"),
+            ("metro_exodus", "Metro Exodus"),
+            ("mount_and_blade_warband", "Mount & Blade: Warband"),
+            ("police_stories", "Police Stories"),
             ("relicta", "Relicta"),
+            ("the_wild_eight", "The Wild Eight"),
+            ("vane", "Vane"),
         ]
     );
+}
+
+#[tokio::test]
+async fn choice_month_parses_claimed_set_and_claimable_is_offered_minus_chosen() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/membership/may-2021"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture_str("membership_may_2021.html"))
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let m = client(&server)
+        .await
+        .choice_month("may-2021")
+        .await
+        .unwrap();
+    // The blob's `contentChoicesMade.initial.choices_made` — wire order, verbatim. `Some`:
+    // the single-month read is the endpoint that KNOWS the claimed set.
+    assert_eq!(
+        m.claimed_machine_names,
+        Some(vec!["metro_exodus".to_string(), "vane".to_string()])
+    );
+
+    // claimable = offered − chosen: 12 offered, 2 chosen → exactly the other 10, with the
+    // chosen pair excluded and the offered (sorted) order preserved.
+    let claimable = m
+        .claimable_games()
+        .expect("choice_month knows the claimed set");
+    assert_eq!(claimable.len(), 10);
+    let names: Vec<&str> = claimable.iter().map(|g| g.machine_name.as_str()).collect();
+    assert!(!names.contains(&"metro_exodus"));
+    assert!(!names.contains(&"vane"));
+    assert_eq!(
+        names,
+        vec![
+            "calico",
+            "darksiders_genesis",
+            "essays_on_empathy",
+            "fury_unleashed",
+            "horace",
+            "just_die_already",
+            "mount_and_blade_warband",
+            "police_stories",
+            "relicta",
+            "the_wild_eight",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn choice_month_absent_choices_made_means_nothing_claimed() {
+    let server = MockServer::start().await;
+    // No `contentChoicesMade` at all (a month untouched by picks) — the serde default path must
+    // yield an empty claimed set, making every offered game claimable.
+    Mock::given(method("GET"))
+        .and(path("/membership/oct-2020"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    r#"<script id="webpack-monthly-product-data">
+                    {
+                      "contentChoiceOptions": {
+                        "gamekey": "Oct20Gamekey00",
+                        "title": "October 2020",
+                        "productUrlPath": "oct-2020",
+                        "productMachineName": "october_2020_choice",
+                        "usesChoices": true,
+                        "canRedeemGames": true,
+                        "contentChoiceData": {
+                          "initial": {
+                            "total_choices": 12,
+                            "content_choices": {
+                              "vane": { "title": "Vane" },
+                              "relicta": { "title": "Relicta" }
+                            }
+                          }
+                        }
+                      }
+                    }
+                    </script>"#,
+                )
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let m = client(&server)
+        .await
+        .choice_month("oct-2020")
+        .await
+        .unwrap();
+    // Absent block ⇒ Some(empty) — "no picks made", KNOWN, not the list walk's None-unknown.
+    assert_eq!(m.claimed_machine_names, Some(vec![]));
+    // Nothing chosen ⇒ claimable == all offered.
+    assert_eq!(
+        m.claimable_games(),
+        Some(m.offered_games.iter().collect::<Vec<_>>())
+    );
+    assert_eq!(m.claimable_games().unwrap().len(), 2);
+}
+
+/// The model docstring's promise, pinned: ABSENCE is the only shape read as "nothing chosen".
+/// A `contentChoicesMade` that is present but malformed (`null` here — serde's `default` applies
+/// only to a MISSING key, never to an explicit null) must fail the whole parse, not quietly decay
+/// into `Some(vec![])` and mark already-picked games claimable.
+#[tokio::test]
+async fn choice_month_malformed_choices_made_fails_parse_not_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/membership/nov-2020"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    r#"<script id="webpack-monthly-product-data">
+                    {
+                      "contentChoiceOptions": {
+                        "gamekey": "Nov20Gamekey00",
+                        "title": "November 2020",
+                        "productUrlPath": "nov-2020",
+                        "productMachineName": "november_2020_choice",
+                        "usesChoices": true,
+                        "canRedeemGames": true,
+                        "contentChoiceData": {
+                          "initial": {
+                            "total_choices": 12,
+                            "content_choices": {
+                              "vane": { "title": "Vane" }
+                            }
+                          }
+                        },
+                        "contentChoicesMade": null
+                      }
+                    }
+                    </script>"#,
+                )
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choice_month("nov-2020")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Parse(_)));
+}
+
+/// Pure edge cases of the load-bearing subtraction: duplicates in the chosen list and a chosen
+/// identifier that is NOT in offered must neither panic nor over/under-subtract — phase 3 trusts
+/// this set to decide whether a pick still needs spending.
+#[test]
+fn claimable_games_subtraction_edges() {
+    use humble_client::{ChoiceMonth, OfferedGame};
+    let offered = |names: &[&str]| -> Vec<OfferedGame> {
+        names
+            .iter()
+            .map(|n| OfferedGame {
+                machine_name: n.to_string(),
+                title: n.to_uppercase(),
+            })
+            .collect()
+    };
+    let month = |claimed: Option<Vec<&str>>| ChoiceMonth {
+        gamekey: "gk".into(),
+        title: "May 2021".into(),
+        product_url_path: "may-2021".into(),
+        product_machine_name: "may_2021_choice".into(),
+        uses_choices: true,
+        is_active_content: false,
+        can_redeem_games: true,
+        total_choices: Some(12),
+        offered_games: offered(&["calico", "relicta", "vane"]),
+        claimed_machine_names: claimed.map(|v| v.iter().map(|s| s.to_string()).collect()),
+    };
+
+    // Duplicate chosen identifiers subtract once, not twice.
+    let m = month(Some(vec!["vane", "vane"]));
+    let names: Vec<&str> = m
+        .claimable_games()
+        .unwrap()
+        .iter()
+        .map(|g| g.machine_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["calico", "relicta"]);
+
+    // A chosen identifier not in offered (wire says chosen ⊆ offered, but don't trust it with
+    // money): ignored, never panics, never removes an unrelated offered game.
+    let m = month(Some(vec!["not_offered_at_all", "relicta"]));
+    let names: Vec<&str> = m
+        .claimable_games()
+        .unwrap()
+        .iter()
+        .map(|g| g.machine_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["calico", "vane"]);
+
+    // Unknown claimed set (list-walk provenance) ⇒ None, never a guess.
+    assert_eq!(month(None).claimable_games(), None);
 }
 
 #[tokio::test]
@@ -691,6 +903,9 @@ async fn choice_months_base64url_cursor_round_trips_through_the_path() {
     assert_eq!(months.len(), 2);
     assert_eq!(months[1].product_machine_name, "p2_choice");
     assert_eq!(months[1].total_choices, None); // list walk carries no pick budget
+    // ...nor the claimed set: None = unknown, and claimable_games refuses to guess.
+    assert_eq!(months[1].claimed_machine_names, None);
+    assert_eq!(months[1].claimable_games(), None);
 }
 
 #[tokio::test]

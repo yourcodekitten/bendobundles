@@ -290,8 +290,9 @@ pub struct GiftUrl(pub String);
 ///
 /// `gamekey` links to the order (`order(gamekey)`) whose `all_tpks` hold the already-claimed keys —
 /// so "offered here, not yet in the order" = still claimable. `uses_choices=false` is the claim-all
-/// tier (every offered game is claimable); `true` is pick-N. `total_choices` is `Some` only from the
-/// single-month read (the list endpoint doesn't carry it).
+/// tier (every offered game is claimable); `true` is pick-N. `total_choices` and
+/// `claimed_machine_names` are `Some` only from the single-month read (the list endpoint carries
+/// neither).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChoiceMonth {
     pub gamekey: String,
@@ -305,6 +306,35 @@ pub struct ChoiceMonth {
     pub total_choices: Option<u32>,
     /// Every game the month offers (machine_name + title), sorted by machine_name for stable order.
     pub offered_games: Vec<OfferedGame>,
+    /// machine_names of the offered games ALREADY chosen this month — the same identifiers keying
+    /// `offered_games` (chosen ⊆ offered on the observed wire; the subtraction in
+    /// [`claimable_games`](Self::claimable_games) tolerates violations). `Some` only from
+    /// `choice_month` (the blob's `contentChoicesMade`; a blob without that block is read as
+    /// `Some(vec![])` — no picks made). `None` from the `choice_months` list walk, whose endpoint
+    /// doesn't carry the claimed set at all — same unknown-vs-known split as `total_choices`.
+    pub claimed_machine_names: Option<Vec<String>>,
+}
+
+impl ChoiceMonth {
+    /// The offered games NOT yet chosen — claimable = offered − chosen, preserving `offered_games`
+    /// order. `None` when the claimed set is UNKNOWN (a `choice_months`-sourced month): a caller
+    /// deciding whether a pick still needs spending must not guess — re-read the month via
+    /// `choice_month` instead. `Some` always from a `choice_month`-sourced month, even with no
+    /// picks made (then it's every offered game).
+    pub fn claimable_games(&self) -> Option<Vec<&OfferedGame>> {
+        let claimed: std::collections::HashSet<&str> = self
+            .claimed_machine_names
+            .as_ref()?
+            .iter()
+            .map(String::as_str)
+            .collect();
+        Some(
+            self.offered_games
+                .iter()
+                .filter(|g| !claimed.contains(g.machine_name.as_str()))
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -545,9 +575,14 @@ impl HumbleClient {
     /// page, which embeds the data in a `<script id="webpack-monthly-product-data">` blob — one GET,
     /// no API auth dance. `month_url` is the slug, e.g. `"may-2021"` (a month's `product_url_path`).
     ///
-    /// Cross-reference with `order(month.gamekey)`: a game OFFERED here but absent from that order's
-    /// `all_tpks` is still claimable (via `choose_content`); one present there is already claimed and
-    /// redeems through the existing key path.
+    /// This read is the one that KNOWS the claimed set: the returned month carries
+    /// `claimed_machine_names: Some(..)` (even `Some(vec![])` for a no-picks month), so
+    /// [`ChoiceMonth::claimable_games`] answers claimable = offered − chosen directly — no order
+    /// diffing needed.
+    ///
+    /// For a key-level cross-check, `order(month.gamekey)` still agrees: a game OFFERED here but
+    /// absent from that order's `all_tpks` is still claimable (via `choose_content`); one present
+    /// there is already claimed and redeems through the existing key path.
     pub async fn choice_month(&self, month_url: &str) -> Result<ChoiceMonth, HumbleError> {
         let html = self.get_html(&format!("/membership/{month_url}")).await?;
         let json = extract_script_json(&html, "webpack-monthly-product-data").ok_or_else(|| {
@@ -579,6 +614,7 @@ impl HumbleClient {
             can_redeem_games: cco.can_redeem_games,
             total_choices: Some(cco.content_choice_data.initial.total_choices),
             offered_games,
+            claimed_machine_names: Some(cco.content_choices_made.initial.choices_made),
         })
     }
 
@@ -642,6 +678,10 @@ impl HumbleClient {
                     // The list endpoint doesn't carry the pick budget — only the single-month read.
                     total_choices: None,
                     offered_games,
+                    // Nor the claimed set — None (unknown), NOT Some(empty): only the
+                    // `choice_month` read knows what's chosen, and a caller must not mistake
+                    // "this endpoint can't see the picks" for "no picks made".
+                    claimed_machine_names: None,
                 });
             }
             match page.cursor {
