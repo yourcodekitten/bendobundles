@@ -575,9 +575,14 @@ impl HumbleClient {
     /// page, which embeds the data in a `<script id="webpack-monthly-product-data">` blob — one GET,
     /// no API auth dance. `month_url` is the slug, e.g. `"may-2021"` (a month's `product_url_path`).
     ///
-    /// Cross-reference with `order(month.gamekey)`: a game OFFERED here but absent from that order's
-    /// `all_tpks` is still claimable (via `choose_content`); one present there is already claimed and
-    /// redeems through the existing key path.
+    /// This read is the one that KNOWS the claimed set: the returned month carries
+    /// `claimed_machine_names: Some(..)` (even `Some(vec![])` for a no-picks month), so
+    /// [`ChoiceMonth::claimable_games`] answers claimable = offered − chosen directly — no order
+    /// diffing needed.
+    ///
+    /// For a key-level cross-check, `order(month.gamekey)` still agrees: a game OFFERED here but
+    /// absent from that order's `all_tpks` is still claimable (via `choose_content`); one present
+    /// there is already claimed and redeems through the existing key path.
     pub async fn choice_month(&self, month_url: &str) -> Result<ChoiceMonth, HumbleError> {
         let html = self.get_html(&format!("/membership/{month_url}")).await?;
         let json = extract_script_json(&html, "webpack-monthly-product-data").ok_or_else(|| {

@@ -636,6 +636,53 @@ async fn choice_month_absent_choices_made_means_nothing_claimed() {
     assert_eq!(m.claimable_games().unwrap().len(), 2);
 }
 
+/// The model docstring's promise, pinned: ABSENCE is the only shape read as "nothing chosen".
+/// A `contentChoicesMade` that is present but malformed (`null` here — serde's `default` applies
+/// only to a MISSING key, never to an explicit null) must fail the whole parse, not quietly decay
+/// into `Some(vec![])` and mark already-picked games claimable.
+#[tokio::test]
+async fn choice_month_malformed_choices_made_fails_parse_not_empty() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/membership/nov-2020"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    r#"<script id="webpack-monthly-product-data">
+                    {
+                      "contentChoiceOptions": {
+                        "gamekey": "Nov20Gamekey00",
+                        "title": "November 2020",
+                        "productUrlPath": "nov-2020",
+                        "productMachineName": "november_2020_choice",
+                        "usesChoices": true,
+                        "canRedeemGames": true,
+                        "contentChoiceData": {
+                          "initial": {
+                            "total_choices": 12,
+                            "content_choices": {
+                              "vane": { "title": "Vane" }
+                            }
+                          }
+                        },
+                        "contentChoicesMade": null
+                      }
+                    }
+                    </script>"#,
+                )
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choice_month("nov-2020")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Parse(_)));
+}
+
 /// Pure edge cases of the load-bearing subtraction: duplicates in the chosen list and a chosen
 /// identifier that is NOT in offered must neither panic nor over/under-subtract — phase 3 trusts
 /// this set to decide whether a pick still needs spending.
