@@ -50,7 +50,7 @@ const CHOICE_DISCOVERY_RECENT_PROBE: usize = 4;
 /// mismatch may be a mid-deploy artifact or an order shape the very next sync corrects.
 const RECONCILE_STUCK_ALERT_AGE: time::Duration = time::Duration::hours(24);
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum FulfillRequest {
     Gift {
@@ -94,7 +94,7 @@ pub enum FulfillRequest {
     ValidateCookie,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum FulfillResponse {
     GiftUrl {

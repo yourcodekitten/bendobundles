@@ -4,10 +4,12 @@
 //! - POST  /admin/api/login              — argon2 verify, 7-day session cookie
 //! - GET   /admin/api/catalog            — full game catalog (all statuses)
 //! - POST  /admin/api/games/:id/hidden   — toggle hidden flag
+//! - POST  /admin/api/games/:id/self-claim — intake + synchronous reveal (RequestResponse)
 //! - POST  /admin/api/links              — create link (64-char token)
 //! - GET   /admin/api/links              — list all links with used/allowed counts
 //! - POST  /admin/api/links/:token/revoke
 //! - GET   /admin/api/links/:token/claims
+//! - GET   /admin/api/claims/self        — Ben's own self-claimed keys (SELF partition)
 //! - POST  /admin/api/sync               — trigger catalog sync now
 //! - GET   /admin/api/status             — sync state + game counts by status
 //!
@@ -23,8 +25,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dynamo::{HiddenWrite, Store};
-use fulfillment::FulfillRequest;
+use dynamo::{ClaimTxError, HiddenWrite, Store};
+use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
@@ -37,9 +39,12 @@ pub trait AdminInvoker: Send + Sync {
     /// Fire-and-forget invoke (`Event`) — returns as soon as the request is
     /// accepted, not when the work finishes. Used by sync-now: a full backfill
     /// runs for minutes, far past any HTTP timeout, so it MUST NOT be awaited
-    /// through the request path. (The blocking `RequestResponse` invoke existed
-    /// only for the retired cookie-paste validate and left with it.)
+    /// through the request path.
     async fn fire(&self, req: FulfillRequest) -> Result<(), String>;
+    /// Blocking `RequestResponse` invoke — self-claim needs the fulfillment RESULT (the revealed
+    /// key) inside the request/response cycle, exactly like public-api's claim path. A reveal is
+    /// seconds, not minutes: safe through the HTTP path.
+    async fn call(&self, req: FulfillRequest) -> Result<FulfillResponse, String>;
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -69,12 +74,14 @@ pub fn router(store: Arc<Store>, invoker: Arc<dyn AdminInvoker>, admin_hash: Str
     let protected = Router::new()
         .route("/admin/api/catalog", get(handle_catalog))
         .route("/admin/api/games/:id/hidden", post(handle_game_hidden))
+        .route("/admin/api/games/:id/self-claim", post(handle_self_claim))
         .route(
             "/admin/api/links",
             post(handle_create_link).get(handle_list_links),
         )
         .route("/admin/api/links/:token/revoke", post(handle_revoke_link))
         .route("/admin/api/links/:token/claims", get(handle_link_claims))
+        .route("/admin/api/claims/self", get(handle_self_claims))
         .route("/admin/api/sync", post(handle_sync))
         .route("/admin/api/status", get(handle_status))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -194,6 +201,7 @@ struct CatalogGameView {
     status: domain::GameStatus,
     claim_id: Option<String>,
     artwork_url: Option<String>,
+    requires_choice: bool,
 }
 
 async fn handle_catalog(State(s): State<AppState>) -> Response {
@@ -211,6 +219,7 @@ async fn handle_catalog(State(s): State<AppState>) -> Response {
                     status: g.status,
                     claim_id: g.claim_id,
                     artwork_url: g.artwork_url,
+                    requires_choice: g.requires_choice,
                 })
                 .collect();
             (StatusCode::OK, Json(views)).into_response()
@@ -367,9 +376,11 @@ async fn handle_revoke_link(State(s): State<AppState>, Path(token): Path<String>
 
 // ── GET /admin/api/links/:token/claims ────────────────────────────────────────
 
-/// Admin view of a claim. Deliberately NOT `domain::Claim`: the friend's
-/// one-time gift URL is a bearer secret — the single value the plan says must
-/// never reach the admin surface. The admin only learns THAT one was issued.
+/// Admin view of a gift claim. Deliberately NOT `domain::Claim`: the friend's
+/// one-time gift URL is a bearer secret — it must never reach the admin surface,
+/// and the admin only learns THAT one was issued. Self-claims are different by
+/// design: `revealed_key` is Ben's own key and is served by `handle_self_claims`
+/// ONLY (never on this gift-claim view).
 #[derive(serde::Serialize)]
 struct AdminClaimView {
     game_id: String,
@@ -395,6 +406,111 @@ async fn handle_link_claims(State(s): State<AppState>, Path(token): Path<String>
                     game_id: c.game_id,
                     state: c.state,
                     issued: c.gift_url.is_some(),
+                })
+                .collect();
+            (StatusCode::OK, Json(views)).into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── POST /admin/api/games/:id/self-claim ─────────────────────────────────────
+
+/// Self-claim view of a claim — the ONE admin surface that serves a key value (Ben's own).
+#[derive(serde::Serialize)]
+struct SelfClaimView {
+    game_id: String,
+    state: domain::ClaimState,
+    revealed_key: Option<String>,
+    created_at: String,
+}
+
+async fn handle_self_claim(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    // 1. Read the game — need gamekey/machine_name/keyindex/requires_choice for the invoke,
+    //    and key_type for the response.
+    let game = match s.store.get_game(&id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if game.status != domain::GameStatus::Available {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "game is not available"})),
+        )
+            .into_response();
+    }
+
+    // 2. Intake under LINK#SELF (single-winner on the status condition).
+    let claim_id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = s
+        .store
+        .claim_game_self(&id, &claim_id, OffsetDateTime::now_utc())
+        .await
+    {
+        return match e {
+            ClaimTxError::GameUnavailable | ClaimTxError::TxConflict => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "game was just claimed — refresh"})),
+            )
+                .into_response(),
+            _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
+
+    // 3. Synchronous fulfillment — the reveal happens now; parks return 202.
+    let req = FulfillRequest::SelfClaim {
+        claim_id: claim_id.clone(),
+        game_id: id.clone(),
+        gamekey: game.gamekey.clone(),
+        machine_name: game.machine_name.clone(),
+        keyindex: game.keyindex,
+        requires_choice: game.requires_choice,
+    };
+    match s.invoker.call(req).await {
+        Ok(FulfillResponse::RevealedKey { key }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"revealed_key": key, "key_type": game.key_type})),
+        )
+            .into_response(),
+        Ok(FulfillResponse::AlreadyRedeemed) => (
+            StatusCode::GONE,
+            Json(serde_json::json!({"error": "key was already redeemed"})),
+        )
+            .into_response(),
+        Ok(FulfillResponse::Parked { .. }) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "processing",
+                "message": "reveal parked — the key will appear under self-claims when reconcile completes"
+            })),
+        )
+            .into_response(),
+        Ok(_) | Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "fulfillment failed — check self-claims later; the claim is recorded"})),
+        )
+            .into_response(),
+    }
+}
+
+// ── GET /admin/api/claims/self ────────────────────────────────────────────────
+
+/// Self-claims list. NOTE: deliberately no link-existence pre-check — LINK#SELF has no META item
+/// (handle_link_claims' pre-check would 404 this; do not reuse it).
+async fn handle_self_claims(State(s): State<AppState>) -> Response {
+    match s.store.claims_for_link(domain::SELF_LINK_TOKEN).await {
+        Ok(claims) => {
+            let views: Vec<SelfClaimView> = claims
+                .into_iter()
+                .map(|c| SelfClaimView {
+                    game_id: c.game_id,
+                    state: c.state,
+                    revealed_key: c.revealed_key,
+                    created_at: c
+                        .created_at
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
                 })
                 .collect();
             (StatusCode::OK, Json(views)).into_response()
