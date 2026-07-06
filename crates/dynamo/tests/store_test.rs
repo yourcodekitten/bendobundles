@@ -1,5 +1,5 @@
 use aws_sdk_dynamodb::types::AttributeValue;
-use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
+use domain::{Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
     ClaimTxError, HiddenWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin, SyncState, SyncWrite,
     sync_run_is_live,
@@ -876,4 +876,67 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
     assert_eq!(l.claims_used, 2);
     assert!(!l.revoked);
     assert_eq!(l.expires_at, None);
+}
+
+#[tokio::test]
+async fn self_claim_intake_accepts_non_giftable_and_hidden() {
+    let Some(store) = store_or_skip("sc-nongiftable").await else {
+        return;
+    };
+    // A game that is available but NOT listable: giftable=false AND hidden=true — no gsi1pk.
+    // claim_game would reject this (gsi1pk absent); claim_game_self must accept it.
+    let mut g = game(1, false); // giftable=false
+    g.hidden = true;
+    store.put_game(&g).await.unwrap();
+
+    store
+        .claim_game_self(&game_id("gk1", "mn"), "claim-1", time::OffsetDateTime::now_utc())
+        .await
+        .expect("non-giftable+hidden must be self-claimable");
+
+    let after = store.get_game(&game_id("gk1", "mn")).await.unwrap().unwrap();
+    assert_eq!(after.status, GameStatus::Pending);
+    assert_eq!(after.claim_id.as_deref(), Some("claim-1"));
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "claim-1")
+        .await
+        .unwrap()
+        .expect("claim recorded under LINK#SELF");
+    assert_eq!(claim.state, ClaimState::Pending);
+    assert_eq!(claim.link_token, SELF_LINK_TOKEN);
+}
+
+#[tokio::test]
+async fn self_claim_intake_single_winner_on_race() {
+    let Some(store) = store_or_skip("sc-race").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let gid = game_id("gk1", "mn");
+    let now = time::OffsetDateTime::now_utc();
+    // Sequential calls: first wins, second refuses on the status condition.
+    let a = store.claim_game_self(&gid, "claim-a", now).await;
+    let b = store.claim_game_self(&gid, "claim-b", now).await;
+    assert!(a.is_ok());
+    assert!(matches!(b, Err(ClaimTxError::GameUnavailable)));
+}
+
+#[tokio::test]
+async fn gift_vs_self_claim_race_single_winner() {
+    let Some(store) = store_or_skip("sc-gift-vs-self").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let lnk = link("tok-race");
+    store.create_link(&lnk).await.unwrap();
+    let gid = game_id("gk1", "mn");
+    let now = time::OffsetDateTime::now_utc();
+    // Gift claim wins first…
+    store
+        .claim_game("tok-race", &gid, "claim-g", now)
+        .await
+        .unwrap();
+    // …self-claim then refuses on the same status condition.
+    let s = store.claim_game_self(&gid, "claim-s", now).await;
+    assert!(matches!(s, Err(ClaimTxError::GameUnavailable)));
 }

@@ -191,6 +191,30 @@ fn claim_cancellation_error(
     None
 }
 
+/// Map `claim_game_self`'s two-item transaction cancellation reasons to a `ClaimTxError`.
+/// Reasons are positional: item 0 = GAME update, item 1 = CLAIM put (no LINK item).
+///
+/// Same precedence rules as [`claim_cancellation_error`]: CCF wins over TransactionConflict in a
+/// mixed cancel; a pure TransactionConflict cancel maps to the retryable [`ClaimTxError::TxConflict`].
+fn self_claim_cancellation_error(
+    reasons: &[aws_sdk_dynamodb::types::CancellationReason],
+) -> Option<ClaimTxError> {
+    let code = |i: usize| reasons.get(i).and_then(|r| r.code());
+    if code(0) == Some("ConditionalCheckFailed") {
+        return Some(ClaimTxError::GameUnavailable);
+    }
+    if code(1) == Some("ConditionalCheckFailed") {
+        return Some(ClaimTxError::DuplicateClaim);
+    }
+    if reasons
+        .iter()
+        .any(|r| r.code() == Some("TransactionConflict"))
+    {
+        return Some(ClaimTxError::TxConflict);
+    }
+    None
+}
+
 pub struct Store {
     client: Client,
     table: String,
@@ -586,6 +610,102 @@ impl Store {
                     // The transaction wasn't cancelled — it never ran, because an identical
                     // request is still in flight. Same disposition as a conflict cancel:
                     // transient, retryable, 409-shaped.
+                    Some(TwiErr::TransactionInProgressException(_)) => {
+                        return Err(ClaimTxError::TxConflict);
+                    }
+                    _ => {}
+                }
+                Err(ClaimTxError::Store(StoreError::Aws(err_str)))
+            }
+        }
+    }
+
+    /// Admin self-claim intake — the two-item sibling of [`claim_game`]. Differences, both
+    /// deliberate (spec §3.1): NO LINK item (LINK#SELF has no META; there is no budget to
+    /// enforce), and the GAME condition is `#st = :available` ALONE — not the gift path's
+    /// `attribute_exists(gsi1pk)`. The sparse listable marker (available ∧ giftable ∧ ¬hidden)
+    /// guards FRIEND claims against the hide-race; self-claim must accept exactly the
+    /// non-giftable and hidden games that marker excludes. The status condition alone still
+    /// makes gift-vs-self and self-vs-self races single-winner.
+    pub async fn claim_game_self(
+        &self,
+        game_id: &str,
+        claim_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), ClaimTxError> {
+        let game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(ClaimTxError::GameUnavailable)?;
+
+        let mut pending = game.clone();
+        pending.status = GameStatus::Pending;
+        pending.claim_id = Some(claim_id.to_string());
+        let claim = domain::Claim {
+            id: claim_id.to_string(),
+            link_token: domain::SELF_LINK_TOKEN.to_string(),
+            game_id: game_id.to_string(),
+            state: ClaimState::Pending,
+            gift_url: None,
+            revealed_key: None,
+            created_at: now,
+            choice_pre_tpks: None,
+        };
+
+        let av_s = |v: &str| aws_sdk_dynamodb::types::AttributeValue::S(v.to_string());
+        let game_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", av_s(&game_pk(game_id)))
+            .key("sk", av_s("META"))
+            .update_expression(
+                "SET body = :b, #st = :pending, claim_id = :cid REMOVE gsi1pk, gsi1sk",
+            )
+            // Status-only condition — deliberately NO attribute_exists(gsi1pk). The sparse
+            // listable marker guards friend claims against the hide-race; self-claim must accept
+            // non-giftable and hidden games that the marker excludes. Status alone still
+            // provides single-winner semantics for gift-vs-self and self-vs-self races.
+            .condition_expression("#st = :available")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":b", av_s(&serde_json::to_string(&pending).expect("game")))
+            .expression_attribute_values(":pending", av_s("pending"))
+            .expression_attribute_values(":available", av_s("available"))
+            .expression_attribute_values(":cid", av_s(claim_id))
+            .build()
+            .expect("game_update");
+        let claim_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(&claim)))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .expect("claim_put");
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(game_update)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(claim_put)
+                    .build(),
+            )
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError as TwiErr;
+                let err_str = format!("{sdk_err:?}");
+                match sdk_err.as_service_error() {
+                    Some(TwiErr::TransactionCanceledException(tce)) => {
+                        if let Some(e) = self_claim_cancellation_error(tce.cancellation_reasons()) {
+                            return Err(e);
+                        }
+                    }
                     Some(TwiErr::TransactionInProgressException(_)) => {
                         return Err(ClaimTxError::TxConflict);
                     }
