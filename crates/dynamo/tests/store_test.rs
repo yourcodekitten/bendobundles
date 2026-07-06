@@ -47,6 +47,7 @@ fn game(n: u32, listable: bool) -> Game {
         claim_id: None,
         artwork_url: None,
         keyindex: 0,
+        requires_choice: false,
     }
 }
 

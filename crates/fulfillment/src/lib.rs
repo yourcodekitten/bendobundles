@@ -623,6 +623,9 @@ async fn run_sync(deps: &Deps) {
                 claim_id: None,
                 artwork_url: domain::match_artwork(&key.human_name, &subs).map(str::to_string),
                 keyindex: key.keyindex,
+                // Sync walks order.keys — these all have a real redemption key already.
+                // Choice discovery (which sets this true) is a separate ingest path.
+                requires_choice: false,
             };
             match deps.store.upsert_game_from_sync(game).await {
                 Ok(SyncWrite::Written) => games_written += 1,
