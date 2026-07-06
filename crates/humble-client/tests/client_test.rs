@@ -403,6 +403,32 @@ async fn choose_content_auth_layer_rejection_is_choose_failed() {
 }
 
 #[tokio::test]
+async fn choose_content_403_with_login_required_body_is_a_step_up_gate() {
+    let server = MockServer::start().await;
+    // The step-up gate can appear at the auth layer as a 401/403 carrying a login_required BODY with
+    // no secureArea location (redeem_once reads the body here too). choose_once must catch it as a
+    // gate, not a plain rejection — else the auto step-up-and-retry never fires. No creds → the gate
+    // surfaces as SecureAreaStepUpFailed (NOT ChooseFailed).
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error_id": "login_required"
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choose_content("gk123", &["somegame"], true)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        humble_client::HumbleError::SecureAreaStepUpFailed { .. }
+    ));
+}
+
+#[tokio::test]
 async fn choose_content_empty_selection_is_guarded_before_any_request() {
     let server = MockServer::start().await;
     // No mount — if choose_content fired a POST on an empty set, the client would get a wiremock

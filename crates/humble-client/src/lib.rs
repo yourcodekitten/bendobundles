@@ -681,6 +681,9 @@ impl HumbleClient {
                 .iter()
                 .map(|m| ("chosen_identifiers[]", (*m).to_string())),
         );
+        // Self-claim OMITS is_gift entirely (the captured self-claim request sent no is_gift field —
+        // humble's SPA drops the unchecked control), rather than sending is_gift=false. VERIFY on the
+        // live receipt that humble treats "absent" as self-claim, same as the browser does.
         if is_gift {
             form.push(("is_gift", "true".to_string()));
         }
@@ -733,13 +736,18 @@ impl HumbleClient {
                 }
             }
             401 | 403 | 302 => {
-                // A 302 to `?reason=secureArea` is the header-only form of the same step-up gate —
+                // The step-up gate shows up here two ways (exactly as `redeem_once` handles it): a
+                // 302 to `?reason=secureArea` (header-only, survives a body-read failure) OR a
+                // 401/403 carrying a `login_required` JSON body with no such location. Read the body
+                // too so a body-only gate isn't misclassified as a plain rejection — both forms are
                 // a live session that needs elevating, NOT a dead cookie. Everything else at this
                 // layer is an auth/CSRF rejection: no pick spent, park (csrf_minted names a
                 // systematic capture failure vs a rejection of humble's own token).
                 let raw_location = header_str(resp.headers(), "location");
-                if raw_location.contains("secureArea") {
-                    tracing::info!(status, "choose gated: secureArea redirect — step-up needed");
+                let login_required_body =
+                    matches!(resp.bytes().await, Ok(b) if is_login_required(&b));
+                if raw_location.contains("secureArea") || login_required_body {
+                    tracing::info!(status, "choose gated behind secure-area step-up — needed");
                     return Ok(ChooseStep::StepUpNeeded { status });
                 }
                 Err(HumbleError::ChooseFailed {
