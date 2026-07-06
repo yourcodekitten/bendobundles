@@ -987,11 +987,13 @@ async fn choice_months_single_page_no_cursor_stops() {
     assert_eq!(months[0].product_machine_name, "may_2021_choice");
 }
 
-// A product with NO `gamekey` (an active/pending month not yet assigned one) must NOT fail the whole
-// page parse — it is skipped, and the other months still parse. Observed live: one such product made
-// the entire month walk return `Parse("missing field \`gamekey\`")`, so discovery wrote nothing.
+// A product with NO `gamekey` (the current / just-billed month — gamekey-less in the LIST even though
+// its membership page carries one) must (a) NOT fail the whole page parse, and (b) be KEPT with its
+// slug, not dropped — discovery resolves the real gamekey from the per-month read. Its list gamekey
+// defaults to empty. (Earlier it was skipped; that silently dropped the two newest months, which is
+// exactly where an unspent pick lives.)
 #[tokio::test]
-async fn choice_months_skips_product_without_gamekey() {
+async fn choice_months_keeps_gamekeyless_product_with_its_slug() {
     let server = MockServer::start().await;
     const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
     Mock::given(method("GET"))
@@ -999,29 +1001,36 @@ async fn choice_months_skips_product_without_gamekey() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "products": [
                 {
-                    // No "gamekey" — an active/pending month. Must be skipped, not fatal.
-                    "title": "Active Month", "productUrlPath": "active-month",
-                    "productMachineName": "active_month_choice", "usesChoices": true,
+                    // No "gamekey" in the list — the current/just-billed month. Kept, not dropped.
+                    "title": "June 2026", "productUrlPath": "june-2026",
+                    "productMachineName": "june_2026_choice", "usesChoices": false,
                     "isActiveContent": true, "canRedeemGames": false,
-                    "contentChoiceData": { "game_data": { "somegame": { "title": "Some Game" } } }
+                    "contentChoiceData": { "game_data": { "constructionsimulator": { "title": "Construction Simulator" } } }
                 },
                 {
-                    "gamekey": "gkReal", "title": "June 2026", "productUrlPath": "june-2026",
-                    "productMachineName": "june_2026_choice", "usesChoices": true,
+                    "gamekey": "gkReal", "title": "May 2026", "productUrlPath": "may-2026",
+                    "productMachineName": "may_2026_choice", "usesChoices": true,
                     "isActiveContent": false, "canRedeemGames": true,
-                    "contentChoiceData": { "game_data": { "construction_simulator": { "title": "Construction Simulator" } } }
+                    "contentChoiceData": { "game_data": { "some_game": { "title": "Some Game" } } }
                 }
             ]
         })))
         .mount(&server)
         .await;
 
-    // The whole walk must succeed (not a Parse error), yielding only the gamekey-bearing month.
+    // The whole walk succeeds (not a Parse error) and keeps BOTH months — the gamekey-less one with
+    // an empty placeholder gamekey and its real slug intact for the per-month read.
     let walk = client(&server).await.choice_months(10).await.unwrap();
     assert!(walk.complete);
-    assert_eq!(walk.months.len(), 1, "the gamekey-less product is skipped");
-    assert_eq!(walk.months[0].gamekey, "gkReal");
-    assert_eq!(walk.months[0].product_machine_name, "june_2026_choice");
+    assert_eq!(
+        walk.months.len(),
+        2,
+        "the gamekey-less month is kept, not dropped"
+    );
+    let june = &walk.months[0];
+    assert_eq!(june.product_url_path, "june-2026");
+    assert_eq!(june.gamekey, "", "list gamekey is an empty placeholder");
+    assert_eq!(walk.months[1].gamekey, "gkReal");
 }
 
 #[tokio::test]

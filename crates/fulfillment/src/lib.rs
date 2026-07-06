@@ -1400,11 +1400,13 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
     }
 
     let mut written = 0u32;
-    // Only months whose games can still be redeemed (`can_redeem_games`). Both tiers qualify: pick-N
-    // months (`uses_choices=true`) AND claim-all months (`uses_choices=false`, Ben's newer "Get My
-    // Games" tier) — `choosecontent` works for both, so both carry claimable offers. (An earlier
-    // build wrongly also required `uses_choices`, which silently dropped every claim-all month.)
-    for month in walk.months.iter().filter(|m| m.can_redeem_games) {
+    // Process EVERY enumerated month via its per-month read — do NOT pre-filter on the list's
+    // `can_redeem_games`. The subscription LIST is unreliable for the two newest months (the current
+    // and just-billed one show up gamekey-less and/or `canRedeemGames=false`), yet their membership
+    // PAGE is fully claimable. So the membership read is the source of truth: we gate the WRITE on
+    // `detail.can_redeem_games` (page truth) below, not the list flag. Both tiers qualify —
+    // `choosecontent` works for pick-N and claim-all alike. Cost is bounded by the walk's page cap.
+    for month in walk.months.iter() {
         tokio::time::sleep(SYNC_PACE).await;
         let (heal, read) = selfheal_once(deps, !*healed, || {
             deps.humble.choice_month(&month.product_url_path)
@@ -1426,6 +1428,11 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
                 continue;
             }
         };
+        // Gate on the membership PAGE's redeemability, not the list's — a month whose page can no
+        // longer be redeemed carries no spendable pick, so skip it (no wasted writes on dead months).
+        if !detail.can_redeem_games {
+            continue;
+        }
         // `choice_month` always populates the claimed set, so `claimable_games` is `Some`. A `None`
         // here would mean the claimed set is UNKNOWN (a `choice_months`-sourced month) — never true
         // on this path, but we skip rather than guess: the contract forbids writing `true` without a
