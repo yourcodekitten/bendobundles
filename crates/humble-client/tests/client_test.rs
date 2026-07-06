@@ -584,6 +584,61 @@ async fn choice_month_parses_claimed_set_and_claimable_is_offered_minus_chosen()
     );
 }
 
+// A claim-all tier month (`usesChoices=false`, Ben's newer "Get My Games" tier) has NO `initial`
+// block — its offered games live under `contentChoiceData.game_data`. choice_month must (a) not fail
+// to parse on the missing `initial`, and (b) source offered games from `game_data`. Verified against a
+// live June-2026 capture. claimable = game_data − choices_made.
+#[tokio::test]
+async fn choice_month_claim_all_tier_reads_game_data() {
+    let server = MockServer::start().await;
+    let blob = r#"<html><body><script type="application/json" id="webpack-monthly-product-data">
+    {"contentChoiceOptions":{
+        "gamekey":"gkJun26","title":"June 2026","productUrlPath":"june-2026",
+        "productMachineName":"june_2026_choice","usesChoices":false,
+        "isActiveContent":false,"canRedeemGames":true,
+        "contentChoiceData":{"game_data":{
+            "constructionsimulator":{"title":"Construction Simulator"},
+            "octopathtravelerii":{"title":"OCTOPATH TRAVELER II"}
+        }},
+        "contentChoicesMade":{"initial":{"choices_made":["octopathtravelerii"]}}
+    }}</script></body></html>"#;
+    Mock::given(method("GET"))
+        .and(path("/membership/june-2026"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(blob)
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let m = client(&server)
+        .await
+        .choice_month("june-2026")
+        .await
+        .unwrap();
+    assert!(!m.uses_choices, "this is the claim-all tier");
+    // Offered games sourced from game_data despite no `initial` block.
+    let offered: Vec<&str> = m
+        .offered_games
+        .iter()
+        .map(|g| g.machine_name.as_str())
+        .collect();
+    assert_eq!(offered, vec!["constructionsimulator", "octopathtravelerii"]);
+    assert_eq!(
+        m.claimed_machine_names,
+        Some(vec!["octopathtravelerii".to_string()])
+    );
+    // claimable = offered − chosen → the un-chosen game.
+    let claimable: Vec<&str> = m
+        .claimable_games()
+        .unwrap()
+        .iter()
+        .map(|g| g.machine_name.as_str())
+        .collect();
+    assert_eq!(claimable, vec!["constructionsimulator"]);
+}
+
 #[tokio::test]
 async fn choice_month_absent_choices_made_means_nothing_claimed() {
     let server = MockServer::start().await;
