@@ -332,6 +332,213 @@ async fn create_link_token_is_64_chars_and_visible_in_list() {
     assert_eq!(created["claims_used"], 0);
 }
 
+/// POST a create-link body and return the response. Shared by the input-validation tests.
+async fn post_create_link(
+    store: &Arc<Store>,
+    invoker: &Arc<dyn AdminInvoker>,
+    admin_hash: &str,
+    session: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let req = Request::post("/admin/api/links")
+        .header("content-type", "application/json")
+        .header("cookie", format!("session={session}"))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    router(
+        Arc::clone(store),
+        Arc::clone(invoker),
+        admin_hash.to_string(),
+    )
+    .oneshot(req)
+    .await
+    .unwrap()
+}
+
+/// POST /admin/api/links with an absurd expires_days → 422, NOT a panic.
+/// `OffsetDateTime + Duration::days(4_000_000_000)` panics (year > 9999) — before validation,
+/// this body 502'd the lambda and forced a cold restart.
+#[tokio::test]
+async fn create_link_absurd_expires_days_returns_422_not_panic() {
+    let Some(store) = store_or_skip("link-422-days").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Overflow", "claims_allowed": 1, "expires_days": 4_000_000_000u32}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"].as_str().unwrap().contains("expires_days"),
+        "error must name the bad field, got: {j}"
+    );
+}
+
+/// POST /admin/api/links with claims_allowed: 0 → 422. A zero-claim link is born exhausted —
+/// it can never be used and only clutters the list.
+#[tokio::test]
+async fn create_link_zero_claims_allowed_returns_422() {
+    let Some(store) = store_or_skip("link-422-claims").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Zero", "claims_allowed": 0}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"].as_str().unwrap().contains("claims_allowed"),
+        "error must name the bad field, got: {j}"
+    );
+}
+
+/// POST /admin/api/links with an over-long label → 422.
+#[tokio::test]
+async fn create_link_overlong_label_returns_422() {
+    let Some(store) = store_or_skip("link-422-label").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x".repeat(201), "claims_allowed": 1}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"].as_str().unwrap().contains("label"),
+        "error must name the bad field, got: {j}"
+    );
+}
+
+/// Regression guard: a valid create with expires_days at the max bound (3650) still succeeds —
+/// validation must reject the absurd, never the legitimate.
+#[tokio::test]
+async fn create_link_valid_with_max_expires_days_succeeds() {
+    let Some(store) = store_or_skip("link-valid-days").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Decade", "claims_allowed": 100, "expires_days": 3650}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["token"].as_str().unwrap().len(), 64);
+}
+
+/// The validation bounds are EXACT: the last legal value on each side passes, the first illegal
+/// value is rejected. Guards against off-by-one drift in the 1..=MAX ranges.
+#[tokio::test]
+async fn create_link_bounds_are_exact() {
+    let Some(store) = store_or_skip("link-bounds").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    // (body, expected status, name) — one post per boundary edge.
+    let cases = [
+        (
+            serde_json::json!({"label": "d0", "claims_allowed": 1, "expires_days": 0}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expires_days = 0 (below min)",
+        ),
+        (
+            serde_json::json!({"label": "d1", "claims_allowed": 1, "expires_days": 1}),
+            StatusCode::OK,
+            "expires_days = 1 (min legal)",
+        ),
+        (
+            serde_json::json!({"label": "d3651", "claims_allowed": 1, "expires_days": 3651}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expires_days = 3651 (just past max)",
+        ),
+        (
+            serde_json::json!({"label": "c101", "claims_allowed": 101}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "claims_allowed = 101 (just past max)",
+        ),
+        (
+            serde_json::json!({"label": "x".repeat(200), "claims_allowed": 1}),
+            StatusCode::OK,
+            "label = 200 chars (max legal)",
+        ),
+    ];
+
+    for (body, want, name) in cases {
+        let resp = post_create_link(&store, &invoker, &admin_hash, &session, body).await;
+        assert_eq!(resp.status(), want, "boundary case: {name}");
+    }
+}
+
+/// GET /admin/api/links/:token/claims on an unknown token → 404, matching the revoke handler.
+/// Before this, "no such link" and "link exists, no claims" were both 200 [].
+#[tokio::test]
+async fn link_claims_unknown_token_returns_404() {
+    let Some(store) = store_or_skip("claims-404").await else {
+        return;
+    };
+    let password = "clmpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let req = Request::get("/admin/api/links/no-such-token/claims")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 /// GET /admin/api/catalog returns the full game list (including hidden). POST .../hidden toggles
 /// the hidden flag and the change is reflected in the next catalog fetch.
 #[tokio::test]
