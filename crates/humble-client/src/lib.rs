@@ -657,6 +657,11 @@ impl HumbleClient {
                 break;
             }
             for p in page.products {
+                // A product with no gamekey has no order to redeem against (an active/pending month
+                // not yet assigned one) — it can never be a source of claimable games, so skip it.
+                // The list mixes these in, and one used to fail the whole page parse before `gamekey`
+                // was made optional.
+                let Some(gamekey) = p.gamekey else { continue };
                 let mut offered_games: Vec<OfferedGame> = p
                     .content_choice_data
                     .game_data
@@ -668,7 +673,7 @@ impl HumbleClient {
                     .collect();
                 offered_games.sort_by(|a, b| a.machine_name.cmp(&b.machine_name));
                 months.push(ChoiceMonth {
-                    gamekey: p.gamekey,
+                    gamekey,
                     title: p.title,
                     product_url_path: p.product_url_path,
                     product_machine_name: p.product_machine_name,
