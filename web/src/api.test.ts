@@ -481,15 +481,31 @@ describe('adminCreateLink', () => {
     );
   });
 
-  it('throws a generic error on non-422 failure (never returns the error body as success)', async () => {
+  it('throws on a 500-with-JSON-body instead of resolving {token: undefined}', async () => {
+    // API Gateway 5xx errors carry a JSON body — parsing it "successfully"
+    // used to hand the UI token:undefined and mint /l/undefined for a link
+    // that was never created
     const mockResponse = {
       ok: false,
-      status: 502,
-      json: vi.fn().mockResolvedValue({ message: 'Internal server error' }),
+      status: 500,
+      json: vi.fn().mockResolvedValue({ message: 'internal server error' }),
     };
     mockFetch.mockResolvedValueOnce(mockResponse);
 
-    await expect(adminCreateLink('Link', 10)).rejects.toThrow('failed to create link');
+    await expect(adminCreateLink('Link', 10)).rejects.toThrow(/create link/);
+  });
+
+  it('throws on a 200 whose body is missing the link contract', async () => {
+    // A success status with the wrong shape (proxy error page, API drift)
+    // must not resolve as {token: undefined} — shape is part of the contract
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ message: 'ok' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminCreateLink('Link', 10)).rejects.toThrow(/create link/);
   });
 });
 

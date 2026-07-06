@@ -5,6 +5,7 @@ import {
   adminCreateLink,
   adminRevoke,
   adminLinkClaims,
+  CreateLinkValidationError,
   type AdminLink,
   type AdminClaimView,
 } from '../api';
@@ -51,7 +52,9 @@ export function Links() {
   const [creating, setCreating] = useState(false);
   // Stored after successful create — separate from page state so reload doesn't clear it
   const [createdInfo, setCreatedInfo] = useState<{ fullUrl: string; label: string } | null>(null);
-  // Create failure (e.g. the server's 422 naming a violated bound) — shown in the form
+  // Create failure — creating a link is a spend-adjacent action; a silent catch
+  // leaves the admin with zero signal whether a link now exists (mirrors the
+  // revoke-error pattern below). A 422 carries the violated bound verbatim.
   const [createError, setCreateError] = useState<string | null>(null);
 
   // Two-step revoke: set of armed token strings
@@ -85,6 +88,7 @@ export function Links() {
     withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires), navigate)
       .then((result) => {
         setCreatedInfo({ fullUrl: inviteUrl(result.token), label: trimmedLabel });
+        setCreateError(null);
         setFormLabel('');
         setClaimsAllowed(1);
         setExpiresDays('');
@@ -92,9 +96,20 @@ export function Links() {
         load();
       })
       .catch((err: unknown) => {
-        // withAuth redirects on 401; anything else (422 validation, network)
-        // surfaces in the form — the inputs stay put so ben can correct them.
-        setCreateError(err instanceof Error ? err.message : 'failed to create link');
+        // withAuth handles 401. A 422 means the server rejected the INPUT —
+        // no link exists; show the violated bound verbatim so it can be
+        // corrected (inputs stay put). Anything else (5xx, network) means we
+        // DON'T KNOW whether the link exists — say so. Either way drop any
+        // PREVIOUS success callout: it has no visible label, so next to a
+        // fresh failure it reads as "your link was created" and the admin can
+        // hand a friend the wrong URL. (The old link's URL stays copyable
+        // from its list row.)
+        setCreatedInfo(null);
+        setCreateError(
+          err instanceof CreateLinkValidationError
+            ? err.message
+            : "couldn't create the link — check the list below before retrying.",
+        );
       })
       .finally(() => {
         setCreating(false);
@@ -233,6 +248,9 @@ export function Links() {
         >
           create invite link
         </button>
+
+        {/* Create failure — must be loud; without it the admin can't tell
+            whether an invite link exists */}
         {createError !== null && (
           <p role="alert" className="text-xs text-red-400">
             {createError}

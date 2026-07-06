@@ -35,6 +35,28 @@ pub struct Game {
     pub artwork_url: Option<String>,
     #[serde(default)]
     pub keyindex: u32,
+    /// `true` = a Humble Choice game with **no redeemable key yet**: a monthly pick must be
+    /// spent (choosecontent) before a key exists. `false` = a normal key-backed game.
+    ///
+    /// Trust contract (phase-3 orchestration reads this as law):
+    /// - Only the Choice discovery ingest may write `true`, and only from a KNOWN claimed
+    ///   set: humble-client's single-month read (`choice_month`, claimable = offered − chosen).
+    ///   The `choice_months` list walk cannot see the picks (its claimed set is `None` =
+    ///   unknown, and `ChoiceMonth::claimable_games` refuses to guess) — it must never be a
+    ///   source of `true`. Every key-derived path (`fulfillment::run_sync` walking
+    ///   `order.keys`) writes `false`, because presence in `order.keys` is itself proof a
+    ///   redeemable key exists.
+    /// - While `true`, there is no key to gift or redeem — any path that hands out a key
+    ///   must gate on this flag (choose first, then redeem).
+    /// - [`Game::is_listable`] deliberately does NOT consult this flag: choice games stay
+    ///   listable/claimable, and the pick is spent at fulfillment time.
+    /// - `#[serde(default)]`: records written before this field existed deserialize to
+    ///   `false`, which is correct — every pre-existing record came from `order.keys`.
+    ///
+    /// As of this build nothing writes `true` yet; the discovery-wiring build is the sole
+    /// intended writer.
+    #[serde(default)]
+    pub requires_choice: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +137,17 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
             let merged = match existing_game.status {
                 GameStatus::Pending | GameStatus::Gifted => {
                     // App owns the record: keep status, claim_id, hidden, giftable
-                    // Refresh: title, bundle, artwork_url, keyindex, key_type from fresh
+                    // Refresh: title, bundle, artwork_url, keyindex, key_type, requires_choice
+                    // from fresh. requires_choice is Humble-derived, so fresh always wins
+                    // (both branches agree on this): a key-sync fresh carries `false` because
+                    // presence in order.keys proves a key exists, so a chosen game flips false
+                    // on its next sync — PROVIDED the discovery ingest derives the same
+                    // game id (via `game_id()`: gamekey:machine_name) as the post-choose
+                    // key record. That id
+                    // agreement is an obligation on the discovery-wiring build; if the ids
+                    // diverge, the stale `true` record lingers as a duplicate instead of
+                    // flipping. A stale `true` must never survive a fresh `false`, nor the
+                    // reverse.
                     Game {
                         id: existing_game.id.clone(),
                         title: fresh.title,
@@ -129,6 +161,7 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                         claim_id: existing_game.claim_id.clone(),
                         artwork_url: fresh.artwork_url,
                         keyindex: fresh.keyindex,
+                        requires_choice: fresh.requires_choice,
                     }
                 }
                 GameStatus::Available | GameStatus::BenRedeemed | GameStatus::Expired => {
@@ -214,6 +247,7 @@ mod tests {
             claim_id: None,
             artwork_url: None,
             keyindex: 0,
+            requires_choice: false,
         };
         assert!(g.is_listable());
         g.hidden = true;
@@ -271,6 +305,7 @@ mod tests {
             claim_id: None,
             artwork_url: Some("new.png".into()),
             keyindex: 4,
+            requires_choice: false,
         }
     }
 
@@ -308,6 +343,50 @@ mod tests {
     fn merge_no_change_returns_none() {
         let g = fresh_game();
         assert_eq!(merge_sync(Some(&g), g.clone()), None);
+    }
+
+    #[test]
+    fn merge_flips_requires_choice_when_key_lands() {
+        // A choice game got chosen: the next key-sync fresh carries requires_choice=false
+        // (presence in order.keys proves a key exists). The stale `true` must not survive —
+        // in either ownership branch.
+        let mut existing = fresh_game();
+        existing.requires_choice = true;
+        let merged = merge_sync(Some(&existing), fresh_game()).unwrap();
+        assert!(!merged.requires_choice, "humble-owned: fresh false wins");
+
+        let mut existing = fresh_game();
+        existing.requires_choice = true;
+        existing.status = GameStatus::Pending;
+        existing.claim_id = Some("c1".into());
+        let merged = merge_sync(Some(&existing), fresh_game()).unwrap();
+        assert!(!merged.requires_choice, "app-owned: fresh false wins");
+        assert_eq!(merged.status, GameStatus::Pending, "status stays app-owned");
+        assert_eq!(merged.claim_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn requires_choice_defaults_false_on_old_records() {
+        // A stored record written before the field existed: no `requires_choice` key at all.
+        let json = serde_json::to_value(fresh_game()).unwrap();
+        let mut stripped = json.clone();
+        stripped.as_object_mut().unwrap().remove("requires_choice");
+        assert!(stripped.get("requires_choice").is_none(), "field stripped");
+        let g: Game = serde_json::from_value(stripped).unwrap();
+        assert!(
+            !g.requires_choice,
+            "missing attribute must default to false"
+        );
+    }
+
+    #[test]
+    fn requires_choice_roundtrips_true() {
+        let mut g = fresh_game();
+        g.requires_choice = true;
+        let json = serde_json::to_string(&g).unwrap();
+        let back: Game = serde_json::from_str(&json).unwrap();
+        assert!(back.requires_choice);
+        assert_eq!(back, g);
     }
 
     #[test]

@@ -5,8 +5,26 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { Links } from './Links';
 import type { AdminLink, AdminClaimView } from '../api';
 
-vi.mock('../api');
-import { adminLinks, adminCreateLink, adminRevoke, adminLinkClaims } from '../api';
+// Partial mock: the fetch wrappers are stubbed, but CreateLinkValidationError
+// stays the real class — Links.tsx branches on `instanceof`, and an automocked
+// class constructor wouldn't carry `.message` through.
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api')>();
+  return {
+    ...actual,
+    adminLinks: vi.fn(),
+    adminCreateLink: vi.fn(),
+    adminRevoke: vi.fn(),
+    adminLinkClaims: vi.fn(),
+  };
+});
+import {
+  adminLinks,
+  adminCreateLink,
+  adminRevoke,
+  adminLinkClaims,
+  CreateLinkValidationError,
+} from '../api';
 
 function renderLinks() {
   return render(
@@ -165,11 +183,11 @@ describe('Links', () => {
       );
     });
 
-    it('rejected create shows the server message, keeps inputs, and never shows a created panel', async () => {
+    it('422 validation rejection shows the violated bound verbatim and keeps inputs', async () => {
       const user = userEvent.setup();
       vi.mocked(adminLinks).mockResolvedValue([]);
       vi.mocked(adminCreateLink).mockRejectedValue(
-        new Error('expires_days must be between 1 and 3650'),
+        new CreateLinkValidationError('expires_days must be between 1 and 3650'),
       );
 
       renderLinks();
@@ -188,6 +206,80 @@ describe('Links', () => {
       expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
       // Inputs preserved so the value can be corrected
       expect(screen.getByRole('textbox', { name: 'label' })).toHaveValue('Overflow');
+    });
+
+    it('create failure shows a loud error instead of silence', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockRejectedValue(new Error('failed to load create link'));
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+      // Failure surfaces as an alert — the admin must never be left guessing
+      // whether a link exists
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent(/couldn't create the link/i);
+      });
+      // No "invite link created" callout for a link that doesn't exist
+      expect(screen.queryByText(/invite link created/i)).not.toBeInTheDocument();
+      // Button re-enabled so the admin can retry after checking the list
+      expect(screen.getByRole('button', { name: /create invite link/i })).toBeEnabled();
+    });
+
+    it('error clears on a subsequent successful create', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink)
+        .mockRejectedValueOnce(new Error('failed to load create link'))
+        .mockResolvedValue({ token: 'tok-new', url_path: '/l/tok-new' });
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      await waitFor(() => screen.getByRole('alert'));
+
+      // Retry succeeds — the stale failure message must not linger next to
+      // the fresh "send this to your friend" callout
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/invite link created/i)).toBeInTheDocument();
+      });
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
+    it('a failed create clears the previous success callout (no stale URL next to the error)', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink)
+        .mockResolvedValueOnce({ token: 'tok-bob', url_path: '/l/tok-bob' })
+        .mockRejectedValue(new Error('failed to load create link'));
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      // First create succeeds — callout shows Bob's URL
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Bob');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      await waitFor(() => screen.getByText(/invite link created/i));
+
+      // Second create fails — the unlabeled Bob callout must NOT keep sitting
+      // under the error, or the admin copies the wrong URL for Charlie
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      await waitFor(() => screen.getByRole('alert'));
+
+      expect(screen.queryByText(/invite link created/i)).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(`${window.location.origin}/l/tok-bob`),
+      ).not.toBeInTheDocument();
     });
   });
 

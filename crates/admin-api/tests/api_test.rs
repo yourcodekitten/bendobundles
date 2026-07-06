@@ -182,6 +182,7 @@ fn test_game(n: u32) -> Game {
         claim_id: None,
         artwork_url: None,
         keyindex: n,
+        requires_choice: false,
     }
 }
 

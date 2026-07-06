@@ -134,6 +134,7 @@ async fn seed_pending_claim(store: &Store, gamekey: &str, machine: &str) -> Stri
         claim_id: None,
         artwork_url: None,
         keyindex: 0,
+        requires_choice: false,
     };
     store.put_game(&g).await.unwrap();
     store.create_link(&link("tok1")).await.unwrap();
