@@ -1599,6 +1599,7 @@ async fn choice_happy_path_chooses_then_redeems() {
 
 // -------------------------------------------------------------------------------------------------
 // MERGE GATE: crash after choose, before redeem → reconcile redeems WITHOUT ever choosing.
+// Also: a parked SELF choice claim reconciles (compensates via B1) WITHOUT any choosecontent POST.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn merge_gate_reconcile_redeems_without_choosing() {
@@ -1609,14 +1610,30 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
     let _gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, Some(vec![])).await;
 
+    // SELF choice claim on a separate gamekey — snapshot present, no tpk in order → B1 compensate.
+    // No choosecontent route is mounted; a choose attempt would 404 and surface via the gate below.
+    let self_gid = game_id("gkM", "offered_m");
+    seed_choice_game(&store, &self_gid, "SELF Merge Test").await;
+    store.claim_game_self(&self_gid, "sc-mg1", aged).await.unwrap();
+    store.record_choice_intent(SELF_LINK_TOKEN, "sc-mg1", vec![]).await.unwrap();
+
     let humble = MockServer::start().await;
     mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
-    // The order now shows the tpk present + unredeemed.
+    // The order now shows the tpk present + unredeemed (for the Gift claim).
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
+        )))
+        .mount(&humble)
+        .await;
+    // Order for the SELF claim: empty tpks → B1 (snapshot present, no new tpk → compensate).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkM"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gkM",
+            serde_json::json!([]),
         )))
         .mount(&humble)
         .await;
@@ -1638,7 +1655,7 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     assert_eq!(
         claim.state,
         ClaimState::Fulfilled,
-        "reconcile completed the claim"
+        "reconcile completed the gift claim"
     );
     assert_eq!(
         claim.gift_url.as_deref(),
@@ -1646,6 +1663,14 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     );
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Gifted);
+
+    // SELF claim reconciled without choosing: B1 → compensate_self_claim → Compensated.
+    let self_claim = deps.store.get_claim(SELF_LINK_TOKEN, "sc-mg1").await.unwrap().unwrap();
+    assert_eq!(
+        self_claim.state,
+        ClaimState::Compensated,
+        "self claim must be compensated (B1), not choosing"
+    );
 
     let reqs = humble.received_requests().await.unwrap();
     assert_eq!(
@@ -1656,7 +1681,7 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     assert_eq!(
         count_path(&reqs, "/humbler/redeemkey"),
         1,
-        "exactly one redeem from reconcile"
+        "exactly one redeem from reconcile (gift claim only)"
     );
 }
 
@@ -3207,4 +3232,120 @@ async fn choice_self_claim_ambiguous_choose_parks_no_reveal_attempted() {
         0,
         "no reveal should be attempted on ambiguous choose"
     );
+}
+
+// =================================================================================================
+// Reconcile SELF-claim tests (Task 8)
+// =================================================================================================
+
+/// A timestamp old enough to pass the RECONCILE_MIN_AGE gate (15 minutes).
+fn old_enough() -> OffsetDateTime {
+    hours_ago(1)
+}
+
+/// Drive one reconcile pass via handle(Sync). The listing will 404 (no mock mounted),
+/// which is treated as a transient failure → reconcile still runs over all parked claims.
+async fn run_reconcile(d: &Deps) {
+    let _ = handle(d, FulfillRequest::Sync).await;
+}
+
+/// Mount GET /api/v1/order/{gamekey} returning a choice order with one unredeemed tpk.
+async fn mount_order_with_unredeemed_tpk(
+    humble: &MockServer,
+    gamekey: &str,
+    machine_name: &str,
+    _keyindex: u32,
+    human_name: &str,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/order/{gamekey}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            gamekey,
+            serde_json::json!([tpk_json(machine_name, human_name, false)]),
+        )))
+        .mount(humble)
+        .await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Task 8 – Test 1: SELF choice claim, no intent snapshot → arm A → compensate_self_claim.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_self_choice_no_snapshot_compensates_via_self_variant() {
+    let Some(store) = store_or_skip("sc-rec-choice-no-snap").await else {
+        return;
+    };
+    seed_choice_game(&store, "gkG:off_g", "Reconcile Me").await;
+    store.claim_game_self("gkG:off_g", "sc-r1", old_enough()).await.unwrap();
+
+    let humble = MockServer::start().await;
+    // Order has no tpks and no snapshot on the claim → arm A → compensate_self_claim.
+    mount_order_pre_choose(&humble, "gkG").await;
+    // Deliberately NO choosecontent mock.
+
+    let deps_val = deps(store.clone(), &humble.uri(), None);
+    run_reconcile(&deps_val).await;
+
+    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-r1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Compensated, "self choice arm A must compensate via self-variant");
+    assert_eq!(
+        store.get_game("gkG:off_g").await.unwrap().unwrap().status,
+        GameStatus::Available,
+        "game must be re-listed after compensate"
+    );
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0, "reconcile must never call choosecontent");
+}
+
+// -------------------------------------------------------------------------------------------------
+// Task 8 – Test 2: SELF choice claim, B2 (snapshot + unredeemed tpk) → reveal, no choose.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_self_choice_b2_reveals_never_chooses() {
+    let Some(store) = store_or_skip("sc-rec-choice-b2").await else {
+        return;
+    };
+    seed_choice_game(&store, "gkH:off_h", "Crashed Mid-Claim").await;
+    store.claim_game_self("gkH:off_h", "sc-r2", old_enough()).await.unwrap();
+    // pre=[] → any tpk present in the order is "new".
+    store.record_choice_intent(SELF_LINK_TOKEN, "sc-r2", vec![]).await.unwrap();
+
+    let humble = MockServer::start().await;
+    // Order: unredeemed tpk present → B2 → reveal (not redeem, not choose).
+    mount_order_with_unredeemed_tpk(&humble, "gkH", "off_h_choice_steam", 0, "Crashed Mid-Claim").await;
+    mount_reveal_success(&humble, "RECONCILED-KEY").await;
+    // Deliberately NO choosecontent mock.
+
+    let deps_val = deps(store.clone(), &humble.uri(), None);
+    run_reconcile(&deps_val).await;
+
+    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-r2").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Fulfilled, "self choice B2 must be fulfilled");
+    assert_eq!(claim.revealed_key.as_deref(), Some("RECONCILED-KEY"));
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0, "reconcile must never call choosecontent");
+}
+
+// -------------------------------------------------------------------------------------------------
+// Task 8 – Test 3: SELF bundle claim, tpk already redeemed → recover_already_redeemed_key.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_self_bundle_already_redeemed_recovers_key() {
+    let Some(store) = store_or_skip("sc-rec-bundle-redeemed").await else {
+        return;
+    };
+    seed_available_game(&store, "gkI:mnI", "Old Reveal").await;
+    store.claim_game_self("gkI:mnI", "sc-r3", old_enough()).await.unwrap();
+
+    let humble = MockServer::start().await;
+    // Order shows the tpk already redeemed with a recoverable key value.
+    // Mounted unlimited — reconcile reads it once; recover_already_redeemed_key re-reads it.
+    mount_order_with_redeemed_tpk(&humble, "gkI", "mnI", "OLD-KEY").await;
+
+    let deps_val = deps(store.clone(), &humble.uri(), None);
+    run_reconcile(&deps_val).await;
+
+    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-r3").await.unwrap().unwrap();
+    assert_eq!(claim.revealed_key.as_deref(), Some("OLD-KEY"));
+    assert_eq!(claim.state, ClaimState::Fulfilled, "self bundle already-redeemed must be recovered, not pinged");
 }

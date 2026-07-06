@@ -10,7 +10,7 @@
 //! silently rot.
 
 use domain::{Claim, Game, GameStatus};
-use dynamo::{Store, SyncBegin, SyncState, SyncWrite};
+use dynamo::{Store, StoreError, SyncBegin, SyncState, SyncWrite};
 use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order, RevealedKey};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -1405,6 +1405,22 @@ async fn recover_already_redeemed_key(
     }
 }
 
+/// Dispatch [`compensate_claim`](Store::compensate_claim) or
+/// [`compensate_self_claim`](Store::compensate_self_claim) based on the claim's link token.
+/// SELF claims have no link-meta item; the gift path needs the token to locate the link record.
+/// Used by every reconcile arm that proves no pick was spent (bundle not-redeemed, choice A, B1).
+async fn compensate_any(deps: &Deps, claim: &domain::Claim) -> Result<(), StoreError> {
+    if claim.link_token == domain::SELF_LINK_TOKEN {
+        deps.store
+            .compensate_self_claim(&claim.id, &claim.game_id)
+            .await
+    } else {
+        deps.store
+            .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
+            .await
+    }
+}
+
 /// The choice branch of [`reconcile`]. Called for an aged `Pending` claim whose game
 /// `requires_choice`, with a fresh `order`. Decides PURELY from the intent snapshot + the order
 /// diff — it must NEVER call `choose_content` on any branch, and must not even take the offered id
@@ -1414,13 +1430,10 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
     match &claim.choice_pre_tpks {
         // A. No snapshot ⇒ the intent write never landed ⇒ choose was NEVER attempted (write order
         // §2.3) ⇒ pick NOT spent ⇒ compensate (slot returns, game re-lists). Same shape as the
-        // bundle "not redeemed → compensate" arm.
+        // bundle "not redeemed → compensate" arm. SELF uses compensate_self_claim (no link-meta).
         None => {
             tracing::info!(claim_id = %claim.id, "reconcile(choice): no intent snapshot — choose never ran, compensating (no pick spent)");
-            let _ = deps
-                .store
-                .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
-                .await;
+            let _ = compensate_any(deps, claim).await;
             ping(
                 deps,
                 &format!(
@@ -1436,13 +1449,10 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
             // commit ⇒ pick NOT spent ⇒ compensate. Hard backstop against a mis-decided ambiguous
             // choose: a re-list → re-claim → re-choose of the same game is REFUSED by humble
             // ("already chosen" → ChooseFailed → park), so no pick is ever double-spent — the
-            // residual is churn + pings, never value.
+            // residual is churn + pings, never value. SELF uses compensate_self_claim (no link-meta).
             TpkPick::None => {
                 tracing::info!(claim_id = %claim.id, "reconcile(choice): snapshot present, no new tpk — choose did not commit, compensating (no pick spent)");
-                let _ = deps
-                    .store
-                    .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
-                    .await;
+                let _ = compensate_any(deps, claim).await;
                 ping(
                     deps,
                     &format!(
@@ -1456,13 +1466,24 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                 .await;
             }
             // B2. Unique new tpk, NOT redeemed ⇒ pick SPENT, key not yet burned (crash between the
-            // two writes) ⇒ redeem it and complete the claim FROM RECONCILE — never choosing.
+            // two writes) ⇒ complete the claim FROM RECONCILE — never choosing.
+            // Gift → redeem as gift URL; SELF → reveal and record key value.
             // allow_heal=false: this pass's order read just proved the session live; a dead-session
-            // redeem here simply leaves the claim Pending for the next sync (which heals + retries).
+            // call here simply leaves the claim Pending for the next sync (which heals + retries).
             TpkPick::Unique(tpk) if !tpk.redeemed => {
-                tracing::info!(claim_id = %claim.id, "reconcile(choice): pick spent, key present + unredeemed — redeeming from reconcile (NO choose)");
-                let resp = redeem_claimed_tpk(
+                let flavor = if claim.link_token == domain::SELF_LINK_TOKEN {
+                    ClaimFlavor::SelfClaim
+                } else {
+                    ClaimFlavor::Gift
+                };
+                tracing::info!(
+                    claim_id = %claim.id,
+                    is_self = claim.link_token == domain::SELF_LINK_TOKEN,
+                    "reconcile(choice): pick spent, key present + unredeemed — completing from reconcile (NO choose)"
+                );
+                let resp = claimed_tpk_terminal(
                     deps,
+                    flavor,
                     &claim.id,
                     &claim.link_token,
                     &claim.game_id,
@@ -1472,31 +1493,47 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                 )
                 .await;
                 match resp {
-                    FulfillResponse::GiftUrl { .. } => {
+                    FulfillResponse::GiftUrl { .. } | FulfillResponse::RevealedKey { .. } => {
                         tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
                     }
                     other => {
                         // Any non-success just leaves the claim Pending for the next pass (the
                         // executor already pinged the loud classes / handled AlreadyRedeemed → B3).
-                        tracing::warn!(claim_id = %claim.id, ?other, "reconcile(choice): redeem did not complete — claim stays pending for the next pass");
+                        tracing::warn!(claim_id = %claim.id, ?other, "reconcile(choice): terminal did not complete — claim stays pending for the next pass");
                     }
                 }
             }
-            // B3. Unique new tpk, ALREADY redeemed ⇒ pick spent AND key burned, URL unrecorded
-            // (crash after write 2, or ben self-redeemed) ⇒ leave Pending + human-recover ping,
-            // verbatim the existing bundle redeemed arm. NEVER a key value in the ping.
-            TpkPick::Unique(_tpk) => {
-                tracing::warn!(claim_id = %claim.id, "reconcile(choice): key present but already redeemed — human recovery (URL unrecorded)");
-                ping(
-                    deps,
-                    &format!(
-                        "choice claim {} ({}) shows its key already redeemed on humble but no gift \
-                         URL was recorded — recover it manually from humble's gift-history page. \
-                         Claim left pending.",
-                        claim.id, game.title
-                    ),
-                )
-                .await;
+            // B3. Unique new tpk, ALREADY redeemed ⇒ pick spent AND key burned/revealed.
+            // Gift: URL unrecorded — leave Pending + human-recover ping (NEVER a key value).
+            // SELF: key value may be recoverable from the order's redeemed_key_val; attempt
+            //       recover_already_redeemed_key so the claim can complete autonomously.
+            TpkPick::Unique(tpk) => {
+                if claim.link_token == domain::SELF_LINK_TOKEN {
+                    tracing::warn!(
+                        claim_id = %claim.id,
+                        "reconcile(choice): self-claim key already redeemed — recovering key from order"
+                    );
+                    let _ = recover_already_redeemed_key(
+                        deps,
+                        &claim.id,
+                        &claim.game_id,
+                        &order.gamekey,
+                        &tpk.machine_name,
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(claim_id = %claim.id, "reconcile(choice): key present but already redeemed — human recovery (URL unrecorded)");
+                    ping(
+                        deps,
+                        &format!(
+                            "choice claim {} ({}) shows its key already redeemed on humble but no gift \
+                             URL was recorded — recover it manually from humble's gift-history page. \
+                             Claim left pending.",
+                            claim.id, game.title
+                        ),
+                    )
+                    .await;
+                }
             }
             // B4. Two-or-more new tpks the title can't split (concurrent sibling on this month) ⇒
             // leave Pending + a distinct ping. A human decides; the next pass retries once the
@@ -1997,20 +2034,34 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             continue;
         };
         if key.redeemed {
-            tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
-            // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message
-            // carries claim id + human game context only — NEVER a key value.
-            ping(
-                deps,
-                &format!(
-                    "parked claim {} ({} / {}) shows redeemed on humble but no gift URL was \
-                     recorded — recover manually via humble's gift-history page",
-                    claim.id, order.bundle_name, key.human_name
-                ),
-            )
-            .await;
+            if claim.link_token == domain::SELF_LINK_TOKEN {
+                // SELF: the key value may be recoverable from the order's redeemed_key_val.
+                // recover_already_redeemed_key re-reads the order, extracts the value, and
+                // records it — completing the claim autonomously. NEVER a key value in logs.
+                tracing::warn!(
+                    claim_id = %claim.id,
+                    "reconcile: self-claim parked shows redeemed on humble — recovering key from order"
+                );
+                let _ =
+                    recover_already_redeemed_key(deps, &claim.id, &claim.game_id, gamekey, machine_name)
+                        .await;
+            } else {
+                tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
+                // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message
+                // carries claim id + human game context only — NEVER a key value.
+                ping(
+                    deps,
+                    &format!(
+                        "parked claim {} ({} / {}) shows redeemed on humble but no gift URL was \
+                         recorded — recover manually via humble's gift-history page",
+                        claim.id, order.bundle_name, key.human_name
+                    ),
+                )
+                .await;
+            }
         } else {
-            // The redeem never landed on humble → return the slot and re-list the game.
+            // The redeem/reveal never landed on humble → return the slot and re-list the game.
+            // SELF uses compensate_self_claim (no link-meta item); Gift uses compensate_claim.
             //
             // Risk bound (this arm's worst case is NOT a double-spend): the compensate arm assumes a
             // gifted key would show redeemed here (redeemed_key_val set). If humble does NOT set that
@@ -2023,10 +2074,7 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             // would route the crash-after-gift case to the redeemed/URL-recovery branch instead — is
             // a non-urgent follow-up: the plan-2 live receipt.)
             tracing::info!(claim_id = %claim.id, "reconcile: parked claim not redeemed on humble — compensating (slot returns, game re-lists)");
-            let _ = deps
-                .store
-                .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
-                .await;
+            let _ = compensate_any(deps, &claim).await;
             // Ping every reconcile compensate. Self-login keeps the session alive 24/7, so this arm
             // runs autonomously on every sync — the dead-cookie stall that used to force a human to
             // look is gone. The ping restores that checkpoint: a compensate of a key that was in fact
