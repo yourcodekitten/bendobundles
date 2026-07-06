@@ -1122,7 +1122,7 @@ async fn self_claim_endpoint_intakes_invokes_and_returns_key() {
     assert!(
         matches!(&sent[0], FulfillRequest::SelfClaim { game_id, .. } if game_id == "gkJ:mnJ"),
         "first call must be SelfClaim for gkJ:mnJ, got: {:?}",
-        sent.get(0)
+        sent.first()
     );
 }
 

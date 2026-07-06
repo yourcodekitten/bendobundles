@@ -3006,6 +3006,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
 static LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // intentional: LOG_TEST_LOCK guards the whole async body (see its doc)
 async fn revealed_key_value_never_appears_in_logs_or_pings() {
     use std::sync::{Arc, Mutex};
 

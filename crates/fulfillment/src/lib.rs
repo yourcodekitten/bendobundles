@@ -951,6 +951,7 @@ async fn handle_gift_choice(
 
 /// Flavor-dispatched terminal on a claimed tpk — called from the pre-check resume, the happy tail,
 /// and (Task 8) reconcile B2. Gift → [`redeem_claimed_tpk`]; SelfClaim → [`reveal_claimed_tpk`].
+#[allow(clippy::too_many_arguments)] // private dispatcher; params mirror the two terminals it fans into
 async fn claimed_tpk_terminal(
     deps: &Deps,
     flavor: ClaimFlavor,
