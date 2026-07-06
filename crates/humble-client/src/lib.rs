@@ -127,8 +127,11 @@ fn extract_set_cookie(headers: &wreq::header::HeaderMap, name: &str) -> Option<S
 /// in the opening tag; returns `None` if the tag isn't present.
 fn extract_script_json<'a>(html: &'a str, id: &str) -> Option<&'a str> {
     // Find `id="<id>"`, then the `>` that ends that opening <script ...> tag, then the next
-    // `</script>`. The blob is JSON, which never contains a literal `</script>`, so the first close
-    // is the right one.
+    // `</script>`. Safe because a server embedding JSON in a <script> MUST escape any interior
+    // `</script>` as the legal JSON `<\/script>` (else the *browser's* parser breaks) — so the
+    // first literal `</script>` is the blob's real close, and serde decodes `\/`→`/` fine. Worst
+    // case if that convention were ever violated is a truncated slice → a clean Parse error, never
+    // a panic or a silently-wrong result.
     let id_at = html.find(&format!("id=\"{id}\""))?;
     let tag_end = html[id_at..].find('>')? + id_at + 1;
     let close = html[tag_end..].find("</script>")? + tag_end;
