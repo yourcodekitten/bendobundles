@@ -85,3 +85,30 @@ The extracted function is a direct lift of the `Err(err) => match err { ... }` a
 
 - **Task 7 stub**: `handle_self_claim_choice` returns `parked_choice("choice-self-claim-not-built")`. Task 7 replaces it. No functional path currently exercises it for real.
 - **`redeemed_key_val` in humble client**: This field is `None` when the tpk has not been redeemed (expected). The field is only populated when the humble wire response includes a redeemed key value. The `recover` path relies on this being `Some` when `AlreadyRedeemed` was triggered — which is the expected humble behavior (you can re-read an order to get the key you already redeemed).
+
+---
+
+## Post-commit amendment (same day, second signed commit)
+
+**Tightened the log-scrub positive assertion.** The original assertion was
+`captured.contains("self-claim reveal returned a key") || captured.contains("self-claim")` — the
+`||` fallback could be satisfied by the dispatch line (`"fulfillment: self-claim request"`) alone,
+i.e. the test could pass without ever proving the reveal info line was captured. Replaced with two
+strict assertions: the happy-path reveal info line (`"self-claim reveal returned a key"`) AND the
+recover-path record line (`"redeemed_key_val present"`) must BOTH appear — proving the capture saw
+both exercised paths, per the M2 anti-vacuity requirement.
+
+**Re-verified after the amendment** (all against live moto at `DYNAMODB_LOCAL_URL=http://localhost:8155`):
+
+```
+cargo test -p fulfillment  → test result: ok. 44 passed; 0 failed  (23.37s)
+cargo test -p dynamo       → test result: ok. 29 passed; 0 failed
+cargo test -p humble-client→ test result: ok. 48 passed (+10 unit); 0 failed
+```
+
+**Dynamo suite note (pre-existing, not a Task-6 regression):** `crates/dynamo/tests/store_test.rs`
+uses fixed table names (`t-{test}`) against the persistent moto instance, so a re-run against a
+moto that already holds a prior run's tables fails with `Corrupt("link token already exists")`.
+Clearing the stale `t-*` tables makes the suite fully green (29/29). The fulfillment harness got
+PID-scoped names in this task; giving dynamo's harness the same treatment is a candidate follow-up,
+deliberately out of Task 6's scope (its files weren't in scope).

@@ -2954,10 +2954,16 @@ async fn revealed_key_value_never_appears_in_logs_or_pings() {
         !captured.is_empty(),
         "log capture must be non-empty — the test cannot pass vacuously on an empty capture"
     );
-    // Assert the capture includes the reveal info line (proves the subscriber actually fired).
+    // Assert the capture includes the happy-path reveal info line AND the recover-path record
+    // line — proves the subscriber captured BOTH runs' logging. (No substring fallback: the
+    // dispatch line alone contains "self-claim" and would satisfy a weaker check vacuously.)
     assert!(
-        captured.contains("self-claim reveal returned a key") || captured.contains("self-claim"),
-        "captured logs must include the reveal info line: {captured:.200}"
+        captured.contains("self-claim reveal returned a key"),
+        "captured logs must include the reveal info line: {captured:.500}"
+    );
+    assert!(
+        captured.contains("redeemed_key_val present"),
+        "captured logs must include the recover-path record line: {captured:.500}"
     );
     // The key VALUE must never appear in any log line.
     assert!(
