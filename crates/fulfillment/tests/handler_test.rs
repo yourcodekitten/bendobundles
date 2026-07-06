@@ -1614,8 +1614,14 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     // No choosecontent route is mounted; a choose attempt would 404 and surface via the gate below.
     let self_gid = game_id("gkM", "offered_m");
     seed_choice_game(&store, &self_gid, "SELF Merge Test").await;
-    store.claim_game_self(&self_gid, "sc-mg1", aged).await.unwrap();
-    store.record_choice_intent(SELF_LINK_TOKEN, "sc-mg1", vec![]).await.unwrap();
+    store
+        .claim_game_self(&self_gid, "sc-mg1", aged)
+        .await
+        .unwrap();
+    store
+        .record_choice_intent(SELF_LINK_TOKEN, "sc-mg1", vec![])
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
@@ -1631,10 +1637,10 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     // Order for the SELF claim: empty tpks → B1 (snapshot present, no new tpk → compensate).
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gkM"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
-            "gkM",
-            serde_json::json!([]),
-        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gkM", serde_json::json!([]))),
+        )
         .mount(&humble)
         .await;
     Mock::given(method("POST"))
@@ -1665,7 +1671,12 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     assert_eq!(game.status, GameStatus::Gifted);
 
     // SELF claim reconciled without choosing: B1 → compensate_self_claim → Compensated.
-    let self_claim = deps.store.get_claim(SELF_LINK_TOKEN, "sc-mg1").await.unwrap().unwrap();
+    let self_claim = deps
+        .store
+        .get_claim(SELF_LINK_TOKEN, "sc-mg1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         self_claim.state,
         ClaimState::Compensated,
@@ -2681,7 +2692,9 @@ fn now() -> OffsetDateTime {
 
 /// Seed an Available game with a game_id of the form "gamekey:machine_name" and a given title.
 async fn seed_available_game(store: &Store, game_id_str: &str, title: &str) {
-    let (gk, mn) = game_id_str.split_once(':').expect("game_id must be gamekey:machine_name");
+    let (gk, mn) = game_id_str
+        .split_once(':')
+        .expect("game_id must be gamekey:machine_name");
     let g = domain::Game {
         id: game_id_str.into(),
         title: title.into(),
@@ -2700,7 +2713,12 @@ async fn seed_available_game(store: &Store, game_id_str: &str, title: &str) {
     store.put_game(&g).await.unwrap();
 }
 
-fn self_claim_req(claim_id: &str, game_id: &str, gamekey: &str, machine_name: &str) -> FulfillRequest {
+fn self_claim_req(
+    claim_id: &str,
+    game_id: &str,
+    gamekey: &str,
+    machine_name: &str,
+) -> FulfillRequest {
     FulfillRequest::SelfClaim {
         claim_id: claim_id.into(),
         game_id: game_id.into(),
@@ -2736,7 +2754,12 @@ async fn mount_reveal_already_redeemed(humble: &MockServer) {
 }
 
 /// Mount an order GET with a tpk that has a redeemed_key_val.
-async fn mount_order_with_redeemed_tpk(humble: &MockServer, gamekey: &str, machine_name: &str, key_val: &str) {
+async fn mount_order_with_redeemed_tpk(
+    humble: &MockServer,
+    gamekey: &str,
+    machine_name: &str,
+    key_val: &str,
+) {
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/order/{gamekey}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2757,7 +2780,11 @@ async fn mount_order_with_redeemed_tpk(humble: &MockServer, gamekey: &str, machi
 }
 
 /// Mount an order GET with a tpk that has NO redeemed_key_val.
-async fn mount_order_with_redeemed_tpk_no_val(humble: &MockServer, gamekey: &str, machine_name: &str) {
+async fn mount_order_with_redeemed_tpk_no_val(
+    humble: &MockServer,
+    gamekey: &str,
+    machine_name: &str,
+) {
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/order/{gamekey}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2794,31 +2821,56 @@ async fn self_claim_bundle_reveals_and_records() {
         return;
     };
     seed_available_game(&store, "gkA:mnA", "Stardew Valley").await;
-    store.claim_game_self("gkA:mnA", "sc-1", now()).await.unwrap();
+    store
+        .claim_game_self("gkA:mnA", "sc-1", now())
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     mount_reveal_success(&humble, "AAAA-BBBB-CCCC").await;
 
     let deps = deps(store.clone(), &humble.uri(), None);
-    let resp = handle(&deps, FulfillRequest::SelfClaim {
-        claim_id: "sc-1".into(),
-        game_id: "gkA:mnA".into(),
-        gamekey: "gkA".into(),
-        machine_name: "mnA".into(),
-        keyindex: 0,
-        requires_choice: false,
-    }).await;
+    let resp = handle(
+        &deps,
+        FulfillRequest::SelfClaim {
+            claim_id: "sc-1".into(),
+            game_id: "gkA:mnA".into(),
+            gamekey: "gkA".into(),
+            machine_name: "mnA".into(),
+            keyindex: 0,
+            requires_choice: false,
+        },
+    )
+    .await;
 
-    assert_eq!(resp, FulfillResponse::RevealedKey { key: "AAAA-BBBB-CCCC".into() });
-    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-1").await.unwrap().unwrap();
+    assert_eq!(
+        resp,
+        FulfillResponse::RevealedKey {
+            key: "AAAA-BBBB-CCCC".into()
+        }
+    );
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.revealed_key.as_deref(), Some("AAAA-BBBB-CCCC"));
-    assert_eq!(store.get_game("gkA:mnA").await.unwrap().unwrap().status, domain::GameStatus::BenRedeemed);
+    assert_eq!(
+        store.get_game("gkA:mnA").await.unwrap().unwrap().status,
+        domain::GameStatus::BenRedeemed
+    );
 
     // Assert the reveal POST had no gift= param.
     let reqs = humble.received_requests().await.unwrap();
-    let reveal_req = reqs.iter().find(|r| r.url.path() == "/humbler/redeemkey").unwrap();
+    let reveal_req = reqs
+        .iter()
+        .find(|r| r.url.path() == "/humbler/redeemkey")
+        .unwrap();
     let body = String::from_utf8(reveal_req.body.clone()).unwrap();
-    assert!(!body.contains("gift="), "reveal must not send gift param: {body}");
+    assert!(
+        !body.contains("gift="),
+        "reveal must not send gift param: {body}"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -2830,7 +2882,10 @@ async fn self_claim_already_redeemed_recovers_key_from_order() {
         return;
     };
     seed_available_game(&store, "gkB:mnB", "Two Point Campus").await;
-    store.claim_game_self("gkB:mnB", "sc-2", now()).await.unwrap();
+    store
+        .claim_game_self("gkB:mnB", "sc-2", now())
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     mount_reveal_already_redeemed(&humble).await;
@@ -2840,8 +2895,17 @@ async fn self_claim_already_redeemed_recovers_key_from_order() {
     let deps = deps(store.clone(), &humble.uri(), Some(discord.uri()));
     let resp = handle(&deps, self_claim_req("sc-2", "gkB:mnB", "gkB", "mnB")).await;
 
-    assert_eq!(resp, FulfillResponse::RevealedKey { key: "RECOVERED-KEY".into() });
-    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-2").await.unwrap().unwrap();
+    assert_eq!(
+        resp,
+        FulfillResponse::RevealedKey {
+            key: "RECOVERED-KEY".into()
+        }
+    );
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-2")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.revealed_key.as_deref(), Some("RECOVERED-KEY"));
 }
 
@@ -2854,7 +2918,10 @@ async fn self_claim_already_redeemed_with_no_key_val_parks() {
         return;
     };
     seed_available_game(&store, "gkC:mnC", "Mystery Game").await;
-    store.claim_game_self("gkC:mnC", "sc-3", now()).await.unwrap();
+    store
+        .claim_game_self("gkC:mnC", "sc-3", now())
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     mount_reveal_already_redeemed(&humble).await;
@@ -2865,7 +2932,11 @@ async fn self_claim_already_redeemed_with_no_key_val_parks() {
     let resp = handle(&deps, self_claim_req("sc-3", "gkC:mnC", "gkC", "mnC")).await;
 
     assert!(matches!(resp, FulfillResponse::Parked { .. }));
-    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-3").await.unwrap().unwrap();
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-3")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.state, domain::ClaimState::Pending);
 }
 
@@ -2878,7 +2949,10 @@ async fn self_claim_ambiguous_failure_parks_never_compensates() {
         return;
     };
     seed_available_game(&store, "gkD:mnD", "Park Me").await;
-    store.claim_game_self("gkD:mnD", "sc-4", now()).await.unwrap();
+    store
+        .claim_game_self("gkD:mnD", "sc-4", now())
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     mount_reveal_500(&humble).await;
@@ -2886,8 +2960,15 @@ async fn self_claim_ambiguous_failure_parks_never_compensates() {
     let deps = deps(store.clone(), &humble.uri(), None);
     let resp = handle(&deps, self_claim_req("sc-4", "gkD:mnD", "gkD", "mnD")).await;
     assert!(matches!(resp, FulfillResponse::Parked { .. }));
-    assert_eq!(store.get_claim(SELF_LINK_TOKEN, "sc-4").await.unwrap().unwrap().state,
-               domain::ClaimState::Pending);
+    assert_eq!(
+        store
+            .get_claim(SELF_LINK_TOKEN, "sc-4")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        domain::ClaimState::Pending
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -2903,7 +2984,9 @@ impl std::io::Write for CaptureBuf {
         self.0.lock().unwrap().extend_from_slice(buf);
         Ok(buf.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
@@ -2948,36 +3031,50 @@ async fn revealed_key_value_never_appears_in_logs_or_pings() {
 
     // --- Happy path (store_a) ---
     seed_available_game(&store_a, "gkSA:mnSA", "Scrub Game A").await;
-    store_a.claim_game_self("gkSA:mnSA", "sc-s1", now()).await.unwrap();
+    store_a
+        .claim_game_self("gkSA:mnSA", "sc-s1", now())
+        .await
+        .unwrap();
     let humble_a = MockServer::start().await;
     mount_reveal_success(&humble_a, key).await;
     let discord_a = discord_ok().await;
     let deps_a = deps(store_a.clone(), &humble_a.uri(), Some(discord_a.uri()));
-    let _ = handle(&deps_a, FulfillRequest::SelfClaim {
-        claim_id: "sc-s1".into(),
-        game_id: "gkSA:mnSA".into(),
-        gamekey: "gkSA".into(),
-        machine_name: "mnSA".into(),
-        keyindex: 0,
-        requires_choice: false,
-    }).await;
+    let _ = handle(
+        &deps_a,
+        FulfillRequest::SelfClaim {
+            claim_id: "sc-s1".into(),
+            game_id: "gkSA:mnSA".into(),
+            gamekey: "gkSA".into(),
+            machine_name: "mnSA".into(),
+            keyindex: 0,
+            requires_choice: false,
+        },
+    )
+    .await;
 
     // --- Recover path (store_b) ---
     seed_available_game(&store_b, "gkSB:mnSB", "Scrub Game B").await;
-    store_b.claim_game_self("gkSB:mnSB", "sc-s2", now()).await.unwrap();
+    store_b
+        .claim_game_self("gkSB:mnSB", "sc-s2", now())
+        .await
+        .unwrap();
     let humble_b = MockServer::start().await;
     mount_reveal_already_redeemed(&humble_b).await;
     mount_order_with_redeemed_tpk(&humble_b, "gkSB", "mnSB", key).await;
     let discord_b = discord_ok().await;
     let deps_b = deps(store_b.clone(), &humble_b.uri(), Some(discord_b.uri()));
-    let _ = handle(&deps_b, FulfillRequest::SelfClaim {
-        claim_id: "sc-s2".into(),
-        game_id: "gkSB:mnSB".into(),
-        gamekey: "gkSB".into(),
-        machine_name: "mnSB".into(),
-        keyindex: 0,
-        requires_choice: false,
-    }).await;
+    let _ = handle(
+        &deps_b,
+        FulfillRequest::SelfClaim {
+            claim_id: "sc-s2".into(),
+            game_id: "gkSB:mnSB".into(),
+            gamekey: "gkSB".into(),
+            machine_name: "mnSB".into(),
+            keyindex: 0,
+            requires_choice: false,
+        },
+    )
+    .await;
 
     // --- Assert key value never appeared in logs ---
     let captured = {
@@ -3025,22 +3122,52 @@ async fn revealed_key_value_never_appears_in_logs_or_pings() {
 #[test]
 fn reveal_decision_ladder_matches_gift_decision() {
     use humble_client::{GiftUrl, HumbleError as E, RevealedKey};
-    assert_eq!(reveal_decision(&Ok(RevealedKey("k".into()))), Decision::Record);
-    assert_eq!(reveal_decision(&Err(E::AlreadyRedeemed)), Decision::Compensate);
-    assert_eq!(reveal_decision(&Err(E::Unauthorized)), Decision::ParkCookieDead);
+    assert_eq!(
+        reveal_decision(&Ok(RevealedKey("k".into()))),
+        Decision::Record
+    );
+    assert_eq!(
+        reveal_decision(&Err(E::AlreadyRedeemed)),
+        Decision::Compensate
+    );
+    assert_eq!(
+        reveal_decision(&Err(E::Unauthorized)),
+        Decision::ParkCookieDead
+    );
     assert_eq!(reveal_decision(&Err(E::AmbiguousRedeem)), Decision::Park);
-    assert_eq!(reveal_decision(&Err(E::RedeemRefused("x".into()))), Decision::Park);
+    assert_eq!(
+        reveal_decision(&Err(E::RedeemRefused("x".into()))),
+        Decision::Park
+    );
     assert_eq!(reveal_decision(&Err(E::RateLimited)), Decision::Park);
     assert_eq!(reveal_decision(&Err(E::Api(500))), Decision::Park);
-    assert_eq!(reveal_decision(&Err(E::RedeemAuthRejected { status: 403, csrf_minted: false })), Decision::Park);
-    assert_eq!(reveal_decision(&Err(E::SecureAreaStepUpFailed { reason: "x".into() })), Decision::Park);
-    assert_eq!(reveal_decision(&Err(E::LoginFailed { reason: "x".into() })), Decision::Park);
-    assert_eq!(reveal_decision(&Err(E::ChooseFailed { reason: "x".into() })), Decision::Park);
+    assert_eq!(
+        reveal_decision(&Err(E::RedeemAuthRejected {
+            status: 403,
+            csrf_minted: false
+        })),
+        Decision::Park
+    );
+    assert_eq!(
+        reveal_decision(&Err(E::SecureAreaStepUpFailed { reason: "x".into() })),
+        Decision::Park
+    );
+    assert_eq!(
+        reveal_decision(&Err(E::LoginFailed { reason: "x".into() })),
+        Decision::Park
+    );
+    assert_eq!(
+        reveal_decision(&Err(E::ChooseFailed { reason: "x".into() })),
+        Decision::Park
+    );
     // gift_decision and reveal_decision must always agree on Err arms (written out explicitly
     // because HumbleError doesn't implement Clone, so a loop would require reconstruction).
     macro_rules! check_agree {
         ($err:expr) => {{
-            assert_eq!(gift_decision(&Err::<GiftUrl, _>($err)), reveal_decision(&Err::<RevealedKey, _>($err)));
+            assert_eq!(
+                gift_decision(&Err::<GiftUrl, _>($err)),
+                reveal_decision(&Err::<RevealedKey, _>($err))
+            );
         }};
     }
     check_agree!(E::AlreadyRedeemed);
@@ -3049,7 +3176,10 @@ fn reveal_decision_ladder_matches_gift_decision() {
     check_agree!(E::RateLimited);
     check_agree!(E::Api(500));
     check_agree!(E::RedeemRefused("y".into()));
-    check_agree!(E::RedeemAuthRejected { status: 403, csrf_minted: true });
+    check_agree!(E::RedeemAuthRejected {
+        status: 403,
+        csrf_minted: true
+    });
     check_agree!(E::SecureAreaStepUpFailed { reason: "y".into() });
     check_agree!(E::LoginFailed { reason: "y".into() });
     check_agree!(E::ChooseFailed { reason: "y".into() });
@@ -3061,7 +3191,9 @@ fn reveal_decision_ladder_matches_gift_decision() {
 
 /// Seed an Available game with `requires_choice=true` — the self-claim choice variant.
 async fn seed_choice_game(store: &Store, game_id_str: &str, title: &str) {
-    let (gk, mn) = game_id_str.split_once(':').expect("game_id must be gamekey:machine_name");
+    let (gk, mn) = game_id_str
+        .split_once(':')
+        .expect("game_id must be gamekey:machine_name");
     let g = domain::Game {
         id: game_id_str.into(),
         title: title.into(),
@@ -3232,8 +3364,11 @@ async fn choice_self_claim_ambiguous_choose_parks_no_reveal_attempted() {
     mount_choose_500(&humble, "gkF").await;
 
     let deps = deps(store.clone(), &humble.uri(), None);
-    let resp =
-        handle(&deps, self_claim_choice_req("sc-c2", "gkF:offered_x", "gkF", "offered_x")).await;
+    let resp = handle(
+        &deps,
+        self_claim_choice_req("sc-c2", "gkF:offered_x", "gkF", "offered_x"),
+    )
+    .await;
 
     assert!(matches!(resp, FulfillResponse::Parked { .. }));
     // No reveal POST was attempted.
@@ -3287,7 +3422,10 @@ async fn reconcile_self_choice_no_snapshot_compensates_via_self_variant() {
         return;
     };
     seed_choice_game(&store, "gkG:off_g", "Reconcile Me").await;
-    store.claim_game_self("gkG:off_g", "sc-r1", old_enough()).await.unwrap();
+    store
+        .claim_game_self("gkG:off_g", "sc-r1", old_enough())
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     // Order has no tpks and no snapshot on the claim → arm A → compensate_self_claim.
@@ -3297,15 +3435,27 @@ async fn reconcile_self_choice_no_snapshot_compensates_via_self_variant() {
     let deps_val = deps(store.clone(), &humble.uri(), None);
     run_reconcile(&deps_val).await;
 
-    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-r1").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Compensated, "self choice arm A must compensate via self-variant");
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-r1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Compensated,
+        "self choice arm A must compensate via self-variant"
+    );
     assert_eq!(
         store.get_game("gkG:off_g").await.unwrap().unwrap().status,
         GameStatus::Available,
         "game must be re-listed after compensate"
     );
     let reqs = humble.received_requests().await.unwrap();
-    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0, "reconcile must never call choosecontent");
+    assert_eq!(
+        count_path(&reqs, "/humbler/choosecontent"),
+        0,
+        "reconcile must never call choosecontent"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -3317,24 +3467,43 @@ async fn reconcile_self_choice_b2_reveals_never_chooses() {
         return;
     };
     seed_choice_game(&store, "gkH:off_h", "Crashed Mid-Claim").await;
-    store.claim_game_self("gkH:off_h", "sc-r2", old_enough()).await.unwrap();
+    store
+        .claim_game_self("gkH:off_h", "sc-r2", old_enough())
+        .await
+        .unwrap();
     // pre=[] → any tpk present in the order is "new".
-    store.record_choice_intent(SELF_LINK_TOKEN, "sc-r2", vec![]).await.unwrap();
+    store
+        .record_choice_intent(SELF_LINK_TOKEN, "sc-r2", vec![])
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     // Order: unredeemed tpk present → B2 → reveal (not redeem, not choose).
-    mount_order_with_unredeemed_tpk(&humble, "gkH", "off_h_choice_steam", 0, "Crashed Mid-Claim").await;
+    mount_order_with_unredeemed_tpk(&humble, "gkH", "off_h_choice_steam", 0, "Crashed Mid-Claim")
+        .await;
     mount_reveal_success(&humble, "RECONCILED-KEY").await;
     // Deliberately NO choosecontent mock.
 
     let deps_val = deps(store.clone(), &humble.uri(), None);
     run_reconcile(&deps_val).await;
 
-    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-r2").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Fulfilled, "self choice B2 must be fulfilled");
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-r2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "self choice B2 must be fulfilled"
+    );
     assert_eq!(claim.revealed_key.as_deref(), Some("RECONCILED-KEY"));
     let reqs = humble.received_requests().await.unwrap();
-    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0, "reconcile must never call choosecontent");
+    assert_eq!(
+        count_path(&reqs, "/humbler/choosecontent"),
+        0,
+        "reconcile must never call choosecontent"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -3346,7 +3515,10 @@ async fn reconcile_self_bundle_already_redeemed_recovers_key() {
         return;
     };
     seed_available_game(&store, "gkI:mnI", "Old Reveal").await;
-    store.claim_game_self("gkI:mnI", "sc-r3", old_enough()).await.unwrap();
+    store
+        .claim_game_self("gkI:mnI", "sc-r3", old_enough())
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     // Order shows the tpk already redeemed with a recoverable key value.
@@ -3356,9 +3528,17 @@ async fn reconcile_self_bundle_already_redeemed_recovers_key() {
     let deps_val = deps(store.clone(), &humble.uri(), None);
     run_reconcile(&deps_val).await;
 
-    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-r3").await.unwrap().unwrap();
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-r3")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.revealed_key.as_deref(), Some("OLD-KEY"));
-    assert_eq!(claim.state, ClaimState::Fulfilled, "self bundle already-redeemed must be recovered, not pinged");
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "self bundle already-redeemed must be recovered, not pinged"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -3372,7 +3552,10 @@ async fn reconcile_self_bundle_not_redeemed_reveals() {
         return;
     };
     seed_available_game(&store, "gkJ:mnJ", "Parked Self Game").await;
-    store.claim_game_self("gkJ:mnJ", "sc-r4", old_enough()).await.unwrap();
+    store
+        .claim_game_self("gkJ:mnJ", "sc-r4", old_enough())
+        .await
+        .unwrap();
 
     let humble = MockServer::start().await;
     // Order shows tpk NOT redeemed — the reveal never landed on humble.
@@ -3387,7 +3570,11 @@ async fn reconcile_self_bundle_not_redeemed_reveals() {
     let deps_val = deps(store.clone(), &humble.uri(), None);
     run_reconcile(&deps_val).await;
 
-    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-r4").await.unwrap().unwrap();
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-r4")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         claim.state,
         ClaimState::Fulfilled,

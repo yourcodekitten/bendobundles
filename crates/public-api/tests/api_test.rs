@@ -447,9 +447,10 @@ async fn self_reserved_token_is_a_plain_404() {
         .await
         .unwrap();
 
-    let req_other = Request::get("/api/l/nonexistent0000000000000000000000000000000000000000000000000000")
-        .body(Body::empty())
-        .unwrap();
+    let req_other =
+        Request::get("/api/l/nonexistent0000000000000000000000000000000000000000000000000000")
+            .body(Body::empty())
+            .unwrap();
     let resp_other = router(Arc::clone(&store), mock.clone())
         .oneshot(req_other)
         .await

@@ -890,11 +890,19 @@ async fn self_claim_intake_accepts_non_giftable_and_hidden() {
     store.put_game(&g).await.unwrap();
 
     store
-        .claim_game_self(&game_id("gk1", "mn"), "claim-1", time::OffsetDateTime::now_utc())
+        .claim_game_self(
+            &game_id("gk1", "mn"),
+            "claim-1",
+            time::OffsetDateTime::now_utc(),
+        )
         .await
         .expect("non-giftable+hidden must be self-claimable");
 
-    let after = store.get_game(&game_id("gk1", "mn")).await.unwrap().unwrap();
+    let after = store
+        .get_game(&game_id("gk1", "mn"))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(after.status, GameStatus::Pending);
     assert_eq!(after.claim_id.as_deref(), Some("claim-1"));
     let claim = store
@@ -981,15 +989,9 @@ async fn fulfill_self_claim_is_idempotent_on_retry() {
         .await
         .unwrap();
 
-    store
-        .fulfill_self_claim("c-f2", &gid, "K1")
-        .await
-        .unwrap();
+    store.fulfill_self_claim("c-f2", &gid, "K1").await.unwrap();
     // Second call: no error, state unchanged.
-    store
-        .fulfill_self_claim("c-f2", &gid, "K1")
-        .await
-        .unwrap();
+    store.fulfill_self_claim("c-f2", &gid, "K1").await.unwrap();
     let claim = store
         .get_claim(SELF_LINK_TOKEN, "c-f2")
         .await

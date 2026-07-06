@@ -468,12 +468,19 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
             keyindex,
             requires_choice,
         } => {
-            tracing::info!(claim_id, game_id, machine_name, keyindex, requires_choice,
-                "fulfillment: self-claim request");
+            tracing::info!(
+                claim_id,
+                game_id,
+                machine_name,
+                keyindex,
+                requires_choice,
+                "fulfillment: self-claim request"
+            );
             if requires_choice {
                 handle_self_claim_choice(deps, &claim_id, &game_id, &gamekey, &machine_name).await
             } else {
-                handle_self_claim(deps, &claim_id, &game_id, &gamekey, &machine_name, keyindex).await
+                handle_self_claim(deps, &claim_id, &game_id, &gamekey, &machine_name, keyindex)
+                    .await
             }
         }
         FulfillRequest::Sync => handle_sync(deps).await,
@@ -956,7 +963,10 @@ async fn claimed_tpk_terminal(
 ) -> FulfillResponse {
     match flavor {
         ClaimFlavor::Gift => {
-            redeem_claimed_tpk(deps, claim_id, link_token, game_id, gamekey, tpk, allow_heal).await
+            redeem_claimed_tpk(
+                deps, claim_id, link_token, game_id, gamekey, tpk, allow_heal,
+            )
+            .await
         }
         ClaimFlavor::SelfClaim => {
             reveal_claimed_tpk(deps, claim_id, game_id, gamekey, tpk, allow_heal).await
@@ -1323,9 +1333,15 @@ async fn handle_self_claim(
         }
         Decision::ParkCookieDead => {
             set_cookie_ok(deps, false).await;
-            let msg = if deps.session_store.is_some() { COOKIE_DEAD_SELFHEAL_MSG } else { COOKIE_DEAD_MSG };
+            let msg = if deps.session_store.is_some() {
+                COOKIE_DEAD_SELFHEAL_MSG
+            } else {
+                COOKIE_DEAD_MSG
+            };
             ping(deps, msg).await;
-            FulfillResponse::Parked { reason: "humble session needs attention".into() }
+            FulfillResponse::Parked {
+                reason: "humble session needs attention".into(),
+            }
         }
         Decision::Park => {
             let detail = match &outcome {
@@ -1337,13 +1353,19 @@ async fn handle_self_claim(
                 _ => "transient",
             };
             if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
-                ping(deps, &format!(
-                    "self-claim reveal for claim {claim_id} ({machine_name}) needed humble's \
+                ping(
+                    deps,
+                    &format!(
+                        "self-claim reveal for claim {claim_id} ({machine_name}) needed humble's \
                      secure-area step-up and it did not complete: {reason}. The key was NOT \
                      revealed — the claim is parked and reconcile will finish it."
-                )).await;
+                    ),
+                )
+                .await;
             }
-            FulfillResponse::Parked { reason: format!("self-claim reveal inconclusive: park for reconcile ({detail})") }
+            FulfillResponse::Parked {
+                reason: format!("self-claim reveal inconclusive: park for reconcile ({detail})"),
+            }
         }
     }
 }
@@ -1365,7 +1387,9 @@ async fn record_revealed_key(
                 "self-claim fulfill failed for claim {claim_id}: {e} — the key was revealed but \
                  not recorded; it is still readable in humble's library keys page."
             )).await;
-            FulfillResponse::Error { message: "key revealed but recording failed — flagged for ben".into() }
+            FulfillResponse::Error {
+                message: "key revealed but recording failed — flagged for ben".into(),
+            }
         }
     }
 }
@@ -1385,22 +1409,33 @@ async fn recover_already_redeemed_key(
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(claim_id, error = ?e, "self-claim recover: order re-read failed — parking");
-            return FulfillResponse::Parked { reason: "recover re-read failed: park for reconcile".into() };
+            return FulfillResponse::Parked {
+                reason: "recover re-read failed: park for reconcile".into(),
+            };
         }
     };
     let tpk = order.keys.iter().find(|k| k.machine_name == machine_name);
     match tpk.and_then(|k| k.redeemed_key_val.clone()) {
         Some(val) => {
-            tracing::info!(claim_id, "self-claim recover: redeemed_key_val present — recording");
+            tracing::info!(
+                claim_id,
+                "self-claim recover: redeemed_key_val present — recording"
+            );
             record_revealed_key(deps, claim_id, game_id, val).await
         }
         None => {
-            ping(deps, &format!(
-                "self-claim {claim_id} ({machine_name}): humble says already-redeemed but the \
+            ping(
+                deps,
+                &format!(
+                    "self-claim {claim_id} ({machine_name}): humble says already-redeemed but the \
                  order carries no key value — it may have been gifted out-of-band. Parked for \
                  review; nothing was compensated."
-            )).await;
-            FulfillResponse::Parked { reason: "already-redeemed with no recoverable key value".into() }
+                ),
+            )
+            .await;
+            FulfillResponse::Parked {
+                reason: "already-redeemed with no recoverable key value".into(),
+            }
         }
     }
 }
@@ -2042,9 +2077,14 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
                     claim_id = %claim.id,
                     "reconcile: self-claim parked shows redeemed on humble — recovering key from order"
                 );
-                let _ =
-                    recover_already_redeemed_key(deps, &claim.id, &claim.game_id, gamekey, machine_name)
-                        .await;
+                let _ = recover_already_redeemed_key(
+                    deps,
+                    &claim.id,
+                    &claim.game_id,
+                    gamekey,
+                    machine_name,
+                )
+                .await;
             } else {
                 tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
                 // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message

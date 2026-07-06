@@ -667,7 +667,10 @@ impl Store {
             // provides single-winner semantics for gift-vs-self and self-vs-self races.
             .condition_expression("#st = :available")
             .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":b", av_s(&serde_json::to_string(&pending).expect("game")))
+            .expression_attribute_values(
+                ":b",
+                av_s(&serde_json::to_string(&pending).expect("game")),
+            )
             .expression_attribute_values(":pending", av_s("pending"))
             .expression_attribute_values(":available", av_s("available"))
             .expression_attribute_values(":cid", av_s(claim_id))
@@ -814,7 +817,9 @@ impl Store {
                 let current = self
                     .get_claim(domain::SELF_LINK_TOKEN, claim_id)
                     .await?
-                    .ok_or(StoreError::Corrupt("fulfill_self: claim missing on recheck"))?;
+                    .ok_or(StoreError::Corrupt(
+                        "fulfill_self: claim missing on recheck",
+                    ))?;
                 if current.state != ClaimState::Fulfilled {
                     return Err(StoreError::Corrupt(
                         "fulfill_self lost to compensate — revealed key needs manual/reconcile recovery",

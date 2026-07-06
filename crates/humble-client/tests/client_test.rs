@@ -1324,11 +1324,17 @@ async fn reveal_key_success_returns_key_and_omits_gift_param() {
         .await
         .reveal_key("GAMEKEY123", "stardew_valley_steam", 0)
         .await;
-    assert_eq!(out.unwrap(), humble_client::RevealedKey("AAAA-BBBB-CCCC".into()));
+    assert_eq!(
+        out.unwrap(),
+        humble_client::RevealedKey("AAAA-BBBB-CCCC".into())
+    );
     // gift-param absence: fetch the received request and assert.
     let reqs = server.received_requests().await.unwrap();
     let body = String::from_utf8(reqs[0].body.clone()).unwrap();
-    assert!(!body.contains("gift="), "reveal must not send the gift param: {body}");
+    assert!(
+        !body.contains("gift="),
+        "reveal must not send the gift param: {body}"
+    );
 }
 
 #[tokio::test]
@@ -1341,11 +1347,11 @@ async fn reveal_key_already_redeemed_is_typed() {
         ))
         .mount(&server)
         .await;
-    let out = client(&server)
-        .await
-        .reveal_key("GK", "mn_steam", 0)
-        .await;
-    assert!(matches!(out, Err(humble_client::HumbleError::AlreadyRedeemed)));
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::AlreadyRedeemed)
+    ));
 }
 
 #[tokio::test]
@@ -1360,10 +1366,7 @@ async fn reveal_key_login_interstitial_is_unauthorized() {
         )
         .mount(&server)
         .await;
-    let out = client(&server)
-        .await
-        .reveal_key("GK", "mn_steam", 0)
-        .await;
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
     assert!(matches!(out, Err(humble_client::HumbleError::Unauthorized)));
 }
 
@@ -1372,16 +1375,14 @@ async fn reveal_key_success_true_but_no_key_is_ambiguous() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/humbler/redeemkey"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(r#"{"success":true}"#),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"success":true}"#))
         .mount(&server)
         .await;
-    let out = client(&server)
-        .await
-        .reveal_key("GK", "mn_steam", 0)
-        .await;
-    assert!(matches!(out, Err(humble_client::HumbleError::AmbiguousRedeem)));
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::AmbiguousRedeem)
+    ));
 }
 
 #[tokio::test]
@@ -1397,10 +1398,7 @@ async fn reveal_key_step_up_gate_without_creds_is_step_up_failed() {
         .mount(&server)
         .await;
 
-    let out = client(&server)
-        .await
-        .reveal_key("GK", "mn_steam", 0)
-        .await;
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
     assert!(matches!(
         out,
         Err(humble_client::HumbleError::SecureAreaStepUpFailed { .. })

@@ -1300,7 +1300,13 @@ impl HumbleClient {
             .await?;
         let status = resp.status().as_u16();
         // Names the outcome class only — never the key value.
-        tracing::info!(status, machine_name, keyindex, csrf_minted, "humble reveal POST response");
+        tracing::info!(
+            status,
+            machine_name,
+            keyindex,
+            csrf_minted,
+            "humble reveal POST response"
+        );
         match status {
             200 => {
                 let bytes = resp.bytes().await?;

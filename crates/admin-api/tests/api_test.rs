@@ -1045,7 +1045,11 @@ async fn get_session(app: &axum::Router) -> String {
         ))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "authed helper: login must succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "authed helper: login must succeed"
+    );
     resp.headers()
         .get(axum::http::header::SET_COOKIE)
         .expect("login must set a cookie")
@@ -1094,9 +1098,9 @@ async fn body_string(resp: axum::response::Response) -> String {
 /// - The invoke carried the correct game identifiers
 #[tokio::test]
 async fn self_claim_endpoint_intakes_invokes_and_returns_key() {
-    let (app, store, invoker_log) = test_app_with_call_invoker(
-        FulfillResponse::RevealedKey { key: "K-123".into() },
-    )
+    let (app, store, invoker_log) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "K-123".into(),
+    })
     .await;
     seed_available_game(&store, "gkJ:mnJ", "Endpoint Game").await;
 
@@ -1125,9 +1129,9 @@ async fn self_claim_endpoint_intakes_invokes_and_returns_key() {
 /// POST /admin/api/games/:id/self-claim on a Pending game → 409 (game not available).
 #[tokio::test]
 async fn self_claim_endpoint_409s_when_game_pending() {
-    let (app, store, _) = test_app_with_call_invoker(
-        FulfillResponse::RevealedKey { key: "unused".into() },
-    )
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
     .await;
     let mut g = sample_game("gkK:mnK");
     g.status = GameStatus::Pending;
@@ -1140,10 +1144,8 @@ async fn self_claim_endpoint_409s_when_game_pending() {
 /// POST /admin/api/games/:id/self-claim when mock returns Parked → 202 processing.
 #[tokio::test]
 async fn self_claim_endpoint_202_on_parked() {
-    let (app, store, _) = test_app_with_call_invoker(
-        FulfillResponse::Parked { reason: "x".into() },
-    )
-    .await;
+    let (app, store, _) =
+        test_app_with_call_invoker(FulfillResponse::Parked { reason: "x".into() }).await;
     seed_available_game(&store, "gkL:mnL", "Parked Game").await;
 
     let resp = authed_post(&app, "/admin/api/games/gkL:mnL/self-claim", "{}").await;
@@ -1154,9 +1156,9 @@ async fn self_claim_endpoint_202_on_parked() {
 /// Crucially: does NOT 404 even though LINK#SELF has no META item (handle_link_claims would 404).
 #[tokio::test]
 async fn claims_self_lists_revealed_keys_without_link_precheck() {
-    let (app, store, _) = test_app_with_call_invoker(
-        FulfillResponse::RevealedKey { key: "unused".into() },
-    )
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
     .await;
     seed_available_game(&store, "gkM:mnM", "Listed Game").await;
     store
@@ -1177,9 +1179,9 @@ async fn claims_self_lists_revealed_keys_without_link_precheck() {
 /// GET /admin/api/catalog includes requires_choice on each game view.
 #[tokio::test]
 async fn catalog_exposes_requires_choice() {
-    let (app, store, _) = test_app_with_call_invoker(
-        FulfillResponse::RevealedKey { key: "unused".into() },
-    )
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
     .await;
     let mut g = sample_game("gkN:mnN");
     g.requires_choice = true;
@@ -1203,9 +1205,9 @@ async fn catalog_exposes_requires_choice() {
 /// Regression guard: a new SelfClaimView with revealed_key must not bleed into this endpoint.
 #[tokio::test]
 async fn gift_link_claims_still_hide_gift_url() {
-    let (app, store, _) = test_app_with_call_invoker(
-        FulfillResponse::RevealedKey { key: "unused".into() },
-    )
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
     .await;
     // Seed a gift link + fulfilled claim with a real gift_url (same pattern as link_claims_redact_gift_url_to_issued_bool)
     store.create_link(&test_link("tok-inv")).await.unwrap();
@@ -1226,7 +1228,16 @@ async fn gift_link_claims_still_hide_gift_url() {
     let resp = authed_get(&app, "/admin/api/links/tok-inv/claims").await;
     assert_eq!(resp.status(), 200);
     let raw = body_string(resp).await;
-    assert!(!raw.contains("gift_url"), "gift surface must not carry gift_url: {raw}");
-    assert!(!raw.contains("revealed_key"), "gift surface must not carry revealed_key: {raw}");
-    assert!(raw.contains("issued"), "sanity: the response is the AdminClaimView shape: {raw}");
+    assert!(
+        !raw.contains("gift_url"),
+        "gift surface must not carry gift_url: {raw}"
+    );
+    assert!(
+        !raw.contains("revealed_key"),
+        "gift surface must not carry revealed_key: {raw}"
+    );
+    assert!(
+        raw.contains("issued"),
+        "sanity: the response is the AdminClaimView shape: {raw}"
+    );
 }
