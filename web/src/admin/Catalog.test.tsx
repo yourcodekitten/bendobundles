@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -6,7 +6,7 @@ import { Catalog } from './Catalog';
 import type { AdminGame } from '../api';
 
 vi.mock('../api');
-import { adminCatalog, adminSetHidden } from '../api';
+import { adminCatalog, adminSetHidden, adminSelfClaim, adminSelfClaims } from '../api';
 
 function renderCatalog() {
   return render(
@@ -19,6 +19,20 @@ function renderCatalog() {
   );
 }
 
+// Base fixture — spread and override in per-test mocks
+const gameFixture: AdminGame = {
+  id: 'gx:base',
+  title: 'Base Game',
+  bundle: 'Base Bundle',
+  key_type: 'steam',
+  giftable: false,
+  hidden: false,
+  status: 'available',
+  claim_id: null,
+  artwork_url: null,
+  requires_choice: false,
+};
+
 const gameAvailable: AdminGame = {
   id: 'g1',
   title: 'Hollow Knight',
@@ -29,6 +43,7 @@ const gameAvailable: AdminGame = {
   status: 'available',
   claim_id: null,
   artwork_url: null,
+  requires_choice: false,
 };
 
 const gamePending: AdminGame = {
@@ -41,6 +56,7 @@ const gamePending: AdminGame = {
   status: 'pending',
   claim_id: 'c-999',
   artwork_url: 'https://example.com/celeste.jpg',
+  requires_choice: false,
 };
 
 const gameGifted: AdminGame = {
@@ -53,11 +69,13 @@ const gameGifted: AdminGame = {
   status: 'gifted',
   claim_id: 'c-100',
   artwork_url: null,
+  requires_choice: false,
 };
 
 describe('Catalog', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(adminSelfClaims).mockResolvedValue([]);
   });
 
   describe('loading + rendering', () => {
@@ -327,6 +345,48 @@ describe('Catalog', () => {
       );
       // Login page must NOT be visible
       expect(screen.queryByText('login page')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('self-claim', () => {
+    it('self-claim is two-step: arm then confirm, loud on choice games', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gk:choice1', title: 'Choicey', status: 'available', requires_choice: true },
+      ]);
+      vi.mocked(adminSelfClaim).mockResolvedValue({ kind: 'processing' });
+      renderCatalog();
+      const btn = await screen.findByRole('button', { name: /claim for me/i });
+      fireEvent.click(btn);
+      expect(adminSelfClaim).not.toHaveBeenCalled();         // armed, not fired
+      expect(screen.getByRole('button', { name: /confirm\? spends 1 pick/i })).toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /confirm\? spends 1 pick/i }));
+      await waitFor(() => expect(adminSelfClaim).toHaveBeenCalledTimes(1));
+      expect(adminSelfClaim).toHaveBeenCalledWith('gk:choice1');
+    });
+
+    it('revealed key panel shows copy box and steam register link for steam keys', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gk:s1', status: 'available', requires_choice: false, key_type: 'steam' },
+      ]);
+      vi.mocked(adminSelfClaim).mockResolvedValue({ kind: 'revealed', key: 'AAAA-BBBB', keyType: 'steam' });
+      renderCatalog();
+      fireEvent.click(await screen.findByRole('button', { name: /claim for me/i }));
+      fireEvent.click(screen.getByRole('button', { name: /confirm\?/i }));
+      expect(await screen.findByText('AAAA-BBBB')).toBeInTheDocument();
+      const link = screen.getByRole('link', { name: /redeem on steam/i });
+      expect(link).toHaveAttribute('href', 'https://store.steampowered.com/account/registerkey?key=AAAA-BBBB');
+    });
+
+    it('non-steam reveal shows key without the steam button', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gk:g1', status: 'available', requires_choice: false, key_type: 'gog' },
+      ]);
+      vi.mocked(adminSelfClaim).mockResolvedValue({ kind: 'revealed', key: 'GOG-KEY-1', keyType: 'gog' });
+      renderCatalog();
+      fireEvent.click(await screen.findByRole('button', { name: /claim for me/i }));
+      fireEvent.click(screen.getByRole('button', { name: /confirm\?/i }));
+      expect(await screen.findByText('GOG-KEY-1')).toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: /redeem on steam/i })).not.toBeInTheDocument();
     });
   });
 });

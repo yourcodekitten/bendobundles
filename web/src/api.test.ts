@@ -11,6 +11,8 @@ import {
   adminLinks,
   adminRevoke,
   adminSync,
+  adminSelfClaim,
+  adminSelfClaims,
   NotFound,
   FetchFailed,
   Unauthorized,
@@ -682,5 +684,52 @@ describe('adminSync', () => {
     mockFetch.mockResolvedValueOnce(mockResponse);
 
     await expect(adminSync()).rejects.toBeInstanceOf(Unauthorized);
+  });
+});
+
+describe('adminSelfClaim', () => {
+  it('returns the revealed key on 200', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ revealed_key: 'K-1', key_type: 'steam' }),
+    });
+    const out = await adminSelfClaim('gk:mn');
+    expect(out).toEqual({ kind: 'revealed', key: 'K-1', keyType: 'steam' });
+  });
+
+  it('maps 202 to processing', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 202,
+      json: vi.fn().mockResolvedValue({ status: 'processing', message: 'parked' }),
+    });
+    const out = await adminSelfClaim('gk:mn');
+    expect(out.kind).toBe('processing');
+  });
+
+  it('maps 409 to refused with message', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      json: vi.fn().mockResolvedValue({ error: 'game was just claimed — refresh' }),
+    });
+    const out = await adminSelfClaim('gk:mn');
+    expect(out).toEqual({ kind: 'refused', message: 'game was just claimed — refresh' });
+  });
+});
+
+describe('adminSelfClaims', () => {
+  it('lists claims', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue([
+        { game_id: 'g', state: 'fulfilled', revealed_key: 'K', created_at: '2026-07-06T00:00:00Z' },
+      ]),
+    });
+    const out = await adminSelfClaims();
+    const [first] = out;
+    expect(first?.revealed_key).toBe('K');
   });
 });
