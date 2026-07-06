@@ -4,6 +4,7 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { Catalog } from './Catalog';
 import type { AdminGame } from '../api';
+import { Unauthorized } from '../api';
 
 vi.mock('../api');
 import { adminCatalog, adminSetHidden, adminSelfClaim, adminSelfClaims } from '../api';
@@ -387,6 +388,19 @@ describe('Catalog', () => {
       fireEvent.click(screen.getByRole('button', { name: /confirm\?/i }));
       expect(await screen.findByText('GOG-KEY-1')).toBeInTheDocument();
       expect(screen.queryByRole('link', { name: /redeem on steam/i })).not.toBeInTheDocument();
+    });
+
+    // Carried from final review I2: handleSelfClaim must use withAuth so an expired session
+    // navigates to login instead of leaving the button stuck disabled with an unhandled rejection.
+    it('adminSelfClaim Unauthorized navigates to login', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gk:auth1', status: 'available', requires_choice: false },
+      ]);
+      vi.mocked(adminSelfClaim).mockRejectedValue(new Unauthorized());
+      renderCatalog();
+      fireEvent.click(await screen.findByRole('button', { name: /claim for me/i }));
+      fireEvent.click(screen.getByRole('button', { name: /confirm\?/i }));
+      await waitFor(() => expect(screen.getByText('login page')).toBeInTheDocument());
     });
   });
 });

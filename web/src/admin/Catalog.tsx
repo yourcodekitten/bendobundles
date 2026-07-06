@@ -80,7 +80,7 @@ export function Catalog() {
     }
     setArmedId(null);
     setClaiming(g.id);
-    const r = await adminSelfClaim(g.id);
+    const r = await withAuth(() => adminSelfClaim(g.id), navigate);
     setClaiming(null);
     setResult({ gameId: g.id, r });
     load();

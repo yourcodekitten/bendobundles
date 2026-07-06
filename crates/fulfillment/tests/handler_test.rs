@@ -3360,3 +3360,53 @@ async fn reconcile_self_bundle_already_redeemed_recovers_key() {
     assert_eq!(claim.revealed_key.as_deref(), Some("OLD-KEY"));
     assert_eq!(claim.state, ClaimState::Fulfilled, "self bundle already-redeemed must be recovered, not pinged");
 }
+
+// -------------------------------------------------------------------------------------------------
+// Fix I1: SELF bundle claim, tpk NOT redeemed → reveal (not compensate).
+// A parked SELF bundle claim must call reveal_claimed_tpk, not compensate_any, so the key appears
+// under self-claims. The redeemed arm (Test 3) exercises recovery; this arm exercises reveal.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_self_bundle_not_redeemed_reveals() {
+    let Some(store) = store_or_skip("sc-rec-bundle-notredeemed").await else {
+        return;
+    };
+    seed_available_game(&store, "gkJ:mnJ", "Parked Self Game").await;
+    store.claim_game_self("gkJ:mnJ", "sc-r4", old_enough()).await.unwrap();
+
+    let humble = MockServer::start().await;
+    // Order shows tpk NOT redeemed — the reveal never landed on humble.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkJ"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkJ", "mnJ", false)))
+        .mount(&humble)
+        .await;
+    mount_reveal_success(&humble, "REVEALED-KEY").await;
+    // Deliberately NO choosecontent mock — reconcile must never choose.
+
+    let deps_val = deps(store.clone(), &humble.uri(), None);
+    run_reconcile(&deps_val).await;
+
+    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-r4").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "self bundle not-redeemed must reveal and record, not compensate"
+    );
+    assert_eq!(
+        claim.revealed_key.as_deref(),
+        Some("REVEALED-KEY"),
+        "revealed key must be recorded on the claim"
+    );
+    assert_eq!(
+        store.get_game("gkJ:mnJ").await.unwrap().unwrap().status,
+        GameStatus::BenRedeemed,
+        "game must flip to BenRedeemed after reconcile reveal"
+    );
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/humbler/choosecontent"),
+        0,
+        "reconcile must never call choosecontent"
+    );
+}

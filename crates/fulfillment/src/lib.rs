@@ -2059,9 +2059,14 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
                 )
                 .await;
             }
+        } else if claim.link_token == domain::SELF_LINK_TOKEN {
+            // SELF: the reveal never landed — attempt a late reveal (plan B1, allow_heal=false).
+            // A race where the key was actually burned hits AlreadyRedeemed inside
+            // reveal_claimed_tpk → recover_already_redeemed_key safely; no double-spend is possible.
+            tracing::info!(claim_id = %claim.id, "reconcile: self-claim parked, not redeemed on humble — revealing (plan B1)");
+            let _ = reveal_claimed_tpk(deps, &claim.id, &claim.game_id, gamekey, key, false).await;
         } else {
-            // The redeem/reveal never landed on humble → return the slot and re-list the game.
-            // SELF uses compensate_self_claim (no link-meta item); Gift uses compensate_claim.
+            // Gift: the redeem/reveal never landed on humble → return the slot and re-list the game.
             //
             // Risk bound (this arm's worst case is NOT a double-spend): the compensate arm assumes a
             // gifted key would show redeemed here (redeemed_key_val set). If humble does NOT set that
@@ -2073,7 +2078,7 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             // recoverable case is caught. (Confirming whether a gift sets redeemed_key_val — which
             // would route the crash-after-gift case to the redeemed/URL-recovery branch instead — is
             // a non-urgent follow-up: the plan-2 live receipt.)
-            tracing::info!(claim_id = %claim.id, "reconcile: parked claim not redeemed on humble — compensating (slot returns, game re-lists)");
+            tracing::info!(claim_id = %claim.id, "reconcile: parked gift claim not redeemed on humble — compensating (slot returns, game re-lists)");
             let _ = compensate_any(deps, &claim).await;
             // Ping every reconcile compensate. Self-login keeps the session alive 24/7, so this arm
             // runs autonomously on every sync — the dead-cookie stall that used to force a human to

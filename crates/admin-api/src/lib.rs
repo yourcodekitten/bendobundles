@@ -482,7 +482,7 @@ async fn handle_self_claim(State(s): State<AppState>, Path(id): Path<String>) ->
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
                 "status": "processing",
-                "message": "reveal parked — the key will appear under self-claims when reconcile completes"
+                "message": "reveal parked — the key will appear under self-claims, or the game will re-list if the claim couldn't complete"
             })),
         )
             .into_response(),
