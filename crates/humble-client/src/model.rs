@@ -48,3 +48,50 @@ pub(crate) struct SubproductWire {
     #[serde(default)]
     pub icon: Option<String>,
 }
+
+// ── Humble Choice: the `webpack-monthly-product-data` blob embedded in `/membership/<month>` ──────
+
+#[derive(Deserialize)]
+pub(crate) struct MembershipBlob {
+    #[serde(rename = "contentChoiceOptions")]
+    pub content_choice_options: ContentChoiceOptions,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ContentChoiceOptions {
+    pub gamekey: String,
+    pub title: String,
+    #[serde(rename = "productUrlPath")]
+    pub product_url_path: String,
+    #[serde(rename = "productMachineName")]
+    pub product_machine_name: String,
+    #[serde(default, rename = "usesChoices")]
+    pub uses_choices: bool,
+    #[serde(default, rename = "isActiveContent")]
+    pub is_active_content: bool,
+    #[serde(default, rename = "canRedeemGames")]
+    pub can_redeem_games: bool,
+    #[serde(rename = "contentChoiceData")]
+    pub content_choice_data: ContentChoiceData,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ContentChoiceData {
+    pub initial: ContentChoiceInitial,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ContentChoiceInitial {
+    #[serde(default)]
+    pub total_choices: u32,
+    /// machine_name → offered game. A claim-all month (`uses_choices=false`) still lists every
+    /// game here; `total_choices` just isn't a limiting budget for that tier.
+    #[serde(default)]
+    pub content_choices: std::collections::HashMap<String, ContentChoiceGame>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ContentChoiceGame {
+    #[serde(default)]
+    pub title: String,
+}
