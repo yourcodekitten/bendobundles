@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { ClaimDialog } from './ClaimDialog';
@@ -82,6 +82,34 @@ describe('ClaimDialog', () => {
       await user.keyboard('{Escape}');
       expect(onClose).not.toHaveBeenCalled();
 
+      resolveClaim({ kind: 'gifted', gift_url: GIFT_URL });
+      await waitFor(() => {
+        expect(screen.getByText(GIFT_URL)).toBeInTheDocument();
+      });
+    });
+
+    it('two same-tick confirm activations fire exactly ONE claim POST (re-entry guard)', async () => {
+      let resolveClaim!: (r: { kind: 'gifted'; gift_url: string }) => void;
+      vi.mocked(claimGame).mockReturnValue(
+        new Promise((resolve) => {
+          resolveClaim = resolve;
+        }),
+      );
+      render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+
+      // Dispatch both clicks synchronously in one act() — a double-click /
+      // Enter-repeat / AT-synthesized pair can land before React re-renders
+      // the confirm button away, so both handler closures still see
+      // step === 'confirm'; only the ref guard stops the second POST.
+      const confirmButton = screen.getByRole('button', { name: /confirm/i });
+      await act(async () => {
+        confirmButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        confirmButton.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      });
+
+      expect(claimGame).toHaveBeenCalledTimes(1);
+
+      // The single claim still completes normally
       resolveClaim({ kind: 'gifted', gift_url: GIFT_URL });
       await waitFor(() => {
         expect(screen.getByText(GIFT_URL)).toBeInTheDocument();

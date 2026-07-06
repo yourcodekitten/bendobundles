@@ -27,6 +27,14 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
   const [result, setResult] = useState<ClaimResult | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
+  // Hard re-entry guard for the one-shot claim POST. Unmounting the confirm
+  // button on setStep('loading') is an implementation detail, and checking
+  // `step` in the handler doesn't help either — a double-click / Enter-repeat /
+  // AT-synthesized second activation can land in the same tick, before React
+  // re-renders, so both closures still see step === 'confirm'. A ref flips
+  // synchronously; the second activation sees it and bails. Never reset: the
+  // dialog never returns to 'confirm', so one claim per mount is the contract.
+  const claimFiredRef = useRef(false);
 
   // Focus the dialog on open
   useEffect(() => {
@@ -47,6 +55,8 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
   }, [step, onClose, onRefresh]);
 
   const handleConfirm = async () => {
+    if (claimFiredRef.current) return;
+    claimFiredRef.current = true;
     setStep('loading');
     const r = await claimGame(token, game.id);
     setResult(r);
