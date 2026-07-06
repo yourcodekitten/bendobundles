@@ -1,9 +1,27 @@
+use aws_sdk_dynamodb::types::AttributeValue;
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
 use dynamo::{
     ClaimTxError, HiddenWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin, SyncState, SyncWrite,
     sync_run_is_live,
 };
+use std::collections::HashMap;
 use time::macros::datetime;
+
+/// A raw dynamodb client + resolved table name for the given test, matching how `store_or_skip`
+/// wires the Store. Lets a test craft an item whose top-level attrs deliberately disagree with
+/// its serialized `body` — impossible via the Store API, which keeps them in lockstep.
+async fn raw_client(test: &str) -> aws_sdk_dynamodb::Client {
+    let url =
+        std::env::var("DYNAMODB_LOCAL_URL").unwrap_or_else(|_| "http://localhost:8000".into());
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(&url)
+        .region("us-east-1")
+        .test_credentials()
+        .load()
+        .await;
+    let _ = test;
+    aws_sdk_dynamodb::Client::new(&config)
+}
 
 async fn store_or_skip(test: &str) -> Option<Store> {
     let (url, explicit) = match std::env::var("DYNAMODB_LOCAL_URL") {
@@ -714,4 +732,146 @@ async fn batch_get_games_found_and_missing() {
 
     let empty = store.batch_get_games(&[]).await.unwrap();
     assert!(empty.is_empty());
+}
+
+/// `list_listable_games` must exhaust every page. Force a 1-item Query page via the test seam so
+/// three listable games span three pages: a single-page read would truncate to the first item.
+#[tokio::test]
+async fn list_listable_games_paginates() {
+    let Some(store) = store_or_skip("list-listable-paginate").await else {
+        return;
+    };
+    for n in 0..3 {
+        store.put_game(&game(n, true)).await.unwrap();
+    }
+
+    // default (full-page) read returns all three
+    let all = store.list_listable_games().await.unwrap();
+    assert_eq!(all.len(), 3, "full read must return every listable game");
+
+    // 1 item per Query page → the loop must follow last_evaluated_key across 3 pages
+    let paged = store.list_listable_games_paged(Some(1)).await.unwrap();
+    assert_eq!(
+        paged.len(),
+        3,
+        "paginated read must not truncate at the first page"
+    );
+    let ids: std::collections::HashSet<_> = paged.iter().map(|g| g.id.clone()).collect();
+    for n in 0..3 {
+        assert!(
+            ids.contains(&game_id(&format!("gk{n}"), "mn")),
+            "game {n} present"
+        );
+    }
+}
+
+/// `list_pending_claims` feeds reconcile completeness — a truncated page parks claims forever.
+/// Force a 1-item page across three pending claims and assert all three come back, oldest-first
+/// ordering preserved across the page boundaries.
+#[tokio::test]
+async fn list_pending_claims_paginates_and_keeps_order() {
+    let Some(store) = store_or_skip("list-pending-paginate").await else {
+        return;
+    };
+    let mut lnk = link("tok-pp");
+    lnk.claims_allowed = 3;
+    store.create_link(&lnk).await.unwrap();
+    // three claims with distinct, increasing created_at so ordering is observable
+    for n in 0..3u32 {
+        store.put_game(&game(n, true)).await.unwrap();
+        let now = datetime!(2026-07-02 12:00 UTC) + time::Duration::minutes(n as i64);
+        store
+            .claim_game(
+                "tok-pp",
+                &game_id(&format!("gk{n}"), "mn"),
+                &format!("c{n}"),
+                now,
+            )
+            .await
+            .unwrap();
+    }
+
+    let all = store.list_pending_claims().await.unwrap();
+    assert_eq!(all.len(), 3, "full read must return every pending claim");
+
+    let paged = store.list_pending_claims_paged(Some(1)).await.unwrap();
+    assert_eq!(
+        paged.len(),
+        3,
+        "paginated read must exhaust all pages — a dropped claim would be parked forever"
+    );
+    // gsi2sk is created_at ascending; the loop must preserve that order across pages
+    let ids: Vec<_> = paged.iter().map(|c| c.id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec!["c0", "c1", "c2"],
+        "oldest-first order preserved across pages"
+    );
+}
+
+/// `get_link` / `list_links` must take EVERY enforcer field (claims_used, claims_allowed,
+/// revoked, expires_at) from the authoritative top-level attributes, never the serialized body.
+/// We craft an item whose body deliberately disagrees with its top-level attrs — the exact
+/// lost-update an edit-link endpoint would create — and assert the top-level values win.
+#[tokio::test]
+async fn get_link_overrides_all_enforcer_fields_from_top_level() {
+    let Some(store) = store_or_skip("enforcer-override").await else {
+        return;
+    };
+    let client = raw_client("enforcer-override").await;
+    let table = "t-enforcer-override";
+
+    // Body carries STALE enforcer values: allowed=1, used=9, revoked=true, expires far past.
+    let stale_body = Link {
+        token: "tok-e".into(),
+        label: "dave".into(),
+        claims_allowed: 1,
+        claims_used: 9,
+        revoked: true,
+        expires_at: Some(datetime!(2020-01-01 00:00 UTC)),
+        created_at: datetime!(2026-07-02 00:00 UTC),
+    };
+    // Top-level attrs are the AUTHORITATIVE truth: allowed=5, used=2, revoked=false, no expiry.
+    let item = HashMap::from([
+        ("pk".to_string(), AttributeValue::S("LINK#tok-e".into())),
+        ("sk".to_string(), AttributeValue::S("META".into())),
+        (
+            "body".to_string(),
+            AttributeValue::S(serde_json::to_string(&stale_body).unwrap()),
+        ),
+        ("claims_allowed".to_string(), AttributeValue::N("5".into())),
+        ("claims_used".to_string(), AttributeValue::N("2".into())),
+        ("revoked".to_string(), AttributeValue::Bool(false)),
+        // expires_at intentionally ABSENT at top level → authoritative "never expires"
+    ]);
+    client
+        .put_item()
+        .table_name(table)
+        .set_item(Some(item))
+        .send()
+        .await
+        .unwrap();
+
+    let got = store.get_link("tok-e").await.unwrap().unwrap();
+    assert_eq!(got.claims_used, 2, "claims_used from top-level attr");
+    assert_eq!(
+        got.claims_allowed, 5,
+        "claims_allowed from top-level attr, not stale body 1"
+    );
+    assert!(
+        !got.revoked,
+        "revoked from top-level attr, not stale body true"
+    );
+    assert_eq!(
+        got.expires_at, None,
+        "absent top-level expires_at is authoritative 'never' — stale body value must NOT leak"
+    );
+
+    // list_links must apply the identical override.
+    let links = store.list_links().await.unwrap();
+    let l = links.iter().find(|l| l.token == "tok-e").unwrap();
+    assert_eq!(l.claims_allowed, 5);
+    assert_eq!(l.claims_used, 2);
+    assert!(!l.revoked);
+    assert_eq!(l.expires_at, None);
 }
