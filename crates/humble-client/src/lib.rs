@@ -284,9 +284,15 @@ pub struct Subproduct {
 pub struct GiftUrl(pub String);
 
 /// One Humble Choice month's offered games + claim state, read from its `/membership/<month>` page.
+/// One Humble Choice month's identity, claim-state, and offered games. Produced by both the
+/// single-month read [`choice_month`](HumbleClient::choice_month) (from the `/membership/<month>`
+/// blob) and the paginated list [`choice_months`](HumbleClient::choice_months) (from the
+/// subscription endpoint) — one shape so a caller correlating the two doesn't juggle near-duplicates.
+///
 /// `gamekey` links to the order (`order(gamekey)`) whose `all_tpks` hold the already-claimed keys —
 /// so "offered here, not yet in the order" = still claimable. `uses_choices=false` is the claim-all
-/// tier (every offered game is claimable); `true` is pick-N-of-`total_choices`.
+/// tier (every offered game is claimable); `true` is pick-N. `total_choices` is `Some` only from the
+/// single-month read (the list endpoint doesn't carry it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChoiceMonth {
     pub gamekey: String,
@@ -296,7 +302,8 @@ pub struct ChoiceMonth {
     pub uses_choices: bool,
     pub is_active_content: bool,
     pub can_redeem_games: bool,
-    pub total_choices: u32,
+    /// The pick budget — `Some` from `choice_month`, `None` from the `choice_months` list walk.
+    pub total_choices: Option<u32>,
     /// Every game the month offers (machine_name + title), sorted by machine_name for stable order.
     pub offered_games: Vec<OfferedGame>,
 }
@@ -305,22 +312,6 @@ pub struct ChoiceMonth {
 pub struct OfferedGame {
     pub machine_name: String,
     pub title: String,
-}
-
-/// One month as returned by the paginated month-list ([`HumbleClient::choice_months`]) — the
-/// month's identity + claim-state + its offered games. `gamekey` links to `order(gamekey)` (whose
-/// `all_tpks` are the already-claimed keys); `offered_games` minus those = still claimable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChoiceMonthSummary {
-    pub gamekey: String,
-    pub title: String,
-    pub product_url_path: String,
-    pub product_machine_name: String,
-    pub uses_choices: bool,
-    pub is_active_content: bool,
-    pub can_redeem_games: bool,
-    /// Offered games (machine_name + title), sorted by machine_name for a stable order.
-    pub offered_games: Vec<OfferedGame>,
 }
 
 #[derive(serde::Deserialize)]
@@ -577,7 +568,7 @@ impl HumbleClient {
             uses_choices: cco.uses_choices,
             is_active_content: cco.is_active_content,
             can_redeem_games: cco.can_redeem_games,
-            total_choices: cco.content_choice_data.initial.total_choices,
+            total_choices: Some(cco.content_choice_data.initial.total_choices),
             offered_games,
         })
     }
@@ -592,16 +583,17 @@ impl HumbleClient {
     /// early once the caller reaches already-known months rather than a full walk every sync.
     /// `max_pages` bounds it defensively so a server that never stops handing back a cursor can't
     /// spin forever.
-    pub async fn choice_months(
-        &self,
-        max_pages: usize,
-    ) -> Result<Vec<ChoiceMonthSummary>, HumbleError> {
+    pub async fn choice_months(&self, max_pages: usize) -> Result<Vec<ChoiceMonth>, HumbleError> {
         const BASE: &str =
             "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
         let mut months = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..max_pages {
-            // Page 1 is the bare path with a trailing slash; later pages append the opaque cursor.
+            // Page 1 is the bare path with a trailing slash; later pages append the opaque cursor
+            // VERBATIM, exactly as the browser sends it back: the captured tokens are base64URL
+            // (`A-Za-z0-9-_` + `=` padding), all URL-path-safe — no `/`, `?`, or `#` to split the
+            // path. If a mid-walk 404 ever shows up here, a cursor with a path-special char is the
+            // first suspect (re-check the alphabet on a long-history walk).
             let path = match &cursor {
                 None => format!("{BASE}/"),
                 Some(c) => format!("{BASE}/{c}"),
@@ -621,7 +613,7 @@ impl HumbleClient {
                     })
                     .collect();
                 offered_games.sort_by(|a, b| a.machine_name.cmp(&b.machine_name));
-                months.push(ChoiceMonthSummary {
+                months.push(ChoiceMonth {
                     gamekey: p.gamekey,
                     title: p.title,
                     product_url_path: p.product_url_path,
@@ -629,11 +621,14 @@ impl HumbleClient {
                     uses_choices: p.uses_choices,
                     is_active_content: p.is_active_content,
                     can_redeem_games: p.can_redeem_games,
+                    // The list endpoint doesn't carry the pick budget — only the single-month read.
+                    total_choices: None,
                     offered_games,
                 });
             }
             match page.cursor {
-                Some(c) if !c.is_empty() => cursor = Some(c),
+                // trim() guards a whitespace-only cursor (won't come from JSON, but cheap + honest).
+                Some(c) if !c.trim().is_empty() => cursor = Some(c),
                 _ => break,
             }
         }

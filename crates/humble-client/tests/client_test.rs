@@ -507,7 +507,7 @@ async fn choice_month_parses_offered_games_and_state() {
     assert!(m.uses_choices);
     assert!(!m.is_active_content);
     assert!(m.can_redeem_games);
-    assert_eq!(m.total_choices, 12);
+    assert_eq!(m.total_choices, Some(12));
     // Sorted by machine_name for stable order (the source is a JSON object / HashMap).
     let games: Vec<(&str, &str)> = m
         .offered_games
@@ -647,6 +647,46 @@ async fn choice_months_walks_the_cursor_pagination() {
         .collect();
     assert_eq!(names, vec!["gameb", "gamec"]);
     assert_eq!(months[2].product_machine_name, "january_2026_choice");
+}
+
+#[tokio::test]
+async fn choice_months_base64url_cursor_round_trips_through_the_path() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    // A realistic cursor: base64URL alphabet (`-`, `_`) with `=` padding — must reach page 2
+    // VERBATIM (no mangling/encoding by the URL builder). This is the walk's one URL-safety bet.
+    let cursor = "Cn0KEgoF-c3RhcnQ_SCQiA0N==";
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "cursor": cursor,
+            "products": [{
+                "gamekey": "gk1", "title": "P1", "productUrlPath": "p1",
+                "productMachineName": "p1_choice", "usesChoices": false,
+                "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/{cursor}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [{
+                "gamekey": "gk2", "title": "P2", "productUrlPath": "p2",
+                "productMachineName": "p2_choice", "usesChoices": false,
+                "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let months = client(&server).await.choice_months(10).await.unwrap();
+    // Reaching page 2 (gk2) proves the base64url cursor round-tripped through the path unmangled.
+    assert_eq!(months.len(), 2);
+    assert_eq!(months[1].product_machine_name, "p2_choice");
+    assert_eq!(months[1].total_choices, None); // list walk carries no pick budget
 }
 
 #[tokio::test]
