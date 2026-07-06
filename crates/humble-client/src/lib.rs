@@ -202,6 +202,18 @@ pub enum HumbleError {
     /// failure is visible. `reason` NEVER contains the password, the TOTP seed, or a session value.
     #[error("humble self-login failed: {reason}")]
     LoginFailed { reason: String },
+    /// A Humble Choice `choosecontent` write was rejected in a way that PROVES no pick was spent:
+    /// either humble answered `success=false` (already chosen, no picks left, not offered — the
+    /// handler ran and refused) or it rejected at the auth/CSRF layer (401/403/302 with no
+    /// step-up gate — rejected before the handler). Both are safe to park and retry cleanly.
+    ///
+    /// This variant carries the "not spent" contract, so AMBIGUOUS failures deliberately do NOT map
+    /// here: an unexpected/5xx status is [`Api`](HumbleError::Api) and a transport failure is
+    /// [`Network`](HumbleError::Network) — either can follow a committed choose, so the caller must
+    /// reconcile against humble state before re-choosing. `reason` is humble's refusal text or a
+    /// status/csrf marker, never a secret value.
+    #[error("humble choosecontent failed: {reason}")]
+    ChooseFailed { reason: String },
     #[error("humble rate-limited us")]
     RateLimited,
     #[error("key already redeemed on humble")]
@@ -265,6 +277,16 @@ struct RedeemResponse {
     errormsg: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct ChooseResponse {
+    // Same as RedeemResponse: a 200 body missing `success` is a parse error, not a silent failure.
+    success: bool,
+    #[serde(default)]
+    errormsg: Option<String>,
+    // humble also returns `force_refresh: true`; we don't act on it (the caller re-reads the order
+    // to see the newly-claimed key), so it's intentionally not deserialized.
+}
+
 /// The positive outcome of a single redeem attempt. Failures come back as `Err(HumbleError)`;
 /// the two non-error shapes a caller must tell apart are a completed redeem and a redeem that was
 /// gated behind humble's secure-area step-up.
@@ -274,6 +296,16 @@ enum RedeemStep {
     /// Humble gated the write behind a secure-area step-up (`login_required` / a `secureArea`
     /// redirect). The session is healthy and **the key was not burned** — retrying after a
     /// successful step-up is safe. Carries the observed HTTP status for logging only.
+    StepUpNeeded { status: u16 },
+}
+
+/// The positive outcome of a single `choosecontent` attempt — the choose analog of [`RedeemStep`].
+/// A completed choose has SPENT a pick; a gated choose has not (the handler ran behind the gate).
+enum ChooseStep {
+    /// The choose completed (`success=true`) — a pick was spent.
+    Done,
+    /// Humble gated the choose behind a secure-area step-up. The session is healthy and **no pick
+    /// was spent** — retrying after a successful step-up is safe. Status is for logging only.
     StepUpNeeded { status: u16 },
 }
 
@@ -551,6 +583,192 @@ impl HumbleClient {
                     }
                 }
             }
+        }
+    }
+
+    /// Spend a monthly Humble Choice pick: claim `chosen` game(s) from the Choice month identified
+    /// by `gamekey`, transparently clearing humble's secure-area step-up when it gates the write
+    /// (same as [`redeem_as_gift`]). This is the FIRST of the two Choice writes — it moves a game
+    /// from "offered" to "claimed" and SPENDS a pick (real, one-shot value). It never touches a key;
+    /// the redeemable key is minted by the subsequent `/humbler/redeemkey` (which `redeem_as_gift`
+    /// already implements) with `keytype = <machine_name>_choice_steam` and `key = gamekey`.
+    ///
+    /// `is_gift = true` claims into a giftable form (redeem then with `gift=true` for a gift URL);
+    /// `false` self-claims into the library. Returns `Ok(())` only on `success=true`.
+    ///
+    /// Flow (mirrors the redeem): try once; if humble answers `login_required` / `secureArea` AND
+    /// step-up credentials are configured, elevate via `/processlogin` and retry EXACTLY once.
+    ///
+    /// SAFETY (pick-spend-once, mirrors burns-once): a gated choose returns `login_required` BEFORE
+    /// the choose handler runs, so the retry is the first attempt that can spend a pick — no
+    /// double-spend window. A pick is spent ONLY on `success=true`; a `Unauthorized` (dead session),
+    /// `SecureAreaStepUpFailed` (gate, no/failed step-up), or `ChooseFailed` (`success=false` or an
+    /// auth-layer rejection) provably did NOT spend a pick. The one residual, like the redeem's
+    /// `AmbiguousRedeem`: a lost response AFTER humble committed — a `Network` read error or an
+    /// unexpected/5xx status (surfaced as `Api`) — can leave a pick spent while this returns `Err`,
+    /// so those outcomes are AMBIGUOUS, not provably clean.
+    /// So the caller MUST reconcile against humble state (re-read the order's `all_tpks` /
+    /// `contentChoicesMade`) before re-choosing; a blind retry could spend a second pick.
+    pub async fn choose_content(
+        &self,
+        gamekey: &str,
+        chosen: &[&str],
+        is_gift: bool,
+    ) -> Result<(), HumbleError> {
+        // Guard the empty pick — a choosecontent with zero chosen_identifiers is a malformed write
+        // (undefined server behavior); fail before the network call rather than POST it.
+        if chosen.is_empty() {
+            return Err(HumbleError::ChooseFailed {
+                reason: "no games to choose (empty chosen set)".into(),
+            });
+        }
+        match self.choose_once(gamekey, chosen, is_gift).await? {
+            ChooseStep::Done => Ok(()),
+            ChooseStep::StepUpNeeded { status } => {
+                if self.step_up.is_none() {
+                    tracing::warn!(
+                        status,
+                        "choose gated behind secure-area step-up but step-up is not configured — parking (set humble_username to enable)"
+                    );
+                    return Err(HumbleError::SecureAreaStepUpFailed {
+                        reason:
+                            "secure-area step-up required but not configured (set humble_username)"
+                                .into(),
+                    });
+                }
+                self.secure_area_step_up().await?;
+                match self.choose_once(gamekey, chosen, is_gift).await? {
+                    ChooseStep::Done => Ok(()),
+                    // Still gated after `/processlogin` accepted the step-up. No pick spent (still
+                    // `login_required` before the handler) — park with an honest reason.
+                    ChooseStep::StepUpNeeded { status } => {
+                        tracing::warn!(
+                            status,
+                            "choose still gated after a successful step-up — parking (no pick spent)"
+                        );
+                        Err(HumbleError::SecureAreaStepUpFailed {
+                            reason: "choosecontent still returned login_required after /processlogin accepted the step-up".into(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    /// One `choosecontent` attempt. Detects humble's secure-area gate (`login_required` body or a
+    /// `secureArea` redirect) and reports it as [`ChooseStep::StepUpNeeded`] so the caller can
+    /// elevate and retry — the exact shape as [`redeem_once`], since choose is the same
+    /// browser-surface write that redeem is. `POST /humbler/choosecontent` — form: `gamekey`,
+    /// `parent_identifier=initial`, `chosen_identifiers[]` (repeated per game), `is_gift`.
+    async fn choose_once(
+        &self,
+        gamekey: &str,
+        chosen: &[&str],
+        is_gift: bool,
+    ) -> Result<ChooseStep, HumbleError> {
+        // Same csrf dance as the redeem write (double-submit pair, prefer humble's token, mint as a
+        // tracked fallback so a systematic capture failure surfaces instead of a silent 403).
+        let (csrf, csrf_minted) = match self.csrf_token().await {
+            Some(t) => (t, false),
+            None => {
+                tracing::warn!(
+                    "csrf capture failed — minting a double-submit fallback for choosecontent"
+                );
+                (uuid::Uuid::new_v4().simple().to_string(), true)
+            }
+        };
+        // `chosen_identifiers[]` is an array field — repeat the key once per game.
+        let mut form: Vec<(&str, String)> = vec![
+            ("gamekey", gamekey.to_string()),
+            ("parent_identifier", "initial".to_string()),
+        ];
+        form.extend(
+            chosen
+                .iter()
+                .map(|m| ("chosen_identifiers[]", (*m).to_string())),
+        );
+        // Self-claim OMITS is_gift entirely (the captured self-claim request sent no is_gift field —
+        // humble's SPA drops the unchecked control), rather than sending is_gift=false. VERIFY on the
+        // live receipt that humble treats "absent" as self-claim, same as the browser does.
+        if is_gift {
+            form.push(("is_gift", "true".to_string()));
+        }
+        // Referer is the membership surface (choice lives there). The double-submit cookie==header
+        // pair is humble's actual CSRF check; the Referer path is browser-shaping — VERIFY the exact
+        // path against the live receipt if a 403 ever appears here.
+        let resp = self
+            .csrf_write(
+                format!("{}/humbler/choosecontent", self.base),
+                &csrf,
+                "/membership",
+            )
+            .form(&form)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        tracing::info!(
+            status,
+            gamekey,
+            is_gift,
+            n_chosen = chosen.len(),
+            csrf_minted,
+            "humble choosecontent POST response"
+        );
+        match status {
+            200 => {
+                let bytes = resp.bytes().await?;
+                // A gated choose on a HEALTHY session returns `login_required` — catch it BEFORE the
+                // success parse so it drives a step-up, NOT a dead-cookie alarm and NOT a pick-spend:
+                // the handler never ran behind the gate. (Same live-verified shape as the redeem.)
+                if is_login_required(&bytes) {
+                    tracing::info!(
+                        status,
+                        "choose gated: humble returned login_required — secure-area step-up needed"
+                    );
+                    return Ok(ChooseStep::StepUpNeeded { status });
+                }
+                // A genuinely dead session returns 200-with-HTML → decode_body maps it to
+                // Unauthorized (leading `<`). success=true spends the pick; success=false is a
+                // semantic refusal (no picks left / already chosen / not offered).
+                let body: ChooseResponse = decode_body(&bytes)?;
+                if body.success {
+                    Ok(ChooseStep::Done)
+                } else {
+                    let reason = body
+                        .errormsg
+                        .unwrap_or_else(|| "choosecontent returned success=false".to_string());
+                    tracing::warn!(reason, "humble choosecontent refused (success=false)");
+                    Err(HumbleError::ChooseFailed { reason })
+                }
+            }
+            401 | 403 | 302 => {
+                // The step-up gate shows up here two ways (exactly as `redeem_once` handles it): a
+                // 302 to `?reason=secureArea` (header-only, survives a body-read failure) OR a
+                // 401/403 carrying a `login_required` JSON body with no such location. Read the body
+                // too so a body-only gate isn't misclassified as a plain rejection — both forms are
+                // a live session that needs elevating, NOT a dead cookie. Everything else at this
+                // layer is an auth/CSRF rejection: no pick spent, park (csrf_minted names a
+                // systematic capture failure vs a rejection of humble's own token).
+                let raw_location = header_str(resp.headers(), "location");
+                let login_required_body =
+                    matches!(resp.bytes().await, Ok(b) if is_login_required(&b));
+                if raw_location.contains("secureArea") || login_required_body {
+                    tracing::info!(status, "choose gated behind secure-area step-up — needed");
+                    return Ok(ChooseStep::StepUpNeeded { status });
+                }
+                Err(HumbleError::ChooseFailed {
+                    reason: format!(
+                        "choosecontent rejected at the auth/CSRF layer (status {status}, csrf_minted={csrf_minted})"
+                    ),
+                })
+            }
+            429 => Err(HumbleError::RateLimited),
+            // Unexpected status (a 5xx especially) is AMBIGUOUS: humble may have committed the
+            // choose and then failed to return — a pick could be spent. So do NOT map it to
+            // ChooseFailed (whose contract is "provably not spent"); surface Api(s), which the
+            // caller parks-and-reconciles exactly like the redeem's ambiguous outcomes. Re-choosing
+            // on this without reconciling against humble state could double-spend a pick.
+            s => Err(HumbleError::Api(s)),
         }
     }
 
