@@ -5,8 +5,26 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { Links } from './Links';
 import type { AdminLink, AdminClaimView } from '../api';
 
-vi.mock('../api');
-import { adminLinks, adminCreateLink, adminRevoke, adminLinkClaims } from '../api';
+// Partial mock: the fetch wrappers are stubbed, but CreateLinkValidationError
+// stays the real class — Links.tsx branches on `instanceof`, and an automocked
+// class constructor wouldn't carry `.message` through.
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api')>();
+  return {
+    ...actual,
+    adminLinks: vi.fn(),
+    adminCreateLink: vi.fn(),
+    adminRevoke: vi.fn(),
+    adminLinkClaims: vi.fn(),
+  };
+});
+import {
+  adminLinks,
+  adminCreateLink,
+  adminRevoke,
+  adminLinkClaims,
+  CreateLinkValidationError,
+} from '../api';
 
 function renderLinks() {
   return render(
@@ -163,6 +181,31 @@ describe('Links', () => {
       expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
         `${window.location.origin}/l/tok-new`,
       );
+    });
+
+    it('422 validation rejection shows the violated bound verbatim and keeps inputs', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockRejectedValue(
+        new CreateLinkValidationError('expires_days must be between 1 and 3650'),
+      );
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Overflow');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+      await waitFor(() =>
+        expect(screen.getByRole('alert')).toHaveTextContent(
+          'expires_days must be between 1 and 3650',
+        ),
+      );
+      // No fake success: no invite callout, no /l/undefined anywhere
+      expect(screen.queryByText(/send this to your friend/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
+      // Inputs preserved so the value can be corrected
+      expect(screen.getByRole('textbox', { name: 'label' })).toHaveValue('Overflow');
     });
 
     it('create failure shows a loud error instead of silence', async () => {
