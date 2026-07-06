@@ -39,9 +39,13 @@ pub struct Game {
     /// spent (choosecontent) before a key exists. `false` = a normal key-backed game.
     ///
     /// Trust contract (phase-3 orchestration reads this as law):
-    /// - Only the Choice discovery ingest may write `true`. Every key-derived path
-    ///   (`fulfillment::run_sync` walking `order.keys`) writes `false`, because presence in
-    ///   `order.keys` is itself proof a redeemable key exists.
+    /// - Only the Choice discovery ingest may write `true`, and only from a KNOWN claimed
+    ///   set: humble-client's single-month read (`choice_month`, claimable = offered − chosen).
+    ///   The `choice_months` list walk cannot see the picks (its claimed set is `None` =
+    ///   unknown, and `ChoiceMonth::claimable_games` refuses to guess) — it must never be a
+    ///   source of `true`. Every key-derived path (`fulfillment::run_sync` walking
+    ///   `order.keys`) writes `false`, because presence in `order.keys` is itself proof a
+    ///   redeemable key exists.
     /// - While `true`, there is no key to gift or redeem — any path that hands out a key
     ///   must gate on this flag (choose first, then redeem).
     /// - [`Game::is_listable`] deliberately does NOT consult this flag: choice games stay
@@ -138,7 +142,8 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                     // (both branches agree on this): a key-sync fresh carries `false` because
                     // presence in order.keys proves a key exists, so a chosen game flips false
                     // on its next sync — PROVIDED the discovery ingest derives the same
-                    // game id (gamekey:machine_name) as the post-choose key record. That id
+                    // game id (via `game_id()`: gamekey:machine_name) as the post-choose
+                    // key record. That id
                     // agreement is an obligation on the discovery-wiring build; if the ids
                     // diverge, the stale `true` record lingers as a duplicate instead of
                     // flipping. A stale `true` must never survive a fresh `false`, nor the
