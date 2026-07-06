@@ -28,8 +28,8 @@ the established secret path (SSM SecureString via deploy.tfvars). The key never 
 **Assumption (M2, load-bearing):** the key is registered on **Ben's own Steam account** — the same
 account as the persisted admin steamid. GetOwnedGames bypasses the "game details" privacy setting
 only for the key owner's own library; if the key were registered elsewhere and Ben's privacy were
-non-public, his library would read private-empty. Confirm at setup; revisit if the key is ever
-re-registered.
+non-public, his library would read private-empty. **Confirmed by Ben 2026-07-06** (key made while
+logged into his own account); revisit if the key is ever re-registered.
 
 ## 2. steam-client crate (extends the crate the modal spec starts)
 
