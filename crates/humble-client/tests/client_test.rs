@@ -221,6 +221,9 @@ async fn choose_content_gift_sends_the_right_form() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/humbler/choosecontent"))
+        // The double-submit CSRF pair (cookie value replayed as the header) must be sent — same
+        // check the redeem write is held to; without this a broken csrf dance passes silently.
+        .and(DoubleSubmitPairMatches)
         .and(body_string_contains("gamekey=UZz2zYTdsC5HfCYp"))
         .and(body_string_contains("parent_identifier=initial"))
         // `chosen_identifiers[]` url-encodes to `chosen_identifiers%5B%5D`.
@@ -312,9 +315,12 @@ async fn choose_content_refused_is_typed_and_spends_nothing() {
 }
 
 #[tokio::test]
-async fn choose_content_dead_session_is_unauthorized() {
+async fn choose_content_login_required_is_a_step_up_gate_not_dead_cookie() {
     let server = MockServer::start().await;
-    // A dead session answers the choose POST with the login-required gate — no pick is spent.
+    // A HEALTHY-but-gated session answers with login_required — the choose write is on the same
+    // secure-area-gated surface as the redeem. The test client has no step-up creds, so the gate
+    // surfaces as SecureAreaStepUpFailed (NOT Unauthorized — a dead-cookie misclassification would
+    // trip the session self-heal on a cookie that's actually fine).
     Mock::given(method("POST"))
         .and(path("/humbler/choosecontent"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -328,7 +334,89 @@ async fn choose_content_dead_session_is_unauthorized() {
         .choose_content("gk123", &["somegame"], true)
         .await
         .unwrap_err();
+    assert!(matches!(
+        err,
+        humble_client::HumbleError::SecureAreaStepUpFailed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn choose_content_html_200_is_unauthorized() {
+    let server = MockServer::start().await;
+    // A genuinely dead session returns a 200-with-HTML login page (not the login_required JSON) —
+    // decode_body maps the leading `<` to Unauthorized. No pick spent.
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<!DOCTYPE html><html>login</html>")
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choose_content("gk123", &["somegame"], true)
+        .await
+        .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::Unauthorized));
+}
+
+#[tokio::test]
+async fn choose_content_rate_limited_is_typed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choose_content("gk123", &["somegame"], true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::RateLimited));
+}
+
+#[tokio::test]
+async fn choose_content_auth_layer_rejection_is_choose_failed() {
+    let server = MockServer::start().await;
+    // A 403 with no secureArea redirect is an auth/CSRF-layer rejection — ChooseFailed (park), not
+    // a step-up gate and not a dead cookie. No pick spent.
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choose_content("gk123", &["somegame"], true)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        humble_client::HumbleError::ChooseFailed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn choose_content_empty_selection_is_guarded_before_any_request() {
+    let server = MockServer::start().await;
+    // No mount — if choose_content fired a POST on an empty set, the client would get a wiremock
+    // 404 and this would still error, so the mount-free server also proves nothing was sent.
+    let err = client(&server)
+        .await
+        .choose_content("gk123", &[], true)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        humble_client::HumbleError::ChooseFailed { ref reason } if reason.contains("empty")
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
 }
 
 /// Matches only when the request body does NOT contain `is_gift` — for asserting the self-claim
