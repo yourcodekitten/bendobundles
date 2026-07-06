@@ -2375,3 +2375,180 @@ async fn choice_redeem_already_redeemed_is_not_compensated() {
         "ping must guide human recovery: {ping}"
     );
 }
+
+// =================================================================================================
+// PHASE-4: choice-discovery ingest — run_sync writes still-claimable OFFERED games as
+// requires_choice=true (the sole intended writer per the domain trust contract).
+// =================================================================================================
+
+/// Base path for the Choice-months cursor walk (`choice_months`).
+const CHOICE_LIST_BASE: &str =
+    "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+
+/// Build a `/membership/<slug>` page carrying the `webpack-monthly-product-data` blob the
+/// single-month `choice_month` read parses — `usesChoices`/`canRedeemGames` on, the given offered
+/// games, and the given already-chosen machine_names. Claimable = offered − chosen.
+fn membership_html(
+    slug: &str,
+    gamekey: &str,
+    title: &str,
+    offered: &[(&str, &str)],
+    chosen: &[&str],
+) -> String {
+    let mut content_choices = serde_json::Map::new();
+    for (mn, t) in offered {
+        content_choices.insert((*mn).to_string(), serde_json::json!({ "title": t }));
+    }
+    let blob = serde_json::json!({
+        "contentChoiceOptions": {
+            "gamekey": gamekey,
+            "title": title,
+            "productUrlPath": slug,
+            "productMachineName": format!("{}_choice", slug.replace('-', "_")),
+            "usesChoices": true,
+            "isActiveContent": false,
+            "canRedeemGames": true,
+            "contentChoiceData": { "initial": {
+                "total_choices": offered.len(),
+                "content_choices": serde_json::Value::Object(content_choices),
+            } },
+            "contentChoicesMade": { "initial": { "choices_made": chosen } },
+        }
+    });
+    format!(
+        "<html><body><script type=\"application/json\" id=\"webpack-monthly-product-data\">{blob}</script></body></html>"
+    )
+}
+
+// -------------------------------------------------------------------------------------------------
+// The happy path: a live month with an unspent pick → its still-claimable offered games land in the
+// catalog as requires_choice=true / Available; the already-chosen one does NOT.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn sync_discovers_offered_choice_games_as_requires_choice_true() {
+    let Some(store) = store_or_skip("choice-discovery-writes").await else {
+        return;
+    };
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await; // no order-walk games — isolate the discovery pass.
+    // choice_months walk: one live month (usesChoices + canRedeemGames), single page (no cursor).
+    Mock::given(method("GET"))
+        .and(path(format!("{CHOICE_LIST_BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [{
+                "gamekey": "gkJun26", "title": "June 2026 Humble Choice",
+                "productUrlPath": "june-2026", "productMachineName": "june_2026_choice",
+                "usesChoices": true, "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {
+                    "construction_simulator": { "title": "Construction Simulator" }
+                } }
+            }]
+        })))
+        .mount(&humble)
+        .await;
+    // single-month read: 3 offered, 1 already chosen → 2 claimable.
+    Mock::given(method("GET"))
+        .and(path("/membership/june-2026"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(membership_html(
+                    "june-2026",
+                    "gkJun26",
+                    "June 2026 Humble Choice",
+                    &[
+                        ("construction_simulator", "Construction Simulator"),
+                        ("another_offer", "Another Offer"),
+                        ("already_picked", "Already Picked"),
+                    ],
+                    &["already_picked"],
+                ))
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&humble)
+        .await;
+
+    let deps = deps(store, &humble.uri(), None);
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // The two still-claimable offered games are written as claimable choice entries.
+    let cs = deps
+        .store
+        .get_game(&game_id("gkJun26", "construction_simulator"))
+        .await
+        .unwrap()
+        .expect("construction sim written as a claimable choice game");
+    assert!(
+        cs.requires_choice,
+        "offered game must be requires_choice=true"
+    );
+    assert_eq!(cs.status, GameStatus::Available);
+    assert_eq!(cs.title, "Construction Simulator");
+    assert_eq!(cs.bundle, "June 2026 Humble Choice");
+    assert_eq!(cs.machine_name, "construction_simulator");
+    assert!(cs.giftable && !cs.hidden);
+
+    assert!(
+        deps.store
+            .get_game(&game_id("gkJun26", "another_offer"))
+            .await
+            .unwrap()
+            .is_some_and(|g| g.requires_choice),
+        "the other unspent offer is also written"
+    );
+
+    // The already-chosen game is NOT re-listed as claimable (offered − chosen removed it).
+    assert!(
+        deps.store
+            .get_game(&game_id("gkJun26", "already_picked"))
+            .await
+            .unwrap()
+            .is_none(),
+        "an already-chosen game must not be written as a claimable choice entry"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// The trust-contract guard: a month the list-walk surfaces but which is NOT still-redeemable
+// (canRedeemGames=false) is filtered out BEFORE the single-month read — so its offered games are
+// never written as requires_choice=true. Proves the list-walk (claimed set unknown) is never a
+// source of `true`: no /membership mock is mounted, and reaching it would 404.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn sync_choice_discovery_skips_non_redeemable_month() {
+    let Some(store) = store_or_skip("choice-discovery-skip").await else {
+        return;
+    };
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    // A month that can no longer be redeemed → must be skipped (no single-month read, no write).
+    Mock::given(method("GET"))
+        .and(path(format!("{CHOICE_LIST_BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [{
+                "gamekey": "gkOld", "title": "Old Spent Month",
+                "productUrlPath": "old-spent", "productMachineName": "old_spent_choice",
+                "usesChoices": true, "isActiveContent": false, "canRedeemGames": false,
+                "contentChoiceData": { "game_data": {
+                    "some_offered_game": { "title": "Some Offered Game" }
+                } }
+            }]
+        })))
+        .mount(&humble)
+        .await;
+    // NOTE: deliberately NO /membership/old-spent mock — the filter must skip it before any read.
+
+    let deps = deps(store, &humble.uri(), None);
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // Nothing from a non-redeemable month is written as a claimable choice entry.
+    assert!(
+        deps.store
+            .get_game(&game_id("gkOld", "some_offered_game"))
+            .await
+            .unwrap()
+            .is_none(),
+        "a non-redeemable month must never yield a requires_choice=true entry"
+    );
+}

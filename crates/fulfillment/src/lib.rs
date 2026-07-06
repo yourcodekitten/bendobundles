@@ -9,7 +9,7 @@
 //! variant is a compile error until someone consciously picks its decision — the invariant can't
 //! silently rot.
 
-use domain::{Claim, Game};
+use domain::{Claim, Game, GameStatus};
 use dynamo::{Store, SyncBegin, SyncState, SyncWrite};
 use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,14 @@ const RECONCILE_MIN_AGE: time::Duration = time::Duration::minutes(15);
 /// Pacing between per-order humble fetches during sync — same jitter-free floor as the probe, to
 /// stay under humble's bot-detection radar.
 const SYNC_PACE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// How many pages of the Choice-months list walk the discovery pass enumerates. The walk is
+/// ~26 pages for the full membership history (3 months/page) and self-terminates early with
+/// `complete = true` once it runs out, so this is a ceiling, not a target. It has to reach back far
+/// enough to catch an *old* month whose pick is still unspent (Humble keeps a choice redeemable
+/// until it's spent), so it covers the whole history; the expensive per-month reads are still gated
+/// to the handful of live months (`uses_choices && can_redeem_games`).
+const CHOICE_DISCOVERY_MAX_PAGES: usize = 26;
 
 /// A parked claim that reconcile structurally CANNOT act on — a `game_id` with no
 /// `gamekey:machine_name` split, or a machine_name that never appears in its order's keys on
@@ -1312,6 +1320,12 @@ async fn run_sync(deps: &Deps) {
         }
     }
 
+    // Choice-discovery ingest — surface each still-claimable OFFERED game as a `requires_choice=true`
+    // catalog entry, so the gift-choice orchestration has something to run on. Runs LAST (after the
+    // order walk) so a heal it triggers can't starve the walk, and it shares the run's one-heal
+    // budget via `healed_this_run` / `cookie_ok`.
+    games_written += discover_choice_games(deps, &mut healed_this_run, &mut cookie_ok).await;
+
     let msg = if cookie_ok {
         format!("sync ok: {games_written} written, {orders_failed} order(s) failed")
     } else {
@@ -1331,6 +1345,128 @@ async fn run_sync(deps: &Deps) {
     )
     .await;
     tracing::info!(games_written, orders_failed, cookie_ok, "sync finished");
+}
+
+/// Choice-discovery ingest — the **sole intended writer** of `requires_choice = true` (see the
+/// trust contract on [`domain::Game::requires_choice`]). A Humble Choice month grants picks that are
+/// spent via `choosecontent`; until a pick is spent, the offered game has no redemption key and so
+/// never appears in any `order.keys` walk. This pass is what surfaces those offered games into the
+/// catalog as claimable entries.
+///
+/// Two-step, mirroring the read layer built in the choice-discovery client work:
+/// 1. `choice_months` enumerates WHICH months exist (its `claimed_machine_names` is `None` — it
+///    cannot see the picks, so it is *never* a source of `true`). We use it only for the month slugs.
+/// 2. For each still-live month, the single-month `choice_month` read supplies the KNOWN claimed set,
+///    and `ChoiceMonth::claimable_games` returns `offered − chosen`. Only this path may write `true`.
+///
+/// The offered game's `machine_name` is both the id fed to `choosecontent` and — per the id-agreement
+/// obligation in the trust contract — the same `machine_name` the post-choose key record will carry,
+/// so a later key-sync (which writes `requires_choice=false`) flips this entry via `merge_sync`
+/// instead of duplicating it. Writes go through the guarded `upsert_game_from_sync`, never `put_game`.
+///
+/// Shares the run's one-heal budget (`healed` / `cookie_ok`) and runs LAST in [`run_sync`]. Returns
+/// the count of newly-written offered games (folded into the sync's `games_written`).
+async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut bool) -> u32 {
+    // Step 1: enumerate month slugs. A truncated walk (`complete == false`) simply means we discover
+    // a prefix of months this pass — safe, because discovery only ADDS entries and never deletes on
+    // absence, so a missed month just waits for the next run.
+    let (heal, read) = selfheal_once(deps, !*healed, || {
+        deps.humble.choice_months(CHOICE_DISCOVERY_MAX_PAGES)
+    })
+    .await;
+    if let Some(h) = heal {
+        *healed = true;
+        *cookie_ok = h.durable();
+    }
+    let walk = match read {
+        Ok(w) => w,
+        // Dead after the run's heal (or none possible) → flag + ping, like the order walk. Discovery
+        // is best-effort; the pings already fired carry the specifics.
+        Err(HumbleError::Unauthorized) => {
+            *cookie_ok = false;
+            ping(deps, COOKIE_DEAD_MSG).await;
+            return 0;
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "choice discovery: month enumeration failed — skipping this pass");
+            return 0;
+        }
+    };
+    if !walk.complete {
+        tracing::warn!(
+            max_pages = CHOICE_DISCOVERY_MAX_PAGES,
+            "choice discovery: month walk truncated — discovered a prefix (additive; nothing deleted on absence)"
+        );
+    }
+
+    let mut written = 0u32;
+    // Only months whose picks can still be spent: `uses_choices` (a pick-N tier, not a claim-all
+    // month) AND `can_redeem_games` (the redemption window is still open). This gate bounds the
+    // per-month reads to the handful of live months instead of the full history.
+    for month in walk
+        .months
+        .iter()
+        .filter(|m| m.uses_choices && m.can_redeem_games)
+    {
+        tokio::time::sleep(SYNC_PACE).await;
+        let (heal, read) = selfheal_once(deps, !*healed, || {
+            deps.humble.choice_month(&month.product_url_path)
+        })
+        .await;
+        if let Some(h) = heal {
+            *healed = true;
+            *cookie_ok = h.durable();
+        }
+        let detail = match read {
+            Ok(m) => m,
+            Err(HumbleError::Unauthorized) => {
+                *cookie_ok = false;
+                ping(deps, COOKIE_DEAD_MSG).await;
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(month = %month.product_url_path, error = ?e, "choice discovery: month read failed — skipping");
+                continue;
+            }
+        };
+        // `choice_month` always populates the claimed set, so `claimable_games` is `Some`. A `None`
+        // here would mean the claimed set is UNKNOWN (a `choice_months`-sourced month) — never true
+        // on this path, but we skip rather than guess: the contract forbids writing `true` without a
+        // known claimed set.
+        let Some(claimable) = detail.claimable_games() else {
+            tracing::warn!(month = %detail.product_url_path, "choice discovery: single-month read had no claimed set — skipping (never writes true without one)");
+            continue;
+        };
+        for offered in claimable {
+            let game = Game {
+                id: domain::game_id(&detail.gamekey, &offered.machine_name),
+                title: offered.title.clone(),
+                bundle: detail.title.clone(),
+                gamekey: detail.gamekey.clone(),
+                machine_name: offered.machine_name.clone(),
+                // No key exists until the pick is spent, so the offered wire carries no key platform.
+                // Placeholder; `merge_sync` refreshes `key_type` from the real key-sync `fresh` once a
+                // pick lands (the id matches by the machine_name agreement above), so it self-corrects.
+                key_type: "steam".to_string(),
+                giftable: true,
+                hidden: false,
+                status: GameStatus::Available,
+                claim_id: None,
+                artwork_url: None,
+                keyindex: 0,
+                requires_choice: true,
+            };
+            match deps.store.upsert_game_from_sync(game).await {
+                Ok(SyncWrite::Written) => written += 1,
+                // Unchanged / SkippedInFlight (an in-flight claim owns the game) — not a failure.
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(machine_name = %offered.machine_name, error = ?e, "choice discovery: upsert failed")
+                }
+            }
+        }
+    }
+    written
 }
 
 /// Reconcile parked (`Pending`) claims older than [`RECONCILE_MIN_AGE`] against humble's truth.
