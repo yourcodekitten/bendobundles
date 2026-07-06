@@ -381,6 +381,26 @@ async fn choose_content_rate_limited_is_typed() {
 }
 
 #[tokio::test]
+async fn choose_content_5xx_is_ambiguous_api_not_choose_failed() {
+    let server = MockServer::start().await;
+    // A 5xx can follow a COMMITTED choose (pick maybe spent) → it must NOT be ChooseFailed (whose
+    // contract is "provably not spent", which a caller would re-choose on). It's Api(s), which the
+    // caller parks-and-reconciles like the redeem's ambiguous outcomes.
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choose_content("gk123", &["somegame"], true)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Api(502)));
+}
+
+#[tokio::test]
 async fn choose_content_auth_layer_rejection_is_choose_failed() {
     let server = MockServer::start().await;
     // A 403 with no secureArea redirect is an auth/CSRF-layer rejection — ChooseFailed (park), not

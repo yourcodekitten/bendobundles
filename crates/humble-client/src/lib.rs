@@ -202,11 +202,16 @@ pub enum HumbleError {
     /// failure is visible. `reason` NEVER contains the password, the TOTP seed, or a session value.
     #[error("humble self-login failed: {reason}")]
     LoginFailed { reason: String },
-    /// A Humble Choice `choosecontent` write (the pick-spend that precedes the redeem) did not
-    /// succeed — humble returned `success=false` (already chosen, no picks left, not offered) or a
-    /// non-200. A choose only SPENDS a pick on `success=true`, so this variant always means the
-    /// pick was NOT spent; the caller parks and does not proceed to the redeem. `reason` is
-    /// humble's own refusal text or a status, never a secret value.
+    /// A Humble Choice `choosecontent` write was rejected in a way that PROVES no pick was spent:
+    /// either humble answered `success=false` (already chosen, no picks left, not offered — the
+    /// handler ran and refused) or it rejected at the auth/CSRF layer (401/403/302 with no
+    /// step-up gate — rejected before the handler). Both are safe to park and retry cleanly.
+    ///
+    /// This variant carries the "not spent" contract, so AMBIGUOUS failures deliberately do NOT map
+    /// here: an unexpected/5xx status is [`Api`](HumbleError::Api) and a transport failure is
+    /// [`Network`](HumbleError::Network) — either can follow a committed choose, so the caller must
+    /// reconcile against humble state before re-choosing. `reason` is humble's refusal text or a
+    /// status/csrf marker, never a secret value.
     #[error("humble choosecontent failed: {reason}")]
     ChooseFailed { reason: String },
     #[error("humble rate-limited us")]
@@ -597,10 +602,11 @@ impl HumbleClient {
     /// SAFETY (pick-spend-once, mirrors burns-once): a gated choose returns `login_required` BEFORE
     /// the choose handler runs, so the retry is the first attempt that can spend a pick — no
     /// double-spend window. A pick is spent ONLY on `success=true`; a `Unauthorized` (dead session),
-    /// `SecureAreaStepUpFailed` (gate, no/failed step-up), or `ChooseFailed` (`success=false` / a
-    /// non-200) provably did NOT spend a pick. The one residual, like the redeem's `AmbiguousRedeem`:
-    /// a lost response AFTER humble committed (a `Network` read error, or a 5xx post-commit) can
-    /// leave a pick spent while this returns `Err` — the outcome is AMBIGUOUS, not provably clean.
+    /// `SecureAreaStepUpFailed` (gate, no/failed step-up), or `ChooseFailed` (`success=false` or an
+    /// auth-layer rejection) provably did NOT spend a pick. The one residual, like the redeem's
+    /// `AmbiguousRedeem`: a lost response AFTER humble committed — a `Network` read error or an
+    /// unexpected/5xx status (surfaced as `Api`) — can leave a pick spent while this returns `Err`,
+    /// so those outcomes are AMBIGUOUS, not provably clean.
     /// So the caller MUST reconcile against humble state (re-read the order's `all_tpks` /
     /// `contentChoicesMade`) before re-choosing; a blind retry could spend a second pick.
     pub async fn choose_content(
@@ -757,9 +763,12 @@ impl HumbleClient {
                 })
             }
             429 => Err(HumbleError::RateLimited),
-            s => Err(HumbleError::ChooseFailed {
-                reason: format!("choosecontent unexpected status {s}"),
-            }),
+            // Unexpected status (a 5xx especially) is AMBIGUOUS: humble may have committed the
+            // choose and then failed to return — a pick could be spent. So do NOT map it to
+            // ChooseFailed (whose contract is "provably not spent"); surface Api(s), which the
+            // caller parks-and-reconciles exactly like the redeem's ambiguous outcomes. Re-choosing
+            // on this without reconciling against humble state could double-spend a pick.
+            s => Err(HumbleError::Api(s)),
         }
     }
 
