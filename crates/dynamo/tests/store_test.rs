@@ -1029,3 +1029,35 @@ async fn fulfill_self_claim_never_flips_when_claim_lost_to_compensate() {
         "game must NOT flip when write-1 failed"
     );
 }
+
+#[tokio::test]
+async fn compensate_self_claim_succeeds_with_no_link_meta_item() {
+    let Some(store) = store_or_skip("sc-comp-1").await else {
+        return;
+    };
+    let gid = game_id("gk5", "mn");
+    store.put_game(&game(5, true)).await.unwrap();
+    store
+        .claim_game_self(&gid, "c-c1", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    // The gift-path compensate MUST fail here (pins WHY the variant exists)…
+    let wrong = store.compensate_claim(SELF_LINK_TOKEN, "c-c1", &gid).await;
+    assert!(
+        wrong.is_err(),
+        "gift compensate must cancel on the absent LINK META"
+    );
+
+    // …and the SELF variant must succeed: claim compensated, game re-listed.
+    store.compensate_self_claim("c-c1", &gid).await.unwrap();
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "c-c1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.state, ClaimState::Compensated);
+    let game = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Available);
+    assert_eq!(game.claim_id, None);
+}

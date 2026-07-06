@@ -1046,6 +1046,96 @@ impl Store {
         }
     }
 
+    /// Self-claim compensation — [`compensate_claim`]'s two-item sibling (spec §3.3): CLAIM →
+    /// compensated (conditioned on the pending marker), GAME re-listed (conditioned
+    /// `#st = :pending`), and NO link decrement — LINK#SELF has no META item; the gift variant's
+    /// `claims_used >= 1` guard against it would cancel the whole transaction, wedging every
+    /// self-claim compensation permanently (the review-B1 finding this method exists to fix).
+    pub async fn compensate_self_claim(
+        &self,
+        claim_id: &str,
+        game_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut claim = self
+            .get_claim(domain::SELF_LINK_TOKEN, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("compensate_self: claim missing"))?;
+        claim.state = ClaimState::Compensated;
+
+        let mut game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(StoreError::Corrupt("compensate_self: game missing"))?;
+        game.status = GameStatus::Available;
+        game.claim_id = None;
+
+        let claim_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(&claim)))
+            .condition_expression("attribute_exists(gsi2pk)")
+            .build()
+            .expect("claim_put");
+        let game_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .condition_expression("#st = :pending")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":pending", schema::s("pending"))
+            .build()
+            .expect("game_put");
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(claim_put)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(game_put)
+                    .build(),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                let err_str = format!("{sdk_err:?}");
+                if let Some(
+                    aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(tce),
+                ) = sdk_err.as_service_error()
+                {
+                    let item0_ccf = tce
+                        .cancellation_reasons()
+                        .first()
+                        .and_then(|r| r.code())
+                        .is_some_and(|c| c == "ConditionalCheckFailed");
+                    if item0_ccf {
+                        // Marker already consumed — someone else finished this claim's fate.
+                        let current = self
+                            .get_claim(domain::SELF_LINK_TOKEN, claim_id)
+                            .await?
+                            .ok_or(StoreError::Corrupt(
+                                "compensate_self: claim missing on recheck",
+                            ))?;
+                        match current.state {
+                            // idempotent retry after a prior full success.
+                            ClaimState::Compensated => return Ok(()),
+                            // fulfill won the race and owns the game; its retry completes the flip.
+                            ClaimState::Fulfilled => return Ok(()),
+                            // marker gone but still Pending is impossible-by-construction → fall
+                            // through to the loud error below.
+                            ClaimState::Pending => {}
+                        }
+                    }
+                }
+                Err(StoreError::Aws(err_str))
+            }
+        }
+    }
+
     /// Toggle a game's `hidden` flag with a guarded conditional write.
     ///
     /// Race handling:
