@@ -781,6 +781,595 @@ async fn redeem_auth_rejection_never_triggers_selfheal() {
     assert!(!body.contains("self-login") && !body.contains("DEAD"));
 }
 
+// =============================================================================================
+// RECONCILE + SYNC-WALK MATRIX
+// ---------------------------------------------------------------------------------------------
+// reconcile + the sync walk had ZERO tests before this suite — phase 3 (Humble Choice) is about
+// to stand on this exact path, so it gets a net first. Every test drives the real code through
+// `handle(FulfillRequest::Sync)`: it takes the sync-run marker, self-heals the listing, runs
+// `reconcile`, then walks orders. We isolate reconcile by returning an EMPTY gamekey listing
+// (GET /api/v1/user/order → []) — the order walk then loops over nothing, while reconcile still
+// fetches each parked claim's order independently (GET /api/v1/order/<gamekey>).
+// =============================================================================================
+
+/// An empty gamekey listing — isolates reconcile from the order walk (the walk sees no orders,
+/// reconcile still fetches per parked-claim gamekey on its own).
+async fn mount_empty_listing(humble: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(humble)
+        .await;
+}
+
+/// One order with a single key. `redeemed` toggles `redeemed_key_val` (present ⇒ redeemed).
+fn order_json(gamekey: &str, machine: &str, redeemed: bool) -> serde_json::Value {
+    let mut tpk = serde_json::json!({
+        "machine_name": machine,
+        "human_name": "Test Game",
+        "key_type": "steam",
+        "is_expired": false,
+        "keyindex": 0,
+    });
+    if redeemed {
+        tpk["redeemed_key_val"] = serde_json::json!("REDEEMED-KEY-VALUE");
+    }
+    serde_json::json!({
+        "gamekey": gamekey,
+        "product": { "human_name": "Test Bundle" },
+        "tpkd_dict": { "all_tpks": [tpk] },
+        "subproducts": [],
+    })
+}
+
+/// Seed a parked (Pending) claim with a controllable `created_at` (via `claim_game`'s `now`), plus
+/// its game (Available) and link (fresh, one slot). `gid` is the game_id stored on the claim —
+/// pass a colonless string to exercise the unsplittable-game_id reconcile arm.
+async fn seed_aged_pending(
+    store: &Store,
+    gid: &str,
+    token: &str,
+    claim_id: &str,
+    created: OffsetDateTime,
+) {
+    let (gk, mn) = gid.split_once(':').unwrap_or((gid, gid));
+    let g = domain::Game {
+        id: gid.into(),
+        title: "Stardew Valley".into(),
+        bundle: "Humble Indie Bundle".into(),
+        gamekey: gk.into(),
+        machine_name: mn.into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+    };
+    store.put_game(&g).await.unwrap();
+    store.create_link(&link(token)).await.unwrap();
+    store
+        .claim_game(token, gid, claim_id, created)
+        .await
+        .unwrap();
+}
+
+fn hours_ago(h: i64) -> OffsetDateTime {
+    OffsetDateTime::now_utc() - time::Duration::hours(h)
+}
+
+async fn discord_ok() -> MockServer {
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+    discord
+}
+
+// ---------------------------------------------------------------------------------------------
+// reconcile: key shows REDEEMED on humble but no URL recorded → ping + LEAVE pending (never blind
+// compensate). This is the crash-after-gift case: the gift WAS generated, so a human recovers the
+// URL from humble's gift-history page; compensating would risk a lost, recoverable gift URL.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_redeemed_pings_and_leaves_pending() {
+    let Some(store) = store_or_skip("recon-redeemed").await else {
+        return;
+    };
+    let gid = game_id("gkR", "mnR");
+    seed_aged_pending(&store, &gid, "tokR", "cR", hours_ago(2)).await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkR"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkR", "mnR", true)))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    assert_eq!(
+        handle(&deps, FulfillRequest::Sync).await,
+        FulfillResponse::SyncDone
+    );
+
+    // claim stays PENDING — human-owned URL recovery, never blind-compensated.
+    let claim = deps.store.get_claim("tokR", "cR").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+    // game NOT re-listed (still owned by the claim).
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending);
+
+    // exactly one ping, naming the manual gift-history recovery, no key value leaked.
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("cR"), "ping carries the claim id");
+    assert!(
+        body.contains("gift-history"),
+        "ping names the recovery path"
+    );
+    assert!(
+        !body.contains("REDEEMED-KEY-VALUE"),
+        "ping must not leak a key"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// reconcile: key NOT redeemed on humble → the redeem never landed → compensate (slot returns,
+// game re-lists). The ping fires so a compensate of an actually-gifted key (recoverable lost URL)
+// is caught.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_not_redeemed_compensates_and_relists() {
+    let Some(store) = store_or_skip("recon-notredeemed").await else {
+        return;
+    };
+    let gid = game_id("gkN", "mnN");
+    seed_aged_pending(&store, &gid, "tokN", "cN", hours_ago(2)).await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkN", "mnN", false)))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // claim compensated, slot returned, game re-listed + listable.
+    let claim = deps.store.get_claim("tokN", "cN").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Compensated);
+    assert_eq!(
+        deps.store
+            .get_link("tokN")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        0,
+        "compensate returns the slot"
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Available);
+    assert_eq!(deps.store.list_listable_games().await.unwrap().len(), 1);
+
+    // the compensate ping fired (recoverable-lost-URL checkpoint).
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("compensated") && body.contains("cN"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// reconcile: a claim younger than RECONCILE_MIN_AGE (15m) is left alone — a live redeem may still
+// be recording its URL. No humble order fetch, no state change.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_min_age_skips_fresh_claim() {
+    let Some(store) = store_or_skip("recon-minage").await else {
+        return;
+    };
+    let gid = game_id("gkF", "mnF");
+    // 1 minute old — well under the 15m floor.
+    seed_aged_pending(
+        &store,
+        &gid,
+        "tokF",
+        "cF",
+        OffsetDateTime::now_utc() - time::Duration::minutes(1),
+    )
+    .await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    // NOTE: intentionally NO /api/v1/order/gkF mock — reconcile must not fetch a too-fresh claim.
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // untouched: still pending, no order fetch, no ping.
+    let claim = deps.store.get_claim("tokF", "cF").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+    let order_hits = humble
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/v1/order/gkF")
+        .count();
+    assert_eq!(order_hits, 0, "a too-fresh claim must not be fetched");
+    assert!(discord.received_requests().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// reconcile: session dies mid-pass (order fetch → 401) with no self-login → stop LOUDLY (flag
+// cookie_ok=false) rather than silently skip every remaining claim. The claim stays pending.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_dead_session_aborts_loudly_and_flags_cookie() {
+    let Some(store) = store_or_skip("recon-dead").await else {
+        return;
+    };
+    let gid = game_id("gkD", "mnD");
+    seed_aged_pending(&store, &gid, "tokD", "cD", hours_ago(2)).await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkD"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // cookie flagged dead; claim untouched (NOT blind-compensated).
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        !st.cookie_ok,
+        "a dead session mid-reconcile must flag cookie_ok=false"
+    );
+    let claim = deps.store.get_claim("tokD", "cD").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+}
+
+// ---------------------------------------------------------------------------------------------
+// reconcile: a transient (429) order fetch skips THAT claim and retries next pass — never
+// compensates on ambiguity. Claim stays pending, cookie_ok not flipped.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_transient_order_error_skips_claim() {
+    let Some(store) = store_or_skip("recon-transient").await else {
+        return;
+    };
+    let gid = game_id("gkT", "mnT");
+    seed_aged_pending(&store, &gid, "tokT", "cT", hours_ago(2)).await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkT"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tokT", "cT").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "transient error must not compensate"
+    );
+    // a transient reconcile skip is silent (no stuck-alert ping — the claim IS reconcilable).
+    assert!(discord.received_requests().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// LOUD-SKIP (new): an unreconcilable parked claim younger than RECONCILE_STUCK_ALERT_AGE (24h)
+// stays SILENT — the machine_name mismatch may be a mid-deploy artifact the next sync corrects.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_unreconcilable_under_threshold_stays_silent() {
+    let Some(store) = store_or_skip("recon-stuck-young").await else {
+        return;
+    };
+    // claim's machine_name is "mnGHOST", but the order only ever lists "mnREAL" → unreconcilable.
+    let gid = game_id("gkS", "mnGHOST");
+    seed_aged_pending(&store, &gid, "tokS", "cS", hours_ago(3)).await; // >15m, <24h
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkS"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkS", "mnREAL", false)))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // claim untouched, and NO ping yet — under the loud-skip threshold.
+    let claim = deps.store.get_claim("tokS", "cS").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+    assert!(
+        discord.received_requests().await.unwrap().is_empty(),
+        "under the age threshold the skip must stay log-only"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// LOUD-SKIP (new): the SAME unreconcilable claim, now past RECONCILE_STUCK_ALERT_AGE → the eternal
+// silent skip goes LOUD: warn + exactly one discord ping (claim id + game_id, no secrets). The
+// skip itself is unchanged (reconcile still decides nothing — the claim stays pending).
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_unreconcilable_over_threshold_pings_once() {
+    let Some(store) = store_or_skip("recon-stuck-old").await else {
+        return;
+    };
+    let gid = game_id("gkS2", "mnGHOST");
+    seed_aged_pending(&store, &gid, "tokS2", "cS2", hours_ago(30)).await; // > 24h
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkS2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkS2", "mnREAL", false)))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // skip UNCHANGED: claim still pending (reconcile decided nothing) …
+    let claim = deps.store.get_claim("tokS2", "cS2").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+    // … but now it's LOUD: exactly one ping, carrying claim id + game_id, no secret.
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "past the threshold, the stuck claim must ping exactly once"
+    );
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("cS2"), "ping carries the claim id");
+    assert!(body.contains(&gid), "ping carries the game_id");
+    assert!(
+        body.to_lowercase().contains("stuck"),
+        "ping names the stuck condition"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// LOUD-SKIP (new): a parked claim whose game_id has no `gamekey:machine_name` split can never be
+// checked against an order at all. Past the threshold it pings loudly (and never fetches humble —
+// there's no gamekey to fetch).
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_unsplittable_game_id_over_threshold_pings() {
+    let Some(store) = store_or_skip("recon-nosplit").await else {
+        return;
+    };
+    // A colonless game_id: split_once(':') yields None → the unreconcilable arm, no order to check.
+    seed_aged_pending(&store, "colonlessgameid", "tokX", "cX", hours_ago(30)).await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tokX", "cX").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        1,
+        "an unsplittable game_id must ping once past the threshold"
+    );
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("cX") && body.contains("game_id"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// ONE-HEAL-PER-RUN CAP: with self-login configured, the run's single heal is spent on the FIRST
+// dead-session order fetch (claim A heals + reconciles); the SECOND dead order fetch (claim B) may
+// NOT heal again — it aborts the pass loudly. Proof: exactly ONE /processlogin for the whole run.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_one_heal_per_run_cap() {
+    let Some(store) = store_or_skip("recon-healcap").await else {
+        return;
+    };
+    // A is OLDER than B, so list_pending_claims (oldest-first) processes A then B.
+    seed_aged_pending(&store, &game_id("gkA", "mnA"), "tokA", "cA", hours_ago(5)).await;
+    seed_aged_pending(&store, &game_id("gkB", "mnB"), "tokB", "cB", hours_ago(2)).await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    // GET / serves the redeem csrf preflight + the login bootstrap (csrf + anon session).
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("set-cookie", "csrf_cookie=csrfval; Path=/")
+                .append_header("set-cookie", "_simpleauth_sess=ANONSESS; Path=/"),
+        )
+        .mount(&humble)
+        .await;
+    // claim A's order: first 401 (dead), then after the heal a 200 not-redeemed → compensate.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkA"))
+        .respond_with(ResponseTemplate::new(401))
+        .up_to_n_times(1)
+        .mount(&humble)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkA"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkA", "mnA", false)))
+        .mount(&humble)
+        .await;
+    // claim B's order: always dead — but the run's heal is already spent, so no second login.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkB"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&humble)
+        .await;
+    // Self-login rotates the session once.
+    Mock::given(method("POST"))
+        .and(path("/processlogin"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"goto": "/home/keys"}))
+                .append_header("set-cookie", "_simpleauth_sess=NEWSESS; Path=/"),
+        )
+        .mount(&humble)
+        .await;
+
+    let ssm = mock_ssm().await;
+    let discord = discord_ok().await;
+    let deps = deps_with_selfheal(store, &humble.uri(), Some(discord.uri()), &ssm.uri()).await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // THE cap: exactly one login for the whole run.
+    let logins = humble
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/processlogin")
+        .count();
+    assert_eq!(
+        logins, 1,
+        "the run's single heal must be spent once, never twice"
+    );
+
+    // A healed + reconciled (not redeemed → compensated); B stayed pending (pass aborted).
+    let a = deps.store.get_claim("tokA", "cA").await.unwrap().unwrap();
+    assert_eq!(
+        a.state,
+        ClaimState::Compensated,
+        "claim A healed and reconciled"
+    );
+    let b = deps.store.get_claim("tokB", "cB").await.unwrap().unwrap();
+    assert_eq!(
+        b.state,
+        ClaimState::Pending,
+        "claim B left for the next run (heal cap hit)"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// SYNC-RUN MARKER: a second sync while one holds the marker is a no-op (SyncDone), does NOT walk,
+// and never touches humble — the mutex that makes concurrent walks impossible.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn sync_run_marker_blocks_concurrent_walk() {
+    let Some(store) = store_or_skip("recon-marker").await else {
+        return;
+    };
+    let gid = game_id("gkM", "mnM");
+    seed_aged_pending(&store, &gid, "tokM", "cM", hours_ago(2)).await;
+    // Hold a LIVE marker — as if another run owns the walk right now.
+    assert_eq!(
+        store
+            .begin_sync_run(OffsetDateTime::now_utc().unix_timestamp())
+            .await
+            .unwrap(),
+        dynamo::SyncBegin::Started
+    );
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    // Order for gkM would compensate if the walk ran — it must NOT.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkM"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkM", "mnM", false)))
+        .mount(&humble)
+        .await;
+
+    let deps = deps(store, &humble.uri(), None);
+    assert_eq!(
+        handle(&deps, FulfillRequest::Sync).await,
+        FulfillResponse::SyncDone
+    );
+
+    // The walk was skipped: claim untouched, and humble was never called at all.
+    let claim = deps.store.get_claim("tokM", "cM").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "a blocked run must not reconcile"
+    );
+    assert!(
+        humble.received_requests().await.unwrap().is_empty(),
+        "a blocked run must not touch humble"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// TRANSIENT LISTING STILL RECONCILES: a 429 on the gamekey LISTING must not also cost a pass of
+// parked-claim recovery — reconcile runs even when the listing failed (it doesn't need the list).
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn transient_listing_still_reconciles() {
+    let Some(store) = store_or_skip("recon-listing429").await else {
+        return;
+    };
+    let gid = game_id("gkL", "mnL");
+    seed_aged_pending(&store, &gid, "tokL", "cL", hours_ago(2)).await;
+
+    let humble = MockServer::start().await;
+    // The LISTING is rate-limited …
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&humble)
+        .await;
+    // … but reconcile can still fetch the parked claim's order and act (not redeemed → compensate).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkL", "mnL", false)))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // reconcile ran despite the failed listing: the claim was compensated.
+    let claim = deps.store.get_claim("tokL", "cL").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Compensated,
+        "reconcile must run even when the listing 429s"
+    );
+    // and the run recorded the listing failure in its summary.
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("failed listing"),
+        "summary names the listing failure: {}",
+        st.message
+    );
+}
+
 /// Success from humble during ValidateCookie → CookieStatus{ok:true} and SyncState updated.
 #[tokio::test]
 async fn validate_cookie_success_flags_ok() {
