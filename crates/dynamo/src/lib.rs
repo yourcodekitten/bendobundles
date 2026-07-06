@@ -215,6 +215,7 @@ fn self_claim_cancellation_error(
     None
 }
 
+#[derive(Clone)]
 pub struct Store {
     client: Client,
     table: String,

@@ -271,6 +271,9 @@ pub struct KeyEntry {
     pub expired: bool,
     pub giftable: bool,
     pub keyindex: u32,
+    /// The raw key value from the wire, present only when the tpk has been redeemed. Used by the
+    /// self-claim recover path to record the value without a second reveal call.
+    pub redeemed_key_val: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -561,6 +564,7 @@ impl HumbleClient {
                         redeemed,
                         expired,
                         keyindex: t.keyindex,
+                        redeemed_key_val: t.redeemed_key_val,
                     }
                 })
                 .collect(),
