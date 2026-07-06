@@ -73,6 +73,24 @@ pub(crate) struct ContentChoiceOptions {
     pub can_redeem_games: bool,
     #[serde(rename = "contentChoiceData")]
     pub content_choice_data: ContentChoiceData,
+    #[serde(default, rename = "contentChoicesMade")]
+    pub content_choices_made: ContentChoicesMade,
+}
+
+/// Which offered games the account has already chosen. Absent entirely on a month with no picks
+/// made yet — hence `Default` all the way down (absent ⇒ empty `choices_made`).
+#[derive(Deserialize, Default)]
+pub(crate) struct ContentChoicesMade {
+    #[serde(default)]
+    pub initial: ContentChoicesMadeInitial,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ContentChoicesMadeInitial {
+    /// machine_names of the already-chosen games — the SAME identifiers keying the offered map
+    /// `contentChoiceData.initial.content_choices` (chosen ⊆ offered).
+    #[serde(default)]
+    pub choices_made: Vec<String>,
 }
 
 #[derive(Deserialize)]

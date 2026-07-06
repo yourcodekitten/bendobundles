@@ -517,11 +517,116 @@ async fn choice_month_parses_offered_games_and_state() {
     assert_eq!(
         games,
         vec![
-            ("darksidersgenesis", "Darksiders Genesis"),
-            ("metroexodus", "Metro Exodus"),
+            ("calico", "Calico"),
+            ("darksiders_genesis", "Darksiders Genesis"),
+            ("essays_on_empathy", "Essays on Empathy"),
+            ("fury_unleashed", "Fury Unleashed"),
+            ("horace", "Horace"),
+            ("just_die_already", "Just Die Already"),
+            ("metro_exodus", "Metro Exodus"),
+            ("mount_and_blade_warband", "Mount & Blade: Warband"),
+            ("police_stories", "Police Stories"),
             ("relicta", "Relicta"),
+            ("the_wild_eight", "The Wild Eight"),
+            ("vane", "Vane"),
         ]
     );
+}
+
+#[tokio::test]
+async fn choice_month_parses_claimed_set_and_claimable_is_offered_minus_chosen() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/membership/may-2021"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture_str("membership_may_2021.html"))
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let m = client(&server)
+        .await
+        .choice_month("may-2021")
+        .await
+        .unwrap();
+    // The blob's `contentChoicesMade.initial.choices_made` — wire order, verbatim.
+    assert_eq!(m.claimed_machine_names, vec!["metro_exodus", "vane"]);
+
+    // claimable = offered − chosen: 12 offered, 2 chosen → exactly the other 10, with the
+    // chosen pair excluded and the offered (sorted) order preserved.
+    let claimable = m.claimable_games();
+    assert_eq!(claimable.len(), 10);
+    let names: Vec<&str> = claimable.iter().map(|g| g.machine_name.as_str()).collect();
+    assert!(!names.contains(&"metro_exodus"));
+    assert!(!names.contains(&"vane"));
+    assert_eq!(
+        names,
+        vec![
+            "calico",
+            "darksiders_genesis",
+            "essays_on_empathy",
+            "fury_unleashed",
+            "horace",
+            "just_die_already",
+            "mount_and_blade_warband",
+            "police_stories",
+            "relicta",
+            "the_wild_eight",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn choice_month_absent_choices_made_means_nothing_claimed() {
+    let server = MockServer::start().await;
+    // No `contentChoicesMade` at all (a month untouched by picks) — the serde default path must
+    // yield an empty claimed set, making every offered game claimable.
+    Mock::given(method("GET"))
+        .and(path("/membership/oct-2020"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    r#"<script id="webpack-monthly-product-data">
+                    {
+                      "contentChoiceOptions": {
+                        "gamekey": "Oct20Gamekey00",
+                        "title": "October 2020",
+                        "productUrlPath": "oct-2020",
+                        "productMachineName": "october_2020_choice",
+                        "usesChoices": true,
+                        "canRedeemGames": true,
+                        "contentChoiceData": {
+                          "initial": {
+                            "total_choices": 12,
+                            "content_choices": {
+                              "vane": { "title": "Vane" },
+                              "relicta": { "title": "Relicta" }
+                            }
+                          }
+                        }
+                      }
+                    }
+                    </script>"#,
+                )
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let m = client(&server)
+        .await
+        .choice_month("oct-2020")
+        .await
+        .unwrap();
+    assert!(m.claimed_machine_names.is_empty());
+    // Nothing chosen ⇒ claimable == all offered.
+    assert_eq!(
+        m.claimable_games(),
+        m.offered_games.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(m.claimable_games().len(), 2);
 }
 
 #[tokio::test]
