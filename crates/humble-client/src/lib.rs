@@ -283,6 +283,12 @@ pub struct Subproduct {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GiftUrl(pub String);
 
+/// The revealed key VALUE from a no-gift redeem (`/humbler/redeemkey` without `gift`) — the
+/// self-claim sibling of [`GiftUrl`]. Holds a live store key: NEVER log it (Debug derive is fine —
+/// the value only surfaces where explicitly serialized).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevealedKey(pub String);
+
 /// One Humble Choice month's identity, claim-state, and offered games. Produced by both the
 /// single-month read [`choice_month`](HumbleClient::choice_month) (from the `/membership/<month>`
 /// blob) and the paginated list [`choice_months`](HumbleClient::choice_months) (from the
@@ -365,6 +371,19 @@ struct RedeemResponse {
 }
 
 #[derive(serde::Deserialize)]
+struct RevealResponse {
+    // Same contract as RedeemResponse: a 200 body missing `success` is a parse error.
+    success: bool,
+    // The revealed key. Observed as a JSON string on every live capture (2026-07-06 HAR: steam +
+    // bungie keytypes); a non-string here (humble drift) must surface as ambiguous, not a panic —
+    // hence Value, narrowed in the caller.
+    #[serde(default)]
+    key: Option<serde_json::Value>,
+    #[serde(default)]
+    errormsg: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
 struct ChooseResponse {
     // Same as RedeemResponse: a 200 body missing `success` is a parse error, not a silent failure.
     success: bool,
@@ -383,6 +402,12 @@ enum RedeemStep {
     /// Humble gated the write behind a secure-area step-up (`login_required` / a `secureArea`
     /// redirect). The session is healthy and **the key was not burned** — retrying after a
     /// successful step-up is safe. Carries the observed HTTP status for logging only.
+    StepUpNeeded { status: u16 },
+}
+
+/// Reveal analog of [`RedeemStep`].
+enum RevealStep {
+    Done(RevealedKey),
     StepUpNeeded { status: u16 },
 }
 
@@ -839,6 +864,47 @@ impl HumbleClient {
         }
     }
 
+    /// Reveal a key's VALUE (self-claim): `/humbler/redeemkey` with the `gift` param OMITTED —
+    /// proven live 2026-07-06 (Ben library HAR: two plain-bundle reveals, steam + bungie keytypes,
+    /// both `{"key":"…","success":true}`). Burns-once + step-up semantics identical to
+    /// [`redeem_as_gift`]; see that method's safety comment.
+    pub async fn reveal_key(
+        &self,
+        gamekey: &str,
+        machine_name: &str,
+        keyindex: u32,
+    ) -> Result<RevealedKey, HumbleError> {
+        match self.reveal_once(gamekey, machine_name, keyindex).await? {
+            RevealStep::Done(k) => Ok(k),
+            RevealStep::StepUpNeeded { status } => {
+                if self.step_up.is_none() {
+                    tracing::warn!(
+                        status,
+                        "reveal gated behind secure-area step-up but step-up is not configured — parking (set humble_username to enable)"
+                    );
+                    return Err(HumbleError::SecureAreaStepUpFailed {
+                        reason:
+                            "secure-area step-up required but not configured (set humble_username)"
+                                .into(),
+                    });
+                }
+                self.secure_area_step_up().await?;
+                match self.reveal_once(gamekey, machine_name, keyindex).await? {
+                    RevealStep::Done(k) => Ok(k),
+                    RevealStep::StepUpNeeded { status } => {
+                        tracing::warn!(
+                            status,
+                            "reveal still gated after a successful step-up — parking (key not burned)"
+                        );
+                        Err(HumbleError::SecureAreaStepUpFailed {
+                            reason: "reveal still returned login_required after /processlogin accepted the step-up".into(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
     /// Spend a monthly Humble Choice pick: claim `chosen` game(s) from the Choice month identified
     /// by `gamekey`, transparently clearing humble's secure-area step-up when it gates the write
     /// (same as [`redeem_as_gift`]). This is the FIRST of the two Choice writes — it moves a game
@@ -1185,6 +1251,115 @@ impl HumbleClient {
                     server,
                     body_read_err,
                     "humble rejected the redeem write despite the CSRF pair — inspect the dance, do not blame the cookie"
+                );
+                Err(HumbleError::RedeemAuthRejected {
+                    status,
+                    csrf_minted,
+                })
+            }
+            429 => Err(HumbleError::RateLimited),
+            s => Err(HumbleError::Api(s)),
+        }
+    }
+
+    /// One reveal attempt — the self-claim analog of [`redeem_once`]. Detects humble's secure-area
+    /// gate and reports it as [`RevealStep::StepUpNeeded`]. The form is identical to `redeem_once`
+    /// except the `gift` pair is OMITTED (HAR-proven: that omission is what makes it a self-claim).
+    async fn reveal_once(
+        &self,
+        gamekey: &str,
+        machine_name: &str,
+        keyindex: u32,
+    ) -> Result<RevealStep, HumbleError> {
+        let (csrf, csrf_minted) = match self.csrf_token().await {
+            Some(t) => (t, false),
+            None => {
+                tracing::warn!(
+                    "csrf capture failed — minting a double-submit fallback (a server-validated token check will reject this)"
+                );
+                (uuid::Uuid::new_v4().simple().to_string(), true)
+            }
+        };
+        let resp = self
+            .csrf_write(
+                format!("{}/humbler/redeemkey", self.base),
+                &csrf,
+                "/home/library",
+            )
+            .form(&[
+                ("keytype", machine_name),
+                ("key", gamekey),
+                ("keyindex", &keyindex.to_string()),
+                // NO ("gift", "true") — omitting it IS the self-claim (HAR-proven).
+            ])
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        // Names the outcome class only — never the key value.
+        tracing::info!(status, machine_name, keyindex, csrf_minted, "humble reveal POST response");
+        match status {
+            200 => {
+                let bytes = resp.bytes().await?;
+                if is_login_required(&bytes) {
+                    tracing::info!(
+                        status,
+                        "reveal gated: humble returned login_required — secure-area step-up needed"
+                    );
+                    return Ok(RevealStep::StepUpNeeded { status });
+                }
+                let body: RevealResponse = decode_body(&bytes)?;
+                match (body.success, body.key) {
+                    (true, Some(serde_json::Value::String(k))) => {
+                        Ok(RevealStep::Done(RevealedKey(k)))
+                    }
+                    // success without a string key value: the key MAY be burned server-side —
+                    // ambiguous, park-and-reconcile, never assume clean.
+                    (true, _) => Err(HumbleError::AmbiguousRedeem),
+                    (false, _) => {
+                        let msg = body
+                            .errormsg
+                            .unwrap_or_else(|| "no error message".to_string());
+                        tracing::warn!(errormsg = %msg, "humble reveal refused (success=false)");
+                        let lower = msg.to_lowercase();
+                        if lower.contains("already been redeemed")
+                            || lower.contains("already redeemed")
+                        {
+                            Err(HumbleError::AlreadyRedeemed)
+                        } else {
+                            Err(HumbleError::RedeemRefused(msg))
+                        }
+                    }
+                }
+            }
+            // Mirror redeem_once's non-200 arms EXACTLY — the two methods must classify identically.
+            401 | 403 | 302 => {
+                let content_type = header_str(resp.headers(), "content-type");
+                let location = location_str(resp.headers());
+                let cf_mitigated = header_str(resp.headers(), "cf-mitigated");
+                let server = header_str(resp.headers(), "server");
+                let raw_location = header_str(resp.headers(), "location");
+                let (login_required_body, body_read_err) = match resp.bytes().await {
+                    Ok(b) => (is_login_required(&b), None),
+                    Err(e) => (false, Some(e.to_string())),
+                };
+                if raw_location.contains("secureArea") || login_required_body {
+                    tracing::info!(
+                        status,
+                        location,
+                        "reveal gated behind secure-area step-up (healthy session) — will step up and retry"
+                    );
+                    return Ok(RevealStep::StepUpNeeded { status });
+                }
+                let body_read_err = body_read_err.as_deref().unwrap_or("-");
+                tracing::warn!(
+                    status,
+                    csrf_minted,
+                    content_type,
+                    location,
+                    cf_mitigated,
+                    server,
+                    body_read_err,
+                    "humble rejected the reveal write despite the CSRF pair — inspect the dance, do not blame the cookie"
                 );
                 Err(HumbleError::RedeemAuthRejected {
                     status,
