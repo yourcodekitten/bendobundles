@@ -3,7 +3,7 @@
 mod model;
 
 use hmac::{Hmac, Mac};
-use model::{GamekeyEntry, MembershipBlob, OrderWire};
+use model::{GamekeyEntry, MembershipBlob, OrderWire, SubProductsPage};
 use sha1::Sha1;
 use wreq_util::Emulation;
 
@@ -307,6 +307,22 @@ pub struct OfferedGame {
     pub title: String,
 }
 
+/// One month as returned by the paginated month-list ([`HumbleClient::choice_months`]) — the
+/// month's identity + claim-state + its offered games. `gamekey` links to `order(gamekey)` (whose
+/// `all_tpks` are the already-claimed keys); `offered_games` minus those = still claimable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceMonthSummary {
+    pub gamekey: String,
+    pub title: String,
+    pub product_url_path: String,
+    pub product_machine_name: String,
+    pub uses_choices: bool,
+    pub is_active_content: bool,
+    pub can_redeem_games: bool,
+    /// Offered games (machine_name + title), sorted by machine_name for a stable order.
+    pub offered_games: Vec<OfferedGame>,
+}
+
 #[derive(serde::Deserialize)]
 struct RedeemResponse {
     // No #[serde(default)] — a 200 body missing `success` must be a parse error, not silently
@@ -564,6 +580,64 @@ impl HumbleClient {
             total_choices: cco.content_choice_data.initial.total_choices,
             offered_games,
         })
+    }
+
+    /// Enumerate ALL Humble Choice months (newest-first), walking the cursor-paginated month list
+    /// `GET /api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys/<cursor>`. The
+    /// cursor is an opaque token in the URL PATH (not a query param); page 1 uses the bare path, and
+    /// each response hands back the next page's `cursor` (3 months/page). Stops when the response
+    /// carries no cursor (or an empty page).
+    ///
+    /// This is a MULTI-request walk (~26 pages for a full history) — pace calls and prefer stopping
+    /// early once the caller reaches already-known months rather than a full walk every sync.
+    /// `max_pages` bounds it defensively so a server that never stops handing back a cursor can't
+    /// spin forever.
+    pub async fn choice_months(
+        &self,
+        max_pages: usize,
+    ) -> Result<Vec<ChoiceMonthSummary>, HumbleError> {
+        const BASE: &str =
+            "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+        let mut months = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..max_pages {
+            // Page 1 is the bare path with a trailing slash; later pages append the opaque cursor.
+            let path = match &cursor {
+                None => format!("{BASE}/"),
+                Some(c) => format!("{BASE}/{c}"),
+            };
+            let page: SubProductsPage = self.get_json(&path).await?;
+            if page.products.is_empty() {
+                break;
+            }
+            for p in page.products {
+                let mut offered_games: Vec<OfferedGame> = p
+                    .content_choice_data
+                    .game_data
+                    .into_iter()
+                    .map(|(machine_name, g)| OfferedGame {
+                        machine_name,
+                        title: g.title,
+                    })
+                    .collect();
+                offered_games.sort_by(|a, b| a.machine_name.cmp(&b.machine_name));
+                months.push(ChoiceMonthSummary {
+                    gamekey: p.gamekey,
+                    title: p.title,
+                    product_url_path: p.product_url_path,
+                    product_machine_name: p.product_machine_name,
+                    uses_choices: p.uses_choices,
+                    is_active_content: p.is_active_content,
+                    can_redeem_games: p.can_redeem_games,
+                    offered_games,
+                });
+            }
+            match page.cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+        }
+        Ok(months)
     }
 
     /// Fetch the value for humble's double-submit CSRF pair. A page GET (sent with the session

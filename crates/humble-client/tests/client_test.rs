@@ -1,5 +1,5 @@
 use humble_client::{HumbleClient, SessionCookie};
-use wiremock::matchers::{body_string_contains, header, method, path, query_param};
+use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -586,6 +586,126 @@ async fn choice_month_malformed_blob_is_parse_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::Parse(_)));
+}
+
+// ── Humble Choice: choice_months (paginated month enumeration via the cursor path segment) ───────
+
+#[tokio::test]
+async fn choice_months_walks_the_cursor_pagination() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    // Page 1 (bare path) → 2 months + a cursor "CURSOR2"; page 2 (path + cursor) → 1 month, no cursor.
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "cursor": "CURSOR2",
+            "products": [
+                {
+                    "gamekey": "gkMar26", "title": "March 2026", "productUrlPath": "march-2026",
+                    "productMachineName": "march_2026_choice", "usesChoices": false,
+                    "isActiveContent": true, "canRedeemGames": true,
+                    "contentChoiceData": { "game_data": { "gamea": { "title": "Game A" } } }
+                },
+                {
+                    "gamekey": "gkFeb26", "title": "February 2026", "productUrlPath": "february-2026",
+                    "productMachineName": "february_2026_choice", "usesChoices": true,
+                    "isActiveContent": false, "canRedeemGames": true,
+                    "contentChoiceData": { "game_data": {
+                        "gamec": { "title": "Game C" }, "gameb": { "title": "Game B" }
+                    } }
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/CURSOR2")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [
+                {
+                    "gamekey": "gkJan26", "title": "January 2026", "productUrlPath": "january-2026",
+                    "productMachineName": "january_2026_choice", "usesChoices": true,
+                    "isActiveContent": false, "canRedeemGames": true,
+                    "contentChoiceData": { "game_data": { "gamed": { "title": "Game D" } } }
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let months = client(&server).await.choice_months(10).await.unwrap();
+    assert_eq!(months.len(), 3);
+    assert_eq!(months[0].product_machine_name, "march_2026_choice");
+    assert!(months[0].is_active_content && !months[0].uses_choices);
+    // February's offered games sorted by machine_name.
+    let feb = &months[1];
+    assert_eq!(feb.product_machine_name, "february_2026_choice");
+    let names: Vec<&str> = feb
+        .offered_games
+        .iter()
+        .map(|g| g.machine_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["gameb", "gamec"]);
+    assert_eq!(months[2].product_machine_name, "january_2026_choice");
+}
+
+#[tokio::test]
+async fn choice_months_single_page_no_cursor_stops() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [{
+                "gamekey": "gkA", "title": "May 2021", "productUrlPath": "may-2021",
+                "productMachineName": "may_2021_choice", "usesChoices": true,
+                "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let months = client(&server).await.choice_months(10).await.unwrap();
+    assert_eq!(months.len(), 1);
+    assert_eq!(months[0].product_machine_name, "may_2021_choice");
+}
+
+#[tokio::test]
+async fn choice_months_max_pages_bounds_a_nonstop_cursor() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    // Every page hands back a cursor and a product — the max_pages bound must stop the walk.
+    Mock::given(method("GET"))
+        .and(path_regex(format!("^{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "cursor": "SAME",
+            "products": [{
+                "gamekey": "gkX", "title": "X", "productUrlPath": "x",
+                "productMachineName": "x_choice", "usesChoices": false,
+                "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let months = client(&server).await.choice_months(3).await.unwrap();
+    assert_eq!(months.len(), 3); // exactly max_pages products, not an infinite spin
+}
+
+#[tokio::test]
+async fn choice_months_dead_session_is_unauthorized() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).await.choice_months(10).await.unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Unauthorized));
 }
 
 /// Matches when the `csrf-prevention-token` header value equals the `csrf_cookie` value inside
