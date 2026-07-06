@@ -1383,3 +1383,26 @@ async fn reveal_key_success_true_but_no_key_is_ambiguous() {
         .await;
     assert!(matches!(out, Err(humble_client::HumbleError::AmbiguousRedeem)));
 }
+
+#[tokio::test]
+async fn reveal_key_step_up_gate_without_creds_is_step_up_failed() {
+    // 200 + the login_required gate body, client WITHOUT step-up configured
+    // → SecureAreaStepUpFailed (key NOT burned).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "error_id": "login_required"
+        })))
+        .mount(&server)
+        .await;
+
+    let out = client(&server)
+        .await
+        .reveal_key("GK", "mn_steam", 0)
+        .await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::SecureAreaStepUpFailed { .. })
+    ));
+}
