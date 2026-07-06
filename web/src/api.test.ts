@@ -467,6 +467,30 @@ describe('adminCreateLink', () => {
 
     await expect(adminCreateLink('Link', 10)).rejects.toBeInstanceOf(Unauthorized);
   });
+
+  it('throws with the server message on 422 validation rejection', async () => {
+    const mockResponse = {
+      ok: false,
+      status: 422,
+      json: vi.fn().mockResolvedValue({ error: 'expires_days must be between 1 and 3650' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminCreateLink('Overflow', 1, 4000000000)).rejects.toThrow(
+      'expires_days must be between 1 and 3650',
+    );
+  });
+
+  it('throws a generic error on non-422 failure (never returns the error body as success)', async () => {
+    const mockResponse = {
+      ok: false,
+      status: 502,
+      json: vi.fn().mockResolvedValue({ message: 'Internal server error' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminCreateLink('Link', 10)).rejects.toThrow('failed to create link');
+  });
 });
 
 describe('adminLinks', () => {

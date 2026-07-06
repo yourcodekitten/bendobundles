@@ -164,6 +164,31 @@ describe('Links', () => {
         `${window.location.origin}/l/tok-new`,
       );
     });
+
+    it('rejected create shows the server message, keeps inputs, and never shows a created panel', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockRejectedValue(
+        new Error('expires_days must be between 1 and 3650'),
+      );
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Overflow');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+      await waitFor(() =>
+        expect(screen.getByRole('alert')).toHaveTextContent(
+          'expires_days must be between 1 and 3650',
+        ),
+      );
+      // No fake success: no invite callout, no /l/undefined anywhere
+      expect(screen.queryByText(/send this to your friend/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/undefined/)).not.toBeInTheDocument();
+      // Inputs preserved so the value can be corrected
+      expect(screen.getByRole('textbox', { name: 'label' })).toHaveValue('Overflow');
+    });
   });
 
   describe('copy invite URL — per-row', () => {

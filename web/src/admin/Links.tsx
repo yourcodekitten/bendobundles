@@ -51,6 +51,8 @@ export function Links() {
   const [creating, setCreating] = useState(false);
   // Stored after successful create — separate from page state so reload doesn't clear it
   const [createdInfo, setCreatedInfo] = useState<{ fullUrl: string; label: string } | null>(null);
+  // Create failure (e.g. the server's 422 naming a violated bound) — shown in the form
+  const [createError, setCreateError] = useState<string | null>(null);
 
   // Two-step revoke: set of armed token strings
   const [revokeArmed, setRevokeArmed] = useState<Set<string>>(new Set());
@@ -78,6 +80,7 @@ export function Links() {
     const trimmedLabel = formLabel.trim();
     if (!trimmedLabel) return;
     setCreating(true);
+    setCreateError(null);
     const expires = expiresDays !== '' ? parseInt(expiresDays, 10) : undefined;
     withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires), navigate)
       .then((result) => {
@@ -88,8 +91,10 @@ export function Links() {
         // Reload to prepend the new link into the list
         load();
       })
-      .catch(() => {
-        // withAuth redirects on 401; other errors swallowed (network hiccup)
+      .catch((err: unknown) => {
+        // withAuth redirects on 401; anything else (422 validation, network)
+        // surfaces in the form — the inputs stay put so ben can correct them.
+        setCreateError(err instanceof Error ? err.message : 'failed to create link');
       })
       .finally(() => {
         setCreating(false);
@@ -228,6 +233,11 @@ export function Links() {
         >
           create invite link
         </button>
+        {createError !== null && (
+          <p role="alert" className="text-xs text-red-400">
+            {createError}
+          </p>
+        )}
       </form>
 
       {/* ── Created link callout — the artifact ben hands a friend ───── */}

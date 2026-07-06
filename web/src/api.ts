@@ -241,6 +241,25 @@ export async function adminCreateLink(
   });
 
   await checkUnauthorized(response);
+
+  // Without this check an error body parses as the success shape and the UI
+  // renders an invite URL of `/l/undefined`. A 422 carries {"error": msg}
+  // naming the violated bound — surface it so the form can say WHY.
+  if (!response.ok) {
+    let message = 'failed to create link';
+    if (response.status === 422) {
+      try {
+        const data = (await response.json()) as { error?: unknown };
+        if (typeof data.error === 'string') {
+          message = data.error;
+        }
+      } catch {
+        // non-JSON body — keep the generic message
+      }
+    }
+    throw new Error(message);
+  }
+
   return await response.json();
 }
 

@@ -507,6 +507,18 @@ async fn create_link_bounds_are_exact() {
             StatusCode::OK,
             "label = 200 chars (max legal)",
         ),
+        // The 422 message promises "characters", so the bound MUST count chars, not bytes:
+        // 200 × 'é' is 400 utf-8 bytes but exactly 200 chars — a bytes-based check would reject it.
+        (
+            serde_json::json!({"label": "é".repeat(200), "claims_allowed": 1}),
+            StatusCode::OK,
+            "label = 200 multibyte chars (max legal — chars, not bytes)",
+        ),
+        (
+            serde_json::json!({"label": "é".repeat(201), "claims_allowed": 1}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "label = 201 multibyte chars (just past max)",
+        ),
     ];
 
     for (body, want, name) in cases {
