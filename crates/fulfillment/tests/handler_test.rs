@@ -2913,9 +2913,20 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
     }
 }
 
+/// File-scope mutex to serialize the log-capture test. When set_default(tracing_subscriber) is
+/// called in a test with #[tokio::test] (multi-threaded runtime), sibling tests running in parallel
+/// can interfere: a tokio worker thread picks up the GLOBAL default subscriber (from a concurrent
+/// test's set_default call), not the thread-local one set for THIS test's thread, causing logs to
+/// either interleave into the wrong capture buffer or not be captured at all. Holding this lock
+/// for the test's entire body prevents concurrent test execution and guarantees that set_default
+/// affects only this test's subscriber dispatch — no cross-test pollution.
+static LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::test]
 async fn revealed_key_value_never_appears_in_logs_or_pings() {
     use std::sync::{Arc, Mutex};
+
+    let _lock = LOG_TEST_LOCK.lock().unwrap();
 
     let Some(store_a) = store_or_skip("sc-scrub-a").await else {
         return;
