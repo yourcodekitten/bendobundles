@@ -245,7 +245,15 @@ export async function adminCreateLink(
   // undefined, and render an /l/undefined invite for a link that was never
   // created. Non-ok must throw, never fake success.
   await checkOk(response, 'create link');
-  return await response.json();
+
+  // A 200 whose body isn't the link contract (proxy error page, API drift)
+  // is the same /l/undefined trap wearing a success status — validate the
+  // shape, not just the status code.
+  const data = await response.json();
+  if (typeof data?.token !== 'string' || typeof data?.url_path !== 'string') {
+    throw new Error('create link returned an unexpected response shape');
+  }
+  return data;
 }
 
 export async function adminLinks(): Promise<AdminLink[]> {

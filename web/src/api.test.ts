@@ -481,6 +481,19 @@ describe('adminCreateLink', () => {
 
     await expect(adminCreateLink('Link', 10)).rejects.toThrow(/create link/);
   });
+
+  it('throws on a 200 whose body is missing the link contract', async () => {
+    // A success status with the wrong shape (proxy error page, API drift)
+    // must not resolve as {token: undefined} — shape is part of the contract
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ message: 'ok' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await expect(adminCreateLink('Link', 10)).rejects.toThrow(/create link/);
+  });
 });
 
 describe('adminLinks', () => {
