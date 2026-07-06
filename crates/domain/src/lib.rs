@@ -83,6 +83,10 @@ pub struct Claim {
     pub game_id: String,
     pub state: ClaimState,
     pub gift_url: Option<String>,
+    /// Self-claim only: the revealed key VALUE, written durable-first exactly like `gift_url`.
+    /// `default` keeps every pre-existing CLAIM item wire-valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revealed_key: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// Pre-choose snapshot of the month order's tpk `machine_name`s, taken and made durable BEFORE
@@ -98,10 +102,6 @@ pub struct Claim {
     /// as `None`, which is correct — none of them ever recorded a choose intent.
     #[serde(default)]
     pub choice_pre_tpks: Option<Vec<String>>,
-    /// Self-claim only: the revealed key VALUE, written durable-first exactly like `gift_url`.
-    /// `default` keeps every pre-existing CLAIM item wire-valid.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub revealed_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -136,6 +136,11 @@ impl Link {
         Ok(())
     }
 }
+
+/// Reserved link_token partition for admin self-claims (`pk=LINK#SELF`). No Link META item ever
+/// exists for it: intake/fulfill/compensate use the SELF-specific store writes, and the public
+/// link fetch 404s it like any unknown token.
+pub const SELF_LINK_TOKEN: &str = "SELF";
 
 pub fn game_id(gamekey: &str, machine_name: &str) -> String {
     format!("{gamekey}:{machine_name}")
@@ -235,11 +240,6 @@ pub fn match_artwork<'a>(
 
     None
 }
-
-/// Reserved link_token partition for admin self-claims (`pk=LINK#SELF`). No Link META item ever
-/// exists for it: intake/fulfill/compensate use the SELF-specific store writes, and the public
-/// link fetch 404s it like any unknown token.
-pub const SELF_LINK_TOKEN: &str = "SELF";
 
 #[cfg(test)]
 mod tests {
