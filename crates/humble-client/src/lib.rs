@@ -313,6 +313,16 @@ pub struct OfferedGame {
     pub title: String,
 }
 
+/// The result of a [`choice_months`](HumbleClient::choice_months) walk. `complete` distinguishes a
+/// full history (`true`) from a prefix truncated at `max_pages` (`false`) — a caller must never
+/// treat a truncated walk as the whole picture (a cycling server would otherwise look like a
+/// complete-but-shrinking sync every run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceMonthsWalk {
+    pub months: Vec<ChoiceMonth>,
+    pub complete: bool,
+}
+
 #[derive(serde::Deserialize)]
 struct RedeemResponse {
     // No #[serde(default)] — a 200 body missing `success` must be a parse error, not silently
@@ -582,11 +592,19 @@ impl HumbleClient {
     /// early once the caller reaches already-known months rather than a full walk every sync.
     /// `max_pages` bounds it defensively so a server that never stops handing back a cursor can't
     /// spin forever.
-    pub async fn choice_months(&self, max_pages: usize) -> Result<Vec<ChoiceMonth>, HumbleError> {
+    ///
+    /// Returns a [`ChoiceMonthsWalk`] whose `complete` flag tells the caller whether it reached the
+    /// end (`true`) or stopped at `max_pages` with a cursor still pending (`false` ⇒ `months` is a
+    /// PARTIAL prefix, not the full history). A truncated walk is NOT an error (the prefix is real
+    /// and useful), but the caller must not treat a partial as complete — a cycling server would
+    /// otherwise report duplicated/truncated data as a full sync, silently, forever. A `warn!` also
+    /// fires on truncation.
+    pub async fn choice_months(&self, max_pages: usize) -> Result<ChoiceMonthsWalk, HumbleError> {
         const BASE: &str =
             "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
         let mut months = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut complete = false;
         for _ in 0..max_pages {
             // Page 1 is the bare path with a trailing slash; later pages append the opaque cursor
             // VERBATIM, exactly as the browser sends it back: the captured tokens are base64URL
@@ -599,6 +617,7 @@ impl HumbleClient {
             };
             let page: SubProductsPage = self.get_json(&path).await?;
             if page.products.is_empty() {
+                complete = true;
                 break;
             }
             for p in page.products {
@@ -628,10 +647,20 @@ impl HumbleClient {
             match page.cursor {
                 // trim() guards a whitespace-only cursor (won't come from JSON, but cheap + honest).
                 Some(c) if !c.trim().is_empty() => cursor = Some(c),
-                _ => break,
+                _ => {
+                    complete = true;
+                    break;
+                }
             }
         }
-        Ok(months)
+        if !complete {
+            tracing::warn!(
+                max_pages,
+                months = months.len(),
+                "choice_months hit the page cap with a cursor still pending — the month list is TRUNCATED, not the full history"
+            );
+        }
+        Ok(ChoiceMonthsWalk { months, complete })
     }
 
     /// Fetch the value for humble's double-submit CSRF pair. A page GET (sent with the session

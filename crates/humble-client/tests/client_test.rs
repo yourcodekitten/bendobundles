@@ -633,7 +633,9 @@ async fn choice_months_walks_the_cursor_pagination() {
         .mount(&server)
         .await;
 
-    let months = client(&server).await.choice_months(10).await.unwrap();
+    let walk = client(&server).await.choice_months(10).await.unwrap();
+    assert!(walk.complete); // reached the end (page 2 had no cursor)
+    let months = walk.months;
     assert_eq!(months.len(), 3);
     assert_eq!(months[0].product_machine_name, "march_2026_choice");
     assert!(months[0].is_active_content && !months[0].uses_choices);
@@ -682,7 +684,9 @@ async fn choice_months_base64url_cursor_round_trips_through_the_path() {
         .mount(&server)
         .await;
 
-    let months = client(&server).await.choice_months(10).await.unwrap();
+    let walk = client(&server).await.choice_months(10).await.unwrap();
+    assert!(walk.complete);
+    let months = walk.months;
     // Reaching page 2 (gk2) proves the base64url cursor round-tripped through the path unmangled.
     assert_eq!(months.len(), 2);
     assert_eq!(months[1].product_machine_name, "p2_choice");
@@ -706,7 +710,9 @@ async fn choice_months_single_page_no_cursor_stops() {
         .mount(&server)
         .await;
 
-    let months = client(&server).await.choice_months(10).await.unwrap();
+    let walk = client(&server).await.choice_months(10).await.unwrap();
+    assert!(walk.complete);
+    let months = walk.months;
     assert_eq!(months.len(), 1);
     assert_eq!(months[0].product_machine_name, "may_2021_choice");
 }
@@ -730,8 +736,10 @@ async fn choice_months_max_pages_bounds_a_nonstop_cursor() {
         .mount(&server)
         .await;
 
-    let months = client(&server).await.choice_months(3).await.unwrap();
-    assert_eq!(months.len(), 3); // exactly max_pages products, not an infinite spin
+    let walk = client(&server).await.choice_months(3).await.unwrap();
+    assert_eq!(walk.months.len(), 3); // exactly max_pages products, not an infinite spin
+    // The cap stopped the walk with a cursor still pending — the caller MUST know it's truncated.
+    assert!(!walk.complete);
 }
 
 #[tokio::test]
