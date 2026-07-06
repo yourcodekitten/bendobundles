@@ -66,7 +66,11 @@ pub struct Link {
     pub claims_allowed: u32,
     pub claims_used: u32,
     pub revoked: bool,
-    #[serde(with = "time::serde::rfc3339::option")]
+    // `with = rfc3339::option` replaces serde's whole Deserialize impl, which DISABLES the
+    // implicit missing-field-is-None behavior plain `Option` fields get — without `default`,
+    // a stored record lacking the field fails the entire deserialize (and one bad link body
+    // bricks a whole list read). `default` restores None-on-missing.
+    #[serde(default, with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -276,6 +280,30 @@ mod tests {
         let mut l = link();
         l.claims_used = 2;
         assert_eq!(l.can_claim(now), Err(ClaimRefusal::Exhausted));
+    }
+
+    #[test]
+    fn link_expires_at_missing_field_is_none_not_error() {
+        // A record written before the field existed (or hand-migrated without it): no
+        // `expires_at` key at all. `time::serde::rfc3339::option` alone would make this a
+        // hard deserialize error — `#[serde(default)]` must map it to None.
+        let mut json = serde_json::to_value(link()).unwrap();
+        json.as_object_mut().unwrap().remove("expires_at");
+        assert!(json.get("expires_at").is_none(), "field stripped");
+        let l: Link = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            l.expires_at, None,
+            "missing expires_at must default to None"
+        );
+
+        // present-and-null and present-and-set still roundtrip
+        let none_link = link();
+        let back: Link = serde_json::from_str(&serde_json::to_string(&none_link).unwrap()).unwrap();
+        assert_eq!(back, none_link);
+        let mut some_link = link();
+        some_link.expires_at = Some(datetime!(2026-08-01 00:00 UTC));
+        let back: Link = serde_json::from_str(&serde_json::to_string(&some_link).unwrap()).unwrap();
+        assert_eq!(back, some_link);
     }
 
     #[test]

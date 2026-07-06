@@ -275,6 +275,14 @@ async fn handle_post_claim(
                 Json(serde_json::json!({"error": "no claims left on this link"})),
             )
                 .into_response(),
+            // A concurrent claim raced this one at the DDB layer (TransactionConflict /
+            // TransactionInProgress). Nothing's wrong with this request — it just lost a
+            // timing coin-flip — so it's a retryable 409, not a 500.
+            ClaimTxError::TxConflict => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "someone else is claiming right now, try again"})),
+            )
+                .into_response(),
             // Should be unreachable with uuid v4, but map it loudly.
             ClaimTxError::DuplicateClaim => (
                 StatusCode::INTERNAL_SERVER_ERROR,
