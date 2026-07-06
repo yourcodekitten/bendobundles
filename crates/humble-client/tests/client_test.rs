@@ -3,12 +3,15 @@ use wiremock::matchers::{body_string_contains, header, method, path, query_param
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture(name: &str) -> serde_json::Value {
-    let raw = std::fs::read_to_string(format!(
+    serde_json::from_str(&fixture_str(name)).unwrap()
+}
+
+fn fixture_str(name: &str) -> String {
+    std::fs::read_to_string(format!(
         "{}/tests/fixtures/{name}",
         env!("CARGO_MANIFEST_DIR")
     ))
-    .unwrap();
-    serde_json::from_str(&raw).unwrap()
+    .unwrap()
 }
 
 async fn client(server: &MockServer) -> HumbleClient {
@@ -475,6 +478,114 @@ impl wiremock::Match for NoIsGift {
             .map(|b| b.contains("is_gift"))
             .unwrap_or(false)
     }
+}
+
+// ── Humble Choice: choice_month (read a month's offered games + state from the membership blob) ──
+
+#[tokio::test]
+async fn choice_month_parses_offered_games_and_state() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/membership/may-2021"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture_str("membership_may_2021.html"))
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let m = client(&server)
+        .await
+        .choice_month("may-2021")
+        .await
+        .unwrap();
+    assert_eq!(m.gamekey, "May21Gamekey00");
+    assert_eq!(m.title, "May 2021");
+    assert_eq!(m.product_url_path, "may-2021");
+    assert_eq!(m.product_machine_name, "may_2021_choice");
+    assert!(m.uses_choices);
+    assert!(!m.is_active_content);
+    assert!(m.can_redeem_games);
+    assert_eq!(m.total_choices, 12);
+    // Sorted by machine_name for stable order (the source is a JSON object / HashMap).
+    let games: Vec<(&str, &str)> = m
+        .offered_games
+        .iter()
+        .map(|g| (g.machine_name.as_str(), g.title.as_str()))
+        .collect();
+    assert_eq!(
+        games,
+        vec![
+            ("darksidersgenesis", "Darksiders Genesis"),
+            ("metroexodus", "Metro Exodus"),
+            ("relicta", "Relicta"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn choice_month_dead_session_is_unauthorized() {
+    let server = MockServer::start().await;
+    // A dead session serves the plain login page here — no webpack-monthly-product-data blob.
+    Mock::given(method("GET"))
+        .and(path("/membership/may-2021"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<!DOCTYPE html><html><body>please log in</body></html>")
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choice_month("may-2021")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Unauthorized));
+}
+
+#[tokio::test]
+async fn choice_month_403_is_unauthorized() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/membership/may-2021"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choice_month("may-2021")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Unauthorized));
+}
+
+#[tokio::test]
+async fn choice_month_malformed_blob_is_parse_error() {
+    let server = MockServer::start().await;
+    // The blob IS present (id matches) but its JSON is truncated/garbage — a distinct path from the
+    // dead-session no-blob case, and exactly what a `</script>`-truncation or early tag-cut produces.
+    Mock::given(method("GET"))
+        .and(path("/membership/may-2021"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(
+                    "<script id=\"webpack-monthly-product-data\">{ not valid json </script>",
+                )
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+
+    let err = client(&server)
+        .await
+        .choice_month("may-2021")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Parse(_)));
 }
 
 /// Matches when the `csrf-prevention-token` header value equals the `csrf_cookie` value inside

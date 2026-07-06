@@ -3,7 +3,7 @@
 mod model;
 
 use hmac::{Hmac, Mac};
-use model::{GamekeyEntry, OrderWire};
+use model::{GamekeyEntry, MembershipBlob, OrderWire};
 use sha1::Sha1;
 use wreq_util::Emulation;
 
@@ -119,6 +119,20 @@ fn extract_set_cookie(headers: &wreq::header::HeaderMap, name: &str) -> Option<S
         }
     }
     None
+}
+
+/// Pull the JSON payload out of an embedded `<script id="…">{…}</script>` blob (humble ships the
+/// Choice month's data server-side in `webpack-monthly-product-data`). Returns the inner text
+/// between the tag's `>` and its closing `</script>`. Tolerant of extra attributes and whitespace
+/// in the opening tag; returns `None` if the tag isn't present.
+fn extract_script_json<'a>(html: &'a str, id: &str) -> Option<&'a str> {
+    // Find `id="<id>"`, then the `>` that ends that opening <script ...> tag, then the next
+    // `</script>`. The blob is JSON, which never contains a literal `</script>`, so the first close
+    // is the right one.
+    let id_at = html.find(&format!("id=\"{id}\""))?;
+    let tag_end = html[id_at..].find('>')? + id_at + 1;
+    let close = html[tag_end..].find("</script>")? + tag_end;
+    Some(html[tag_end..close].trim())
 }
 
 /// Does a redeem response body carry humble's `login_required` gate marker? A gated (but healthy)
@@ -265,6 +279,30 @@ pub struct Subproduct {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GiftUrl(pub String);
+
+/// One Humble Choice month's offered games + claim state, read from its `/membership/<month>` page.
+/// `gamekey` links to the order (`order(gamekey)`) whose `all_tpks` hold the already-claimed keys —
+/// so "offered here, not yet in the order" = still claimable. `uses_choices=false` is the claim-all
+/// tier (every offered game is claimable); `true` is pick-N-of-`total_choices`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceMonth {
+    pub gamekey: String,
+    pub title: String,
+    pub product_url_path: String,
+    pub product_machine_name: String,
+    pub uses_choices: bool,
+    pub is_active_content: bool,
+    pub can_redeem_games: bool,
+    pub total_choices: u32,
+    /// Every game the month offers (machine_name + title), sorted by machine_name for stable order.
+    pub offered_games: Vec<OfferedGame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedGame {
+    pub machine_name: String,
+    pub title: String,
+}
 
 #[derive(serde::Deserialize)]
 struct RedeemResponse {
@@ -461,6 +499,66 @@ impl HumbleClient {
                     icon: s.icon,
                 })
                 .collect(),
+        })
+    }
+
+    /// GET a page as raw HTML text (for the membership pages that embed their data server-side).
+    /// Same auth + non-200 mapping as [`get_json`]; a dead session's 200-with-HTML login page is
+    /// caught by the callers (the membership blob won't be present → a parse error).
+    async fn get_html(&self, path: &str) -> Result<String, HumbleError> {
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base))
+            .header("Cookie", self.session_cookie())
+            .header("X-Requested-By", "hb_android_app")
+            .send()
+            .await?;
+        match resp.status().as_u16() {
+            200 => Ok(String::from_utf8_lossy(&resp.bytes().await?).into_owned()),
+            401 | 403 | 302 => Err(HumbleError::Unauthorized),
+            429 => Err(HumbleError::RateLimited),
+            s => Err(HumbleError::Api(s)),
+        }
+    }
+
+    /// Read one Humble Choice month's offered games + claim state from its `/membership/<month>`
+    /// page, which embeds the data in a `<script id="webpack-monthly-product-data">` blob — one GET,
+    /// no API auth dance. `month_url` is the slug, e.g. `"may-2021"` (a month's `product_url_path`).
+    ///
+    /// Cross-reference with `order(month.gamekey)`: a game OFFERED here but absent from that order's
+    /// `all_tpks` is still claimable (via `choose_content`); one present there is already claimed and
+    /// redeems through the existing key path.
+    pub async fn choice_month(&self, month_url: &str) -> Result<ChoiceMonth, HumbleError> {
+        let html = self.get_html(&format!("/membership/{month_url}")).await?;
+        let json = extract_script_json(&html, "webpack-monthly-product-data").ok_or_else(|| {
+            // A dead session serves the login page here (no blob); surface as Unauthorized so the
+            // caller's self-heal can kick in, same as a dead read elsewhere.
+            HumbleError::Unauthorized
+        })?;
+        let blob: MembershipBlob = serde_json::from_str(json).map_err(HumbleError::Parse)?;
+        let cco = blob.content_choice_options;
+        let mut offered_games: Vec<OfferedGame> = cco
+            .content_choice_data
+            .initial
+            .content_choices
+            .into_iter()
+            .map(|(machine_name, g)| OfferedGame {
+                machine_name,
+                title: g.title,
+            })
+            .collect();
+        // HashMap iteration order is nondeterministic — sort so the list (and any test/log) is stable.
+        offered_games.sort_by(|a, b| a.machine_name.cmp(&b.machine_name));
+        Ok(ChoiceMonth {
+            gamekey: cco.gamekey,
+            title: cco.title,
+            product_url_path: cco.product_url_path,
+            product_machine_name: cco.product_machine_name,
+            uses_choices: cco.uses_choices,
+            is_active_content: cco.is_active_content,
+            can_redeem_games: cco.can_redeem_games,
+            total_choices: cco.content_choice_data.initial.total_choices,
+            offered_games,
         })
     }
 
