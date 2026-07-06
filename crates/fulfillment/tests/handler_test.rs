@@ -1421,7 +1421,7 @@ fn tpk_json(machine_name: &str, human_name: &str, redeemed: bool) -> serde_json:
 }
 
 /// A `/api/v1/order/<gamekey>` body carrying the given tpks.
-fn order_json(gamekey: &str, tpks: serde_json::Value) -> serde_json::Value {
+fn choice_order_json(gamekey: &str, tpks: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "gamekey": gamekey,
         "product": { "human_name": "May 2026 Humble Choice" },
@@ -1522,7 +1522,8 @@ async fn choice_happy_path_chooses_then_redeems() {
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(order_json("gk", serde_json::json!([]))),
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
         )
         .up_to_n_times(1)
         .mount(&humble)
@@ -1530,7 +1531,7 @@ async fn choice_happy_path_chooses_then_redeems() {
     // Re-read: the freshly-minted tpk is present, unredeemed.
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
         )))
@@ -1612,7 +1613,7 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     // The order now shows the tpk present + unredeemed.
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
         )))
@@ -1680,7 +1681,8 @@ async fn choice_choose_refused_parks_without_redeeming() {
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(order_json("gk", serde_json::json!([]))),
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
         )
         .mount(&humble)
         .await;
@@ -1767,7 +1769,7 @@ async fn choice_double_choose_already_chosen_parks_with_snapshot() {
     // Pre-read carries an UNRELATED claimed tpk (so the pre-check doesn't title-match and resume).
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json("unrelated_choice_steam", "Some Other Game", true)]),
         )))
@@ -1823,7 +1825,7 @@ async fn choice_precheck_resumes_without_choosing() {
     // Pre-read already carries the game's key (human_name == title), unredeemed → resume.
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
         )))
@@ -1877,7 +1879,8 @@ async fn choice_5xx_after_choose_parks_then_reconcile_finishes() {
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(order_json("gk", serde_json::json!([]))),
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
         )
         .mount(&humble1)
         .await;
@@ -1910,7 +1913,7 @@ async fn choice_5xx_after_choose_parks_then_reconcile_finishes() {
     mount_gamekeys(&humble2, serde_json::json!([{ "gamekey": "gk" }])).await;
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
         )))
@@ -1958,7 +1961,8 @@ async fn reconcile_choice_not_spent_compensates() {
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(order_json("gk", serde_json::json!([]))),
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
         )
         .mount(&humble)
         .await;
@@ -2023,7 +2027,7 @@ async fn reconcile_choice_no_snapshot_compensates() {
     // Order even carries some unrelated tpk — irrelevant: no snapshot ⇒ choose never ran.
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json("unrelated_choice_steam", "Other Game", true)]),
         )))
@@ -2059,7 +2063,7 @@ async fn reconcile_choice_redeemed_unrecorded_pings_human() {
     // New tpk present AND redeemed → spent + burned, URL unrecorded.
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json(TPK_MN, TITLE, true)]),
         )))
@@ -2130,14 +2134,15 @@ async fn choice_ambiguous_multi_new_tpk_parks() {
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(order_json("gk", serde_json::json!([]))),
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
         )
         .up_to_n_times(1)
         .mount(&humble)
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([
                 tpk_json("alpha_choice_steam", "Alpha Game", false),
@@ -2199,14 +2204,15 @@ async fn choice_redeem_already_redeemed_is_not_compensated() {
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(order_json("gk", serde_json::json!([]))),
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
         )
         .up_to_n_times(1)
         .mount(&humble)
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_json(
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "gk",
             serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
         )))
