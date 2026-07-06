@@ -369,7 +369,7 @@ struct RedeemResponse {
     success: bool,
     #[serde(default)]
     giftkey: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "error_msg")]
     errormsg: Option<String>,
 }
 
@@ -382,7 +382,7 @@ struct RevealResponse {
     // hence Value, narrowed in the caller.
     #[serde(default)]
     key: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, alias = "error_msg")]
     errormsg: Option<String>,
 }
 
@@ -390,7 +390,7 @@ struct RevealResponse {
 struct ChooseResponse {
     // Same as RedeemResponse: a 200 body missing `success` is a parse error, not a silent failure.
     success: bool,
-    #[serde(default)]
+    #[serde(default, alias = "error_msg")]
     errormsg: Option<String>,
     // humble also returns `force_refresh: true`; we don't act on it (the caller re-reads the order
     // to see the newly-claimed key), so it's intentionally not deserialized.
