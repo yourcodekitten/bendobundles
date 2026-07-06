@@ -283,7 +283,6 @@ pub struct Subproduct {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GiftUrl(pub String);
 
-/// One Humble Choice month's offered games + claim state, read from its `/membership/<month>` page.
 /// One Humble Choice month's identity, claim-state, and offered games. Produced by both the
 /// single-month read [`choice_month`](HumbleClient::choice_month) (from the `/membership/<month>`
 /// blob) and the paginated list [`choice_months`](HumbleClient::choice_months) (from the
