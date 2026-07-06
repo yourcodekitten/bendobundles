@@ -1,5 +1,5 @@
 use humble_client::{HumbleClient, SessionCookie};
-use wiremock::matchers::{body_string_contains, header, method, path, query_param};
+use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn fixture(name: &str) -> serde_json::Value {
@@ -507,7 +507,7 @@ async fn choice_month_parses_offered_games_and_state() {
     assert!(m.uses_choices);
     assert!(!m.is_active_content);
     assert!(m.can_redeem_games);
-    assert_eq!(m.total_choices, 12);
+    assert_eq!(m.total_choices, Some(12));
     // Sorted by machine_name for stable order (the source is a JSON object / HashMap).
     let games: Vec<(&str, &str)> = m
         .offered_games
@@ -586,6 +586,174 @@ async fn choice_month_malformed_blob_is_parse_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::Parse(_)));
+}
+
+// ── Humble Choice: choice_months (paginated month enumeration via the cursor path segment) ───────
+
+#[tokio::test]
+async fn choice_months_walks_the_cursor_pagination() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    // Page 1 (bare path) → 2 months + a cursor "CURSOR2"; page 2 (path + cursor) → 1 month, no cursor.
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "cursor": "CURSOR2",
+            "products": [
+                {
+                    "gamekey": "gkMar26", "title": "March 2026", "productUrlPath": "march-2026",
+                    "productMachineName": "march_2026_choice", "usesChoices": false,
+                    "isActiveContent": true, "canRedeemGames": true,
+                    "contentChoiceData": { "game_data": { "gamea": { "title": "Game A" } } }
+                },
+                {
+                    "gamekey": "gkFeb26", "title": "February 2026", "productUrlPath": "february-2026",
+                    "productMachineName": "february_2026_choice", "usesChoices": true,
+                    "isActiveContent": false, "canRedeemGames": true,
+                    "contentChoiceData": { "game_data": {
+                        "gamec": { "title": "Game C" }, "gameb": { "title": "Game B" }
+                    } }
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/CURSOR2")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [
+                {
+                    "gamekey": "gkJan26", "title": "January 2026", "productUrlPath": "january-2026",
+                    "productMachineName": "january_2026_choice", "usesChoices": true,
+                    "isActiveContent": false, "canRedeemGames": true,
+                    "contentChoiceData": { "game_data": { "gamed": { "title": "Game D" } } }
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let walk = client(&server).await.choice_months(10).await.unwrap();
+    assert!(walk.complete); // reached the end (page 2 had no cursor)
+    let months = walk.months;
+    assert_eq!(months.len(), 3);
+    assert_eq!(months[0].product_machine_name, "march_2026_choice");
+    assert!(months[0].is_active_content && !months[0].uses_choices);
+    // February's offered games sorted by machine_name.
+    let feb = &months[1];
+    assert_eq!(feb.product_machine_name, "february_2026_choice");
+    let names: Vec<&str> = feb
+        .offered_games
+        .iter()
+        .map(|g| g.machine_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["gameb", "gamec"]);
+    assert_eq!(months[2].product_machine_name, "january_2026_choice");
+}
+
+#[tokio::test]
+async fn choice_months_base64url_cursor_round_trips_through_the_path() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    // A realistic cursor: base64URL alphabet (`-`, `_`) with `=` padding — must reach page 2
+    // VERBATIM (no mangling/encoding by the URL builder). This is the walk's one URL-safety bet.
+    let cursor = "Cn0KEgoF-c3RhcnQ_SCQiA0N==";
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "cursor": cursor,
+            "products": [{
+                "gamekey": "gk1", "title": "P1", "productUrlPath": "p1",
+                "productMachineName": "p1_choice", "usesChoices": false,
+                "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/{cursor}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [{
+                "gamekey": "gk2", "title": "P2", "productUrlPath": "p2",
+                "productMachineName": "p2_choice", "usesChoices": false,
+                "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let walk = client(&server).await.choice_months(10).await.unwrap();
+    assert!(walk.complete);
+    let months = walk.months;
+    // Reaching page 2 (gk2) proves the base64url cursor round-tripped through the path unmangled.
+    assert_eq!(months.len(), 2);
+    assert_eq!(months[1].product_machine_name, "p2_choice");
+    assert_eq!(months[1].total_choices, None); // list walk carries no pick budget
+}
+
+#[tokio::test]
+async fn choice_months_single_page_no_cursor_stops() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [{
+                "gamekey": "gkA", "title": "May 2021", "productUrlPath": "may-2021",
+                "productMachineName": "may_2021_choice", "usesChoices": true,
+                "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let walk = client(&server).await.choice_months(10).await.unwrap();
+    assert!(walk.complete);
+    let months = walk.months;
+    assert_eq!(months.len(), 1);
+    assert_eq!(months[0].product_machine_name, "may_2021_choice");
+}
+
+#[tokio::test]
+async fn choice_months_max_pages_bounds_a_nonstop_cursor() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    // Every page hands back a cursor and a product — the max_pages bound must stop the walk.
+    Mock::given(method("GET"))
+        .and(path_regex(format!("^{BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "cursor": "SAME",
+            "products": [{
+                "gamekey": "gkX", "title": "X", "productUrlPath": "x",
+                "productMachineName": "x_choice", "usesChoices": false,
+                "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let walk = client(&server).await.choice_months(3).await.unwrap();
+    assert_eq!(walk.months.len(), 3); // exactly max_pages products, not an infinite spin
+    // The cap stopped the walk with a cursor still pending — the caller MUST know it's truncated.
+    assert!(!walk.complete);
+}
+
+#[tokio::test]
+async fn choice_months_dead_session_is_unauthorized() {
+    let server = MockServer::start().await;
+    const BASE: &str = "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+    Mock::given(method("GET"))
+        .and(path(format!("{BASE}/")))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).await.choice_months(10).await.unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::Unauthorized));
 }
 
 /// Matches when the `csrf-prevention-token` header value equals the `csrf_cookie` value inside

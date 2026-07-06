@@ -95,3 +95,43 @@ pub(crate) struct ContentChoiceGame {
     #[serde(default)]
     pub title: String,
 }
+
+// ── Humble Choice: the paginated month list ──────────────────────────────────────────────────────
+// GET /api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys/<cursor>
+// Cursor is an opaque token in the URL PATH (not a query param); each response hands back the next
+// page's cursor. 3 months/page, newest-first; terminate when `cursor` is absent/empty.
+
+#[derive(Deserialize)]
+pub(crate) struct SubProductsPage {
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub products: Vec<SubProductWire>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SubProductWire {
+    pub gamekey: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "productUrlPath")]
+    pub product_url_path: String,
+    #[serde(rename = "productMachineName")]
+    pub product_machine_name: String,
+    #[serde(default, rename = "usesChoices")]
+    pub uses_choices: bool,
+    #[serde(default, rename = "isActiveContent")]
+    pub is_active_content: bool,
+    #[serde(default, rename = "canRedeemGames")]
+    pub can_redeem_games: bool,
+    #[serde(default, rename = "contentChoiceData")]
+    pub content_choice_data: SubContentChoiceData,
+}
+
+/// The subscription endpoint nests offered games under `contentChoiceData.game_data` (a
+/// machine_name→game map) — distinct from the membership blob's `contentChoiceData.initial`.
+#[derive(Deserialize, Default)]
+pub(crate) struct SubContentChoiceData {
+    #[serde(default)]
+    pub game_data: std::collections::HashMap<String, ContentChoiceGame>,
+}
