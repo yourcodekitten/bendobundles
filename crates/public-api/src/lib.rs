@@ -304,6 +304,9 @@ async fn handle_post_claim(
         gamekey: game.gamekey,
         machine_name: game.machine_name,
         keyindex: game.keyindex,
+        // Rides the same freshly-read Game as gamekey/machine_name — one trust boundary. A choice
+        // game flips fulfillment to the choose-then-redeem orchestration.
+        requires_choice: game.requires_choice,
     };
 
     let gift_result = s.invoker.gift(fulfill_req).await;

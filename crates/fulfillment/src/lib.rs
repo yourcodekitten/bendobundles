@@ -9,9 +9,9 @@
 //! variant is a compile error until someone consciously picks its decision — the invariant can't
 //! silently rot.
 
-use domain::Game;
+use domain::{Claim, Game};
 use dynamo::{Store, SyncBegin, SyncState, SyncWrite};
-use humble_client::{GiftUrl, HumbleClient, HumbleError};
+use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -32,8 +32,17 @@ pub enum FulfillRequest {
         link_token: String,
         game_id: String,
         gamekey: String,
+        /// Bundle game: the key's tpk machine_name. Choice game (`requires_choice=true`): the
+        /// OFFERED game's id, the identifier fed to `choosecontent` — there is no tpk yet.
         machine_name: String,
+        /// Bundle game: the tpk's key index. Meaningless on a choice game (no key yet) — ignored on
+        /// that path (the real keyindex is read off the post-choose order's new tpk).
         keyindex: u32,
+        /// `true` ⇒ dispatch the two-write Choice orchestration (spend a monthly pick via
+        /// `choosecontent`, THEN redeem the freshly-minted key). `#[serde(default)]` keeps every
+        /// existing (bundle) Gift payload wire-valid — absent reads back `false`.
+        #[serde(default)]
+        requires_choice: bool,
     },
     Sync,
     /// MANUAL-INVOKE-ONLY diagnostic since the cookie-paste teardown. Its only in-app sender was
@@ -123,6 +132,104 @@ pub fn gift_decision(outcome: &Result<GiftUrl, HumbleError>) -> Decision {
             HumbleError::Network(_) => Decision::Park,
             HumbleError::Parse(_) => Decision::Park,
         },
+    }
+}
+
+/// Map a Humble Choice `choosecontent` (pick-spend) outcome to a [`Decision`]. Pure: no I/O, no
+/// panics, exhaustive — a sibling of [`gift_decision`] with NO catch-all `_` arm, so a new
+/// `HumbleError` variant is a compile error until it's consciously classified.
+///
+/// The whole double-spend prevention rests on ONE property of this map: **no arm produces
+/// `Compensate`.** A `choosecontent` outcome can NEVER prove a pick was NOT spent well enough to
+/// justify returning the monthly slot here — the ambiguous outcomes (`Api`/`Network`/`Parse`) may
+/// follow a pick humble already committed. Compensation for a choice claim happens ONLY in
+/// reconcile, and ONLY where the order diff PROVES no pick was spent (§3 A/B1). So:
+/// - `Ok(())` ⇒ pick spent ⇒ `Record` (read as "proceed to the re-read + redeem").
+/// - `Unauthorized` ⇒ dead session (200-HTML interstitial, provably no spend) ⇒ `ParkCookieDead`.
+/// - everything else ⇒ `Park`. A blind re-choose on the ambiguous ones IS the double-spend bug this
+///   design exists to prevent, so they park and let reconcile's diff (not the error) decide.
+pub fn choose_decision(outcome: &Result<(), HumbleError>) -> Decision {
+    match outcome {
+        // Pick spent — proceed to re-read the order and redeem the new key.
+        Ok(()) => Decision::Record,
+        Err(err) => match err {
+            // A dead session answers `choosecontent` with the 200-with-HTML login interstitial
+            // (decode_body → Unauthorized) BEFORE the handler runs — provably no pick spent. Same
+            // dead-cookie treatment as the gift path.
+            HumbleError::Unauthorized => Decision::ParkCookieDead,
+            // Step-up gate never cleared: the choose handler runs BEHIND the gate, so no pick was
+            // spent. Park (distinct ping in the executor), never compensate.
+            HumbleError::SecureAreaStepUpFailed { .. } => Decision::Park,
+            // `success=false` / auth-CSRF-layer reject: PROVABLY no pick spent THIS attempt. Still
+            // park, never compensate: an earlier duplicate attempt may already have spent the pick
+            // ("already chosen"), and only reconcile's order diff can tell. Parking also avoids a
+            // silent daily loop on a genuine "no picks left".
+            HumbleError::ChooseFailed { .. } => Decision::Park,
+            // Rate-limited (429): almost certainly not spent, but unproven → park; reconcile decides.
+            HumbleError::RateLimited => Decision::Park,
+            // THE dangerous trio — an ambiguous status/transport/parse failure can follow a pick
+            // humble already COMMITTED. Pick state is UNKNOWN, so park and let reconcile's diff
+            // resolve it; a blind re-choose here would double-spend.
+            HumbleError::Api(_) => Decision::Park,
+            HumbleError::Network(_) => Decision::Park,
+            HumbleError::Parse(_) => Decision::Park,
+            // login() is the self-heal path, never a choose outcome — but the match is exhaustive:
+            // no session ⇒ no choose ⇒ park.
+            HumbleError::LoginFailed { .. } => Decision::Park,
+            // Not constructible from a `choosecontent` call (these are redeem-write outcomes), but
+            // classified for exhaustiveness. None of them may compensate a choice claim.
+            HumbleError::AlreadyRedeemed => Decision::Park,
+            HumbleError::RedeemAuthRejected { .. } => Decision::Park,
+            HumbleError::RedeemRefused(_) => Decision::Park,
+            HumbleError::AmbiguousRedeem => Decision::Park,
+        },
+    }
+}
+
+/// The outcome of diffing a post-`choosecontent` order against the pre-choose snapshot: which new
+/// tpk (if any) is the key the pick just minted. Pure; produced by [`find_new_tpk`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum TpkPick<'a> {
+    /// Exactly one tpk to burn was identified (either a single new tpk, or an exact-title match
+    /// among several) — safe to redeem.
+    Unique(&'a KeyEntry),
+    /// No new tpk appeared. Either the choose has not committed yet (eventual consistency / a crash
+    /// mid-write) or it never spent a pick. NEVER re-choose — reconcile owns the resolution.
+    None,
+    /// More than one new tpk appeared and the exact title can't single one out (a concurrent
+    /// sibling claim on the same month). A human must disambiguate — never guess which key to burn.
+    Ambiguous,
+}
+
+/// Diff a freshly-read order against the pre-choose snapshot to find the tpk a `choosecontent` just
+/// minted. Pure. `new = order.keys \ pre` (by `machine_name`):
+/// - exactly one new tpk ⇒ `Unique` (the common happy path: one pick, one new key);
+/// - zero new ⇒ `None`;
+/// - two-or-more new ⇒ split by an EXACT case-insensitive `human_name == title` match (exactly one
+///   match ⇒ `Unique`, else `Ambiguous`). Exact-only: when the output is "which real key to burn",
+///   a prefix/fuzzy guess is unacceptable.
+pub fn find_new_tpk<'a>(order: &'a Order, pre: &[String], title: &str) -> TpkPick<'a> {
+    let pre_set: std::collections::HashSet<&str> = pre.iter().map(String::as_str).collect();
+    let new: Vec<&KeyEntry> = order
+        .keys
+        .iter()
+        .filter(|k| !pre_set.contains(k.machine_name.as_str()))
+        .collect();
+    match new.len() {
+        0 => TpkPick::None,
+        1 => TpkPick::Unique(new[0]),
+        _ => {
+            let exact: Vec<&KeyEntry> = new
+                .iter()
+                .copied()
+                .filter(|k| k.human_name.eq_ignore_ascii_case(title))
+                .collect();
+            if exact.len() == 1 {
+                TpkPick::Unique(exact[0])
+            } else {
+                TpkPick::Ambiguous
+            }
+        }
     }
 }
 
@@ -257,24 +364,39 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
             gamekey,
             machine_name,
             keyindex,
+            requires_choice,
         } => {
             tracing::info!(
                 claim_id,
                 game_id,
                 machine_name,
                 keyindex,
+                requires_choice,
                 "fulfillment: gift request"
             );
-            handle_gift(
-                deps,
-                &claim_id,
-                &link_token,
-                &game_id,
-                &gamekey,
-                &machine_name,
-                keyindex,
-            )
-            .await
+            if requires_choice {
+                // Choice game: machine_name carries the OFFERED id; there's no tpk/keyindex yet.
+                handle_gift_choice(
+                    deps,
+                    &claim_id,
+                    &link_token,
+                    &game_id,
+                    &gamekey,
+                    &machine_name,
+                )
+                .await
+            } else {
+                handle_gift(
+                    deps,
+                    &claim_id,
+                    &link_token,
+                    &game_id,
+                    &gamekey,
+                    &machine_name,
+                    keyindex,
+                )
+                .await
+            }
         }
         FulfillRequest::Sync => handle_sync(deps).await,
         FulfillRequest::ValidateCookie => handle_validate_cookie(deps).await,
@@ -449,6 +571,546 @@ async fn handle_gift(
                 reason: format!("humble call inconclusive: park for reconcile ({detail})"),
             }
         }
+    }
+}
+
+/// The Humble Choice gift orchestration: a TWO-write one-shot that must spend a monthly pick
+/// exactly once. Sibling of [`handle_gift`], dispatched when `requires_choice` is set.
+///
+/// The whole design turns on ONE durable write ordering: the pre-choose snapshot
+/// ([`Store::record_choice_intent`]) is made durable BEFORE `choosecontent` runs (step 3 before
+/// step 4). That snapshot is the crash-recovery hinge — its presence/absence lets reconcile decide
+/// whether a pick could have been spent WITHOUT ever re-choosing. Nothing on this path ever
+/// compensates: a spent pick can't be un-spent, and the ambiguous choose failures may have
+/// committed, so reconcile (reading the order diff, not the error) owns every uncertain outcome.
+///
+/// Entry state (like `handle_gift`): `claim_game` already created a durable `Pending` claim with
+/// its reconcile marker, so a crash at ANY step below leaves a claim reconcile will finish — no
+/// extra "park write" is ever needed; parking = returning without fulfilling.
+async fn handle_gift_choice(
+    deps: &Deps,
+    claim_id: &str,
+    link_token: &str,
+    game_id: &str,
+    gamekey: &str,
+    offered_id: &str,
+) -> FulfillResponse {
+    let selfheal = deps.session_store.is_some();
+    // One self-login per invoke, total (mirrors run_sync's one-heal-per-run cap): every humble call
+    // below passes `selfheal && !healed`, and any heal flips this.
+    let mut healed = false;
+
+    // The friend-facing title is needed for the pre-check (step 2) and find_new_tpk's disambiguation
+    // (step 5). The Gift wire doesn't carry it, so read the game once — cheap, and a choice claim is
+    // rare. (§1.1's blessed alternative: a single store read on this path.)
+    let title = match deps.store.get_game(game_id).await {
+        Ok(Some(g)) => g.title,
+        _ => {
+            tracing::warn!(
+                claim_id,
+                game_id,
+                "choice: game missing at fulfillment — parking"
+            );
+            return parked_choice("game-missing");
+        }
+    };
+
+    // ── Step 1: pre-read the month order (self-heal like handle_gift). ──────────────────────────
+    let (heal, read) =
+        selfheal_once(deps, selfheal && !healed, || deps.humble.order(gamekey)).await;
+    if let Some(h) = heal {
+        healed = true;
+        if !matches!(read, Err(HumbleError::Unauthorized)) {
+            set_cookie_ok(deps, h.durable()).await;
+        }
+    }
+    let pre_order = match read {
+        Ok(o) => o,
+        Err(HumbleError::Unauthorized) => return choice_cookie_dead(deps).await,
+        Err(e) => {
+            tracing::warn!(claim_id, error = ?e, "choice pre-read order failed — parking (no spend)");
+            return parked_choice("pre-read");
+        }
+    };
+
+    // ── Step 2: best-effort pre-check — is this game already claimed on humble? ──────────────────
+    // EXACT case-insensitive title vs a claimed tpk's human_name. A match means a prior crash (or a
+    // stale sync) already spent this game's pick, so we must NOT choose again — resume from the
+    // existing key (idempotent), or hand to a human if it's already redeemed.
+    if let Some(existing) = pre_order
+        .keys
+        .iter()
+        .find(|k| k.human_name.eq_ignore_ascii_case(&title))
+    {
+        if existing.redeemed {
+            tracing::warn!(
+                claim_id,
+                "choice pre-check: game already claimed AND redeemed on humble — human recovery"
+            );
+            ping(
+                deps,
+                &format!(
+                    "choice claim {claim_id} ({title}): this game's pick appears already claimed AND \
+                     redeemed on humble — no re-choose was attempted. Recover the gift URL from \
+                     humble's gift-history page; the claim is parked."
+                ),
+            )
+            .await;
+            return parked_choice("already-claimed-redeemed");
+        }
+        tracing::info!(
+            claim_id,
+            "choice pre-check: pick already spent (tpk present, unredeemed) — resuming to redeem WITHOUT choosing"
+        );
+        // Resume: the pick was already spent; skip the choose entirely and redeem the key that is
+        // already sitting in the order. No intent snapshot needed — nothing new will be chosen.
+        return redeem_claimed_tpk(
+            deps,
+            claim_id,
+            link_token,
+            game_id,
+            gamekey,
+            existing,
+            selfheal && !healed,
+        )
+        .await;
+    }
+
+    // ── Step 3: persist the intent snapshot BEFORE the choose (the crash-recovery hinge). ───────
+    let pre_tpks: Vec<String> = pre_order
+        .keys
+        .iter()
+        .map(|k| k.machine_name.clone())
+        .collect();
+    if let Err(e) = deps
+        .store
+        .record_choice_intent(link_token, claim_id, pre_tpks.clone())
+        .await
+    {
+        // Snapshot didn't land ⇒ do NOT choose. Reconcile will read `choice_pre_tpks == None` and
+        // safely compensate (choose provably never ran).
+        tracing::warn!(claim_id, error = ?e, "choice: intent snapshot failed to persist BEFORE choose — parking, NOT choosing");
+        return parked_choice("intent-write");
+    }
+
+    // ── Step 4: HUMBLE WRITE 1 — spend the pick. ────────────────────────────────────────────────
+    // Bind the chosen slice in-scope: `selfheal_once`'s Fn closure may call twice (heal-retry), so
+    // the borrowed slice must outlive both calls.
+    let chosen: [&str; 1] = [offered_id];
+    let (heal, choose_outcome) = selfheal_once(deps, selfheal && !healed, || {
+        deps.humble.choose_content(gamekey, &chosen, true)
+    })
+    .await;
+    let decision = choose_decision(&choose_outcome);
+    if let Some(h) = heal {
+        healed = true;
+        if decision != Decision::ParkCookieDead {
+            set_cookie_ok(deps, h.durable()).await;
+        }
+    }
+    match decision {
+        // Pick spent — fall through to the re-read + redeem.
+        Decision::Record => {}
+        Decision::ParkCookieDead => return choice_cookie_dead(deps).await,
+        // NEVER compensate at choose time (choose_decision has no Compensate arm). Park; reconcile
+        // resolves from the order diff. Distinct pings for the loop-forever failure classes.
+        Decision::Park | Decision::Compensate => {
+            return choose_park(deps, claim_id, &title, &choose_outcome).await;
+        }
+    }
+
+    // ── Step 5: re-read the order and find the newly-minted tpk. ────────────────────────────────
+    let (heal, read) =
+        selfheal_once(deps, selfheal && !healed, || deps.humble.order(gamekey)).await;
+    if let Some(h) = heal {
+        healed = true;
+        if !matches!(read, Err(HumbleError::Unauthorized)) {
+            set_cookie_ok(deps, h.durable()).await;
+        }
+    }
+    let post_order = match read {
+        Ok(o) => o,
+        Err(HumbleError::Unauthorized) => return choice_cookie_dead(deps).await,
+        Err(e) => {
+            // Pick spent, key not yet burned, tpk unknown THIS invoke = the crash-between-writes
+            // state. Park; reconcile finishes from the snapshot — and NEVER re-chooses.
+            tracing::warn!(claim_id, error = ?e, "choice re-read after choose failed — parking; reconcile finishes (no re-choose)");
+            return parked_choice("re-read");
+        }
+    };
+    let tpk = match find_new_tpk(&post_order, &pre_tpks, &title) {
+        TpkPick::Unique(t) => t,
+        TpkPick::None => {
+            // Choose said ok but no new tpk yet (eventual consistency / drift). Park; reconcile
+            // finishes when the key materializes. NEVER re-choose.
+            tracing::warn!(
+                claim_id,
+                "choose committed but no new tpk in the re-read — parking; reconcile finishes (no re-choose)"
+            );
+            ping(
+                deps,
+                &format!(
+                    "choice claim {claim_id} ({title}): the monthly pick was spent but the new key \
+                     hasn't appeared in the order yet — parked, reconcile will finish it. No pick \
+                     will be spent twice."
+                ),
+            )
+            .await;
+            return parked_choice("no-tpk-yet");
+        }
+        TpkPick::Ambiguous => {
+            tracing::warn!(
+                claim_id,
+                "ambiguous new tpks after choose — parking for human review"
+            );
+            ping(
+                deps,
+                &format!(
+                    "choice claim {claim_id} ({title}): several new keys appeared after the choose \
+                     and the title can't single one out (a concurrent sibling claim on this month?) \
+                     — parked for review. No key was burned."
+                ),
+            )
+            .await;
+            return parked_choice("ambiguous-tpk");
+        }
+    };
+
+    // ── Steps 6 + 7: HUMBLE WRITE 2 — burn the tpk to a gift, record the URL (shared tail). ─────
+    redeem_claimed_tpk(
+        deps,
+        claim_id,
+        link_token,
+        game_id,
+        gamekey,
+        tpk,
+        selfheal && !healed,
+    )
+    .await
+}
+
+/// The shared "redeem a now-present choice tpk and record its gift URL" tail, called by BOTH the
+/// happy path (step 6) AND reconcile's B2 branch — one body so those two can never drift. It burns
+/// `tpk.machine_name` VERBATIM as the keytype (read off the post-choose order, never constructed)
+/// via `redeem_as_gift(gamekey, machine_name, keyindex)`.
+///
+/// Classification reuses [`gift_decision`]; the executor mirrors `handle_gift` with ONE Choice
+/// override: a `Compensate`/`AlreadyRedeemed` outcome does NOT compensate. The monthly pick is
+/// already spent; re-listing the game would strand that pick (a re-claim just `ChooseFailed`-parks)
+/// and could orphan a real gift URL from a crashed prior redeem — so it parks for human recovery,
+/// the same shape as reconcile B3.
+///
+/// `allow_heal` caps the shared one-heal ladder: the happy path passes `selfheal && !healed`;
+/// reconcile passes `false` (its order read just proved the session live this pass — a dead-session
+/// redeem here simply leaves the claim Pending for the next sync, which heals via the listing).
+async fn redeem_claimed_tpk(
+    deps: &Deps,
+    claim_id: &str,
+    link_token: &str,
+    game_id: &str,
+    gamekey: &str,
+    tpk: &KeyEntry,
+    allow_heal: bool,
+) -> FulfillResponse {
+    let (heal, outcome) = selfheal_once(deps, allow_heal, || {
+        deps.humble
+            .redeem_as_gift(gamekey, &tpk.machine_name, tpk.keyindex)
+    })
+    .await;
+    if let Err(e) = &outcome {
+        tracing::warn!(claim_id, game_id, error = ?e, "choice gift redeem did not return a URL");
+    } else {
+        tracing::info!(claim_id, game_id, "choice gift redeem returned a URL");
+    }
+    let decision = gift_decision(&outcome);
+    if let Some(h) = heal
+        && decision != Decision::ParkCookieDead
+    {
+        set_cookie_ok(deps, h.durable()).await;
+    }
+    match decision {
+        Decision::Record => match outcome {
+            Ok(GiftUrl(url)) => {
+                match deps
+                    .store
+                    .fulfill_claim(link_token, claim_id, game_id, &url)
+                    .await
+                {
+                    Ok(()) => FulfillResponse::GiftUrl { url },
+                    Err(e) => {
+                        ping(
+                            deps,
+                            &format!(
+                                "fulfill after choice redeem failed for claim {claim_id}: {e} — \
+                                 gift URL was generated but not recorded — recover it from humble's \
+                                 gift history page (purchases → the order → gift link)"
+                            ),
+                        )
+                        .await;
+                        FulfillResponse::Error {
+                            message: "gift generated but recording failed — flagged for ben".into(),
+                        }
+                    }
+                }
+            }
+            // gift_decision guarantees Record ⇒ Ok; unreachable, handled without panic.
+            Err(_) => FulfillResponse::Error {
+                message: "internal: record decision without a gift url".into(),
+            },
+        },
+        // CHOICE OVERRIDE (§5.3): the pick is spent — NEVER compensate. Park for human recovery,
+        // identical to reconcile B3 (spent-and-burned, URL unrecorded).
+        Decision::Compensate => {
+            tracing::warn!(
+                claim_id,
+                game_id,
+                "choice redeem returned AlreadyRedeemed — pick already spent, NOT compensating; human recovery"
+            );
+            ping(
+                deps,
+                &format!(
+                    "choice claim {claim_id} redeem returned already-redeemed — the monthly pick was \
+                     already spent, so this claim was NOT compensated (re-listing would strand the \
+                     pick). Recover the gift URL from humble's gift-history page; claim parked."
+                ),
+            )
+            .await;
+            FulfillResponse::Parked {
+                reason: "choice key already redeemed — parked for human recovery".into(),
+            }
+        }
+        Decision::ParkCookieDead => choice_cookie_dead(deps).await,
+        // Ambiguous/refused → park (never compensate blind); distinct pings for the loop-forever
+        // classes, mirroring handle_gift.
+        Decision::Park => {
+            let detail = match &outcome {
+                Err(HumbleError::RedeemRefused(_)) => "refused",
+                Err(HumbleError::AmbiguousRedeem) => "ambiguous",
+                Err(HumbleError::RateLimited) => "rate-limited",
+                Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
+                Err(HumbleError::SecureAreaStepUpFailed { .. }) => "secure-area-step-up-failed",
+                _ => "transient",
+            };
+            if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
+                ping(
+                    deps,
+                    &format!(
+                        "choice gift redeem for claim {claim_id} ({}) needed humble's secure-area \
+                         step-up and it did not complete: {reason}. The key was NOT redeemed — the \
+                         claim is parked and reconcile will finish it.",
+                        tpk.machine_name
+                    ),
+                )
+                .await;
+            }
+            if let Err(HumbleError::RedeemAuthRejected {
+                status,
+                csrf_minted,
+            }) = &outcome
+            {
+                let csrf_note = if *csrf_minted {
+                    "csrf capture FAILED (minted fallback used) — the preflight isn't yielding a cookie"
+                } else {
+                    "humble rejected its own captured csrf token — the write dance needs a look"
+                };
+                ping(
+                    deps,
+                    &format!(
+                        "choice gift redeem for claim {claim_id} ({}) was blocked at humble's auth \
+                         layer (status {status}). {csrf_note}. The session cookie is fine (reads \
+                         work). The claim is parked; reconcile will finish it once the write path is \
+                         fixed.",
+                        tpk.machine_name
+                    ),
+                )
+                .await;
+            }
+            FulfillResponse::Parked {
+                reason: format!("humble call inconclusive: park for reconcile ({detail})"),
+            }
+        }
+    }
+}
+
+/// Park a choice claim after a dead-session signal on one of its order reads / the choose
+/// interstitial: flag `cookie_ok=false`, ping, return Parked — the same treatment `handle_gift`'s
+/// ParkCookieDead arm applies. No pick can have been spent on this path (an `Unauthorized` choose is
+/// the pre-handler interstitial), so reconcile stays safe.
+async fn choice_cookie_dead(deps: &Deps) -> FulfillResponse {
+    set_cookie_ok(deps, false).await;
+    let msg = if deps.session_store.is_some() {
+        COOKIE_DEAD_SELFHEAL_MSG
+    } else {
+        COOKIE_DEAD_MSG
+    };
+    ping(deps, msg).await;
+    FulfillResponse::Parked {
+        reason: "humble session needs attention".into(),
+    }
+}
+
+/// Park after a non-cookie-dead `choosecontent` failure. NEVER compensates (a pick may already be
+/// spent; only reconcile's diff can tell). Pings distinctly for the failure classes that would
+/// otherwise loop silently (step-up gate, a `success=false` refusal). The ambiguous
+/// `Api`/`Network`/`Parse`/`RateLimited` outcomes stay quiet — reconcile resolves them next pass.
+async fn choose_park(
+    deps: &Deps,
+    claim_id: &str,
+    title: &str,
+    outcome: &Result<(), HumbleError>,
+) -> FulfillResponse {
+    let detail = match outcome {
+        Err(HumbleError::ChooseFailed { .. }) => "choose-refused",
+        Err(HumbleError::SecureAreaStepUpFailed { .. }) => "secure-area-step-up-failed",
+        Err(HumbleError::RateLimited) => "rate-limited",
+        Err(HumbleError::Api(_)) => "ambiguous-api",
+        Err(HumbleError::Network(_)) => "ambiguous-network",
+        Err(HumbleError::Parse(_)) => "ambiguous-parse",
+        _ => "transient",
+    };
+    if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = outcome {
+        ping(
+            deps,
+            &format!(
+                "choice claim {claim_id} ({title}): choosecontent needed humble's secure-area \
+                 step-up and it did not complete: {reason}. No pick was spent — the claim is parked."
+            ),
+        )
+        .await;
+    }
+    if let Err(HumbleError::ChooseFailed { reason }) = outcome {
+        ping(
+            deps,
+            &format!(
+                "choice claim {claim_id} ({title}): humble refused the pick (choosecontent \
+                 success=false): {reason}. No pick was spent this attempt — the claim is parked \
+                 (reconcile will compensate if the order confirms nothing was claimed)."
+            ),
+        )
+        .await;
+    }
+    FulfillResponse::Parked {
+        reason: format!("choice choose inconclusive: park for reconcile ({detail})"),
+    }
+}
+
+/// A plain choice-claim park (no ping, no cookie flag) — the claim stays `Pending` and reconcile
+/// owns its fate. Used for the pure-transient / pre-read / re-read / snapshot-write parks.
+fn parked_choice(detail: &str) -> FulfillResponse {
+    FulfillResponse::Parked {
+        reason: format!("choice fulfillment inconclusive: park for reconcile ({detail})"),
+    }
+}
+
+/// The choice branch of [`reconcile`]. Called for an aged `Pending` claim whose game
+/// `requires_choice`, with a fresh `order`. Decides PURELY from the intent snapshot + the order
+/// diff — it must NEVER call `choose_content` on any branch, and must not even take the offered id
+/// (there is no choose argument here by construction). Compensation happens ONLY where the diff
+/// PROVES no pick was spent (A / B1).
+async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: &Order) {
+    match &claim.choice_pre_tpks {
+        // A. No snapshot ⇒ the intent write never landed ⇒ choose was NEVER attempted (write order
+        // §2.3) ⇒ pick NOT spent ⇒ compensate (slot returns, game re-lists). Same shape as the
+        // bundle "not redeemed → compensate" arm.
+        None => {
+            tracing::info!(claim_id = %claim.id, "reconcile(choice): no intent snapshot — choose never ran, compensating (no pick spent)");
+            let _ = deps
+                .store
+                .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
+                .await;
+            ping(
+                deps,
+                &format!(
+                    "reconcile compensated choice claim {} ({}) — no choose intent was ever \
+                     recorded, so the monthly pick was NOT spent — slot returned, game re-listed.",
+                    claim.id, game.title
+                ),
+            )
+            .await;
+        }
+        Some(pre) => match find_new_tpk(order, pre, &game.title) {
+            // B1. Snapshot present but no new tpk (and no exact-title match) ⇒ the choose did not
+            // commit ⇒ pick NOT spent ⇒ compensate. Hard backstop against a mis-decided ambiguous
+            // choose: a re-list → re-claim → re-choose of the same game is REFUSED by humble
+            // ("already chosen" → ChooseFailed → park), so no pick is ever double-spent — the
+            // residual is churn + pings, never value.
+            TpkPick::None => {
+                tracing::info!(claim_id = %claim.id, "reconcile(choice): snapshot present, no new tpk — choose did not commit, compensating (no pick spent)");
+                let _ = deps
+                    .store
+                    .compensate_claim(&claim.link_token, &claim.id, &claim.game_id)
+                    .await;
+                ping(
+                    deps,
+                    &format!(
+                        "reconcile compensated choice claim {} ({}) — a choose intent was recorded \
+                         but no new key ever appeared, so the pick was NOT spent — slot returned, \
+                         game re-listed. (If humble later shows the pick spent, its re-choose \
+                         refusal is the backstop — no double-spend.)",
+                        claim.id, game.title
+                    ),
+                )
+                .await;
+            }
+            // B2. Unique new tpk, NOT redeemed ⇒ pick SPENT, key not yet burned (crash between the
+            // two writes) ⇒ redeem it and complete the claim FROM RECONCILE — never choosing.
+            // allow_heal=false: this pass's order read just proved the session live; a dead-session
+            // redeem here simply leaves the claim Pending for the next sync (which heals + retries).
+            TpkPick::Unique(tpk) if !tpk.redeemed => {
+                tracing::info!(claim_id = %claim.id, "reconcile(choice): pick spent, key present + unredeemed — redeeming from reconcile (NO choose)");
+                let resp = redeem_claimed_tpk(
+                    deps,
+                    &claim.id,
+                    &claim.link_token,
+                    &claim.game_id,
+                    &order.gamekey,
+                    tpk,
+                    false,
+                )
+                .await;
+                match resp {
+                    FulfillResponse::GiftUrl { .. } => {
+                        tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
+                    }
+                    other => {
+                        // Any non-success just leaves the claim Pending for the next pass (the
+                        // executor already pinged the loud classes / handled AlreadyRedeemed → B3).
+                        tracing::warn!(claim_id = %claim.id, ?other, "reconcile(choice): redeem did not complete — claim stays pending for the next pass");
+                    }
+                }
+            }
+            // B3. Unique new tpk, ALREADY redeemed ⇒ pick spent AND key burned, URL unrecorded
+            // (crash after write 2, or ben self-redeemed) ⇒ leave Pending + human-recover ping,
+            // verbatim the existing bundle redeemed arm. NEVER a key value in the ping.
+            TpkPick::Unique(_tpk) => {
+                tracing::warn!(claim_id = %claim.id, "reconcile(choice): key present but already redeemed — human recovery (URL unrecorded)");
+                ping(
+                    deps,
+                    &format!(
+                        "choice claim {} ({}) shows its key already redeemed on humble but no gift \
+                         URL was recorded — recover it manually from humble's gift-history page. \
+                         Claim left pending.",
+                        claim.id, game.title
+                    ),
+                )
+                .await;
+            }
+            // B4. Two-or-more new tpks the title can't split (concurrent sibling on this month) ⇒
+            // leave Pending + a distinct ping. A human decides; the next pass retries once the
+            // sibling fulfills. NEVER a key value in the ping.
+            TpkPick::Ambiguous => {
+                tracing::warn!(claim_id = %claim.id, "reconcile(choice): ambiguous new tpks — leaving pending, human decides");
+                ping(
+                    deps,
+                    &format!(
+                        "choice claim {} ({}) has multiple new keys on humble that the title can't \
+                         disambiguate (a concurrent claim on this month?) — left pending for review.",
+                        claim.id, game.title
+                    ),
+                )
+                .await;
+            }
+        },
     }
 }
 
@@ -703,6 +1365,19 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             }
             Err(_) => continue, // transient — skip this claim, reconcile again next pass.
         };
+        // Choice claims reconcile by a DIFFERENT rule (never re-choose): the parked claim's
+        // game_id offered-id never equals any tpk machine_name, so the bundle `find` below would
+        // miss it forever and silently skip it every pass. One extra GetItem per parked claim keys
+        // the branch off the durable `requires_choice` flag; a transient game-read miss falls
+        // through to the bundle path unchanged (that path needs no game read).
+        if let Ok(Some(game)) = deps.store.get_game(&claim.game_id).await
+            && game.requires_choice
+        {
+            // reconcile may WRITE now (redeem/compensate) — pace it under the bot-detection floor.
+            tokio::time::sleep(SYNC_PACE).await;
+            reconcile_choice_claim(deps, &claim, &game, &order).await;
+            continue;
+        }
         let Some(key) = order.keys.iter().find(|k| k.machine_name == machine_name) else {
             continue;
         };
@@ -897,6 +1572,113 @@ mod tests {
     }
 
     #[test]
+    fn gift_requires_choice_absent_defaults_false() {
+        // Every pre-phase-3 (bundle) Gift payload omits requires_choice — it MUST deserialize to
+        // false so those requests still dispatch to the bundle path, never the choice orchestration.
+        let json = r#"{"op":"gift","claim_id":"c1","link_token":"tok","game_id":"gk:mn","gamekey":"gk","machine_name":"mn","keyindex":0}"#;
+        let req: FulfillRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req,
+            FulfillRequest::Gift {
+                claim_id: "c1".into(),
+                link_token: "tok".into(),
+                game_id: "gk:mn".into(),
+                gamekey: "gk".into(),
+                machine_name: "mn".into(),
+                keyindex: 0,
+                requires_choice: false,
+            }
+        );
+    }
+
+    #[test]
+    fn choose_decision_ladder_never_compensates() {
+        use humble_client::HumbleError as E;
+        // Ok ⇒ Record (proceed). Unauthorized ⇒ ParkCookieDead. EVERYTHING else ⇒ Park.
+        assert_eq!(choose_decision(&Ok(())), Decision::Record);
+        assert_eq!(
+            choose_decision(&Err(E::Unauthorized)),
+            Decision::ParkCookieDead
+        );
+        let park_variants = [
+            E::SecureAreaStepUpFailed { reason: "x".into() },
+            E::ChooseFailed {
+                reason: "already chosen".into(),
+            },
+            E::RateLimited,
+            E::Api(500),
+            E::LoginFailed { reason: "x".into() },
+            E::AlreadyRedeemed,
+            E::RedeemAuthRejected {
+                status: 403,
+                csrf_minted: false,
+            },
+            E::RedeemRefused("x".into()),
+            E::AmbiguousRedeem,
+        ];
+        for v in park_variants {
+            let d = choose_decision(&Err(v));
+            assert_eq!(d, Decision::Park, "expected Park");
+            assert_ne!(d, Decision::Compensate);
+        }
+        // The whole-map invariant: NO choose outcome — Ok or any Err — ever yields Compensate.
+        // (Network/Parse are constructed only inside humble-client; the no-`_` match is the guard
+        // that they, and any future variant, are classified — and never as Compensate.)
+        assert_ne!(choose_decision(&Ok(())), Decision::Compensate);
+    }
+
+    #[test]
+    fn find_new_tpk_diff_and_disambiguation() {
+        use humble_client::{KeyEntry, Order};
+        fn key(mn: &str, human: &str, redeemed: bool) -> KeyEntry {
+            KeyEntry {
+                machine_name: mn.into(),
+                human_name: human.into(),
+                key_type: "steam".into(),
+                redeemed,
+                expired: false,
+                giftable: !redeemed,
+                keyindex: 0,
+            }
+        }
+        fn order(keys: Vec<KeyEntry>) -> Order {
+            Order {
+                gamekey: "gk".into(),
+                bundle_name: "May 2026 Humble Choice".into(),
+                keys,
+                subproducts: vec![],
+            }
+        }
+        // 0 new (order key already in pre) → None.
+        let o = order(vec![key("old_choice_steam", "Old Game", false)]);
+        assert_eq!(
+            find_new_tpk(&o, &["old_choice_steam".into()], "New Game"),
+            TpkPick::None
+        );
+        // 1 new → Unique regardless of title.
+        let o = order(vec![
+            key("old_choice_steam", "Old Game", false),
+            key("octo_choice_steam", "Octopath Traveler II", false),
+        ]);
+        assert_eq!(
+            find_new_tpk(&o, &["old_choice_steam".into()], "Octopath Traveler II"),
+            TpkPick::Unique(&o.keys[1])
+        );
+        // 2 new, neither exact-title → Ambiguous.
+        let o = order(vec![
+            key("a_choice_steam", "Alpha", false),
+            key("b_choice_steam", "Beta", false),
+        ]);
+        assert_eq!(find_new_tpk(&o, &[], "Gamma"), TpkPick::Ambiguous);
+        // 2 new, exactly one exact case-insensitive title match → Unique (the split).
+        let o = order(vec![
+            key("a_choice_steam", "Alpha", false),
+            key("b_choice_steam", "Beta", false),
+        ]);
+        assert_eq!(find_new_tpk(&o, &[], "beta"), TpkPick::Unique(&o.keys[1]));
+    }
+
+    #[test]
     fn request_response_serde_roundtrips() {
         let req = FulfillRequest::Gift {
             claim_id: "c1".into(),
@@ -905,9 +1687,11 @@ mod tests {
             gamekey: "gk".into(),
             machine_name: "mn".into(),
             keyindex: 3,
+            requires_choice: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"op\":\"gift\""));
+        assert!(json.contains("\"requires_choice\":true"));
         assert_eq!(serde_json::from_str::<FulfillRequest>(&json).unwrap(), req);
 
         let resp = FulfillResponse::Parked {
