@@ -1,0 +1,60 @@
+{
+ "_provenance": "real /api/v1/orders?all_tpkds=true response captured from Ben library HAR 2026-07-06; key values + gamekeys scrubbed, two representative tpks kept",
+ "_coverage_observed": "505 tpks across 6 responses: steam keytype 487 of which 379 (78%) had populated steam_app_id; all non-steam keytypes 0%; subproducts: 1 steampowered url in 505 (tier-2 dead)",
+ "SCRUBBEDGAMEKY": {
+  "product": {
+   "human_name": "January 2024 Humble Choice",
+   "machine_name": "january_2024_choice"
+  },
+  "tpkd_dict": {
+   "all_tpks": [
+    {
+     "is_gift": false,
+     "machine_name": "theredlantern_choice_steam",
+     "gamekey": "SCRUBBEDGAMEKY",
+     "exclusive_countries": [],
+     "num_days_until_expired": -1,
+     "disallowed_countries": [],
+     "show_custom_instructions_in_user_libraries": false,
+     "key_type": "steam",
+     "visible": true,
+     "instructions_html": "<a href='https://support.humblebundle.com/hc/articles/204008710-How-To-Redeem-Steam-Keys' target='_blank'>Steam Instructions</a>",
+     "display_separately": false,
+     "redeemed_key_val": "SCRUBBED",
+     "key_type_human_name": "Steam",
+     "steam_app_id": 1053710,
+     "human_name": "The Red Lantern",
+     "preinstruction_text": "Copy this key into the Steam client, or click Redeem to redeem in-browser.",
+     "auto_expand": false,
+     "is_expired": false,
+     "class": "steambutton",
+     "keyindex": 0,
+     "disclaimer": "Steam will not provide extra giftable copies of games you already own."
+    },
+    {
+     "is_gift": false,
+     "machine_name": "twopointcampus_choice_steam",
+     "gamekey": "SCRUBBEDGAMEKY",
+     "exclusive_countries": [],
+     "num_days_until_expired": -1,
+     "disallowed_countries": [],
+     "show_custom_instructions_in_user_libraries": false,
+     "key_type": "steam",
+     "visible": true,
+     "instructions_html": "<a href='https://support.humblebundle.com/hc/articles/204008710-How-To-Redeem-Steam-Keys' target='_blank'>Steam Instructions</a>",
+     "display_separately": false,
+     "redeemed_key_val": "SCRUBBED",
+     "key_type_human_name": "Steam",
+     "steam_app_id": null,
+     "human_name": "Two Point Campus",
+     "preinstruction_text": "Copy this key into the Steam client, or click Redeem to redeem in-browser.",
+     "auto_expand": false,
+     "is_expired": false,
+     "class": "steambutton",
+     "keyindex": 0,
+     "disclaimer": "Steam will not provide extra giftable copies of games you already own."
+    }
+   ]
+  }
+ }
+}

@@ -30,11 +30,12 @@ The choice design doc §2 captured the self-claim variants from live HARs **in t
 - Choice self-claim: `POST /humbler/choosecontent` with `is_gift` **omitted** (spends the pick),
   then the redeemkey call above.
 
-**Assumption, stated honestly:** the `{success, key}` response shape for *plain bundle* keys — and
-especially for *non-giftable* keys (non-giftable for a reason humble knows and we don't) — is
-extrapolated from the Choice capture, not proven. The repo holds no HAR of either. Mitigation: the
-first live receipts (§6.5) include a plain bundle key AND a non-giftable key, before the feature is
-trusted unattended.
+**Proven for plain keys (Ben library HAR, 2026-07-06):** two real non-Choice `redeemkey` POSTs were
+captured — `keytype=<machine_name>`, `key=<gamekey>`, `keyindex`, no `gift` param — each returning
+`{"key":"…","success":true}`. One was a **non-steam keytype** (a bungie key), so the shape holds
+beyond steam. The only remaining assumption is *non-giftable* keys specifically (non-giftable for a
+reason humble knows and we don't); the first live receipts (§6.5) still include one before the
+feature is trusted unattended.
 
 New humble-client method, mirroring its sibling's exact signature discipline (domain-named params,
 **no heal flag** — heal is the fulfillment-layer ladder's job, as with `redeem_as_gift`):

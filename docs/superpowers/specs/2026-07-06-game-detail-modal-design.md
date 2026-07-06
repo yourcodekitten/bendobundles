@@ -26,30 +26,28 @@ Humble gives `machine_name` + title; Steam content is keyed by **appid**. A sync
 `Game.steam_app_id: Option<u32>` (new domain field, with `appid_source: manual|humble|title`) for
 steam-keytype games, in resolution order:
 
-1. **Humble's own tpk data** — *unverified assumption*: real order tpks may carry a `steam_app_id`
-   field. The shipped `TpkWire` has no such field, no fixture shows one, and the choice doc's field
-   list is illustrative, not a capture. **Pre-build gate:** examine ONE real order payload (Ben HAR,
-   or a captured response via the deployed stack) to confirm the field name — and where, if
-   anywhere, a steam store link appears (tier 2's home). If absent, tiers 1–2 are deleted, not
-   worked around.
-2. **Humble store link** — parse the appid out of a `store.steampowered.com/app/<id>` URL *if* the
-   §2.1 payload check shows one exists. Same gate.
-3. **Exact-title match** — against Steam's app list, after light normalization (case, trademark
+1. **Humble's own tpk data — CONFIRMED** (Ben library HAR, 2026-07-06; scrubbed sample committed in
+   `captures/2026-07-06-steam/humble-order-tpk-sample-scrubbed.json`): real order tpks carry a
+   populated integer `steam_app_id`. Observed coverage across 505 real tpks: **78% of steam-keytype
+   tpks (379/487) have it**; non-steam keytypes never do (irrelevant — the mapper only runs on
+   steam keytypes). `TpkWire` gains the field (`#[serde(default)] Option<u32>`). A former tier 2
+   (humble store links in subproducts) was checked and **deleted**: 1 steampowered URL in 505
+   subproducts — dead weight.
+2. **Exact-title match** — against Steam's app list, after light normalization (case, trademark
    glyphs). **Unique exact match only**: GetAppList is full of duplicate names (demos, soundtracks,
    re-releases); an ambiguous exact match resolves to **nothing** and is logged as unmapped — a
    wrong trailer is worse than none. The app list (~10–15MB) is fetched **lazily**, only when
    unresolved steam-keytype games exist this sync.
-4. **Admin override** — `POST /admin/api/games/:id/steam-app-id {app_id | null}` + a small "set
+3. **Admin override** — `POST /admin/api/games/:id/steam-app-id {app_id | null}` + a small "set
    appid" affordance in the catalog. **`null` means clear-to-auto** (auto-resolution runs again next
    sync); "pinned none" is a non-goal until needed. After setting an appid the modal stays thin
    until the next sync fetches the STEAMAPP item — accepted lag; the documented workflow is
    "set appid → hit Sync now."
 
-**Coverage expectation, written assuming tiers 1–2 contribute nothing:** exact-unique-title match
-alone will leave a real manual tail (old bundle titles are cursed — expect on the order of 10–20%
-of steam-keytype games needing overrides or staying unmapped). If the §2.1 payload check confirms
-tier 1, the tail shrinks to near zero. Per-sync mapping coverage (mapped/unmapped counts) is logged
-either way.
+**Coverage expectation (from the observed HAR data):** tier 1 maps ~78% of steam-keytype games for
+free; the remaining ~22% (~108 of 487 in the observed sample — old bundle titles are cursed) fall to
+unique-exact-title match, then the manual override. Per-sync mapping coverage (mapped/unmapped
+counts) is logged.
 
 **No-clobber, the actual mechanism:** `steam_app_id` + `appid_source` are **app-owned fields** —
 `merge_sync` preserves the existing values in *both* of its branches (like `hidden`; they are never
@@ -167,8 +165,8 @@ One `GameDetailModal` component, two mounts (friend GameGrid card click, admin C
 
 ## 6. Rollout
 
-0. **Pre-build gate (M1):** one real order payload examined → tiers 1–2 confirmed or deleted;
-   coverage expectations updated in this doc.
+0. ~~Pre-build gate (M1)~~ **SATISFIED 2026-07-06**: real order payload examined (Ben library HAR) —
+   tier 1 confirmed at 78% coverage, store-link tier deleted; scrubbed sample committed.
 1. steam-client crate: the three storefront calls, fixtures from the live captures (wiremock).
 2. Domain fields (`steam_app_id`, `appid_source`) + merge_sync preservation + mapper pass
    (tiers as gated) + coverage logging (moto).
