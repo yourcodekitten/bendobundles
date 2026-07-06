@@ -665,11 +665,12 @@ impl HumbleClient {
                 break;
             }
             for p in page.products {
-                // A product with no gamekey has no order to redeem against (an active/pending month
-                // not yet assigned one) — it can never be a source of claimable games, so skip it.
-                // The list mixes these in, and one used to fail the whole page parse before `gamekey`
-                // was made optional.
-                let Some(gamekey) = p.gamekey else { continue };
+                // A product may have no gamekey in the LIST (the two newest months — the current and
+                // just-billed one — show up gamekey-less here) even though its membership page carries
+                // a real gamekey and is fully claimable. So DON'T drop these: keep the slug
+                // (`product_url_path`), and let discovery resolve the real gamekey from the per-month
+                // read. An empty gamekey here is just a placeholder the single-month read overrides.
+                let gamekey = p.gamekey.unwrap_or_default();
                 let mut offered_games: Vec<OfferedGame> = p
                     .content_choice_data
                     .game_data

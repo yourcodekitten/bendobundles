@@ -2509,27 +2509,25 @@ async fn sync_discovers_offered_choice_games_as_requires_choice_true() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// The trust-contract guard: a month the list-walk surfaces but which is NOT still-redeemable
-// (canRedeemGames=false) is filtered out BEFORE the single-month read — so its offered games are
-// never written as requires_choice=true. Proves the list-walk (claimed set unknown) is never a
-// source of `true`: no /membership mock is mounted, and reaching it would 404.
+// The redeemability gate is the membership PAGE, not the list. A month whose per-month read reports
+// `canRedeemGames=false` writes nothing — even though it was enumerated and read. (Discovery no longer
+// pre-filters on the list flag, precisely because the list is unreliable for the newest months.)
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
-async fn sync_choice_discovery_skips_non_redeemable_month() {
+async fn sync_choice_discovery_skips_page_non_redeemable_month() {
     let Some(store) = store_or_skip("choice-discovery-skip").await else {
         return;
     };
 
     let humble = MockServer::start().await;
     mount_empty_listing(&humble).await;
-    // A month that can no longer be redeemed → must be skipped (no single-month read, no write).
     Mock::given(method("GET"))
         .and(path(format!("{CHOICE_LIST_BASE}/")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "products": [{
                 "gamekey": "gkOld", "title": "Old Spent Month",
                 "productUrlPath": "old-spent", "productMachineName": "old_spent_choice",
-                "usesChoices": true, "isActiveContent": false, "canRedeemGames": false,
+                "usesChoices": true, "isActiveContent": false, "canRedeemGames": true,
                 "contentChoiceData": { "game_data": {
                     "some_offered_game": { "title": "Some Offered Game" }
                 } }
@@ -2537,19 +2535,37 @@ async fn sync_choice_discovery_skips_non_redeemable_month() {
         })))
         .mount(&humble)
         .await;
-    // NOTE: deliberately NO /membership/old-spent mock — the filter must skip it before any read.
+    // The membership PAGE says this month can no longer be redeemed → the write is gated off, even
+    // though the read happened.
+    let blob = r#"<html><body><script type="application/json" id="webpack-monthly-product-data">
+    {"contentChoiceOptions":{
+        "gamekey":"gkOld","title":"Old Spent Month","productUrlPath":"old-spent",
+        "productMachineName":"old_spent_choice","usesChoices":true,
+        "isActiveContent":false,"canRedeemGames":false,
+        "contentChoiceData":{"initial":{"content_choices":{"some_offered_game":{"title":"Some Offered Game"}}}},
+        "contentChoicesMade":{"initial":{"choices_made":[]}}
+    }}</script></body></html>"#;
+    Mock::given(method("GET"))
+        .and(path("/membership/old-spent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(blob)
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&humble)
+        .await;
 
     let deps = deps(store, &humble.uri(), None);
     handle(&deps, FulfillRequest::Sync).await;
 
-    // Nothing from a non-redeemable month is written as a claimable choice entry.
+    // The page's canRedeemGames=false gates the write: nothing surfaced.
     assert!(
         deps.store
             .get_game(&game_id("gkOld", "some_offered_game"))
             .await
             .unwrap()
             .is_none(),
-        "a non-redeemable month must never yield a requires_choice=true entry"
+        "a page-non-redeemable month must never yield a requires_choice=true entry"
     );
 }
 
