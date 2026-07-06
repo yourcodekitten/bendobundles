@@ -211,6 +211,33 @@ describe('Links', () => {
       });
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
+
+    it('a failed create clears the previous success callout (no stale URL next to the error)', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink)
+        .mockResolvedValueOnce({ token: 'tok-bob', url_path: '/l/tok-bob' })
+        .mockRejectedValue(new Error('failed to load create link'));
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      // First create succeeds — callout shows Bob's URL
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Bob');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      await waitFor(() => screen.getByText(/invite link created/i));
+
+      // Second create fails — the unlabeled Bob callout must NOT keep sitting
+      // under the error, or the admin copies the wrong URL for Charlie
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      await waitFor(() => screen.getByRole('alert'));
+
+      expect(screen.queryByText(/invite link created/i)).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(`${window.location.origin}/l/tok-bob`),
+      ).not.toBeInTheDocument();
+    });
   });
 
   describe('copy invite URL — per-row', () => {

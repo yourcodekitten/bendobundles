@@ -96,6 +96,11 @@ export function Links() {
       .catch(() => {
         // withAuth handles 401. Anything else (adminCreateLink throws on !ok,
         // or network) means we DON'T KNOW whether the link exists — say so.
+        // Also drop any PREVIOUS success callout: it has no visible label, so
+        // next to a fresh failure it reads as "your link was created" and the
+        // admin can hand a friend the wrong URL. (The old link's URL stays
+        // copyable from its list row.)
+        setCreatedInfo(null);
         setCreateError(
           "couldn't create the link — check the list below before retrying.",
         );
