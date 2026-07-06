@@ -1355,6 +1355,27 @@ async fn reveal_key_already_redeemed_is_typed() {
 }
 
 #[tokio::test]
+async fn reveal_key_refused_reads_error_msg_field() {
+    // Live-captured shape (Ben's HAR, 2026-07-06): humble's refusal carries the human reason in
+    // `error_msg` (underscored), not `errormsg` — e.g. keys_depleted_email. The message must
+    // surface in RedeemRefused, not collapse to "no error message".
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"error":"keys_depleted_email","error_msg":"Keys are temporarily exhausted for this product","success":false}"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::RedeemRefused(ref msg))
+            if msg == "Keys are temporarily exhausted for this product"
+    ));
+}
+
+#[tokio::test]
 async fn reveal_key_login_interstitial_is_unauthorized() {
     // 200-with-HTML login interstitial = dead session = Unauthorized (heal-ladder eligible).
     let server = MockServer::start().await;
