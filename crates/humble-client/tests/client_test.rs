@@ -551,12 +551,18 @@ async fn choice_month_parses_claimed_set_and_claimable_is_offered_minus_chosen()
         .choice_month("may-2021")
         .await
         .unwrap();
-    // The blob's `contentChoicesMade.initial.choices_made` — wire order, verbatim.
-    assert_eq!(m.claimed_machine_names, vec!["metro_exodus", "vane"]);
+    // The blob's `contentChoicesMade.initial.choices_made` — wire order, verbatim. `Some`:
+    // the single-month read is the endpoint that KNOWS the claimed set.
+    assert_eq!(
+        m.claimed_machine_names,
+        Some(vec!["metro_exodus".to_string(), "vane".to_string()])
+    );
 
     // claimable = offered − chosen: 12 offered, 2 chosen → exactly the other 10, with the
     // chosen pair excluded and the offered (sorted) order preserved.
-    let claimable = m.claimable_games();
+    let claimable = m
+        .claimable_games()
+        .expect("choice_month knows the claimed set");
     assert_eq!(claimable.len(), 10);
     let names: Vec<&str> = claimable.iter().map(|g| g.machine_name.as_str()).collect();
     assert!(!names.contains(&"metro_exodus"));
@@ -620,13 +626,67 @@ async fn choice_month_absent_choices_made_means_nothing_claimed() {
         .choice_month("oct-2020")
         .await
         .unwrap();
-    assert!(m.claimed_machine_names.is_empty());
+    // Absent block ⇒ Some(empty) — "no picks made", KNOWN, not the list walk's None-unknown.
+    assert_eq!(m.claimed_machine_names, Some(vec![]));
     // Nothing chosen ⇒ claimable == all offered.
     assert_eq!(
         m.claimable_games(),
-        m.offered_games.iter().collect::<Vec<_>>()
+        Some(m.offered_games.iter().collect::<Vec<_>>())
     );
-    assert_eq!(m.claimable_games().len(), 2);
+    assert_eq!(m.claimable_games().unwrap().len(), 2);
+}
+
+/// Pure edge cases of the load-bearing subtraction: duplicates in the chosen list and a chosen
+/// identifier that is NOT in offered must neither panic nor over/under-subtract — phase 3 trusts
+/// this set to decide whether a pick still needs spending.
+#[test]
+fn claimable_games_subtraction_edges() {
+    use humble_client::{ChoiceMonth, OfferedGame};
+    let offered = |names: &[&str]| -> Vec<OfferedGame> {
+        names
+            .iter()
+            .map(|n| OfferedGame {
+                machine_name: n.to_string(),
+                title: n.to_uppercase(),
+            })
+            .collect()
+    };
+    let month = |claimed: Option<Vec<&str>>| ChoiceMonth {
+        gamekey: "gk".into(),
+        title: "May 2021".into(),
+        product_url_path: "may-2021".into(),
+        product_machine_name: "may_2021_choice".into(),
+        uses_choices: true,
+        is_active_content: false,
+        can_redeem_games: true,
+        total_choices: Some(12),
+        offered_games: offered(&["calico", "relicta", "vane"]),
+        claimed_machine_names: claimed.map(|v| v.iter().map(|s| s.to_string()).collect()),
+    };
+
+    // Duplicate chosen identifiers subtract once, not twice.
+    let m = month(Some(vec!["vane", "vane"]));
+    let names: Vec<&str> = m
+        .claimable_games()
+        .unwrap()
+        .iter()
+        .map(|g| g.machine_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["calico", "relicta"]);
+
+    // A chosen identifier not in offered (wire says chosen ⊆ offered, but don't trust it with
+    // money): ignored, never panics, never removes an unrelated offered game.
+    let m = month(Some(vec!["not_offered_at_all", "relicta"]));
+    let names: Vec<&str> = m
+        .claimable_games()
+        .unwrap()
+        .iter()
+        .map(|g| g.machine_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["calico", "vane"]);
+
+    // Unknown claimed set (list-walk provenance) ⇒ None, never a guess.
+    assert_eq!(month(None).claimable_games(), None);
 }
 
 #[tokio::test]
@@ -796,6 +856,9 @@ async fn choice_months_base64url_cursor_round_trips_through_the_path() {
     assert_eq!(months.len(), 2);
     assert_eq!(months[1].product_machine_name, "p2_choice");
     assert_eq!(months[1].total_choices, None); // list walk carries no pick budget
+    // ...nor the claimed set: None = unknown, and claimable_games refuses to guess.
+    assert_eq!(months[1].claimed_machine_names, None);
+    assert_eq!(months[1].claimable_games(), None);
 }
 
 #[tokio::test]

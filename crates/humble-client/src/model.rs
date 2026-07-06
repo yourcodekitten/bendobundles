@@ -77,8 +77,10 @@ pub(crate) struct ContentChoiceOptions {
     pub content_choices_made: ContentChoicesMade,
 }
 
-/// Which offered games the account has already chosen. Absent entirely on a month with no picks
-/// made yet — hence `Default` all the way down (absent ⇒ empty `choices_made`).
+/// Which offered games the account has already chosen. Observed on the May-2021 HAR (a month WITH
+/// picks); a no-picks month is ASSUMED to omit the block or send it empty — hence `Default` all
+/// the way down (absent ⇒ empty `choices_made`). Present-but-malformed (e.g. `null`, wrong type)
+/// still fails the parse — absence is the only shape read as "nothing chosen".
 #[derive(Deserialize, Default)]
 pub(crate) struct ContentChoicesMade {
     #[serde(default)]
