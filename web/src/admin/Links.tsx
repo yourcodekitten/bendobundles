@@ -51,6 +51,10 @@ export function Links() {
   const [creating, setCreating] = useState(false);
   // Stored after successful create — separate from page state so reload doesn't clear it
   const [createdInfo, setCreatedInfo] = useState<{ fullUrl: string; label: string } | null>(null);
+  // Create failure — creating a link is a spend-adjacent action; a silent catch
+  // leaves the admin with zero signal whether a link now exists (mirrors the
+  // revoke-error pattern below)
+  const [createError, setCreateError] = useState<string | null>(null);
 
   // Two-step revoke: set of armed token strings
   const [revokeArmed, setRevokeArmed] = useState<Set<string>>(new Set());
@@ -82,6 +86,7 @@ export function Links() {
     withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires), navigate)
       .then((result) => {
         setCreatedInfo({ fullUrl: inviteUrl(result.token), label: trimmedLabel });
+        setCreateError(null);
         setFormLabel('');
         setClaimsAllowed(1);
         setExpiresDays('');
@@ -89,7 +94,16 @@ export function Links() {
         load();
       })
       .catch(() => {
-        // withAuth redirects on 401; other errors swallowed (network hiccup)
+        // withAuth handles 401. Anything else (adminCreateLink throws on !ok,
+        // or network) means we DON'T KNOW whether the link exists — say so.
+        // Also drop any PREVIOUS success callout: it has no visible label, so
+        // next to a fresh failure it reads as "your link was created" and the
+        // admin can hand a friend the wrong URL. (The old link's URL stays
+        // copyable from its list row.)
+        setCreatedInfo(null);
+        setCreateError(
+          "couldn't create the link — check the list below before retrying.",
+        );
       })
       .finally(() => {
         setCreating(false);
@@ -228,6 +242,14 @@ export function Links() {
         >
           create invite link
         </button>
+
+        {/* Create failure — must be loud; without it the admin can't tell
+            whether an invite link exists */}
+        {createError !== null && (
+          <p role="alert" className="text-xs text-red-400">
+            {createError}
+          </p>
+        )}
       </form>
 
       {/* ── Created link callout — the artifact ben hands a friend ───── */}
