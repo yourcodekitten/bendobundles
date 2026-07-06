@@ -108,9 +108,8 @@ gift-shaped. A parked self-claim lands in the same `PENDINGCLAIM` GSI, so reconc
 
 | Branch (existing semantics) | Gift terminal today | SELF terminal |
 |---|---|---|
-| bundle: order shows tpk unredeemed | `redeem_as_gift` → record gift_url | `reveal_key` → `fulfill_self_claim` |
+| bundle: tpk NOT redeemed (the code's only other bundle arm — keyed on `tpk.redeemed`) | `compensate_claim` (re-list; a late gift URL has no waiting recipient) | reveal the key (allow_heal=false) — a late reveal is exactly what Ben wants; an AlreadyRedeemed race routes through the recover-then-record path |
 | bundle: tpk already redeemed | ping human (gift URL unrecoverable) | record `redeemed_key_val` if present; else ping (fallback above) |
-| bundle: provably never redeemed | `compensate_claim` | `compensate_self_claim` |
 | choice A: no intent snapshot | compensate (no pick spent) | `compensate_self_claim` |
 | choice B1: snapshot, no new tpk | compensate (no pick spent) | `compensate_self_claim` |
 | choice B2: new tpk, unredeemed | redeem from reconcile (never choose) | `reveal_key` from reconcile (never choose), heal disallowed same as B2 today |
