@@ -780,6 +780,52 @@ impl Store {
             .await
     }
 
+    /// Self-claim fulfillment — [`fulfill_claim`]'s sibling (spec §3.2): write the revealed key
+    /// to the CLAIM durable-FIRST (conditioned on the pending marker, same fulfill-vs-compensate
+    /// mutual exclusion), then flip the GAME pending → ben_redeemed gated on claim ownership.
+    pub async fn fulfill_self_claim(
+        &self,
+        claim_id: &str,
+        game_id: &str,
+        revealed_key: &str,
+    ) -> Result<(), StoreError> {
+        let mut claim = self
+            .get_claim(domain::SELF_LINK_TOKEN, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("fulfill_self: claim missing"))?;
+        claim.state = ClaimState::Fulfilled;
+        claim.revealed_key = Some(revealed_key.to_string());
+
+        let put_res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(&claim)))
+            .condition_expression("attribute_exists(gsi2pk)")
+            .send()
+            .await;
+        match put_res {
+            Ok(_) => {}
+            Err(sdk_err) => {
+                if !is_ccf_put(&sdk_err) {
+                    return Err(StoreError::Aws(format!("{sdk_err:?}")));
+                }
+                let current = self
+                    .get_claim(domain::SELF_LINK_TOKEN, claim_id)
+                    .await?
+                    .ok_or(StoreError::Corrupt("fulfill_self: claim missing on recheck"))?;
+                if current.state != ClaimState::Fulfilled {
+                    return Err(StoreError::Corrupt(
+                        "fulfill_self lost to compensate — revealed key needs manual/reconcile recovery",
+                    ));
+                }
+                // idempotent retry: key already durable; fall through to re-attempt the flip.
+            }
+        }
+        self.flip_game_from_pending(game_id, Some(claim_id), GameStatus::BenRedeemed)
+            .await
+    }
+
     /// Flip a game out of `pending` to a terminal `new_status` via a guarded full-item put. The
     /// condition is always `status = pending`; when `claim_id` is `Some`, it ALSO requires the
     /// game still carries that top-level `claim_id`, so the caller only touches a game it still

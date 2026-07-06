@@ -940,3 +940,60 @@ async fn gift_vs_self_claim_race_single_winner() {
     let s = store.claim_game_self(&gid, "claim-s", now).await;
     assert!(matches!(s, Err(ClaimTxError::GameUnavailable)));
 }
+
+#[tokio::test]
+async fn fulfill_self_claim_writes_key_then_flips_ben_redeemed() {
+    let Some(store) = store_or_skip("sc-fulfill-1").await else {
+        return;
+    };
+    let gid = game_id("gk2", "mn1");
+    store.put_game(&game(2, true)).await.unwrap();
+    store
+        .claim_game_self(&gid, "c-f1", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    store
+        .fulfill_self_claim("c-f1", &gid, "AAAA-BBBB-CCCC")
+        .await
+        .unwrap();
+
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "c-f1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.state, ClaimState::Fulfilled);
+    assert_eq!(claim.revealed_key.as_deref(), Some("AAAA-BBBB-CCCC"));
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::BenRedeemed);
+}
+
+#[tokio::test]
+async fn fulfill_self_claim_is_idempotent_on_retry() {
+    let Some(store) = store_or_skip("sc-fulfill-2").await else {
+        return;
+    };
+    let gid = game_id("gk2", "mn2");
+    store.put_game(&game(2, true)).await.unwrap();
+    store
+        .claim_game_self(&gid, "c-f2", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+
+    store
+        .fulfill_self_claim("c-f2", &gid, "K1")
+        .await
+        .unwrap();
+    // Second call: no error, state unchanged.
+    store
+        .fulfill_self_claim("c-f2", &gid, "K1")
+        .await
+        .unwrap();
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "c-f2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.revealed_key.as_deref(), Some("K1"));
+}
