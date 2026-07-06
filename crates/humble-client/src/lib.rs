@@ -592,10 +592,18 @@ impl HumbleClient {
         })?;
         let blob: MembershipBlob = serde_json::from_str(json).map_err(HumbleError::Parse)?;
         let cco = blob.content_choice_options;
-        let mut offered_games: Vec<OfferedGame> = cco
-            .content_choice_data
-            .initial
-            .content_choices
+        let ccd = cco.content_choice_data;
+        let total_choices = ccd.initial.total_choices;
+        // Offered games live in one of two places depending on the tier: a pick-N month
+        // (`usesChoices=true`) nests them under `initial.content_choices`; a claim-all month
+        // (`usesChoices=false`) has no `initial` block and lists them under `game_data`. Prefer the
+        // pick-N map when present, else fall back to `game_data` — so BOTH tiers surface their offers.
+        let offered = if !ccd.initial.content_choices.is_empty() {
+            ccd.initial.content_choices
+        } else {
+            ccd.game_data
+        };
+        let mut offered_games: Vec<OfferedGame> = offered
             .into_iter()
             .map(|(machine_name, g)| OfferedGame {
                 machine_name,
@@ -612,7 +620,7 @@ impl HumbleClient {
             uses_choices: cco.uses_choices,
             is_active_content: cco.is_active_content,
             can_redeem_games: cco.can_redeem_games,
-            total_choices: Some(cco.content_choice_data.initial.total_choices),
+            total_choices: Some(total_choices),
             offered_games,
             claimed_machine_names: Some(cco.content_choices_made.initial.choices_made),
         })

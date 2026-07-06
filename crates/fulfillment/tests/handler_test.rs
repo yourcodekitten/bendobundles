@@ -2552,3 +2552,79 @@ async fn sync_choice_discovery_skips_non_redeemable_month() {
         "a non-redeemable month must never yield a requires_choice=true entry"
     );
 }
+
+// -------------------------------------------------------------------------------------------------
+// The CLAIM-ALL tier (usesChoices=false, "Get My Games"): the month has no `initial` block and lists
+// its games under `game_data`. Discovery must (a) NOT filter it out (an earlier build required
+// uses_choices=true), and (b) surface its un-chosen offers as requires_choice=true. Regression guard
+// for the June-2026 live miss.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn sync_discovers_claim_all_tier_offers() {
+    let Some(store) = store_or_skip("choice-discovery-claim-all").await else {
+        return;
+    };
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    // List-walk: a claim-all month (usesChoices=false, canRedeemGames=true).
+    Mock::given(method("GET"))
+        .and(path(format!("{CHOICE_LIST_BASE}/")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "products": [{
+                "gamekey": "gkJun26", "title": "June 2026 Humble Choice",
+                "productUrlPath": "june-2026", "productMachineName": "june_2026_choice",
+                "usesChoices": false, "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {
+                    "constructionsimulator": { "title": "Construction Simulator" }
+                } }
+            }]
+        })))
+        .mount(&humble)
+        .await;
+    // Single-month read: claim-all blob — NO `initial` block, games under `game_data`, one chosen.
+    let blob = r#"<html><body><script type="application/json" id="webpack-monthly-product-data">
+    {"contentChoiceOptions":{
+        "gamekey":"gkJun26","title":"June 2026","productUrlPath":"june-2026",
+        "productMachineName":"june_2026_choice","usesChoices":false,
+        "isActiveContent":false,"canRedeemGames":true,
+        "contentChoiceData":{"game_data":{
+            "constructionsimulator":{"title":"Construction Simulator"},
+            "octopathtravelerii":{"title":"OCTOPATH TRAVELER II"}
+        }},
+        "contentChoicesMade":{"initial":{"choices_made":["octopathtravelerii"]}}
+    }}</script></body></html>"#;
+    Mock::given(method("GET"))
+        .and(path("/membership/june-2026"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(blob)
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&humble)
+        .await;
+
+    let deps = deps(store, &humble.uri(), None);
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // The un-chosen claim-all offer is surfaced as a claimable choice game.
+    let cs = deps
+        .store
+        .get_game(&game_id("gkJun26", "constructionsimulator"))
+        .await
+        .unwrap()
+        .expect("claim-all offer written as a claimable choice game");
+    assert!(cs.requires_choice);
+    assert_eq!(cs.status, GameStatus::Available);
+    assert_eq!(cs.title, "Construction Simulator");
+
+    // The already-chosen game is NOT re-surfaced as claimable.
+    assert!(
+        deps.store
+            .get_game(&game_id("gkJun26", "octopathtravelerii"))
+            .await
+            .unwrap()
+            .is_none(),
+        "an already-chosen claim-all game must not be written as claimable"
+    );
+}

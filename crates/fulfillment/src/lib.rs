@@ -1400,14 +1400,11 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
     }
 
     let mut written = 0u32;
-    // Only months whose picks can still be spent: `uses_choices` (a pick-N tier, not a claim-all
-    // month) AND `can_redeem_games` (the redemption window is still open). This gate bounds the
-    // per-month reads to the handful of live months instead of the full history.
-    for month in walk
-        .months
-        .iter()
-        .filter(|m| m.uses_choices && m.can_redeem_games)
-    {
+    // Only months whose games can still be redeemed (`can_redeem_games`). Both tiers qualify: pick-N
+    // months (`uses_choices=true`) AND claim-all months (`uses_choices=false`, Ben's newer "Get My
+    // Games" tier) — `choosecontent` works for both, so both carry claimable offers. (An earlier
+    // build wrongly also required `uses_choices`, which silently dropped every claim-all month.)
+    for month in walk.months.iter().filter(|m| m.can_redeem_games) {
         tokio::time::sleep(SYNC_PACE).await;
         let (heal, read) = selfheal_once(deps, !*healed, || {
             deps.humble.choice_month(&month.product_url_path)

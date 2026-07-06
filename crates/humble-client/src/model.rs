@@ -97,15 +97,24 @@ pub(crate) struct ContentChoicesMadeInitial {
 
 #[derive(Deserialize)]
 pub(crate) struct ContentChoiceData {
+    // pick-N tier (`usesChoices=true`) nests offered games under `initial.content_choices`. A
+    // claim-all tier (`usesChoices=false`) month has NO `initial` block at all and lists its games
+    // under a sibling `game_data` map instead (verified from a live June-2026 membership capture) —
+    // so `initial` must default, or a claim-all month fails to parse ("missing field `initial`").
+    #[serde(default)]
     pub initial: ContentChoiceInitial,
+    /// Claim-all tier: machine_name → offered game, the same shape the subscription list endpoint
+    /// uses. Empty on a pick-N month (whose games live in `initial.content_choices`).
+    #[serde(default)]
+    pub game_data: std::collections::HashMap<String, ContentChoiceGame>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(crate) struct ContentChoiceInitial {
     #[serde(default)]
     pub total_choices: u32,
-    /// machine_name → offered game. A claim-all month (`uses_choices=false`) still lists every
-    /// game here; `total_choices` just isn't a limiting budget for that tier.
+    /// machine_name → offered game, for the pick-N tier only. A claim-all month lists its games
+    /// under `ContentChoiceData::game_data`, not here.
     #[serde(default)]
     pub content_choices: std::collections::HashMap<String, ContentChoiceGame>,
 }
