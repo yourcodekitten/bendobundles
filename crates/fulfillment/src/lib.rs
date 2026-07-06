@@ -1437,6 +1437,17 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
             tracing::warn!(month = %detail.product_url_path, "choice discovery: single-month read had no claimed set — skipping (never writes true without one)");
             continue;
         };
+        // Per-month observability: which months surfaced how many claimable offered games, and the
+        // offered/chosen split behind that number. Cheap, and it turns "why did this month write
+        // nothing?" from a guessing game into a log line.
+        tracing::info!(
+            month = %detail.product_url_path,
+            gamekey = %detail.gamekey,
+            offered = detail.offered_games.len(),
+            chosen = detail.claimed_machine_names.as_ref().map_or(0, Vec::len),
+            claimable = claimable.len(),
+            "choice discovery: month processed"
+        );
         for offered in claimable {
             let game = Game {
                 id: domain::game_id(&detail.gamekey, &offered.machine_name),
