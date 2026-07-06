@@ -35,6 +35,12 @@ pub struct Game {
     pub artwork_url: Option<String>,
     #[serde(default)]
     pub keyindex: u32,
+    /// `true` = a claimable Humble Choice game that must be chosen (spends a monthly pick)
+    /// before it has a redeemable key; `false` = a normal key-backed game.
+    /// `#[serde(default)]` means every stored record written before this field existed
+    /// deserializes to `false` (no migration needed).
+    #[serde(default)]
+    pub requires_choice: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +121,9 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
             let merged = match existing_game.status {
                 GameStatus::Pending | GameStatus::Gifted => {
                     // App owns the record: keep status, claim_id, hidden, giftable
-                    // Refresh: title, bundle, artwork_url, keyindex, key_type from fresh
+                    // Refresh: title, bundle, artwork_url, keyindex, key_type, requires_choice
+                    // from fresh (requires_choice is Humble-derived: it flips false once a
+                    // choose→redeem lands a real key, and sync is the source of that truth)
                     Game {
                         id: existing_game.id.clone(),
                         title: fresh.title,
@@ -129,6 +137,7 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                         claim_id: existing_game.claim_id.clone(),
                         artwork_url: fresh.artwork_url,
                         keyindex: fresh.keyindex,
+                        requires_choice: fresh.requires_choice,
                     }
                 }
                 GameStatus::Available | GameStatus::BenRedeemed | GameStatus::Expired => {
@@ -214,6 +223,7 @@ mod tests {
             claim_id: None,
             artwork_url: None,
             keyindex: 0,
+            requires_choice: false,
         };
         assert!(g.is_listable());
         g.hidden = true;
@@ -271,6 +281,7 @@ mod tests {
             claim_id: None,
             artwork_url: Some("new.png".into()),
             keyindex: 4,
+            requires_choice: false,
         }
     }
 
@@ -308,6 +319,30 @@ mod tests {
     fn merge_no_change_returns_none() {
         let g = fresh_game();
         assert_eq!(merge_sync(Some(&g), g.clone()), None);
+    }
+
+    #[test]
+    fn requires_choice_defaults_false_on_old_records() {
+        // A stored record written before the field existed: no `requires_choice` key at all.
+        let json = serde_json::to_value(fresh_game()).unwrap();
+        let mut stripped = json.clone();
+        stripped.as_object_mut().unwrap().remove("requires_choice");
+        assert!(stripped.get("requires_choice").is_none(), "field stripped");
+        let g: Game = serde_json::from_value(stripped).unwrap();
+        assert!(
+            !g.requires_choice,
+            "missing attribute must default to false"
+        );
+    }
+
+    #[test]
+    fn requires_choice_roundtrips_true() {
+        let mut g = fresh_game();
+        g.requires_choice = true;
+        let json = serde_json::to_string(&g).unwrap();
+        let back: Game = serde_json::from_str(&json).unwrap();
+        assert!(back.requires_choice);
+        assert_eq!(back, g);
     }
 
     #[test]
