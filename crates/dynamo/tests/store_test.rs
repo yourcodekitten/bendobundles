@@ -946,7 +946,7 @@ async fn fulfill_self_claim_writes_key_then_flips_ben_redeemed() {
     let Some(store) = store_or_skip("sc-fulfill-1").await else {
         return;
     };
-    let gid = game_id("gk2", "mn1");
+    let gid = game_id("gk2", "mn");
     store.put_game(&game(2, true)).await.unwrap();
     store
         .claim_game_self(&gid, "c-f1", time::OffsetDateTime::now_utc())
@@ -974,8 +974,8 @@ async fn fulfill_self_claim_is_idempotent_on_retry() {
     let Some(store) = store_or_skip("sc-fulfill-2").await else {
         return;
     };
-    let gid = game_id("gk2", "mn2");
-    store.put_game(&game(2, true)).await.unwrap();
+    let gid = game_id("gk3", "mn");
+    store.put_game(&game(3, true)).await.unwrap();
     store
         .claim_game_self(&gid, "c-f2", time::OffsetDateTime::now_utc())
         .await
@@ -996,4 +996,36 @@ async fn fulfill_self_claim_is_idempotent_on_retry() {
         .unwrap()
         .unwrap();
     assert_eq!(claim.revealed_key.as_deref(), Some("K1"));
+}
+
+#[tokio::test]
+async fn fulfill_self_claim_never_flips_when_claim_lost_to_compensate() {
+    // durable-first pin: write-1 (claim key write) must precede write-2 (game flip). Make
+    // write-1 fail permanently — claim already Compensated ⇒ pending marker consumed and the
+    // recheck sees a non-Fulfilled state ⇒ fulfill errors — and assert the game NEVER flipped.
+    let Some(store) = store_or_skip("sc-fulfill-3").await else {
+        return;
+    };
+    let gid = game_id("gk4", "mn");
+    store.put_game(&game(4, true)).await.unwrap();
+    store
+        .claim_game_self(&gid, "c-f3", time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let mut c = store
+        .get_claim(SELF_LINK_TOKEN, "c-f3")
+        .await
+        .unwrap()
+        .unwrap();
+    c.state = ClaimState::Compensated; // consumes the gsi2pk pending marker via claim_item
+    store.put_claim(&c).await.unwrap();
+
+    let res = store.fulfill_self_claim("c-f3", &gid, "LATE-KEY").await;
+    assert!(res.is_err(), "fulfill must lose loudly to compensate");
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_ne!(
+        g.status,
+        GameStatus::BenRedeemed,
+        "game must NOT flip when write-1 failed"
+    );
 }
