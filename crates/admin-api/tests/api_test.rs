@@ -759,6 +759,7 @@ async fn link_claims_redact_gift_url_to_issued_bool() {
             gift_url: Some("https://humble.example/gift?key=SECRET".into()),
             created_at: datetime!(2026-07-03 14:00 UTC),
             choice_pre_tpks: None,
+            revealed_key: None,
         })
         .await
         .unwrap();

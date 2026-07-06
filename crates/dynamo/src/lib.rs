@@ -490,6 +490,7 @@ impl Store {
             // A choice intent snapshot is recorded LATER (record_choice_intent), only on a Choice
             // claim and only after the pre-read — never at intake.
             choice_pre_tpks: None,
+            revealed_key: None,
         };
         let av_s = |v: &str| aws_sdk_dynamodb::types::AttributeValue::S(v.to_string());
 

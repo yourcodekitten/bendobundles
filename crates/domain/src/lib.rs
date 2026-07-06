@@ -98,6 +98,10 @@ pub struct Claim {
     /// as `None`, which is correct — none of them ever recorded a choose intent.
     #[serde(default)]
     pub choice_pre_tpks: Option<Vec<String>>,
+    /// Self-claim only: the revealed key VALUE, written durable-first exactly like `gift_url`.
+    /// `default` keeps every pre-existing CLAIM item wire-valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revealed_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -231,6 +235,11 @@ pub fn match_artwork<'a>(
 
     None
 }
+
+/// Reserved link_token partition for admin self-claims (`pk=LINK#SELF`). No Link META item ever
+/// exists for it: intake/fulfill/compensate use the SELF-specific store writes, and the public
+/// link fetch 404s it like any unknown token.
+pub const SELF_LINK_TOKEN: &str = "SELF";
 
 #[cfg(test)]
 mod tests {
@@ -443,6 +452,7 @@ mod tests {
             gift_url: None,
             created_at: datetime!(2026-07-02 00:00 UTC),
             choice_pre_tpks: None,
+            revealed_key: None,
         };
         let mut json = serde_json::to_value(&claim).unwrap();
         json.as_object_mut().unwrap().remove("choice_pre_tpks");
@@ -462,6 +472,7 @@ mod tests {
             gift_url: None,
             created_at: datetime!(2026-07-02 00:00 UTC),
             choice_pre_tpks: Some(vec!["already_owned_choice_steam".into()]),
+            revealed_key: None,
         };
         let json = serde_json::to_string(&claim).unwrap();
         let back: Claim = serde_json::from_str(&json).unwrap();
@@ -501,5 +512,18 @@ mod tests {
             Some("p2.png"),
             "longest prefix (Portal 2) must beat shorter prefix (Portal)"
         );
+    }
+
+    #[test]
+    fn claim_without_revealed_key_field_still_deserializes() {
+        // Every pre-existing CLAIM item in dynamo lacks the field — this pins backcompat.
+        let old = r#"{"id":"c1","link_token":"t","game_id":"g","state":"pending","gift_url":null,"created_at":"2026-07-01T00:00:00Z","choice_pre_tpks":null}"#;
+        let c: Claim = serde_json::from_str(old).expect("old claim must deserialize");
+        assert_eq!(c.revealed_key, None);
+    }
+
+    #[test]
+    fn self_link_token_is_self() {
+        assert_eq!(SELF_LINK_TOKEN, "SELF");
     }
 }
