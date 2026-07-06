@@ -24,6 +24,17 @@ const RECONCILE_MIN_AGE: time::Duration = time::Duration::minutes(15);
 /// stay under humble's bot-detection radar.
 const SYNC_PACE: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// A parked claim that reconcile structurally CANNOT act on — a `game_id` with no
+/// `gamekey:machine_name` split, or a machine_name that never appears in its order's keys on
+/// humble — would otherwise be skipped silently on every pass, forever: the friend stays stuck on
+/// "processing", the link slot stays consumed, and no operator ever hears about it. That violates
+/// this crate's "stop loudly, never skip silently" principle, so once such a claim is older than
+/// this threshold the skip turns loud: `warn!` plus a discord ping, once per claim per reconcile
+/// pass (the same bounded cadence as the redeemed-but-unrecorded arm — sync runs on a schedule,
+/// so ping volume is capped by that schedule). Younger than this, the skip stays log-only: the
+/// mismatch may be a mid-deploy artifact or an order shape the very next sync corrects.
+const RECONCILE_STUCK_ALERT_AGE: time::Duration = time::Duration::hours(24);
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum FulfillRequest {
@@ -1328,6 +1339,10 @@ async fn run_sync(deps: &Deps) {
 ///   value) and leave the claim pending: loud, human-owned recovery via humble's gift-history page.
 /// - key **not redeemed** → the redeem never landed → `compensate_claim` (slot + game return).
 /// - transient humble fetch error → skip that claim; the next pass retries.
+/// - claim is structurally unreconcilable (unsplittable `game_id`, or machine_name absent from
+///   the order's keys) → skip, but LOUDLY once it's past [`RECONCILE_STUCK_ALERT_AGE`]: such a
+///   skip repeats identically forever, so it warns + pings instead of leaking the slot in silence.
+///   The skip itself is unchanged — reconcile still decides nothing for these claims.
 /// - session dead mid-pass → self-heal via the shared ladder (respecting the caller's
 ///   once-per-run cap via `healed_this_run`); if still dead, stop the pass LOUDLY (warn +
 ///   `cookie_ok=false`) instead of silently skipping every remaining claim — the caller's order
@@ -1339,11 +1354,20 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
     };
     let now = OffsetDateTime::now_utc();
     for claim in claims {
-        if now - claim.created_at < RECONCILE_MIN_AGE {
+        let age = now - claim.created_at;
+        if age < RECONCILE_MIN_AGE {
             continue; // too fresh — a live redeem may still be recording.
         }
         // game_id is "gamekey:machine_name" (gamekey carries no colon).
         let Some((gamekey, machine_name)) = claim.game_id.split_once(':') else {
+            alert_unreconcilable(
+                deps,
+                &claim,
+                age,
+                "its game_id has no `gamekey:machine_name` shape, so there is no order to check \
+                 it against",
+            )
+            .await;
             continue;
         };
         let (heal, read) =
@@ -1379,6 +1403,16 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             continue;
         }
         let Some(key) = order.keys.iter().find(|k| k.machine_name == machine_name) else {
+            alert_unreconcilable(
+                deps,
+                &claim,
+                age,
+                &format!(
+                    "machine_name `{machine_name}` is not among order `{gamekey}`'s keys on \
+                     humble, so there is nothing to reconcile it against"
+                ),
+            )
+            .await;
             continue;
         };
         if key.redeemed {
@@ -1430,6 +1464,45 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             .await;
         }
     }
+}
+
+/// A parked claim reconcile structurally can't act on repeats its silent skip on every pass — the
+/// slot leaks and the friend stays stuck with zero operator signal. Past
+/// [`RECONCILE_STUCK_ALERT_AGE`] that goes loud: `warn!` + one discord ping. Younger than that it
+/// stays log-only (`debug!`) — the mismatch may be a transient deploy artifact the next sync fixes.
+/// `reason` names the structural cause and MUST carry no key/cookie/URL secret (claim id + human
+/// context only, same discipline as reconcile's other pings).
+async fn alert_unreconcilable(
+    deps: &Deps,
+    claim: &domain::Claim,
+    age: time::Duration,
+    reason: &str,
+) {
+    if age < RECONCILE_STUCK_ALERT_AGE {
+        tracing::debug!(
+            claim_id = %claim.id,
+            game_id = %claim.game_id,
+            "reconcile: skipping an unreconcilable parked claim (still young — not yet alerting)"
+        );
+        return;
+    }
+    let hours = age.whole_hours();
+    tracing::warn!(
+        claim_id = %claim.id,
+        game_id = %claim.game_id,
+        age_hours = hours,
+        "reconcile: parked claim is unreconcilable and STUCK — {reason}"
+    );
+    ping(
+        deps,
+        &format!(
+            "parked claim {} (game_id {}) has been stuck ~{hours}h and reconcile cannot act on \
+             it: {reason}. Nothing self-heals this — the link slot stays consumed until someone \
+             looks. Fix the claim/game_id by hand (or compensate it) to free the slot.",
+            claim.id, claim.game_id
+        ),
+    )
+    .await;
 }
 
 /// Validate the humble session by making a cheap authenticated call, self-healing a dead session

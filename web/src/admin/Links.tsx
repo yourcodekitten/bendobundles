@@ -5,6 +5,7 @@ import {
   adminCreateLink,
   adminRevoke,
   adminLinkClaims,
+  CreateLinkValidationError,
   type AdminLink,
   type AdminClaimView,
 } from '../api';
@@ -53,7 +54,7 @@ export function Links() {
   const [createdInfo, setCreatedInfo] = useState<{ fullUrl: string; label: string } | null>(null);
   // Create failure — creating a link is a spend-adjacent action; a silent catch
   // leaves the admin with zero signal whether a link now exists (mirrors the
-  // revoke-error pattern below)
+  // revoke-error pattern below). A 422 carries the violated bound verbatim.
   const [createError, setCreateError] = useState<string | null>(null);
 
   // Two-step revoke: set of armed token strings
@@ -82,6 +83,7 @@ export function Links() {
     const trimmedLabel = formLabel.trim();
     if (!trimmedLabel) return;
     setCreating(true);
+    setCreateError(null);
     const expires = expiresDays !== '' ? parseInt(expiresDays, 10) : undefined;
     withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires), navigate)
       .then((result) => {
@@ -93,16 +95,20 @@ export function Links() {
         // Reload to prepend the new link into the list
         load();
       })
-      .catch(() => {
-        // withAuth handles 401. Anything else (adminCreateLink throws on !ok,
-        // or network) means we DON'T KNOW whether the link exists — say so.
-        // Also drop any PREVIOUS success callout: it has no visible label, so
-        // next to a fresh failure it reads as "your link was created" and the
-        // admin can hand a friend the wrong URL. (The old link's URL stays
-        // copyable from its list row.)
+      .catch((err: unknown) => {
+        // withAuth handles 401. A 422 means the server rejected the INPUT —
+        // no link exists; show the violated bound verbatim so it can be
+        // corrected (inputs stay put). Anything else (5xx, network) means we
+        // DON'T KNOW whether the link exists — say so. Either way drop any
+        // PREVIOUS success callout: it has no visible label, so next to a
+        // fresh failure it reads as "your link was created" and the admin can
+        // hand a friend the wrong URL. (The old link's URL stays copyable
+        // from its list row.)
         setCreatedInfo(null);
         setCreateError(
-          "couldn't create the link — check the list below before retrying.",
+          err instanceof CreateLinkValidationError
+            ? err.message
+            : "couldn't create the link — check the list below before retrying.",
         );
       })
       .finally(() => {

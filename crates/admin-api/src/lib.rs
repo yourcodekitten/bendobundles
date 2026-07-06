@@ -251,6 +251,14 @@ async fn handle_game_hidden(
 
 // ── POST /admin/api/links ─────────────────────────────────────────────────────
 
+/// Bounds for create-link input. `expires_days` MUST be capped: the handler computes
+/// `now + Duration::days(d)`, and `OffsetDateTime + Duration` panics once the result leaves the
+/// representable range (year > 9999) — as does the rfc3339 serializer in dynamo's link schema.
+/// A panic here is a lambda 502 + cold restart, so absurd input gets a 422 instead.
+const EXPIRES_DAYS_MAX: u32 = 3650; // ~10 years — nobody needs a longer-lived gift link
+const CLAIMS_ALLOWED_MAX: u32 = 100;
+const LABEL_MAX_CHARS: usize = 200;
+
 #[derive(Deserialize)]
 struct CreateLinkBody {
     label: String,
@@ -258,10 +266,44 @@ struct CreateLinkBody {
     expires_days: Option<u32>,
 }
 
+impl CreateLinkBody {
+    /// Validate the body before any store or time arithmetic is touched.
+    /// Returns a client-facing message on the first violated bound.
+    fn validate(&self) -> Result<(), String> {
+        if self
+            .expires_days
+            .is_some_and(|d| !(1..=EXPIRES_DAYS_MAX).contains(&d))
+        {
+            return Err(format!(
+                "expires_days must be between 1 and {EXPIRES_DAYS_MAX}"
+            ));
+        }
+        if !(1..=CLAIMS_ALLOWED_MAX).contains(&self.claims_allowed) {
+            return Err(format!(
+                "claims_allowed must be between 1 and {CLAIMS_ALLOWED_MAX}"
+            ));
+        }
+        if self.label.chars().count() > LABEL_MAX_CHARS {
+            return Err(format!(
+                "label must be at most {LABEL_MAX_CHARS} characters"
+            ));
+        }
+        Ok(())
+    }
+}
+
 async fn handle_create_link(
     State(s): State<AppState>,
     Json(body): Json<CreateLinkBody>,
 ) -> Response {
+    if let Err(msg) = body.validate() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": msg})),
+        )
+            .into_response();
+    }
+
     // Token = two uuid-v4 simple-format (no hyphens) concatenated: 32 + 32 = 64 hex chars.
     let token = format!(
         "{}{}",
@@ -336,6 +378,15 @@ struct AdminClaimView {
 }
 
 async fn handle_link_claims(State(s): State<AppState>, Path(token): Path<String>) -> Response {
+    // Look the link up first: `claims_for_link` on an unknown token yields an empty list, which
+    // is indistinguishable from "link exists, no claims yet". Unknown token → 404, matching the
+    // revoke handler.
+    match s.store.get_link(&token).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+
     match s.store.claims_for_link(&token).await {
         Ok(claims) => {
             let views: Vec<AdminClaimView> = claims

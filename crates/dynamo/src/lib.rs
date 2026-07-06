@@ -89,6 +89,12 @@ pub enum ClaimTxError {
     LinkNotClaimable,
     #[error("duplicate claim id")]
     DuplicateClaim,
+    /// A concurrent transaction touched the same items — DynamoDB cancelled this one with
+    /// `TransactionConflict` (or refused it outright with `TransactionInProgressException`).
+    /// Transient by definition: nothing about THIS claim is invalid, it just lost a timing
+    /// race. Callers should surface a retryable 409, never a 500.
+    #[error("concurrent transaction conflict — safe to retry")]
+    TxConflict,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -113,6 +119,76 @@ fn is_ccf_put<R>(
             aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(_)
         )
     )
+}
+
+/// Deserialize a LINK META item, overriding EVERY enforcer field from the authoritative
+/// top-level attributes. The `body` blob is a convenience copy; the fields `claim_game`'s
+/// condition expression actually enforces — `claims_used`, `claims_allowed`, `revoked`,
+/// `expires_at` — live as top-level attributes (see `schema::link_item`) and are what
+/// concurrent writers (claim's atomic ADD, compensate's decrement, `update_link_meta`'s
+/// scoped SET/REMOVE) keep current. Reading any of them from `body` is a latent lost-update:
+/// harmless while body and attrs move in lockstep, live the day any writer moves an attr
+/// without rewriting body. So: body for identity/cosmetics, top-level attrs for enforcement.
+///
+/// `expires_at` absence is authoritative too — `link_item` omits it and `update_link_meta`
+/// REMOVEs it for never-expires — so the override is unconditional, not only-when-present.
+fn link_from_item(
+    item: &HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Result<Link, StoreError> {
+    let mut link: Link = parse_body(item)?;
+    let n_attr = |name: &str| item.get(name).and_then(|v| v.as_n().ok());
+    if let Some(v) = n_attr("claims_used").and_then(|n| n.parse::<u32>().ok()) {
+        link.claims_used = v;
+    }
+    if let Some(v) = n_attr("claims_allowed").and_then(|n| n.parse::<u32>().ok()) {
+        link.claims_allowed = v;
+    }
+    if let Some(b) = item.get("revoked").and_then(|v| v.as_bool().ok()) {
+        link.revoked = *b;
+    }
+    link.expires_at = match n_attr("expires_at") {
+        None => None,
+        Some(n) => {
+            let secs = n
+                .parse::<i64>()
+                .map_err(|_| StoreError::Corrupt("link expires_at not numeric"))?;
+            Some(
+                OffsetDateTime::from_unix_timestamp(secs)
+                    .map_err(|_| StoreError::Corrupt("link expires_at out of range"))?,
+            )
+        }
+    };
+    Ok(link)
+}
+
+/// Map `claim_game`'s three-item transaction cancellation reasons to a `ClaimTxError`.
+/// Reasons are positional: item 0 = GAME update, item 1 = LINK update, item 2 = CLAIM put.
+///
+/// A `ConditionalCheckFailed` is a definitive business answer (game taken / link dead /
+/// duplicate), so it wins even in a mixed cancel where another item also reports
+/// `TransactionConflict`. A cancel whose only failure codes are `TransactionConflict` is a
+/// pure timing race — a concurrent transaction held the same items — and maps to the
+/// retryable [`ClaimTxError::TxConflict`], not a 500-shaped `Store` error.
+fn claim_cancellation_error(
+    reasons: &[aws_sdk_dynamodb::types::CancellationReason],
+) -> Option<ClaimTxError> {
+    let code = |i: usize| reasons.get(i).and_then(|r| r.code());
+    if code(0) == Some("ConditionalCheckFailed") {
+        return Some(ClaimTxError::GameUnavailable);
+    }
+    if code(1) == Some("ConditionalCheckFailed") {
+        return Some(ClaimTxError::LinkNotClaimable);
+    }
+    if code(2) == Some("ConditionalCheckFailed") {
+        return Some(ClaimTxError::DuplicateClaim);
+    }
+    if reasons
+        .iter()
+        .any(|r| r.code() == Some("TransactionConflict"))
+    {
+        return Some(ClaimTxError::TxConflict);
+    }
+    None
 }
 
 pub struct Store {
@@ -265,19 +341,9 @@ impl Store {
             .key("sk", sk)
             .send()
             .await?;
-        out.item
-            .map(|item| {
-                let mut link: Link = parse_body(&item)?;
-                // Top-level `claims_used` (N) is the authoritative counter — updated atomically
-                // via ADD in claim_game's transaction. Override body's potentially stale value.
-                if let Some(n) = item.get("claims_used").and_then(|v| v.as_n().ok())
-                    && let Ok(v) = n.parse::<u32>()
-                {
-                    link.claims_used = v;
-                }
-                Ok(link)
-            })
-            .transpose()
+        // Enforcer fields (claims_used/claims_allowed/revoked/expires_at) come from the
+        // authoritative top-level attributes, never the possibly-stale body — see link_from_item.
+        out.item.map(|item| link_from_item(&item)).transpose()
     }
 
     pub async fn put_claim(&self, c: &Claim) -> Result<(), StoreError> {
@@ -307,23 +373,50 @@ impl Store {
         out.item.map(|i| parse_body(&i)).transpose()
     }
 
-    /// Single Query page (DynamoDB's 1 MB / page cap, no pagination). Fine at this app's scale —
-    /// one person's giftable-game catalog is small — but do NOT assume completeness at larger
-    /// scale: a bigger listable set would need `.into_paginator()` to be exhaustive.
+    /// Every listable game, exhaustively: loops `last_evaluated_key` so a catalog past
+    /// DynamoDB's 1 MB Query-page cap can't silently truncate the friend-facing list. (The
+    /// old single-page read was "fine at this scale" — until it wasn't; same loop as
+    /// `list_all_games` / `list_links`.)
     pub async fn list_listable_games(&self) -> Result<Vec<Game>, StoreError> {
-        let out = self
-            .client
-            .query()
-            .table_name(&self.table)
-            .index_name(schema::GSI_LISTABLE)
-            .key_condition_expression("gsi1pk = :p")
-            .expression_attribute_values(
-                ":p",
-                aws_sdk_dynamodb::types::AttributeValue::S("LISTABLE".into()),
-            )
-            .send()
-            .await?;
-        out.items().iter().map(parse_body).collect()
+        self.list_listable_games_paged(None).await
+    }
+
+    /// Pagination-exercising variant of [`list_listable_games`]. `page_limit` caps items per
+    /// Query page (DynamoDB `Limit`) so tests can force multi-page reads deterministically
+    /// without seeding a megabyte of data — it is a TEST SEAM, not a public paging API;
+    /// production callers use `list_listable_games` (no limit, full 1 MB pages).
+    #[doc(hidden)]
+    pub async fn list_listable_games_paged(
+        &self,
+        page_limit: Option<i32>,
+    ) -> Result<Vec<Game>, StoreError> {
+        let mut games: Vec<Game> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let mut req = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .index_name(schema::GSI_LISTABLE)
+                .key_condition_expression("gsi1pk = :p")
+                .expression_attribute_values(
+                    ":p",
+                    aws_sdk_dynamodb::types::AttributeValue::S("LISTABLE".into()),
+                )
+                .set_exclusive_start_key(last_key.take());
+            if let Some(limit) = page_limit {
+                req = req.limit(limit);
+            }
+            let out = req.send().await?;
+            for item in out.items() {
+                games.push(parse_body(item)?);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(games)
     }
 
     pub async fn claims_for_link(&self, token: &str) -> Result<Vec<Claim>, StoreError> {
@@ -476,30 +569,26 @@ impl Store {
         match result {
             Ok(_) => Ok(()),
             Err(sdk_err) => {
+                use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError as TwiErr;
                 // Capture debug string before borrowing sdk_err via as_service_error()
                 let err_str = format!("{sdk_err:?}");
                 // In aws-sdk-dynamodb 1.116.0 there is no as_transaction_canceled_exception();
-                // pattern-match directly on the public enum variant instead.
-                if let Some(
-                    aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(tce),
-                ) = sdk_err.as_service_error()
-                {
-                    let reasons = tce.cancellation_reasons();
-                    let failed = |i: usize| {
-                        reasons
-                            .get(i)
-                            .and_then(|r| r.code())
-                            .is_some_and(|c| c == "ConditionalCheckFailed")
-                    };
-                    if failed(0) {
-                        return Err(ClaimTxError::GameUnavailable);
+                // pattern-match directly on the public enum variants instead.
+                match sdk_err.as_service_error() {
+                    Some(TwiErr::TransactionCanceledException(tce)) => {
+                        // Positional CCF mapping + TransactionConflict → TxConflict; see
+                        // claim_cancellation_error for precedence rules.
+                        if let Some(e) = claim_cancellation_error(tce.cancellation_reasons()) {
+                            return Err(e);
+                        }
                     }
-                    if failed(1) {
-                        return Err(ClaimTxError::LinkNotClaimable);
+                    // The transaction wasn't cancelled — it never ran, because an identical
+                    // request is still in flight. Same disposition as a conflict cancel:
+                    // transient, retryable, 409-shaped.
+                    Some(TwiErr::TransactionInProgressException(_)) => {
+                        return Err(ClaimTxError::TxConflict);
                     }
-                    if failed(2) {
-                        return Err(ClaimTxError::DuplicateClaim);
-                    }
+                    _ => {}
                 }
                 Err(ClaimTxError::Store(StoreError::Aws(err_str)))
             }
@@ -914,24 +1003,50 @@ impl Store {
     /// Query the `pending-claims` GSI for all claims currently in `Pending` state, oldest first
     /// (ascending by gsi2sk, which is the RFC3339 `created_at`).
     ///
-    /// Single Query page (DynamoDB's 1 MB / page cap, no pagination). Fine at this app's scale —
-    /// pending claims are transient and expected to be few — but do NOT assume completeness at
-    /// larger scale: a larger pending set would need `.into_paginator()` to be exhaustive.
+    /// Exhaustive: loops `last_evaluated_key` across Query pages. This list feeds reconcile's
+    /// COMPLETENESS guarantee — a claim missing from a truncated page would be parked forever,
+    /// invisibly — so unlike a cosmetic list, partial results here are corruption, not
+    /// degradation. Ordering is preserved across pages (Query pages continue the gsi2sk sort).
     pub async fn list_pending_claims(&self) -> Result<Vec<Claim>, StoreError> {
-        let out = self
-            .client
-            .query()
-            .table_name(&self.table)
-            .index_name(schema::GSI_PENDING)
-            .key_condition_expression("gsi2pk = :p")
-            .expression_attribute_values(
-                ":p",
-                aws_sdk_dynamodb::types::AttributeValue::S("PENDINGCLAIM".into()),
-            )
-            .scan_index_forward(true)
-            .send()
-            .await?;
-        out.items().iter().map(parse_body).collect()
+        self.list_pending_claims_paged(None).await
+    }
+
+    /// Pagination-exercising variant of [`list_pending_claims`]. `page_limit` caps items per
+    /// Query page (DynamoDB `Limit`) so tests can force multi-page reads deterministically —
+    /// a TEST SEAM, not a public paging API; production callers use `list_pending_claims`.
+    #[doc(hidden)]
+    pub async fn list_pending_claims_paged(
+        &self,
+        page_limit: Option<i32>,
+    ) -> Result<Vec<Claim>, StoreError> {
+        let mut claims: Vec<Claim> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let mut req = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .index_name(schema::GSI_PENDING)
+                .key_condition_expression("gsi2pk = :p")
+                .expression_attribute_values(
+                    ":p",
+                    aws_sdk_dynamodb::types::AttributeValue::S("PENDINGCLAIM".into()),
+                )
+                .scan_index_forward(true)
+                .set_exclusive_start_key(last_key.take());
+            if let Some(limit) = page_limit {
+                req = req.limit(limit);
+            }
+            let out = req.send().await?;
+            for item in out.items() {
+                claims.push(parse_body(item)?);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(claims)
     }
 
     /// Full-catalog Scan over every GAME# item. Admin needs completeness: game IDs are scattered
@@ -974,9 +1089,10 @@ impl Store {
 
     /// Full Scan for all LINK# META items. Paginated via `last_evaluated_key` for completeness.
     /// The filter `begins_with(pk, "LINK#") AND sk = "META"` excludes CLAIM# sub-items (those
-    /// have `sk = "CLAIM#<id>"`) and any other item types. `claims_used` is overridden from the
-    /// authoritative top-level counter on each item — same logic as `get_link` — so the result
-    /// always reflects the enforcer's truth rather than a potentially-stale `body` counter.
+    /// have `sk = "CLAIM#<id>"`) and any other item types. Enforcer fields (claims_used,
+    /// claims_allowed, revoked, expires_at) are overridden from the authoritative top-level
+    /// attributes on each item — same logic as `get_link` (see `link_from_item`) — so the
+    /// result always reflects the enforcer's truth rather than a potentially-stale `body`.
     pub async fn list_links(&self) -> Result<Vec<Link>, StoreError> {
         let mut links: Vec<Link> = Vec::new();
         let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
@@ -998,15 +1114,8 @@ impl Store {
                 .send()
                 .await?;
             for item in out.items() {
-                let mut link: Link = parse_body(item)?;
-                // Top-level `claims_used` (N) is the authoritative counter — same override as
-                // `get_link`. The body's counter can lag under concurrent claim_game ADD ops.
-                if let Some(n) = item.get("claims_used").and_then(|v| v.as_n().ok())
-                    && let Ok(v) = n.parse::<u32>()
-                {
-                    link.claims_used = v;
-                }
-                links.push(link);
+                // Same enforcer-field override as `get_link` — top-level attrs win over body.
+                links.push(link_from_item(item)?);
             }
             match out.last_evaluated_key() {
                 None => break,
@@ -1197,5 +1306,88 @@ impl Store {
             .send()
             .await; // ignore ResourceInUse on re-run
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_dynamodb::types::CancellationReason;
+
+    fn reason(code: Option<&str>) -> CancellationReason {
+        let mut b = CancellationReason::builder();
+        if let Some(c) = code {
+            b = b.code(c);
+        }
+        b.build()
+    }
+
+    // dynamodb-local can't be coerced into producing a live TransactionConflict on demand, so
+    // the conflict→TxConflict decision is unit-tested against the mapping function directly with
+    // synthetic cancellation-reason vectors. (The positional CCF cases mirror what the live
+    // integration tests already exercise end-to-end.)
+
+    #[test]
+    fn conflict_reason_maps_to_txconflict() {
+        // A pure timing race: no CCF anywhere, a TransactionConflict on one item.
+        let reasons = vec![
+            reason(Some("TransactionConflict")),
+            reason(None),
+            reason(None),
+        ];
+        assert!(matches!(
+            claim_cancellation_error(&reasons),
+            Some(ClaimTxError::TxConflict)
+        ));
+    }
+
+    #[test]
+    fn conditional_check_beats_conflict() {
+        // Mixed cancel: the game's CCF is a definitive business answer and must win over a
+        // co-occurring TransactionConflict on the link — never degrade a real "taken" to a retry.
+        let reasons = vec![
+            reason(Some("ConditionalCheckFailed")),
+            reason(Some("TransactionConflict")),
+            reason(None),
+        ];
+        assert!(matches!(
+            claim_cancellation_error(&reasons),
+            Some(ClaimTxError::GameUnavailable)
+        ));
+    }
+
+    #[test]
+    fn positional_ccf_mapping() {
+        assert!(matches!(
+            claim_cancellation_error(&[
+                reason(Some("ConditionalCheckFailed")),
+                reason(None),
+                reason(None)
+            ]),
+            Some(ClaimTxError::GameUnavailable)
+        ));
+        assert!(matches!(
+            claim_cancellation_error(&[
+                reason(None),
+                reason(Some("ConditionalCheckFailed")),
+                reason(None)
+            ]),
+            Some(ClaimTxError::LinkNotClaimable)
+        ));
+        assert!(matches!(
+            claim_cancellation_error(&[
+                reason(None),
+                reason(None),
+                reason(Some("ConditionalCheckFailed"))
+            ]),
+            Some(ClaimTxError::DuplicateClaim)
+        ));
+    }
+
+    #[test]
+    fn unclassifiable_cancel_is_none() {
+        // No CCF, no conflict → caller falls through to the loud Store error.
+        let reasons = vec![reason(None), reason(None), reason(None)];
+        assert!(claim_cancellation_error(&reasons).is_none());
     }
 }

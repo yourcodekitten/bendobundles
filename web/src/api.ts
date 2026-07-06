@@ -225,6 +225,10 @@ export async function adminSetHidden(
   return { ok: false, message: 'unknown error' };
 }
 
+/// The server rejected the create-link INPUT (422) — no link exists and the
+/// message names the violated bound, safe to show verbatim in the form.
+export class CreateLinkValidationError extends Error {}
+
 export async function adminCreateLink(
   label: string,
   claims: number,
@@ -240,11 +244,28 @@ export async function adminCreateLink(
     }),
   });
 
+  await checkUnauthorized(response);
+
   // Creating a link mints the artifact ben hands a friend — a 5xx from API
   // Gateway still carries a JSON body, which would parse "fine", leave token
   // undefined, and render an /l/undefined invite for a link that was never
-  // created. Non-ok must throw, never fake success.
-  await checkOk(response, 'create link');
+  // created. Non-ok must throw, never fake success. A 422 carries
+  // {"error": msg} naming the violated bound — surface it so the form says WHY.
+  if (!response.ok) {
+    if (response.status === 422) {
+      let message = 'invalid link parameters';
+      try {
+        const errBody = (await response.json()) as { error?: unknown };
+        if (typeof errBody.error === 'string') {
+          message = errBody.error;
+        }
+      } catch {
+        // non-JSON body — keep the generic message
+      }
+      throw new CreateLinkValidationError(message);
+    }
+    throw new Error('failed to create link');
+  }
 
   // A 200 whose body isn't the link contract (proxy error page, API drift)
   // is the same /l/undefined trap wearing a success status — validate the
