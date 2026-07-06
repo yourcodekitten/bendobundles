@@ -507,7 +507,8 @@ impl HumbleClient {
 
     /// GET a page as raw HTML text (for the membership pages that embed their data server-side).
     /// Same auth + non-200 mapping as [`get_json`]; a dead session's 200-with-HTML login page is
-    /// caught by the callers (the membership blob won't be present → a parse error).
+    /// caught by the callers (the embedded blob won't be present — `choice_month` maps that to
+    /// `Unauthorized` so self-heal can kick in).
     async fn get_html(&self, path: &str) -> Result<String, HumbleError> {
         let resp = self
             .http
