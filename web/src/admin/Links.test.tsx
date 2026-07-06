@@ -164,6 +164,53 @@ describe('Links', () => {
         `${window.location.origin}/l/tok-new`,
       );
     });
+
+    it('create failure shows a loud error instead of silence', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockRejectedValue(new Error('failed to load create link'));
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+      // Failure surfaces as an alert — the admin must never be left guessing
+      // whether a link exists
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent(/couldn't create the link/i);
+      });
+      // No "invite link created" callout for a link that doesn't exist
+      expect(screen.queryByText(/invite link created/i)).not.toBeInTheDocument();
+      // Button re-enabled so the admin can retry after checking the list
+      expect(screen.getByRole('button', { name: /create invite link/i })).toBeEnabled();
+    });
+
+    it('error clears on a subsequent successful create', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink)
+        .mockRejectedValueOnce(new Error('failed to load create link'))
+        .mockResolvedValue({ token: 'tok-new', url_path: '/l/tok-new' });
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      await waitFor(() => screen.getByRole('alert'));
+
+      // Retry succeeds — the stale failure message must not linger next to
+      // the fresh "send this to your friend" callout
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/invite link created/i)).toBeInTheDocument();
+      });
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
   });
 
   describe('copy invite URL — per-row', () => {
