@@ -32,6 +32,13 @@ const SYNC_PACE: std::time::Duration = std::time::Duration::from_millis(300);
 /// to the handful of live months (`uses_choices && can_redeem_games`).
 const CHOICE_DISCOVERY_MAX_PAGES: usize = 26;
 
+/// How many of the newest months discovery probes DIRECTLY by constructed slug (current month + the
+/// preceding N-1), independent of the subscription list. The `subscription_products_with_gamekeys`
+/// list omits the 1-2 newest months (the current + just-billed one), which is exactly where an
+/// unspent pick lives — so we build their slugs from the wall clock and read each membership page.
+/// A small window with margin; each probe is one paced GET, deduped against the walk's slugs.
+const CHOICE_DISCOVERY_RECENT_PROBE: usize = 4;
+
 /// A parked claim that reconcile structurally CANNOT act on — a `game_id` with no
 /// `gamekey:machine_name` split, or a machine_name that never appears in its order's keys on
 /// humble — would otherwise be skipped silently on every pass, forever: the friend stays stuck on
@@ -1366,6 +1373,40 @@ async fn run_sync(deps: &Deps) {
 ///
 /// Shares the run's one-heal budget (`healed` / `cookie_ok`) and runs LAST in [`run_sync`]. Returns
 /// the count of newly-written offered games (folded into the sync's `games_written`).
+/// A Humble Choice month's membership slug is deterministic: `<lowercase-month>-<year>` (e.g.
+/// `june-2026`). The subscription list omits the 1-2 newest months, so discovery probes them by
+/// building their slugs from `now`. Returns the current month and the preceding `count-1`, newest
+/// first. `now` is injected so the construction is testable.
+fn recent_month_slugs(now: OffsetDateTime, count: usize) -> Vec<String> {
+    let mut year = now.year();
+    let mut month = now.month() as u8; // time::Month: January = 1 ..= December = 12
+    let mut slugs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = match month {
+            1 => "january",
+            2 => "february",
+            3 => "march",
+            4 => "april",
+            5 => "may",
+            6 => "june",
+            7 => "july",
+            8 => "august",
+            9 => "september",
+            10 => "october",
+            11 => "november",
+            _ => "december",
+        };
+        slugs.push(format!("{name}-{year}"));
+        if month == 1 {
+            month = 12;
+            year -= 1;
+        } else {
+            month -= 1;
+        }
+    }
+    slugs
+}
+
 async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut bool) -> u32 {
     // Step 1: enumerate month slugs. A truncated walk (`complete == false`) simply means we discover
     // a prefix of months this pass — safe, because discovery only ADDS entries and never deletes on
@@ -1400,31 +1441,43 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
     }
 
     let mut written = 0u32;
-    // Process EVERY enumerated month via its per-month read — do NOT pre-filter on the list's
-    // `can_redeem_games`. The subscription LIST is unreliable for the two newest months (the current
-    // and just-billed one show up gamekey-less and/or `canRedeemGames=false`), yet their membership
-    // PAGE is fully claimable. So the membership read is the source of truth: we gate the WRITE on
-    // `detail.can_redeem_games` (page truth) below, not the list flag. Both tiers qualify —
-    // `choosecontent` works for pick-N and claim-all alike. Cost is bounded by the walk's page cap.
-    for month in walk.months.iter() {
+    // Targets = `(slug, is_probe)`: the newest months probed DIRECTLY (the list omits them, is_probe
+    // = true), then every month the list DID enumerate (is_probe = false) — deduped, newest-first. We
+    // read each via its membership page and do NOT pre-filter on the list's `can_redeem_games`
+    // (unreliable for recent months); the page is the source of truth, gated on `detail.can_redeem_games`
+    // below. Both tiers qualify — `choosecontent` works for pick-N and claim-all alike.
+    let mut targets: Vec<(String, bool)> =
+        recent_month_slugs(OffsetDateTime::now_utc(), CHOICE_DISCOVERY_RECENT_PROBE)
+            .into_iter()
+            .map(|s| (s, true))
+            .collect();
+    for m in &walk.months {
+        if !targets.iter().any(|(s, _)| s == &m.product_url_path) {
+            targets.push((m.product_url_path.clone(), false));
+        }
+    }
+    for (slug, is_probe) in &targets {
         tokio::time::sleep(SYNC_PACE).await;
-        let (heal, read) = selfheal_once(deps, !*healed, || {
-            deps.humble.choice_month(&month.product_url_path)
-        })
-        .await;
+        // A speculative probe NEVER spends the run's one heal: a not-yet-live month can 302 →
+        // Unauthorized, which would both waste the heal and masquerade as a session death. Only a
+        // list-enumerated month (a real month) may heal + treat Unauthorized as the cookie-dead signal.
+        let allow_heal = !is_probe && !*healed;
+        let (heal, read) = selfheal_once(deps, allow_heal, || deps.humble.choice_month(slug)).await;
         if let Some(h) = heal {
             *healed = true;
             *cookie_ok = h.durable();
         }
         let detail = match read {
             Ok(m) => m,
+            // Probe hit a redirect/login page (a not-yet-live month) — skip, NOT a session death.
+            Err(HumbleError::Unauthorized) if *is_probe => continue,
             Err(HumbleError::Unauthorized) => {
                 *cookie_ok = false;
                 ping(deps, COOKIE_DEAD_MSG).await;
                 break;
             }
             Err(e) => {
-                tracing::warn!(month = %month.product_url_path, error = ?e, "choice discovery: month read failed — skipping");
+                tracing::warn!(month = %slug, error = ?e, "choice discovery: month read failed — skipping");
                 continue;
             }
         };
@@ -1773,6 +1826,23 @@ mod tests {
         let c = ping_content("cookie is DEAD");
         assert!(c.starts_with("🐱 bendobundles: "));
         assert!(c.contains("cookie is DEAD"));
+    }
+
+    #[test]
+    fn recent_month_slugs_are_newest_first_and_cross_year() {
+        use time::macros::datetime;
+        // 2026-07-06 → july-2026, newest first.
+        let now = datetime!(2026-07-06 12:00 UTC);
+        assert_eq!(
+            recent_month_slugs(now, 4),
+            vec!["july-2026", "june-2026", "may-2026", "april-2026"],
+        );
+        // Crosses into the prior year correctly.
+        let jan = datetime!(2026-01-15 00:00 UTC);
+        assert_eq!(
+            recent_month_slugs(jan, 3),
+            vec!["january-2026", "december-2025", "november-2025"],
+        );
     }
 
     #[test]
