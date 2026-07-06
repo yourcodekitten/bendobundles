@@ -3018,3 +3018,193 @@ fn reveal_decision_ladder_matches_gift_decision() {
     check_agree!(E::LoginFailed { reason: "y".into() });
     check_agree!(E::ChooseFailed { reason: "y".into() });
 }
+
+// =================================================================================================
+// Task 7: Self-claim choice path tests.
+// =================================================================================================
+
+/// Seed an Available game with `requires_choice=true` — the self-claim choice variant.
+async fn seed_choice_game(store: &Store, game_id_str: &str, title: &str) {
+    let (gk, mn) = game_id_str.split_once(':').expect("game_id must be gamekey:machine_name");
+    let g = domain::Game {
+        id: game_id_str.into(),
+        title: title.into(),
+        bundle: "Test Bundle".into(),
+        gamekey: gk.into(),
+        machine_name: mn.into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: true,
+    };
+    store.put_game(&g).await.unwrap();
+}
+
+/// Mount GET /api/v1/order/{gamekey} returning no tpks — the pre-choose state.
+/// Matched `up_to_n_times(1)` so the subsequent mount (post-choose) can serve the new tpk.
+async fn mount_order_pre_choose(humble: &MockServer, gamekey: &str) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/order/{gamekey}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json(gamekey, serde_json::json!([]))),
+        )
+        .up_to_n_times(1)
+        .mount(humble)
+        .await;
+}
+
+/// Mount GET /api/v1/order/{gamekey} returning a newly-minted unredeemed tpk.
+async fn mount_order_post_choose(
+    humble: &MockServer,
+    gamekey: &str,
+    machine_name: &str,
+    _keyindex: u32,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/order/{gamekey}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            gamekey,
+            serde_json::json!([tpk_json(machine_name, machine_name, false)]),
+        )))
+        .mount(humble)
+        .await;
+}
+
+/// Mount POST /humbler/choosecontent → success (200, success=true). The "asserting_no_is_gift"
+/// in the name documents intent — the actual assertion that `is_gift` is absent is made after the
+/// call via `humble.received_requests()`.
+async fn mount_choose_success_asserting_no_is_gift(humble: &MockServer, _gamekey: &str) {
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "force_refresh": true
+        })))
+        .mount(humble)
+        .await;
+}
+
+/// Mount POST /humbler/choosecontent → 500 (ambiguous: pick MAY be spent).
+async fn mount_choose_500(humble: &MockServer, _gamekey: &str) {
+    Mock::given(method("POST"))
+        .and(path("/humbler/choosecontent"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(humble)
+        .await;
+}
+
+fn self_claim_choice_req(
+    claim_id: &str,
+    game_id: &str,
+    gamekey: &str,
+    machine_name: &str,
+) -> FulfillRequest {
+    FulfillRequest::SelfClaim {
+        claim_id: claim_id.into(),
+        game_id: game_id.into(),
+        gamekey: gamekey.into(),
+        machine_name: machine_name.into(),
+        keyindex: 0,
+        requires_choice: true,
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 1: Happy path — pre-read (no tpk) → record intent → choose (no is_gift) → re-read → reveal.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn choice_self_claim_chooses_without_gift_then_reveals() {
+    let Some(store) = store_or_skip("sc-choice-happy").await else {
+        return;
+    };
+    seed_choice_game(&store, "gkE:offered_sim", "Construction Simulator").await;
+    store
+        .claim_game_self("gkE:offered_sim", "sc-c1", now())
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_order_pre_choose(&humble, "gkE").await;
+    mount_choose_success_asserting_no_is_gift(&humble, "gkE").await;
+    mount_order_post_choose(&humble, "gkE", "constructionsim_choice_steam", 0).await;
+    mount_reveal_success(&humble, "SIM-KEY-123").await;
+
+    let deps = deps(store.clone(), &humble.uri(), None);
+    let resp = handle(
+        &deps,
+        FulfillRequest::SelfClaim {
+            claim_id: "sc-c1".into(),
+            game_id: "gkE:offered_sim".into(),
+            gamekey: "gkE".into(),
+            machine_name: "offered_sim".into(),
+            keyindex: 0,
+            requires_choice: true,
+        },
+    )
+    .await;
+
+    assert_eq!(
+        resp,
+        FulfillResponse::RevealedKey {
+            key: "SIM-KEY-123".into()
+        }
+    );
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-c1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        claim.choice_pre_tpks.is_some(),
+        "intent snapshot must be recorded before choose"
+    );
+    assert_eq!(claim.revealed_key.as_deref(), Some("SIM-KEY-123"));
+
+    // Assert is_gift was NOT sent in the choose POST (self-claim must NOT use is_gift).
+    let reqs = humble.received_requests().await.unwrap();
+    let choose = reqs
+        .iter()
+        .find(|r| r.url.path() == "/humbler/choosecontent")
+        .unwrap();
+    let body = String::from_utf8(choose.body.clone()).unwrap();
+    assert!(
+        !body.contains("is_gift"),
+        "self-claim choose must not send is_gift: {body}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 2: Ambiguous choose (500) → park, no reveal attempted.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn choice_self_claim_ambiguous_choose_parks_no_reveal_attempted() {
+    let Some(store) = store_or_skip("sc-choice-park").await else {
+        return;
+    };
+    seed_choice_game(&store, "gkF:offered_x", "Parked Sim").await;
+    store
+        .claim_game_self("gkF:offered_x", "sc-c2", now())
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_order_pre_choose(&humble, "gkF").await;
+    mount_choose_500(&humble, "gkF").await;
+
+    let deps = deps(store.clone(), &humble.uri(), None);
+    let resp =
+        handle(&deps, self_claim_choice_req("sc-c2", "gkF:offered_x", "gkF", "offered_x")).await;
+
+    assert!(matches!(resp, FulfillResponse::Parked { .. }));
+    // No reveal POST was attempted.
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/humbler/redeemkey"),
+        0,
+        "no reveal should be attempted on ambiguous choose"
+    );
+}
