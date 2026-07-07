@@ -96,3 +96,36 @@
     2px 2px 0 var(--color-pixel), -2px 2px 0 var(--color-pixel),
     2px -2px 0 var(--color-pixel), -2px -2px 0 var(--color-pixel);
 }
+
+/* the dialog-box typing cursor — a blinking block, JRPG style */
+.tw-cursor {
+  display: inline-block;
+  margin-left: 1px;
+  animation: tw-blink 0.8s steps(1) infinite;
+}
+@keyframes tw-blink {
+  50% {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tw-cursor {
+    display: none;
+  }
+}
+
+/* the menu-selection cursor — a chunky two-frame bob, "press A to continue" */
+.menu-cursor {
+  display: inline-block;
+  animation: menu-cursor-bob 0.6s steps(1) infinite;
+}
+@keyframes menu-cursor-bob {
+  50% {
+    transform: translateX(3px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .menu-cursor {
+    animation: none;
+  }
+}

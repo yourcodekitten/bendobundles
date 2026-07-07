@@ -24,6 +24,32 @@ export function LinkPage() {
   const { token } = useParams<{ token: string }>();
   const [view, setView] = useState<ViewState>({ kind: 'loading' });
   const [claimingGame, setClaimingGame] = useState<GameView | null>(null);
+  // ── dialog-box typewriter (the page's one entrance; see DESIGN.md motion) ──
+  const DIALOG_BODY =
+    "games from ben's humble stash, picked for you \u2661 open one for details, claim it, and the key is yours.";
+  const typedLabel = view.kind === 'loaded' ? view.data.label : '';
+  const typeTotal = typedLabel.length + DIALOG_BODY.length;
+  const [typeChars, setTypeChars] = useState(0);
+  const [typeKey, setTypeKey] = useState(0);
+  useEffect(() => {
+    if (typeTotal === 0) return;
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      setTypeChars(typeTotal);
+      return;
+    }
+    setTypeChars(0);
+    const iv = setInterval(() => {
+      setTypeChars((c) => {
+        if (c >= typeTotal) {
+          clearInterval(iv);
+          return c;
+        }
+        return c + 1;
+      });
+    }, 14);
+    return () => clearInterval(iv);
+  }, [typeKey, typeTotal]);
+  const typeDone = typeChars >= typeTotal;
   const [detailGame, setDetailGame] = useState<GameView | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const prevTokenRef = useRef<string | undefined>(undefined);
@@ -181,13 +207,28 @@ export function LinkPage() {
               {data.claims_used}/{data.claims_allowed} claims used
             </span>
           </div>
-          <div className="absolute bottom-4 left-6 max-w-xl rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)]">
-              <h2 className="text-xl leading-tight text-give-soft">{data.label}</h2>
-              <p className="mt-1.5 max-w-[60ch] text-sm text-ink-soft">
-                games from ben&apos;s humble stash, picked for you ♡ open one for details, claim it, and the key is yours.
+          <div className="absolute bottom-4 left-6 w-[34rem] max-w-[calc(100%-3rem)] rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)]">
+              <button
+                type="button"
+                onClick={() => setTypeKey((k) => k + 1)}
+                aria-label="replay the text"
+                title="replay"
+                className="font-pixel absolute top-2.5 right-3 text-sm text-dust-faint hover:text-ink"
+              >
+                &#8635;
+              </button>
+              <h2 className="min-h-7 text-xl leading-tight text-give-soft">
+                {typedLabel.slice(0, typeChars)}
+                {typeChars < typedLabel.length && <span aria-hidden="true" className="tw-cursor">&#9646;</span>}
+              </h2>
+              <p className="mt-1.5 min-h-10 max-w-[60ch] text-sm text-ink-soft">
+                {DIALOG_BODY.slice(0, Math.max(0, typeChars - typedLabel.length))}
+                {typeChars >= typedLabel.length && !typeDone && (
+                  <span aria-hidden="true" className="tw-cursor">&#9646;</span>
+                )}
               </p>
               {steamIdentity !== null ? (
-                <div className="mt-2 flex items-center gap-2">
+                <div className={`mt-2 flex items-center gap-2 transition-opacity duration-300 ${typeDone ? 'opacity-100' : 'pointer-events-none opacity-0'}`}>
                   <span className="rounded bg-shelf px-2 py-1 text-xs text-ink-soft">{steamIdentity.persona}</span>
                   <button type="button" onClick={() => { clearIdentity(); setSteamIdentity(null); setSteamPrivate(false); setSteamError(null); }} className="text-xs text-dust-faint hover:text-ink-soft">disconnect</button>
                 </div>
@@ -195,9 +236,9 @@ export function LinkPage() {
                 <button
                   type="button"
                   onClick={() => beginConnect(`/l/${token}`)}
-                  className="font-pixel group mt-2 -mx-1 flex items-center gap-1.5 rounded px-1 py-0.5 text-sm text-ink hover:bg-shelf"
+                  className={`font-pixel group mt-2 -mx-1 flex items-center gap-1.5 rounded px-1 py-0.5 text-sm text-ink hover:bg-shelf transition-opacity duration-300 ${typeDone ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
                 >
-                  <span aria-hidden="true" className="text-give transition-transform group-hover:translate-x-0.5">▸</span>
+                  <span aria-hidden="true" className="menu-cursor text-give">&#9656;</span>
                   connect to steam
                   <span className="font-sans text-xs text-dust-faint">— flags the games you already own</span>
                 </button>

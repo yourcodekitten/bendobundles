@@ -124,8 +124,11 @@ describe('LinkPage', () => {
     });
     await user.click(screen.getByRole('button', { name: /close/i }));
 
-    // Soft refresh: header and grid still there, no full-page spinner
-    expect(screen.getByText('Test Bundle')).toBeInTheDocument();
+    // Soft refresh: header and grid still there, no full-page spinner.
+    // (waitFor: the dialog-box title types in, so the full label lands async.)
+    await waitFor(() => {
+      expect(screen.getByText('Test Bundle')).toBeInTheDocument();
+    });
     expect(screen.getByText('Portal')).toBeInTheDocument();
     expect(screen.queryByText(/^loading\.\.\.$/)).not.toBeInTheDocument();
   });
