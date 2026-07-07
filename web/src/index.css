@@ -1,1 +1,52 @@
 @import "tailwindcss";
+
+/* ── the pea soup world ─────────────────────────────────────────────────────
+   bendobundles design tokens (see DESIGN.md — "The Attic Arcade", pea soup
+   palette). The room is the light olive of an original 1989 handheld LCD;
+   the ink is its darkest shade; the accent is the burgundy-magenta of the
+   A/B buttons, reserved for giving and claiming (The Button Burgundy Rule). */
+@theme {
+  /* room — surfaces, light to dark */
+  --color-room: oklch(87% 0.085 112);           /* page background — the screen */
+  --color-floor: oklch(91% 0.07 110);           /* cards, dialogs, panels */
+  --color-shelf: oklch(80% 0.09 112);           /* chips, raised rows */
+  --color-control: oklch(73% 0.09 113);         /* neutral buttons */
+  --color-control-bright: oklch(69% 0.09 114);  /* neutral button hover */
+
+  /* ink — text, dark to light */
+  --color-ink: oklch(30% 0.06 120);             /* primary text */
+  --color-ink-soft: oklch(36% 0.06 118);        /* secondary text */
+  --color-dust: oklch(43% 0.06 116);            /* muted text */
+  --color-dust-faint: oklch(48% 0.06 114);      /* faintest legible text */
+
+  /* structure */
+  --color-line: oklch(66% 0.075 112);           /* hairline borders */
+  --color-pixel: oklch(35% 0.06 120);           /* bezel: dialog rings, focus, frames */
+
+  /* give — the DMG A/B button burgundy; claiming and gifting ONLY */
+  --color-give: oklch(46% 0.155 355);
+  --color-give-bright: oklch(52% 0.16 355);     /* hover */
+  --color-give-soft: oklch(42% 0.14 350);       /* accent text on light surfaces */
+  --color-give-ink: oklch(97% 0.012 350);       /* text on give backgrounds */
+}
+
+/* landing entrance — a single quiet rise; the ceremony budget lives in the
+   claim dialog, not here */
+@keyframes landing-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.landing-rise {
+  animation: landing-rise 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing-rise {
+    animation: none;
+  }
+}

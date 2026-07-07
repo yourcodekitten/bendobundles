@@ -23,13 +23,13 @@ function statusBadgeClass(status: string): string {
     case 'pending':
       return 'bg-amber-700 text-amber-100';
     case 'gifted':
-      return 'bg-violet-700 text-violet-100';
+      return 'bg-give text-give-ink';
     case 'ben_redeemed':
       return 'bg-slate-600 text-slate-100';
     case 'expired':
       return 'bg-red-700 text-red-100';
     default:
-      return 'bg-zinc-700 text-zinc-100';
+      return 'bg-control text-ink';
   }
 }
 
@@ -210,15 +210,15 @@ export function GameDetailModal(props: GameDetailModalProps) {
           if (e.target === e.currentTarget) onClose();
         }}
       >
-        <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl bg-zinc-900 shadow-2xl ring-1 ring-zinc-700">
+        <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl bg-floor shadow-2xl ring-1 ring-pixel">
           {/* Header */}
-          <div className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
+          <div className="flex items-center justify-between border-b border-line px-6 py-4">
             <h2 className="text-lg font-semibold">{game.title}</h2>
             <button
               type="button"
               onClick={onClose}
               aria-label="close"
-              className="text-zinc-400 hover:text-zinc-200"
+              className="text-dust hover:text-ink-soft"
             >
               ✕
             </button>
@@ -227,16 +227,16 @@ export function GameDetailModal(props: GameDetailModalProps) {
           {/* Body */}
           <div className="flex-1 overflow-y-auto">
             {loadState.phase === 'loading' && (
-              <p className="px-6 py-8 text-center text-zinc-400">loading...</p>
+              <p className="px-6 py-8 text-center text-dust">loading...</p>
             )}
 
             {loadState.phase === 'error' && (
               <div className="px-6 py-8 text-center">
-                <p className="text-zinc-400">couldn&apos;t load details</p>
+                <p className="text-dust">couldn&apos;t load details</p>
                 <button
                   type="button"
                   onClick={() => setRetryKey((k) => k + 1)}
-                  className="mt-2 text-sm text-violet-400 hover:text-violet-300"
+                  className="mt-2 text-sm text-give-soft hover:text-give"
                 >
                   retry
                 </button>
@@ -259,14 +259,14 @@ export function GameDetailModal(props: GameDetailModalProps) {
                   />
                 )}
                 <div className="flex flex-wrap gap-2">
-                  <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300">
+                  <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
                     {game.bundle}
                   </span>
-                  <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300">
+                  <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
                     {game.key_type}
                   </span>
                 </div>
-                <p className="text-sm text-zinc-400">no steam page for this one.</p>
+                <p className="text-sm text-dust">no steam page for this one.</p>
               </div>
             )}
 
@@ -320,7 +320,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
                   {detail !== null && (
                     <div className="space-y-3 px-6">
                       {/* Dev · Pub · Release */}
-                      <p className="text-sm text-zinc-300">
+                      <p className="text-sm text-ink-soft">
                         {detail.developers.join(', ')}
                         {detail.publishers.length > 0 &&
                           detail.publishers.join(',') !== detail.developers.join(',') && (
@@ -335,7 +335,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
                           {detail.genres.map((genre) => (
                             <span
                               key={genre}
-                              className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400"
+                              className="rounded bg-shelf px-2 py-0.5 text-xs text-dust"
                             >
                               {genre}
                             </span>
@@ -344,7 +344,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
                       )}
 
                       {/* Short description */}
-                      <p className="text-sm leading-relaxed text-zinc-300">
+                      <p className="text-sm leading-relaxed text-ink-soft">
                         {detail.short_description}
                       </p>
                     </div>
@@ -355,14 +355,14 @@ export function GameDetailModal(props: GameDetailModalProps) {
                     <div className="flex flex-wrap gap-2 px-6">
                       {overall !== null && (
                         <span
-                          className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-200"
+                          className="rounded bg-shelf px-2 py-1 text-xs text-ink-soft"
                           title={`${overall.total_positive.toLocaleString()} positive · ${overall.total_negative.toLocaleString()} negative`}
                         >
                           {overall.desc} · {overall.total_reviews.toLocaleString()} reviews
                         </span>
                       )}
                       {recent !== null && (
-                        <span className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-200">
+                        <span className="rounded bg-shelf px-2 py-1 text-xs text-ink-soft">
                           {recent.percent_positive}% positive (
                           {recent.count.toLocaleString()} recent)
                         </span>
@@ -375,13 +375,13 @@ export function GameDetailModal(props: GameDetailModalProps) {
           </div>
 
           {/* Footer */}
-          <div className="flex items-center gap-3 border-t border-zinc-800 px-6 py-4">
+          <div className="flex items-center gap-3 border-t border-line px-6 py-4">
             {props.mount === 'friend' ? (
               <button
                 type="button"
                 disabled={!props.active}
                 onClick={() => props.onClaim(props.game)}
-                className="rounded bg-violet-700 px-4 py-2 text-sm font-medium hover:bg-violet-600 disabled:cursor-not-allowed disabled:opacity-40"
+                className="rounded bg-give px-4 py-2 text-sm font-medium text-give-ink hover:bg-give-bright disabled:cursor-not-allowed disabled:opacity-40"
               >
                 claim
               </button>
@@ -411,7 +411,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
                         className={`rounded px-3 py-1 text-xs ${
                           isArmed
                             ? 'bg-emerald-700 text-emerald-100 hover:bg-emerald-600'
-                            : 'bg-zinc-700 hover:bg-zinc-600'
+                            : 'bg-control hover:bg-control-bright'
                         } disabled:opacity-50`}
                       >
                         {isArmed
@@ -435,7 +435,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
                         <button
                           type="button"
                           onClick={() => void navigator.clipboard.writeText(r.key)}
-                          className="rounded bg-zinc-700 px-2 py-1 text-xs"
+                          className="rounded bg-control px-2 py-1 text-xs"
                         >
                           copy
                         </button>
@@ -444,7 +444,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
                             href={`https://store.steampowered.com/account/registerkey?key=${encodeURIComponent(r.key)}`}
                             target="_blank"
                             rel="noreferrer"
-                            className="rounded bg-blue-700 px-2 py-1 text-xs"
+                            className="rounded bg-blue-700 px-2 py-1 text-xs text-blue-100"
                           >
                             redeem on steam
                           </a>
@@ -452,10 +452,10 @@ export function GameDetailModal(props: GameDetailModalProps) {
                       </div>
                     )}
                     {r?.kind === 'processing' && (
-                      <p className="text-xs text-amber-300">processing — check self-claims below</p>
+                      <p className="text-xs text-amber-800">processing — check self-claims below</p>
                     )}
                     {r?.kind === 'refused' && (
-                      <p className="text-xs text-red-400">{r.message}</p>
+                      <p className="text-xs text-red-700">{r.message}</p>
                     )}
                   </>
                 );

@@ -34,7 +34,7 @@ export function GameGrid({ games, active, onClaim, owned, onDetail }: GameGridPr
         return (
           <div
             key={game.title}
-            className={`rounded-lg bg-zinc-900 overflow-hidden${onDetail !== undefined ? ' cursor-pointer' : ''}`}
+            className={`rounded-lg bg-floor overflow-hidden${onDetail !== undefined ? ' cursor-pointer' : ''}`}
             onClick={() => onDetail?.(game)}
           >
             {game.artwork_url !== null ? (
@@ -51,13 +51,13 @@ export function GameGrid({ games, active, onClaim, owned, onDetail }: GameGridPr
             )}
             <div className="p-4">
               <h3 className="font-semibold text-sm leading-tight">{game.title}</h3>
-              <p className="mt-1 text-xs text-zinc-400 truncate">{game.bundle}</p>
+              <p className="mt-1 text-xs text-dust truncate">{game.bundle}</p>
               <div className="mt-2 flex flex-wrap gap-1.5">
-                <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300">
+                <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
                   {game.key_type}
                 </span>
                 {count > 1 && (
-                  <span className="rounded bg-zinc-700 px-2 py-0.5 text-xs text-zinc-300">
+                  <span className="rounded bg-control px-2 py-0.5 text-xs text-ink-soft">
                     ×{count} copies
                   </span>
                 )}
@@ -71,7 +71,7 @@ export function GameGrid({ games, active, onClaim, owned, onDetail }: GameGridPr
                 type="button"
                 disabled={!active}
                 onClick={(e) => { e.stopPropagation(); onClaim(game); }}
-                className="mt-3 w-full rounded bg-violet-700 px-3 py-1.5 text-sm font-medium hover:bg-violet-600 disabled:cursor-not-allowed disabled:opacity-40"
+                className="mt-3 w-full rounded bg-give px-3 py-1.5 text-sm font-medium text-give-ink hover:bg-give-bright disabled:cursor-not-allowed disabled:opacity-40"
               >
                 claim
               </button>

@@ -24,13 +24,13 @@ function statusBadgeClass(status: string): string {
     case 'pending':
       return 'bg-amber-700 text-amber-100';
     case 'gifted':
-      return 'bg-violet-700 text-violet-100';
+      return 'bg-give text-give-ink';
     case 'ben_redeemed':
       return 'bg-slate-600 text-slate-100';
     case 'expired':
       return 'bg-red-700 text-red-100';
     default:
-      return 'bg-zinc-700 text-zinc-100';
+      return 'bg-control text-ink';
   }
 }
 
@@ -169,17 +169,17 @@ export function Catalog() {
   }, [games]);
 
   if (state.phase === 'loading') {
-    return <p className="text-zinc-400">loading…</p>;
+    return <p className="text-dust">loading…</p>;
   }
 
   if (state.phase === 'error') {
     return (
       <div className="flex flex-col gap-4">
-        <p className="text-zinc-400">couldn't load the catalog — try again</p>
+        <p className="text-dust">couldn't load the catalog — try again</p>
         <button
           type="button"
           onClick={load}
-          className="w-fit rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600"
+          className="w-fit rounded bg-control px-4 py-2 text-sm hover:bg-control-bright"
         >
           retry
         </button>
@@ -196,9 +196,9 @@ export function Catalog() {
           placeholder="search title or bundle…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
-          className="rounded border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-zinc-500 focus:outline-none"
+          className="rounded border border-line bg-floor px-3 py-1.5 text-sm text-ink placeholder-dust focus:border-pixel focus:outline-none"
         />
-        <p className="text-sm text-zinc-500">{summary}</p>
+        <p className="text-sm text-dust-faint">{summary}</p>
       </div>
 
       <div className="space-y-1">
@@ -212,7 +212,7 @@ export function Catalog() {
           return (
             <div key={game.id} className="space-y-1">
               <div
-                className="flex flex-wrap items-center gap-3 rounded bg-zinc-900 px-4 py-3 cursor-pointer"
+                className="flex flex-wrap items-center gap-3 rounded bg-floor px-4 py-3 cursor-pointer"
                 onClick={() => setDetailGame(game)}
               >
                 {/* Artwork thumbnail — colored fallback when url absent */}
@@ -232,11 +232,11 @@ export function Catalog() {
                 {/* Title + bundle */}
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-medium">{game.title}</p>
-                  <p className="truncate text-xs text-zinc-400">{game.bundle}</p>
+                  <p className="truncate text-xs text-dust">{game.bundle}</p>
                 </div>
 
                 {/* key_type */}
-                <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-300">
+                <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
                   {game.key_type}
                 </span>
 
@@ -249,7 +249,7 @@ export function Catalog() {
 
                 {/* Giftable chip — only shown when true */}
                 {game.giftable && (
-                  <span className="rounded bg-violet-900 px-2 py-0.5 text-xs text-violet-200">
+                  <span className="rounded bg-give px-2 py-0.5 text-xs text-give-ink">
                     giftable
                   </span>
                 )}
@@ -270,7 +270,7 @@ export function Catalog() {
                     className={`rounded px-3 py-1 text-xs ${
                       isArmed
                         ? 'bg-emerald-700 text-emerald-100 hover:bg-emerald-600'
-                        : 'bg-zinc-700 hover:bg-zinc-600'
+                        : 'bg-control hover:bg-control-bright'
                     } disabled:opacity-50`}
                   >
                     {isArmed
@@ -298,14 +298,14 @@ export function Catalog() {
                     aria-label={`hide ${game.title}`}
                     checked={game.hidden}
                     onChange={() => handleToggle(game)}
-                    className="h-4 w-4 cursor-pointer accent-zinc-500"
+                    className="h-4 w-4 cursor-pointer accent-give"
                   />
-                  <span className="text-xs text-zinc-400">hidden</span>
+                  <span className="text-xs text-dust">hidden</span>
                 </label>
 
                 {/* Inline toggle error — shown when server refuses (e.g. mid-claim) */}
                 {rowErr !== undefined && (
-                  <p className="w-full text-xs text-red-400">{rowErr}</p>
+                  <p className="w-full text-xs text-red-700">{rowErr}</p>
                 )}
               </div>
 
@@ -316,7 +316,7 @@ export function Catalog() {
                   <button
                     type="button"
                     onClick={() => void navigator.clipboard.writeText(r.key)}
-                    className="ml-2 rounded bg-zinc-700 px-2 py-1 text-xs"
+                    className="ml-2 rounded bg-control px-2 py-1 text-xs"
                   >
                     copy
                   </button>
@@ -325,7 +325,7 @@ export function Catalog() {
                       href={`https://store.steampowered.com/account/registerkey?key=${encodeURIComponent(r.key)}`}
                       target="_blank"
                       rel="noreferrer"
-                      className="ml-2 rounded bg-blue-700 px-2 py-1 text-xs"
+                      className="ml-2 rounded bg-blue-700 px-2 py-1 text-xs text-blue-100"
                     >
                       redeem on steam
                     </a>
@@ -333,7 +333,7 @@ export function Catalog() {
                   <button
                     type="button"
                     onClick={() => setResult(null)}
-                    className="ml-2 text-xs text-zinc-400"
+                    className="ml-2 text-xs text-dust"
                   >
                     dismiss
                   </button>
@@ -386,14 +386,14 @@ export function Catalog() {
       {/* Self-claims section */}
       {selfClaims.length > 0 && (
         <div className="mt-8">
-          <h2 className="mb-3 text-sm font-medium text-zinc-300">your self-claims</h2>
+          <h2 className="mb-3 text-sm font-medium text-ink-soft">your self-claims</h2>
           <div className="space-y-2">
             {selfClaims.map((sc) => (
               <div
                 key={sc.game_id}
-                className="flex flex-wrap items-center gap-3 rounded bg-zinc-900 px-4 py-3 text-sm"
+                className="flex flex-wrap items-center gap-3 rounded bg-floor px-4 py-3 text-sm"
               >
-                <span className="font-mono text-xs text-zinc-400">{sc.game_id}</span>
+                <span className="font-mono text-xs text-dust">{sc.game_id}</span>
                 <span
                   className={`rounded px-2 py-0.5 text-xs font-medium ${
                     sc.state === 'fulfilled'
@@ -411,7 +411,7 @@ export function Catalog() {
                     <button
                       type="button"
                       onClick={() => void navigator.clipboard.writeText(sc.revealed_key!)}
-                      className="rounded bg-zinc-700 px-2 py-1 text-xs"
+                      className="rounded bg-control px-2 py-1 text-xs"
                     >
                       copy
                     </button>

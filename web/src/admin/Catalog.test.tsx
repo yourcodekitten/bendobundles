@@ -143,13 +143,13 @@ describe('Catalog', () => {
       expect(summary).toBeInTheDocument();
     });
 
-    it('renders all status badge colors (spot-check gifted = violet)', async () => {
+    it('renders all status badge colors (spot-check gifted = give accent)', async () => {
       vi.mocked(adminCatalog).mockResolvedValue([gameGifted]);
       renderCatalog();
 
       await waitFor(() => screen.getByText('Hades'));
       const badge = screen.getByText('gifted');
-      expect(badge.className).toMatch(/violet/);
+      expect(badge.className).toMatch(/give/);
     });
   });
 

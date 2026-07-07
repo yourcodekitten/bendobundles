@@ -168,39 +168,39 @@ export function Ops() {
   return (
     <div className="flex flex-col gap-8">
       {/* ── Sync panel ──────────────────────────────────────────────────── */}
-      <section className="flex flex-col gap-3 rounded bg-zinc-900 p-4">
-        <h2 className="text-sm font-medium text-zinc-300">sync</h2>
+      <section className="flex flex-col gap-3 rounded bg-floor p-4">
+        <h2 className="text-sm font-medium text-ink-soft">sync</h2>
         <button
           type="button"
           onClick={handleSync}
           disabled={syncing || syncRunning}
-          className="w-fit rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600 disabled:opacity-50"
+          className="w-fit rounded bg-control px-4 py-2 text-sm hover:bg-control-bright disabled:opacity-50"
         >
           {syncing || syncRunning ? 'syncing…' : 'sync now'}
         </button>
         {syncMsg !== null && (
-          <p role="status" className="text-sm text-zinc-300">
+          <p role="status" className="text-sm text-ink-soft">
             {syncMsg}
           </p>
         )}
       </section>
 
       {/* ── Steam connect panel ──────────────────────────────────────────── */}
-      <section className="flex flex-col gap-3 rounded bg-zinc-900 p-4">
-        <h2 className="text-sm font-medium text-zinc-300">steam identity</h2>
+      <section className="flex flex-col gap-3 rounded bg-floor p-4">
+        <h2 className="text-sm font-medium text-ink-soft">steam identity</h2>
         {steamIdState === undefined ? (
-          <p className="text-xs text-zinc-500">loading…</p>
+          <p className="text-xs text-dust-faint">loading…</p>
         ) : steamConnecting ? (
-          <p className="text-xs text-zinc-500">connecting…</p>
+          <p className="text-xs text-dust-faint">connecting…</p>
         ) : steamIdState !== null ? (
           <div className="flex items-center gap-3">
-            <span className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-200">
+            <span className="rounded bg-shelf px-2 py-1 text-xs text-ink-soft">
               {steamPersona ?? steamIdState}
             </span>
             <button
               type="button"
               onClick={handleDisconnect}
-              className="rounded bg-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-600"
+              className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright"
             >
               disconnect
             </button>
@@ -209,25 +209,25 @@ export function Ops() {
           <button
             type="button"
             onClick={() => beginConnect('/admin/ops')}
-            className="w-fit rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600"
+            className="w-fit rounded bg-control px-4 py-2 text-sm hover:bg-control-bright"
           >
             connect steam
           </button>
         )}
         {steamMsg !== null && (
-          <p role="status" className="text-sm text-zinc-300">
+          <p role="status" className="text-sm text-ink-soft">
             {steamMsg}
           </p>
         )}
       </section>
 
       {/* ── Status card ─────────────────────────────────────────────────── */}
-      <section className="flex flex-col gap-3 rounded bg-zinc-900 p-4">
-        <h2 className="text-sm font-medium text-zinc-300">status</h2>
-        {status === null && <p className="text-xs text-zinc-500">loading…</p>}
+      <section className="flex flex-col gap-3 rounded bg-floor p-4">
+        <h2 className="text-sm font-medium text-ink-soft">status</h2>
+        {status === null && <p className="text-xs text-dust-faint">loading…</p>}
         {status !== null && (
           <div className="flex flex-col gap-2">
-            <p className="text-xs text-zinc-400">
+            <p className="text-xs text-dust">
               last run:{' '}
               {status.sync === null ? (
                 <span>never</span>
@@ -239,14 +239,14 @@ export function Ops() {
             </p>
 
             {status.sync_run !== null && status.sync_run.running && (
-              <p className="text-xs text-amber-300">
+              <p className="text-xs text-amber-800">
                 sync running — started {formatRelativeTime(status.sync_run.started_epoch)}
               </p>
             )}
             {/* Marker present but not live: the run died before reporting (crash/timeout).
                 Without this line a dropped backfill is indistinguishable from idle. */}
             {status.sync_run !== null && !status.sync_run.running && (
-              <p className="text-xs text-red-300">
+              <p className="text-xs text-red-700">
                 a sync started {formatRelativeTime(status.sync_run.started_epoch)} but never
                 reported — it likely failed; safe to retry
               </p>
@@ -272,7 +272,7 @@ export function Ops() {
                     {status.sync.cookie_ok ? 'cookie ✓' : 'cookie ✗'}
                   </span>
                 </div>
-                <p className="text-xs text-zinc-400">{status.sync.message}</p>
+                <p className="text-xs text-dust">{status.sync.message}</p>
               </>
             )}
 
@@ -281,7 +281,7 @@ export function Ops() {
                 {Object.entries(status.game_counts).map(([key, count]) => (
                   <span
                     key={key}
-                    className="rounded bg-zinc-700 px-2 py-0.5 text-xs text-zinc-300"
+                    className="rounded bg-control px-2 py-0.5 text-xs text-ink-soft"
                   >
                     {key}: {count}
                   </span>

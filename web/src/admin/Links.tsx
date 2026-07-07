@@ -31,9 +31,9 @@ function stateBadgeClass(state: string): string {
     case 'pending':
       return 'bg-amber-700 text-amber-100';
     case 'compensated':
-      return 'bg-violet-700 text-violet-100';
+      return 'bg-give text-give-ink';
     default:
-      return 'bg-zinc-700 text-zinc-100';
+      return 'bg-control text-ink';
   }
 }
 
@@ -176,17 +176,17 @@ export function Links() {
 
   // Loading / error early returns (mirror Catalog.tsx style)
   if (state.phase === 'loading') {
-    return <p className="text-zinc-400">loading…</p>;
+    return <p className="text-dust">loading…</p>;
   }
 
   if (state.phase === 'error') {
     return (
       <div className="flex flex-col gap-4">
-        <p className="text-zinc-400">couldn't load links — try again</p>
+        <p className="text-dust">couldn't load links — try again</p>
         <button
           type="button"
           onClick={load}
-          className="w-fit rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600"
+          className="w-fit rounded bg-control px-4 py-2 text-sm hover:bg-control-bright"
         >
           retry
         </button>
@@ -200,10 +200,10 @@ export function Links() {
   return (
     <div className="flex flex-col gap-6">
       {/* ── Create form ────────────────────────────────────────────────── */}
-      <form onSubmit={handleCreate} className="flex flex-col gap-3 rounded bg-zinc-900 p-4">
-        <h2 className="text-sm font-medium text-zinc-300">new invite link</h2>
+      <form onSubmit={handleCreate} className="flex flex-col gap-3 rounded bg-floor p-4">
+        <h2 className="text-sm font-medium text-ink-soft">new invite link</h2>
         <div className="flex flex-wrap gap-3">
-          <label className="flex flex-col gap-1 text-xs text-zinc-400">
+          <label className="flex flex-col gap-1 text-xs text-dust">
             label
             <input
               type="text"
@@ -211,10 +211,10 @@ export function Links() {
               aria-label="label"
               value={formLabel}
               onChange={(e) => setFormLabel(e.target.value)}
-              className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-sm text-zinc-100"
+              className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
             />
           </label>
-          <label className="flex flex-col gap-1 text-xs text-zinc-400">
+          <label className="flex flex-col gap-1 text-xs text-dust">
             claims allowed
             <input
               type="number"
@@ -225,10 +225,10 @@ export function Links() {
                 const n = parseInt(e.target.value, 10);
                 setClaimsAllowed(isNaN(n) ? 1 : Math.max(1, n));
               }}
-              className="w-24 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-sm text-zinc-100"
+              className="w-24 rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
             />
           </label>
-          <label className="flex flex-col gap-1 text-xs text-zinc-400">
+          <label className="flex flex-col gap-1 text-xs text-dust">
             expires in days (optional)
             <input
               type="number"
@@ -237,14 +237,14 @@ export function Links() {
               value={expiresDays}
               onChange={(e) => setExpiresDays(e.target.value)}
               placeholder="never"
-              className="w-24 rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-sm text-zinc-100"
+              className="w-24 rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
             />
           </label>
         </div>
         <button
           type="submit"
           disabled={creating}
-          className="w-fit rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600 disabled:opacity-50"
+          className="w-fit rounded bg-control px-4 py-2 text-sm hover:bg-control-bright disabled:opacity-50"
         >
           create invite link
         </button>
@@ -252,7 +252,7 @@ export function Links() {
         {/* Create failure — must be loud; without it the admin can't tell
             whether an invite link exists */}
         {createError !== null && (
-          <p role="alert" className="text-xs text-red-400">
+          <p role="alert" className="text-xs text-red-700">
             {createError}
           </p>
         )}
@@ -260,19 +260,19 @@ export function Links() {
 
       {/* ── Created link callout — the artifact ben hands a friend ───── */}
       {info !== null && (
-        <div className="rounded border border-zinc-700 bg-zinc-900 p-4">
-          <p className="mb-2 text-sm text-zinc-300">
+        <div className="rounded border border-line bg-floor p-4">
+          <p className="mb-2 text-sm text-ink-soft">
             invite link created — send this to your friend:
           </p>
           <div className="flex items-center gap-3">
-            <code className="flex-1 break-all rounded bg-zinc-800 px-3 py-2 text-sm text-zinc-100">
+            <code className="flex-1 break-all rounded bg-shelf px-3 py-2 text-sm text-ink">
               {info.fullUrl}
             </code>
             <button
               type="button"
               onClick={() => copyToClipboard(info.fullUrl)}
               aria-label={`copy invite for ${info.label}`}
-              className="rounded bg-zinc-700 px-3 py-2 text-xs hover:bg-zinc-600"
+              className="rounded bg-control px-3 py-2 text-xs hover:bg-control-bright"
             >
               copy
             </button>
@@ -289,10 +289,10 @@ export function Links() {
           const revokeErr = revokeErrors[link.token];
 
           return (
-            <div key={link.token} className="rounded bg-zinc-900 p-4">
+            <div key={link.token} className="rounded bg-floor p-4">
               {/* Row: label, meta, actions */}
               <div className="flex flex-wrap items-center gap-3">
-                <span className="font-medium text-zinc-100">{link.label}</span>
+                <span className="font-medium text-ink">{link.label}</span>
 
                 {link.revoked && (
                   <span className="rounded bg-red-900 px-2 py-0.5 text-xs text-red-200">
@@ -300,15 +300,15 @@ export function Links() {
                   </span>
                 )}
 
-                <span className="text-sm text-zinc-400">
+                <span className="text-sm text-dust">
                   {link.claims_used}/{link.claims_allowed} used
                 </span>
 
-                <span className="text-xs text-zinc-500">
+                <span className="text-xs text-dust-faint">
                   created {formatDate(link.created_at)}
                 </span>
 
-                <span className="text-xs text-zinc-500">
+                <span className="text-xs text-dust-faint">
                   expires{' '}
                   {link.expires_at !== null ? formatDate(link.expires_at) : 'never'}
                 </span>
@@ -319,7 +319,7 @@ export function Links() {
                     type="button"
                     onClick={() => copyToClipboard(linkUrl)}
                     aria-label={`copy invite for ${link.label}`}
-                    className="rounded bg-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-600"
+                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright"
                   >
                     copy URL
                   </button>
@@ -337,7 +337,7 @@ export function Links() {
                       className={`rounded px-3 py-1.5 text-xs ${
                         armed
                           ? 'bg-red-700 text-red-100 hover:bg-red-600'
-                          : 'bg-zinc-700 hover:bg-zinc-600'
+                          : 'bg-control hover:bg-control-bright'
                       }`}
                     >
                       {armed ? 'confirm?' : 'revoke'}
@@ -352,7 +352,7 @@ export function Links() {
                         ? `collapse audit for ${link.label}`
                         : `expand audit for ${link.label}`
                     }
-                    className="rounded bg-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-600"
+                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright"
                   >
                     {auditState !== undefined ? 'collapse' : 'audit'}
                   </button>
@@ -361,7 +361,7 @@ export function Links() {
 
               {/* Revoke failure — must be loud; the link may still be claimable */}
               {revokeErr !== undefined && (
-                <p role="alert" className="mt-2 text-xs text-red-400">
+                <p role="alert" className="mt-2 text-xs text-red-700">
                   {revokeErr}
                 </p>
               )}
@@ -370,27 +370,27 @@ export function Links() {
                   redacted SERVER-side (AdminClaimView sends only issued:bool);
                   it never even reaches this browser's network tab. */}
               {auditState !== undefined && (
-                <div className="mt-3 border-t border-zinc-800 pt-3">
+                <div className="mt-3 border-t border-line pt-3">
                   {auditState.phase === 'loading' && (
-                    <p className="text-xs text-zinc-500">loading claims…</p>
+                    <p className="text-xs text-dust-faint">loading claims…</p>
                   )}
                   {auditState.phase === 'error' && (
-                    <p className="text-xs text-red-400">couldn't load claims</p>
+                    <p className="text-xs text-red-700">couldn't load claims</p>
                   )}
                   {auditState.phase === 'loaded' && auditState.claims.length === 0 && (
-                    <p className="text-xs text-zinc-500">no claims yet</p>
+                    <p className="text-xs text-dust-faint">no claims yet</p>
                   )}
                   {auditState.phase === 'loaded' && auditState.claims.length > 0 && (
                     <div className="space-y-1">
                       {auditState.claims.map((claim, i) => (
                         <div key={i} className="flex items-center gap-3 text-xs">
-                          <span className="text-zinc-400">{claim.game_id}</span>
+                          <span className="text-dust">{claim.game_id}</span>
                           <span
                             className={`rounded px-2 py-0.5 ${stateBadgeClass(claim.state)}`}
                           >
                             {claim.state}
                           </span>
-                          {claim.issued && <span className="text-green-400">issued ✓</span>}
+                          {claim.issued && <span className="text-green-700">issued ✓</span>}
                         </div>
                       ))}
                     </div>
