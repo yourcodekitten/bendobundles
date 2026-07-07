@@ -85,3 +85,14 @@
     animation: none;
   }
 }
+
+/* the logotype outline — light Silkscreen with a hard 8-direction pixel edge,
+   for wordmarks floating over the banner scene */
+.wordmark-outline {
+  color: var(--color-floor);
+  text-shadow:
+    2px 0 0 var(--color-pixel), -2px 0 0 var(--color-pixel),
+    0 2px 0 var(--color-pixel), 0 -2px 0 var(--color-pixel),
+    2px 2px 0 var(--color-pixel), -2px 2px 0 var(--color-pixel),
+    2px -2px 0 var(--color-pixel), -2px -2px 0 var(--color-pixel);
+}

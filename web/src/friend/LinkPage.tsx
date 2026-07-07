@@ -176,7 +176,7 @@ export function LinkPage() {
             }}
           />
           <div className="absolute inset-x-0 top-0 flex items-center justify-between px-6 py-3">
-            <h1 className="font-logo text-sm uppercase tracking-[0.03em] text-ink">bendobundles</h1>
+            <h1 className="font-logo wordmark-outline text-xl uppercase tracking-[0.03em]">bendobundles</h1>
             <span className="text-sm font-medium text-ink">
               {data.claims_used}/{data.claims_allowed} claims used
             </span>
