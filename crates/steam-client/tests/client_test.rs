@@ -140,7 +140,12 @@ fn assertion_params(claimed: &str, return_to: &str) -> Vec<(String, String)> {
             "2026-07-06T00:00:00Znonce".into(),
         ),
         ("openid.assoc_handle".into(), "h".into()),
-        ("openid.signed".into(), "signed,fields".into()),
+        // Realistic signed set (field names omit the openid. prefix per OpenID 2.0);
+        // MUST include claimed_id or verification rejects it before any network call.
+        (
+            "openid.signed".into(),
+            "signed,op_endpoint,claimed_id,identity,return_to,response_nonce,assoc_handle".into(),
+        ),
         ("openid.sig".into(), "sig".into()),
     ]
 }
@@ -317,6 +322,87 @@ async fn network_error_does_not_leak_api_key() {
     assert!(
         !err_str.contains("SECRETKEY"),
         "network error must not contain the API key; got: {err_str}"
+    );
+}
+
+// ── Round 2: claimed_id must appear in the openid.signed set ────────────────────────────────
+
+#[tokio::test]
+async fn openid_claimed_id_not_in_signed_set_rejected_without_network() {
+    // If claimed_id is not among the signed fields, Steam's check_authentication would not
+    // recompute the signature over it — so a valid is_valid:true would NOT vouch for the id
+    // we extract. Must be rejected before any HTTP. No mock mounted: a network attempt would
+    // yield Api(404), not OpenIdRejected.
+    let server = wiremock::MockServer::start().await;
+    let c = test_openid_client(&server);
+    let mut params = assertion_params(
+        "https://steamcommunity.com/openid/id/76561198000000001",
+        "https://bendobundles.com/api/steam/return",
+    );
+    for (k, v) in &mut params {
+        if k == "openid.signed" {
+            // Signed set WITHOUT claimed_id.
+            *v = "signed,op_endpoint,identity,return_to,response_nonce,assoc_handle".into();
+        }
+    }
+    let out = c
+        .verify_openid_assertion(&params, "https://bendobundles.com/api/steam/return")
+        .await;
+    assert!(
+        matches!(out, Err(steam_client::SteamError::OpenIdRejected(_))),
+        "claimed_id absent from signed set must be rejected pre-network; got: {out:?}"
+    );
+}
+
+// ── Round 2: near-miss claimed_id shapes all rejected without network ────────────────────────
+
+#[tokio::test]
+async fn openid_near_miss_claimed_ids_rejected_without_network() {
+    // 16 digits, 18 digits, 17 chars with one embedded non-digit — all must fail the shape
+    // pin BEFORE any HTTP (no mock mounted; network attempt → Api(404), not OpenIdRejected).
+    let server = wiremock::MockServer::start().await;
+    let c = test_openid_client(&server);
+    for bad in [
+        "https://steamcommunity.com/openid/id/7656119800000001", // 16 digits
+        "https://steamcommunity.com/openid/id/765611980000000012", // 18 digits
+        "https://steamcommunity.com/openid/id/7656119800000000x", // 17 chars, non-digit
+    ] {
+        let params = assertion_params(bad, "https://bendobundles.com/api/steam/return");
+        let out = c
+            .verify_openid_assertion(&params, "https://bendobundles.com/api/steam/return")
+            .await;
+        assert!(
+            matches!(out, Err(steam_client::SteamError::OpenIdRejected(_))),
+            "near-miss claimed_id {bad:?} must be rejected pre-network; got: {out:?}"
+        );
+    }
+}
+
+// ── Round 2: strict-line is_valid parse (no substring match) ────────────────────────────────
+
+#[tokio::test]
+async fn openid_is_valid_substring_line_is_not_trusted() {
+    // A body whose only "is_valid:true" appears embedded in another line must be rejected —
+    // pins the trim-exact-line parse against a substring-match regression.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            "ns:http://specs.openid.net/auth/2.0\nis_valid:false\nx:is_valid:true\n",
+        ))
+        .mount(&server)
+        .await;
+    let c = test_openid_client(&server);
+    let params = assertion_params(
+        "https://steamcommunity.com/openid/id/76561198000000001",
+        "https://bendobundles.com/api/steam/return",
+    );
+    let out = c
+        .verify_openid_assertion(&params, "https://bendobundles.com/api/steam/return")
+        .await;
+    assert!(
+        matches!(out, Err(steam_client::SteamError::OpenIdRejected(_))),
+        "embedded is_valid:true substring must not be trusted; got: {out:?}"
     );
 }
 

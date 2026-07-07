@@ -122,6 +122,13 @@ impl SteamClient {
     /// * `store_base`   — Steam store root (prod: `https://store.steampowered.com`)
     /// * `openid_base`  — Steam community root used for OpenID (prod: `https://steamcommunity.com`)
     /// * `key`          — Steam Web API key
+    ///
+    /// The HTTP client carries hard ceilings — 10s total-request timeout, 5s connect
+    /// timeout — so a hung steamcommunity connection cannot pin a request handler open
+    /// forever. This matters most for the unauthenticated OpenID return endpoint, which
+    /// makes one outbound `check_authentication` call per hit: without a timeout, slow-drip
+    /// connections become a trivial resource-exhaustion vector, and the spec's
+    /// `steam_unreachable` contract could never fire.
     pub fn new(
         web_api_base: &str,
         store_base: &str,
@@ -129,6 +136,8 @@ impl SteamClient {
         key: SteamApiKey,
     ) -> Result<Self, SteamError> {
         let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .map_err(|e| SteamError::Network(e.to_string()))?;
         Ok(Self {
@@ -267,6 +276,15 @@ impl SteamClient {
             .filter(|rest| rest.len() == 17 && rest.bytes().all(|b| b.is_ascii_digit()))
             .ok_or_else(|| SteamError::OpenIdRejected("claimed_id shape".into()))?;
 
+        // claimed_id must be in the signed field set (names in openid.signed omit the
+        // "openid." prefix per OpenID 2.0). If it isn't, Steam's check_authentication would
+        // not recompute the signature over it — is_valid:true would then vouch for the
+        // assertion WITHOUT vouching for the id we're about to return. Reject before HTTP.
+        let signed = get("openid.signed").unwrap_or("");
+        if !signed.split(',').any(|f| f == "claimed_id") {
+            return Err(SteamError::OpenIdRejected("claimed_id not signed".into()));
+        }
+
         // Echo the assertion back with mode=check_authentication (form-encoded).
         let mut form: Vec<(String, String)> = params.to_vec();
         for (k, v) in &mut form {
@@ -297,6 +315,11 @@ impl SteamClient {
 
 /// Build the "Sign in through Steam" redirect URL. Pure; both surfaces use it via the return
 /// endpoint. `realm` is the RP domain; `return_to` is the exact callback URL Steam will POST to.
+///
+/// Deliberate asymmetry: this helper hardcodes prod `https://steamcommunity.com/openid/login`
+/// while `verify_openid_assertion` uses the injectable `self.base_openid`. Users always
+/// authenticate against real Steam even when running from a dev origin — which is also why
+/// this helper is not wiremock-pointable (its output is pinned by a pure string test instead).
 pub fn steam_openid_redirect_url(realm: &str, return_to: &str) -> String {
     let q = [
         ("openid.ns", "http://specs.openid.net/auth/2.0"),
