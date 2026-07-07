@@ -28,6 +28,30 @@
   --color-give-bright: oklch(52% 0.16 355);     /* hover */
   --color-give-soft: oklch(42% 0.14 350);       /* accent text on light surfaces */
   --color-give-ink: oklch(97% 0.012 350);       /* text on give backgrounds */
+
+  /* type — the pixel grammar: pixel faces mark game-world things (logotype,
+     headings, labels, the key); prose stays human (see DESIGN.md) */
+  --font-sans: "Chivo Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-pixel: "Pixelify Sans Variable", ui-sans-serif, sans-serif;
+  --font-logo: "Silkscreen", ui-monospace, monospace;
+}
+
+/* headings wear the pixel display face */
+@layer base {
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-pixel);
+    letter-spacing: 0;
+  }
+}
+
+/* the label tier (chips, badges, helper text) wears the pixel face too.
+   Unlayered on purpose: it must beat the text-xs utility, and pixel faces
+   run visually small — 13px keeps them legible. */
+.text-xs {
+  font-family: var(--font-pixel);
+  font-size: 0.8125rem;
 }
 
 /* landing entrance — a single quiet rise; the ceremony budget lives in the

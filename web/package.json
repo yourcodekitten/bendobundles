@@ -12,6 +12,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource-variable/chivo": "^5.2.8",
+    "@fontsource-variable/pixelify-sans": "^5.2.7",
+    "@fontsource/silkscreen": "^5.2.8",
     "hls.js": "^1.6.16",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

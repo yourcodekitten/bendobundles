@@ -1,42 +1,154 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-07-07T17:00:00Z",
+  "generatedAt": "2026-07-07T17:40:00Z",
   "title": "Design System: bendobundles",
   "extensions": {
     "colorMeta": {
-      "give": { "role": "primary", "displayName": "Button Burgundy", "canonical": "oklch(46% 0.155 355)", "tonalRamp": ["oklch(20% 0.09 355)", "oklch(28% 0.12 355)", "oklch(36% 0.14 355)", "oklch(46% 0.155 355)", "oklch(52% 0.16 355)", "oklch(64% 0.13 353)", "oklch(78% 0.08 352)", "oklch(92% 0.03 350)"] },
-      "give-bright": { "role": "primary", "displayName": "Button Burgundy Bright", "canonical": "oklch(52% 0.16 355)" },
-      "give-soft": { "role": "primary", "displayName": "Burgundy Ink", "canonical": "oklch(42% 0.14 350)" },
-      "give-ink": { "role": "primary", "displayName": "On-Burgundy", "canonical": "oklch(97% 0.012 350)" },
-      "room": { "role": "neutral", "displayName": "Room", "canonical": "oklch(87% 0.085 112)", "tonalRamp": ["oklch(30% 0.06 120)", "oklch(36% 0.06 118)", "oklch(43% 0.06 116)", "oklch(56% 0.07 114)", "oklch(66% 0.075 112)", "oklch(73% 0.09 113)", "oklch(80% 0.09 112)", "oklch(91% 0.07 110)"] },
-      "floor": { "role": "neutral", "displayName": "Floor", "canonical": "oklch(91% 0.07 110)" },
-      "shelf": { "role": "neutral", "displayName": "Shelf", "canonical": "oklch(80% 0.09 112)" },
-      "control": { "role": "neutral", "displayName": "Control", "canonical": "oklch(73% 0.09 113)" },
-      "control-bright": { "role": "neutral", "displayName": "Control Bright", "canonical": "oklch(69% 0.09 114)" },
-      "ink": { "role": "neutral", "displayName": "Ink", "canonical": "oklch(30% 0.06 120)" },
-      "ink-soft": { "role": "neutral", "displayName": "Ink Soft", "canonical": "oklch(36% 0.06 118)" },
-      "dust": { "role": "neutral", "displayName": "Dust", "canonical": "oklch(43% 0.06 116)" },
-      "dust-faint": { "role": "neutral", "displayName": "Dust Faint", "canonical": "oklch(48% 0.06 114)" },
-      "line": { "role": "neutral", "displayName": "Line", "canonical": "oklch(66% 0.075 112)" },
-      "pixel": { "role": "neutral", "displayName": "Pixel", "canonical": "oklch(35% 0.06 120)" }
+      "give": {
+        "role": "primary",
+        "displayName": "Button Burgundy",
+        "canonical": "oklch(46% 0.155 355)",
+        "tonalRamp": [
+          "oklch(20% 0.09 355)",
+          "oklch(28% 0.12 355)",
+          "oklch(36% 0.14 355)",
+          "oklch(46% 0.155 355)",
+          "oklch(52% 0.16 355)",
+          "oklch(64% 0.13 353)",
+          "oklch(78% 0.08 352)",
+          "oklch(92% 0.03 350)"
+        ]
+      },
+      "give-bright": {
+        "role": "primary",
+        "displayName": "Button Burgundy Bright",
+        "canonical": "oklch(52% 0.16 355)"
+      },
+      "give-soft": {
+        "role": "primary",
+        "displayName": "Burgundy Ink",
+        "canonical": "oklch(42% 0.14 350)"
+      },
+      "give-ink": {
+        "role": "primary",
+        "displayName": "On-Burgundy",
+        "canonical": "oklch(97% 0.012 350)"
+      },
+      "room": {
+        "role": "neutral",
+        "displayName": "Room",
+        "canonical": "oklch(87% 0.085 112)",
+        "tonalRamp": [
+          "oklch(30% 0.06 120)",
+          "oklch(36% 0.06 118)",
+          "oklch(43% 0.06 116)",
+          "oklch(56% 0.07 114)",
+          "oklch(66% 0.075 112)",
+          "oklch(73% 0.09 113)",
+          "oklch(80% 0.09 112)",
+          "oklch(91% 0.07 110)"
+        ]
+      },
+      "floor": {
+        "role": "neutral",
+        "displayName": "Floor",
+        "canonical": "oklch(91% 0.07 110)"
+      },
+      "shelf": {
+        "role": "neutral",
+        "displayName": "Shelf",
+        "canonical": "oklch(80% 0.09 112)"
+      },
+      "control": {
+        "role": "neutral",
+        "displayName": "Control",
+        "canonical": "oklch(73% 0.09 113)"
+      },
+      "control-bright": {
+        "role": "neutral",
+        "displayName": "Control Bright",
+        "canonical": "oklch(69% 0.09 114)"
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "oklch(30% 0.06 120)"
+      },
+      "ink-soft": {
+        "role": "neutral",
+        "displayName": "Ink Soft",
+        "canonical": "oklch(36% 0.06 118)"
+      },
+      "dust": {
+        "role": "neutral",
+        "displayName": "Dust",
+        "canonical": "oklch(43% 0.06 116)"
+      },
+      "dust-faint": {
+        "role": "neutral",
+        "displayName": "Dust Faint",
+        "canonical": "oklch(48% 0.06 114)"
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Line",
+        "canonical": "oklch(66% 0.075 112)"
+      },
+      "pixel": {
+        "role": "neutral",
+        "displayName": "Pixel",
+        "canonical": "oklch(35% 0.06 120)"
+      }
     },
     "typographyMeta": {
-      "display": { "displayName": "Display", "purpose": "The landing wordmark moment only." },
-      "headline": { "displayName": "Headline", "purpose": "Page-level headings on admin surfaces." },
-      "title": { "displayName": "Title", "purpose": "Dialog headings — the claim question and celebration." },
-      "body": { "displayName": "Body", "purpose": "Default UI size." },
-      "label": { "displayName": "Label", "purpose": "Chips, bundle names, helper text; the most-used size." },
-      "mono": { "displayName": "Mono", "purpose": "Gift keys, link tokens, appids. Never voice copy." }
+      "display": {
+        "displayName": "Logotype",
+        "purpose": "Silkscreen, full caps — the landing wordmark (BENDOBUNDLES) and nowhere else."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Pixelify Sans — page-level headings."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Pixelify Sans — dialog headings, the claim question and celebration."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Chivo — every paragraph and sentence. Prose is always human."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Pixelify Sans at 13px — chips, badges, helper text."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Gift keys, link tokens, appids. Never voice copy."
+      }
     },
     "shadows": [
-      { "name": "ceremony", "value": "0 25px 50px -12px rgb(0 0 0 / 0.25)", "purpose": "Dialogs and gift/claim moments only — paired with a Pixel bezel ring." }
+      {
+        "name": "ceremony",
+        "value": "0 25px 50px -12px rgb(0 0 0 / 0.25)",
+        "purpose": "Dialogs and gift/claim moments only — paired with a Pixel bezel ring."
+      }
     ],
     "motion": [
-      { "name": "landing-rise", "value": "landing-rise 0.6s cubic-bezier(0.22, 1, 0.36, 1) both", "purpose": "The landing's single quiet entrance; prefers-reduced-motion disables it." }
+      {
+        "name": "landing-rise",
+        "value": "landing-rise 0.6s cubic-bezier(0.22, 1, 0.36, 1) both",
+        "purpose": "The landing's single quiet entrance; prefers-reduced-motion disables it."
+      }
     ],
     "breakpoints": [
-      { "name": "sm", "value": "640px" },
-      { "name": "lg", "value": "1024px" }
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      }
     ]
   },
   "components": [
@@ -99,13 +211,46 @@
       "Bezel as motif: chunky dark-olive frames mark ceremony surfaces"
     ],
     "rules": [
-      { "name": "The Button Burgundy Rule", "body": "Burgundy appears only where giving or claiming happens — never as ambient decoration, never above 10% of a screen. Its rarity is what makes the claim button feel like pressing A to accept a gift.", "section": "colors" },
-      { "name": "The Title-Hash Rule", "body": "A game without cover art gets its color from the shared deterministic hash (titleColor.ts). The SAME game must render the SAME color on every surface, forever.", "section": "colors" },
-      { "name": "The Light Text Rule", "body": "Status text on light surfaces uses the deep end of its hue (green-700, amber-800, red-700) — pale 300/400 tones are invisible on olive and forbidden as inline text.", "section": "colors" },
-      { "name": "The Lowercase Rule", "body": "UI copy is lowercase — headings, buttons, labels, errors. Caps do not exist in the attic. (Game titles render as their owners spell them; the rule governs OUR words.)", "section": "typography" },
-      { "name": "The One Heart Rule", "body": "The ♡ appears at sincere moments — the landing line, the successful claim — never scattered as decoration. One per screen, maximum, and it must be earned.", "section": "typography" },
-      { "name": "The Ceremony Rule", "body": "A drop shadow means a gift moment is happening. Cards, chips, nav, and buttons are flat at every state.", "section": "elevation" },
-      { "name": "The Bezel Rule", "body": "Chunky dark-olive (Pixel) borders mark the handheld's screen: the landing art frame and dialog rings wear it. A thick border on an ordinary card is costume.", "section": "elevation" }
+      {
+        "name": "The Pixel Grammar Rule",
+        "body": "Pixel type marks game-world things — the logotype, headings, labels, and the burgundy key on the landing. Prose stays human (Chivo). A paragraph in a pixel face is forbidden.",
+        "section": "typography"
+      },
+      {
+        "name": "The Button Burgundy Rule",
+        "body": "Burgundy appears only where giving or claiming happens — never as ambient decoration, never above 10% of a screen. Its rarity is what makes the claim button feel like pressing A to accept a gift.",
+        "section": "colors"
+      },
+      {
+        "name": "The Title-Hash Rule",
+        "body": "A game without cover art gets its color from the shared deterministic hash (titleColor.ts). The SAME game must render the SAME color on every surface, forever.",
+        "section": "colors"
+      },
+      {
+        "name": "The Light Text Rule",
+        "body": "Status text on light surfaces uses the deep end of its hue (green-700, amber-800, red-700) — pale 300/400 tones are invisible on olive and forbidden as inline text.",
+        "section": "colors"
+      },
+      {
+        "name": "The Lowercase Rule",
+        "body": "UI copy is lowercase. Caps exist in exactly one place: the Silkscreen logotype renders BENDOBUNDLES full caps via text-transform. Game titles render as their owners spell them.",
+        "section": "typography"
+      },
+      {
+        "name": "The One Heart Rule",
+        "body": "The ♡ appears at sincere moments — the landing line, the successful claim — never scattered as decoration. One per screen, maximum, and it must be earned.",
+        "section": "typography"
+      },
+      {
+        "name": "The Ceremony Rule",
+        "body": "A drop shadow means a gift moment is happening. Cards, chips, nav, and buttons are flat at every state.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Bezel Rule",
+        "body": "Chunky dark-olive (Pixel) borders mark the handheld's screen: the landing art frame and dialog rings wear it. A thick border on an ordinary card is costume.",
+        "section": "elevation"
+      }
     ],
     "dos": [
       "Do reserve Button Burgundy for giving and claiming (≤10% of any screen), pairing every bg-give with text-give-ink.",

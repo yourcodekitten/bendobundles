@@ -19,29 +19,29 @@ colors:
   give-ink: "oklch(97% 0.012 350)"
 typography:
   display:
-    fontFamily: "ui-sans-serif, system-ui, sans-serif"
+    fontFamily: "Silkscreen, ui-monospace, monospace"
     fontSize: "2.25rem"
-    fontWeight: 700
+    fontWeight: 400
     lineHeight: 1.15
-    letterSpacing: "-0.025em"
+    letterSpacing: "0.03em"
   headline:
-    fontFamily: "ui-sans-serif, system-ui, sans-serif"
+    fontFamily: "Pixelify Sans Variable, ui-sans-serif, sans-serif"
     fontSize: "1.5rem"
     fontWeight: 600
     lineHeight: 1.3
   title:
-    fontFamily: "ui-sans-serif, system-ui, sans-serif"
+    fontFamily: "Pixelify Sans Variable, ui-sans-serif, sans-serif"
     fontSize: "1.125rem"
     fontWeight: 600
     lineHeight: 1.4
   body:
-    fontFamily: "ui-sans-serif, system-ui, sans-serif"
+    fontFamily: "Chivo Variable, ui-sans-serif, system-ui, sans-serif"
     fontSize: "0.875rem"
     fontWeight: 400
     lineHeight: 1.5
   label:
-    fontFamily: "ui-sans-serif, system-ui, sans-serif"
-    fontSize: "0.75rem"
+    fontFamily: "Pixelify Sans Variable, ui-sans-serif, sans-serif"
+    fontSize: "0.8125rem"
     fontWeight: 400
     lineHeight: 1.4
   mono:
@@ -166,26 +166,35 @@ olive and are forbidden as inline text here.
 
 ## 3. Typography
 
-**Display Font:** system-ui stack (ui-sans-serif, system-ui, sans-serif)
-**Body Font:** same system stack
-**Label/Mono Font:** ui-monospace (keys, tokens, and technical identifiers only)
+**Logotype:** Silkscreen (self-hosted; ui-monospace fallback) — the landing wordmark only
+**Display / Labels:** Pixelify Sans Variable (self-hosted; 400–700)
+**Body:** Chivo Variable (self-hosted; ui-sans-serif fallback)
+**Mono:** ui-monospace (gift keys, tokens, and technical identifiers only)
 
-**Character:** Unassuming and honest — plain type on a plain screen, the way the handheld's
-manual was set. No display face has been chosen yet; if one ever is, it must be warm and a
-little nostalgic, never corporate or aggressive-gamer. The personality lives in the lowercase
-voice, not the letterforms.
+**Character:** The pixel hud — three tiers with a grammar. Silkscreen is a true bitmap grid:
+hard, proud, logotype-only. Pixelify Sans is the readable pixel face: headings and the label
+tier. Chivo is the human voice: every paragraph, every sentence. All fonts are self-hosted
+(fontsource, woff2) — a friend's browser never calls a font CDN.
 
 ### Hierarchy
-- **Display** (700, 2.25rem, tight tracking -0.025em): the landing wordmark moment only.
-- **Headline** (600, 1.5rem): page-level headings on admin surfaces.
-- **Title** (600, 1.125rem): dialog headings — "claim {game}?", "it's yours! ♡".
-- **Body** (400, 0.875rem): the default UI size.
-- **Label** (400–500, 0.75rem): chips, bundle names, helper text. The most-used size in the app.
+- **Logotype/Display** (Silkscreen 400, 2.25rem, +0.03em tracking, UPPERCASE): the landing
+  wordmark — BENDOBUNDLES — and nowhere else.
+- **Headline** (Pixelify 600, 1.5rem): page-level headings.
+- **Title** (Pixelify 600, 1.125rem): dialog headings — "claim {game}?", "it's yours! ♡".
+- **Body** (Chivo 400, 0.875rem): the default UI size. Prose is always Chivo.
+- **Label** (Pixelify 400–500, 0.8125rem): chips, badges, helper text. Pixel faces run
+  visually small, so the label tier sits at 13px, not 12px.
 - **Mono** (400, 0.75rem): gift keys, link tokens, appids. Never for voice copy.
 
 ### Named Rules
-**The Lowercase Rule.** UI copy is lowercase — headings, buttons, labels, errors. Caps do not
-exist in the attic. (Game titles render as their owners spell them; the rule governs OUR words.)
+**The Pixel Grammar Rule.** Pixel type marks game-world things — the logotype, headings,
+labels, and the burgundy "key" on the landing. Prose stays human (Chivo). A paragraph set in a
+pixel face is the costume swallowing the product; forbidden.
+
+**The Lowercase Rule.** UI copy is lowercase — headings, buttons, labels, errors. Caps exist in
+exactly one place: the Silkscreen logotype renders BENDOBUNDLES in full caps (via
+text-transform; the source text stays lowercase). Game titles render as their owners spell
+them; the rule governs OUR words.
 
 **The One Heart Rule.** The ♡ appears at sincere moments — the landing line, the successful
 claim — never scattered as decoration. One per screen, maximum, and it must be earned.
@@ -257,8 +266,9 @@ interaction in the product.
 ### The Landing (signature)
 Room-drenched single viewport: the pixel-art scene (`/art/landing.png` — a four-shade
 adventurer walking toward a treasure chest) in a Pixel bezel with the DMG's asymmetric corner
-(`14px 14px 44px 14px`), wordmark beneath, and the one line where "key" wears Burgundy Ink.
-Entrance is a single quiet rise with a `prefers-reduced-motion` bypass.
+(`14px 14px 44px 14px`), the BENDOBUNDLES logotype (Silkscreen, caps) beneath, and the one line
+where "key" wears both Burgundy Ink and the Pixelify face — the accent word in the accent color
+and the accent type. Entrance is a single quiet rise with a `prefers-reduced-motion` bypass.
 
 ## 6. Do's and Don'ts
 
