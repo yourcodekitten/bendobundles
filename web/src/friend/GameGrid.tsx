@@ -50,8 +50,8 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
               />
             )}
             <div className="p-4">
-              <h3 className="font-semibold text-sm leading-tight">{game.title}</h3>
-              <p className="mt-1 text-xs text-dust truncate">{game.bundle}</p>
+              <h3 className="text-xl font-medium leading-tight">{game.title}</h3>
+              <p className="mt-1 text-xs text-ink-soft truncate">{game.bundle}</p>
               <div className="mt-2 flex flex-wrap gap-1.5">
                 <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
                   {game.key_type}
