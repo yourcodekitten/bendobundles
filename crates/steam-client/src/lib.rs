@@ -105,11 +105,17 @@ struct VanityResp {
 
 #[derive(Deserialize)]
 struct AppListWire {
-    applist: AppListInner,
+    response: AppListResp,
 }
 #[derive(Deserialize)]
-struct AppListInner {
+struct AppListResp {
+    #[serde(default)]
     apps: Vec<AppEntry>,
+    /// Omitted (not `false`) on the final page.
+    #[serde(default)]
+    have_more_results: bool,
+    #[serde(default)]
+    last_appid: Option<u32>,
 }
 #[derive(Deserialize)]
 struct AppEntry {
@@ -227,20 +233,42 @@ impl SteamClient {
         }
     }
 
-    /// Return all `(appid, name)` pairs from `ISteamApps/GetAppList/v2`.
+    /// Return all `(appid, name)` pairs from `IStoreService/GetAppList/v1` (#48 — Steam
+    /// removed the keyless `ISteamApps/GetAppList`; the replacement is keyed and paginated).
     ///
-    /// This is a keyless endpoint — no API key is sent. Duplicate names are returned verbatim;
-    /// deduplication is the caller's (title-match mapper's) responsibility.
+    /// Pages via `have_more_results`/`last_appid` until exhausted. Duplicate names are
+    /// returned verbatim; deduplication is the caller's (title-match mapper's) responsibility.
+    ///
+    /// Termination guards (tier-2 is best-effort — partial data beats a hung sync):
+    /// a cursor that fails to strictly advance, or a missing cursor with
+    /// `have_more_results:true`, ends the loop with what was collected, as does the
+    /// page cap (full catalog is ~200k apps ≈ 5 pages at 50k; cap 50 is generous).
     pub async fn get_app_list(&self) -> Result<Vec<(u32, String)>, SteamError> {
-        let url = format!("{}/ISteamApps/GetAppList/v2/", self.base_web_api);
-        let resp = self.http.get(url).send().await.map_err(net)?;
-        let wire: AppListWire = keyed_json(resp).await?;
-        Ok(wire
-            .applist
-            .apps
-            .into_iter()
-            .map(|a| (a.appid, a.name))
-            .collect())
+        const PAGE_SIZE: &str = "50000";
+        const MAX_PAGES: u32 = 50;
+        let url = format!("{}/IStoreService/GetAppList/v1/", self.base_web_api);
+        let mut out: Vec<(u32, String)> = Vec::new();
+        let mut cursor: Option<u32> = None;
+        for _ in 0..MAX_PAGES {
+            let mut req = self
+                .http
+                .get(&url)
+                .query(&[("key", self.key.expose()), ("max_results", PAGE_SIZE)]);
+            if let Some(last) = cursor {
+                req = req.query(&[("last_appid", last.to_string())]);
+            }
+            let resp = req.send().await.map_err(net)?;
+            let wire: AppListWire = keyed_json(resp).await?;
+            out.extend(wire.response.apps.into_iter().map(|a| (a.appid, a.name)));
+            if !wire.response.have_more_results {
+                break;
+            }
+            match wire.response.last_appid {
+                Some(next) if cursor.is_none_or(|prev| next > prev) => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Verify a Steam OpenID assertion. Trust ladder (spec §2, ALL must hold):

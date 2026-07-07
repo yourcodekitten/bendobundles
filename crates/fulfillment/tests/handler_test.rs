@@ -3746,9 +3746,9 @@ async fn title_pass_maps_unique_leaves_dup_unmapped() {
     let steam_mock = MockServer::start().await;
     // "Unique Game" appears once → appid 1001. "Dup Game" appears twice → ambiguous, skip.
     Mock::given(method("GET"))
-        .and(path("/ISteamApps/GetAppList/v2/"))
+        .and(path("/IStoreService/GetAppList/v1/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "applist": { "apps": [
+            "response": { "apps": [
                 { "appid": 1001, "name": "Unique Game" },
                 { "appid": 2001, "name": "Dup Game" },
                 { "appid": 2002, "name": "Dup Game" }
@@ -3815,17 +3815,22 @@ async fn manual_appid_untouched_by_walk_and_title_pass() {
         Some(AppidSource::Manual),
     )
     .await;
+    // Sentinel: an unmapped game the title pass WILL map. Proves the pass actually ran —
+    // without it, an app-list fetch failure (as when ISteamApps/GetAppList died, #48) makes
+    // the Manual-guard assertions below pass vacuously.
+    seed_steam_game(&store, "gk-sent", "mn-sent", "Half-Life", None, None).await;
 
     let humble = MockServer::start().await;
     mount_empty_listing(&humble).await;
 
     let steam_mock = MockServer::start().await;
-    // GetAppList returns "Portal" → 9999: would overwrite if the guard failed.
+    // App list returns "Portal" → 9999 (would overwrite if the guard failed) + the sentinel.
     Mock::given(method("GET"))
-        .and(path("/ISteamApps/GetAppList/v2/"))
+        .and(path("/IStoreService/GetAppList/v1/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "applist": { "apps": [
-                { "appid": 9999, "name": "Portal" }
+            "response": { "apps": [
+                { "appid": 9999, "name": "Portal" },
+                { "appid": 70, "name": "Half-Life" }
             ]}
         })))
         .mount(&steam_mock)
@@ -3834,6 +3839,19 @@ async fn manual_appid_untouched_by_walk_and_title_pass() {
     let mut d = deps(store, &humble.uri(), None);
     d.steam = Some(steam_client_at(&steam_mock.uri()));
     handle(&d, FulfillRequest::Sync).await;
+
+    let sentinel = d
+        .store
+        .get_game(&game_id("gk-sent", "mn-sent"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sentinel.steam_app_id,
+        Some(70),
+        "sentinel must be mapped — otherwise the title pass never ran and the Manual-guard \
+         assertions below prove nothing"
+    );
 
     let game = d.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(
@@ -3877,9 +3895,9 @@ async fn title_pass_maps_title_with_trademark_symbol() {
     let steam_mock = MockServer::start().await;
     // Steam app list has the same title WITHOUT the ™.
     Mock::given(method("GET"))
-        .and(path("/ISteamApps/GetAppList/v2/"))
+        .and(path("/IStoreService/GetAppList/v1/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "applist": { "apps": [
+            "response": { "apps": [
                 { "appid": 5555, "name": "Cities: Skylines II" }
             ]}
         })))
