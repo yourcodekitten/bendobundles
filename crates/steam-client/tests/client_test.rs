@@ -406,6 +406,31 @@ async fn openid_is_valid_substring_line_is_not_trusted() {
     );
 }
 
+// ── Task 3: get_app_list returns verbatim (appid, name) pairs including duplicates ───────────
+
+#[tokio::test]
+async fn get_app_list_returns_all_pairs_including_dup_names() {
+    // Tier-2 data source for the title-match mapper: keyless endpoint, dup names INCLUDED —
+    // dedup is the mapper's job downstream (unique-only rule), not this method's.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/ISteamApps/GetAppList/v2/"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"applist":{"apps":[{"appid":413150,"name":"Stardew Valley"},{"appid":999,"name":"Stardew Valley"},{"appid":602320,"name":"Train Valley 2"}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = test_client(&server).get_app_list().await.unwrap();
+    assert_eq!(
+        out,
+        vec![
+            (413150u32, "Stardew Valley".to_string()),
+            (999u32, "Stardew Valley".to_string()),
+            (602320u32, "Train Valley 2".to_string()),
+        ]
+    );
+}
+
 // ── F2: steam_openid_redirect_url percent-encodes & = / in the return_to value ─────────────
 
 #[test]

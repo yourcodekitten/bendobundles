@@ -103,6 +103,20 @@ struct VanityResp {
     steamid: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct AppListWire {
+    applist: AppListInner,
+}
+#[derive(Deserialize)]
+struct AppListInner {
+    apps: Vec<AppEntry>,
+}
+#[derive(Deserialize)]
+struct AppEntry {
+    appid: u32,
+    name: String,
+}
+
 // ── Client ───────────────────────────────────────────────────────────────────
 
 pub struct SteamClient {
@@ -211,6 +225,22 @@ impl SteamClient {
         } else {
             Err(SteamError::NotFound)
         }
+    }
+
+    /// Return all `(appid, name)` pairs from `ISteamApps/GetAppList/v2`.
+    ///
+    /// This is a keyless endpoint — no API key is sent. Duplicate names are returned verbatim;
+    /// deduplication is the caller's (title-match mapper's) responsibility.
+    pub async fn get_app_list(&self) -> Result<Vec<(u32, String)>, SteamError> {
+        let url = format!("{}/ISteamApps/GetAppList/v2/", self.base_web_api);
+        let resp = self.http.get(url).send().await.map_err(net)?;
+        let wire: AppListWire = keyed_json(resp).await?;
+        Ok(wire
+            .applist
+            .apps
+            .into_iter()
+            .map(|a| (a.appid, a.name))
+            .collect())
     }
 
     /// Verify a Steam OpenID assertion. Trust ladder (spec §2, ALL must hold):
