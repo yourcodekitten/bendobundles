@@ -445,6 +445,86 @@ export async function adminClearSteamIdentity(): Promise<void> {
   if (!response.ok) throw new FetchFailed();
 }
 
+// ── Steam detail types (mirrors Rust steam-client structs, snake_case serde) ──
+
+export type SteamAppDetail = {
+  app_id: number;
+  name: string;
+  developers: string[];
+  publishers: string[];
+  genres: string[];
+  release_date: string | null;
+  short_description: string;
+  header_image: string | null;
+  video_hls_url: string | null;
+  video_thumbnail: string | null;
+};
+
+export type ReviewSummary = {
+  desc: string;
+  total_positive: number;
+  total_negative: number;
+  total_reviews: number;
+};
+
+export type RecentReviews = {
+  percent_positive: number;
+  count: number;
+};
+
+/** One steam blob from the detail endpoint — all three halves can be null independently. */
+export type SteamDetailBlob = {
+  detail: SteamAppDetail | null;
+  overall: ReviewSummary | null;
+  recent: RecentReviews | null;
+};
+
+/** Friend-surface game detail response. `steam: null` = unmapped / no cache item. */
+export type GameDetailResponse = {
+  game: GameView;
+  steam: SteamDetailBlob | null;
+};
+
+/** Admin-surface game detail response — same steam blob, full AdminGame view. */
+export type AdminGameDetailResponse = {
+  game: AdminGame;
+  steam: SteamDetailBlob | null;
+};
+
+/**
+ * Friend-surface: fetch full Steam detail for a game via a link token.
+ * Throws NotFound on 404 (dead link or unknown game), FetchFailed on other errors.
+ */
+export async function fetchGameDetail(
+  token: string,
+  gameId: string,
+): Promise<GameDetailResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/l/${token}/games/${encodeURIComponent(gameId)}/detail`);
+  } catch {
+    throw new FetchFailed();
+  }
+  if (response.status === 404) throw new NotFound();
+  if (!response.ok) throw new FetchFailed();
+  try {
+    return (await response.json()) as GameDetailResponse;
+  } catch {
+    throw new FetchFailed();
+  }
+}
+
+/**
+ * Admin-surface: fetch full Steam detail for a catalog game.
+ * Throws Unauthorized when session missing, FetchFailed on other errors.
+ */
+export async function adminGameDetail(gameId: string): Promise<AdminGameDetailResponse> {
+  const response = await fetch(`/admin/api/games/${encodeURIComponent(gameId)}/detail`);
+  await checkUnauthorized(response);
+  if (!response.ok) throw new FetchFailed();
+  return (await response.json()) as AdminGameDetailResponse;
+}
+
 /**
  * Associates (or clears) a Steam app ID with a catalog game.
  * Passing null removes the association.
