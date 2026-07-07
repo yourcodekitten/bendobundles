@@ -3000,13 +3000,47 @@ async fn self_claim_ambiguous_failure_parks_never_compensates() {
 // Test 5: Key VALUE never appears in logs or pings (M2 log-scrubbing).
 // -------------------------------------------------------------------------------------------------
 
-/// A `MakeWriter` that captures all written bytes into a shared buffer.
-#[derive(Clone)]
-struct CaptureBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+// Log capture that is race-free against tracing's PROCESS-GLOBAL callsite-interest cache.
+//
+// The old approach (a thread-local `set_default` subscriber guarded by a file-local mutex) was
+// fundamentally racy, and the mutex was a placebo. tracing computes each callsite's interest
+// exactly ONCE — on the callsite's first hit anywhere in the process — against whatever dispatcher
+// is the default on the *registering thread at that instant*, and caches the result GLOBALLY for
+// the whole test binary (see tracing_core::callsite). A thread-local `set_default` also raises the
+// global `MAX_LEVEL` for ALL threads while its guard is live. So while this test held its capture
+// guard, a CONCURRENT sibling test with no subscriber could first-hit a callsite this test relies
+// on (e.g. lib.rs "redeemed_key_val present"), resolve through the slow path to the no-op
+// `NoSubscriber` → `Interest::never()`, and cache that callsite as permanently disabled GLOBALLY —
+// blanking the expected line out of THIS test's capture. That is the observed "missing line" flake,
+// and it only fires under load because full-workspace parallelism widens the window for a sibling
+// to win the first-hit race. `LOG_TEST_LOCK` could not help: the poisoning thread was a *different*
+// test and the interest cache is process-global and cross-thread — a lock only this test takes
+// serializes nothing. (Mechanism reproduced deterministically before this change.)
+//
+// Fix: install exactly ONE always-enabled GLOBAL default subscriber for the whole test binary.
+// That pins `MAX_LEVEL` and makes `get_global()` an *interested* subscriber, so no first-hit — on
+// any thread, by any test — can ever cache a shared callsite as `never`. The global subscriber
+// routes every event to a THREAD-LOCAL buffer; each capturing test installs its own buffer for the
+// lifetime of a guard. Because these tests run on a current-thread runtime, all emission happens on
+// the test's own thread and lands in that test's buffer; other threads with no buffer installed
+// simply discard. No cross-test interference, and no serializing lock required.
 
-impl std::io::Write for CaptureBuf {
+thread_local! {
+    static CAPTURE_SINK: std::cell::RefCell<Option<Arc<std::sync::Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `MakeWriter` that routes each event to the current thread's installed capture buffer, if any.
+#[derive(Clone, Default)]
+struct ThreadLocalCapture;
+
+impl std::io::Write for ThreadLocalCapture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        CAPTURE_SINK.with(|sink| {
+            if let Some(buffer) = sink.borrow().as_ref() {
+                buffer.lock().unwrap().extend_from_slice(buf);
+            }
+        });
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -3014,29 +3048,46 @@ impl std::io::Write for CaptureBuf {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
-    type Writer = CaptureBuf;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalCapture {
+    type Writer = ThreadLocalCapture;
     fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+        ThreadLocalCapture
     }
 }
 
-/// File-scope mutex to serialize the log-capture test. When set_default(tracing_subscriber) is
-/// called in a test with #[tokio::test] (multi-threaded runtime), sibling tests running in parallel
-/// can interfere: a tokio worker thread picks up the GLOBAL default subscriber (from a concurrent
-/// test's set_default call), not the thread-local one set for THIS test's thread, causing logs to
-/// either interleave into the wrong capture buffer or not be captured at all. Holding this lock
-/// for the test's entire body prevents concurrent test execution and guarantees that set_default
-/// affects only this test's subscriber dispatch — no cross-test pollution.
-static LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Installs the always-enabled global capture subscriber exactly once per test binary.
+fn install_global_capture_subscriber() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let sub = tracing_subscriber::fmt()
+            .with_writer(ThreadLocalCapture)
+            .with_ansi(false)
+            .finish();
+        // If a global default was somehow already set, that's fine: the invariant we need is that
+        // *some* interested global default exists so no callsite can be poisoned to `never`.
+        let _ = tracing::subscriber::set_global_default(sub);
+    });
+}
+
+/// RAII guard: clears this thread's capture buffer when dropped.
+struct CaptureGuard;
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURE_SINK.with(|sink| *sink.borrow_mut() = None);
+    }
+}
+
+/// Begin capturing tracing events emitted on THIS thread. Returns the shared buffer and a guard;
+/// hold the guard for the duration of capture.
+fn capture_logs() -> (Arc<std::sync::Mutex<Vec<u8>>>, CaptureGuard) {
+    install_global_capture_subscriber();
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    CAPTURE_SINK.with(|sink| *sink.borrow_mut() = Some(buffer.clone()));
+    (buffer, CaptureGuard)
+}
 
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // intentional: LOG_TEST_LOCK guards the whole async body (see its doc)
 async fn revealed_key_value_never_appears_in_logs_or_pings() {
-    use std::sync::{Arc, Mutex};
-
-    let _lock = LOG_TEST_LOCK.lock().unwrap();
-
     let Some(store_a) = store_or_skip("sc-scrub-a").await else {
         return;
     };
@@ -3046,14 +3097,8 @@ async fn revealed_key_value_never_appears_in_logs_or_pings() {
 
     let key = "AAAA-BBBB-CCCC";
 
-    // Set up log capture using our MakeWriter shim.
-    let log_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let capture = CaptureBuf(log_buf.clone());
-    let sub = tracing_subscriber::fmt()
-        .with_writer(capture)
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(sub);
+    // Set up race-free log capture (see the module comment above capture_logs).
+    let (log_buf, _capture) = capture_logs();
 
     // --- Happy path (store_a) ---
     seed_available_game(&store_a, "gkSA:mnSA", "Scrub Game A").await;
