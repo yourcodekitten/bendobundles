@@ -284,6 +284,28 @@ adventurer walking toward a treasure chest) in a Pixel bezel with the DMG's asym
 where "key" wears both Burgundy Ink and the Pixelify face — the accent word in the accent color
 and the accent type. Entrance is a single quiet rise with a `prefers-reduced-motion` bypass.
 
+### The Link-Page Header (signature — the JRPG scene)
+The gift page opens on a game scene, not a web header (built live with ben, 2026-07-07):
+
+- **The banner**: `/art/banner.png` — meadow, tree, and an open treasure chest — rendered at
+  native pixel scale (`background-repeat: repeat-x`, never resized; the sky letterboxes in the
+  scene's own sampled color). The chest is pinned 200px from the right edge; the scene tiles
+  outward for wide viewports. 240px tall.
+- **The wordmark**: the Silkscreen logotype floats on the sky wearing `.wordmark-outline` — an
+  8-direction dark pixel outline (game-logo grammar), with the claims counter opposite.
+- **The dialog box**: a Pokémon/FF text box floating on the meadow — Floor bg, 3px Pixel
+  border with the double-line inset (`inset 0 0 0 3px floor, inset 0 0 0 5px pixel`), 0.75rem
+  radius. The link label types out in Burgundy Ink, then the body, via the **typewriter**
+  (14ms/char, blinking block cursor `.tw-cursor`), then the menu row fades in:
+  `▸ connect to steam` with the bobbing `.menu-cursor` (two-frame, `steps(1)`). A ↻ control
+  replays the entrance. The box has a fixed footprint (min-heights) so typing never jitters
+  layout.
+- **Responsive**: at ≤800px the box drops out of the banner into flow — still straddling the
+  banner's bottom edge (32px overlap, 28px gutters) like a JRPG text box docked under the
+  scene. Desktop keeps it floating bottom-left.
+- **Motion discipline**: every animation here (rise, typewriter, cursor blink, menu bob) has a
+  `prefers-reduced-motion` bypass that renders the finished state instantly.
+
 ## 6. Do's and Don'ts
 
 ### Do:
