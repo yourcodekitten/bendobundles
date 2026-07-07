@@ -244,11 +244,17 @@ Tactile and cozy: quiet, pressable, unhurried — with all saved energy spent on
   Button Burgundy (it records a completed act of giving).
 
 ### Cards / Containers
-- **The game card is a DMG cartridge** (ben's pick, live session 2026-07-07): grip ridges along
-  the top (control/shelf repeating stripes), Shelf plastic body, cover art (or Title-Hash
-  block) inset like a label sticker (12px sides, 8px top), and the cartridge's asymmetric
-  corner — `border-radius: 6px 6px 20px 6px`. Title in Pixelify (1.25rem semibold); everything
-  else in the body stays Chivo.
+- **The game card is a clear-shell DMG cartridge** (ben's pick, live session 2026-07-07): the
+  special-edition see-through plastic — each cart's shell is tinted by its own game's
+  title-hash hue (hue mixed 20/80 toward Shelf; ridges tinted the same way toward Control).
+  Grip ridges along the top, cover art (or Title-Hash block) inset like a label sticker (12px
+  sides, 8px top), and the cartridge's asymmetric corner — `border-radius: 6px 6px 20px 6px`.
+  Title in Pixelify (1.25rem semibold); everything else in the body stays Chivo. "Games are
+  the color," taken literally: the shelf of carts breaks up the one-green room, deterministic
+  per game (The Title-Hash Rule).
+- **The whole cart is the details control** — a single `<button>`, no separate details button
+  (it was repetitive noise). Focus-visible wears a Pixel outline; the accessible name is
+  "{title} — details".
 - **Shadow Strategy:** none — tonal only (The Ceremony Rule)
 - **Border:** none at rest — the silhouette and ridges carry the object, not an outline
 - **Internal Padding:** 16px body below the label-sticker art
