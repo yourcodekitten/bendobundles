@@ -864,6 +864,207 @@ async fn game_view_carries_steam_app_id() {
     );
 }
 
+// ── I1: steamid validation on public owned proxy ──────────────────────────────
+
+/// I1-RED: live link + 16-digit steamid → 400 (must fail before fix).
+/// Security invariant 8: steamid must be validated as exactly 17 ASCII digits.
+#[tokio::test]
+async fn owned_proxy_steamid_16digit_gets_400() {
+    let Some(store) = store_or_skip("owned-proxy-i1-16digit").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    // Seed a live (active) link.
+    store.create_link(&test_link(CTX_TOKEN)).await.unwrap();
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/l/{CTX_TOKEN}/steam/owned/1234567890123456"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "16-digit steamid on live link must get 400"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["error"], "steamid must be exactly 17 ASCII digits",
+        "error message must match admin twin: {j}"
+    );
+}
+
+/// I1-RED: live link + steamid containing non-digit → 400.
+#[tokio::test]
+async fn owned_proxy_steamid_nondigit_gets_400() {
+    let Some(store) = store_or_skip("owned-proxy-i1-nondigit").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    store.create_link(&test_link(CTX_TOKEN)).await.unwrap();
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/l/{CTX_TOKEN}/steam/owned/7656119800000000x"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "non-digit steamid on live link must get 400"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["error"], "steamid must be exactly 17 ASCII digits",
+        "error message must match admin twin: {j}"
+    );
+}
+
+/// I1-ordering-pin: unknown token + bad steamid → byte-identical 404 (not 400).
+/// The token liveness check must run BEFORE steamid validation — a bad steamid
+/// on a dead/unknown token must never reveal that the steamid was rejected.
+#[tokio::test]
+async fn owned_proxy_unknown_token_bad_steamid_is_still_404() {
+    let Some(store) = store_or_skip("owned-proxy-i1-order").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    // No link seeded — unknown token.
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    // Request with a KNOWN-BAD steamid (16 digits) but unknown token.
+    let proxy_req = Request::get(format!("/api/l/{CTX_TOKEN}/steam/owned/1234567890123456"))
+        .body(Body::empty())
+        .unwrap();
+    let proxy_resp = app.clone().oneshot(proxy_req).await.unwrap();
+
+    // Request the standard unknown-link 404 for byte comparison.
+    let link_req = Request::get(format!("/api/l/{CTX_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let link_resp = app.clone().oneshot(link_req).await.unwrap();
+
+    assert_eq!(
+        proxy_resp.status(),
+        StatusCode::NOT_FOUND,
+        "unknown token + bad steamid must still return 404, not 400"
+    );
+    assert_eq!(link_resp.status(), StatusCode::NOT_FOUND);
+
+    let proxy_bytes = axum::body::to_bytes(proxy_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let link_bytes = axum::body::to_bytes(link_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        proxy_bytes, link_bytes,
+        "unknown-token + bad-steamid 404 must be byte-identical to standard unknown-link 404 \
+         (ordering proof: token gate fires before steamid validation)"
+    );
+}
+
+// ── I2: preserve duplicate query params so DUP_GUARD fires ────────────────────
+
+/// I2-RED: a genuine-shaped assertion with a SECOND `openid.claimed_id` appended
+/// must be rejected with `#steam_error=verify_failed` (DUP_GUARD firing through
+/// the endpoint), NOT succeed. WireMock answers is_valid:true — rejection must
+/// happen locally before the Steam roundtrip.
+#[tokio::test]
+async fn steam_return_duplicate_claimed_id_gets_verify_failed() {
+    let Some(store) = store_or_skip("steam-return-i2-dup").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+
+    // Mount check_authentication to answer is_valid:true — so any success would
+    // mean the DUP_GUARD is dead; we want to prove it fires BEFORE this call.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .and(wiremock::matchers::body_string_contains(
+            "openid.mode=check_authentication",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("ns:http://specs.openid.net/auth/2.0\nis_valid:true\n"),
+        )
+        .expect(0) // DUP_GUARD must reject locally — Steam must NOT be called.
+        .mount(&server)
+        .await;
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let ctx = format!("/l/{CTX_TOKEN}");
+    let expected_return_to = format!(
+        "{TEST_BASE_URL}/api/steam/return?ctx={}",
+        urlencoding::encode(&ctx)
+    );
+
+    // Build the standard assertion params.
+    let params = assertion_params(
+        &format!("https://steamcommunity.com/openid/id/{TEST_STEAMID}"),
+        &expected_return_to,
+    );
+
+    // Build query string with a DUPLICATE openid.claimed_id injected at the end.
+    let mut qs = format!("ctx={}", urlencoding::encode(&ctx));
+    for (k, v) in &params {
+        qs.push('&');
+        qs.push_str(&urlencoding::encode(k));
+        qs.push('=');
+        qs.push_str(&urlencoding::encode(v));
+    }
+    // Inject a second claimed_id (attacker's forgery attempt).
+    qs.push_str(
+        "&openid.claimed_id=https%3A%2F%2Fsteamcommunity.com%2Fopenid%2Fid%2F99999999999999999",
+    );
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/steam/return?{qs}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND, "must redirect");
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.contains("#steam_error=verify_failed"),
+        "duplicate claimed_id must fire the DUP_GUARD → verify_failed; got: {loc}"
+    );
+    assert!(
+        loc.starts_with(&format!("/l/{CTX_TOKEN}")),
+        "must redirect back to ctx; got: {loc}"
+    );
+
+    // Verify Steam was NOT called (DUP_GUARD rejected locally).
+    server.verify().await;
+}
+
 /// Login endpoint rejects a bad ctx (allowlist enforced initiation-side too).
 #[tokio::test]
 async fn steam_login_rejects_bad_ctx() {

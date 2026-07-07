@@ -218,9 +218,19 @@ async fn handle_steam_login(
 
 async fn handle_steam_return(
     State(s): State<AppState>,
-    Query(all_params): Query<HashMap<String, String>>,
+    // Vec<(String,String)> preserves duplicate keys — required so that
+    // verify_openid_assertion's DUP_GUARD can detect a forged second
+    // openid.claimed_id before it reaches Steam.  HashMap would silently
+    // collapse duplicates, making the guard dead code at the endpoint level.
+    Query(all_params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let ctx = all_params.get("ctx").cloned().unwrap_or_default();
+    // Take the FIRST occurrence of `ctx` (first-occurrence semantics, consistent
+    // with how the steam-client crate's get() helper works for openid.* params).
+    let ctx = all_params
+        .iter()
+        .find(|(k, _)| k == "ctx")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
 
     // ctx allowlist — failure → 302 `/` no fragment.
     if !ctx_is_allowed(&ctx) {
@@ -336,7 +346,19 @@ async fn handle_steam_owned_proxy(
             .into_response();
     }
 
-    // 3. Cache-or-fetch exactly like the admin proxy (24h freshness rule).
+    // 3. Validate steamid — invariant (8): exactly 17 ASCII digits.
+    //    Guard placed AFTER the token-resolution + liveness gate so that an
+    //    unknown or dead token always returns the byte-identical 404/409 and
+    //    never leaks that the steamid was also malformed (no oracle upgrade).
+    if steamid.len() != 17 || !steamid.bytes().all(|b| b.is_ascii_digit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "steamid must be exactly 17 ASCII digits"})),
+        )
+            .into_response();
+    }
+
+    // 4. Cache-or-fetch exactly like the admin proxy (24h freshness rule).
     let now_epoch = now.unix_timestamp();
     const FRESH_SECS: i64 = 86400;
 
