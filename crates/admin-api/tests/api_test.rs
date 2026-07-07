@@ -188,6 +188,9 @@ fn test_game(n: u32) -> Game {
         artwork_url: None,
         keyindex: n,
         requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     }
 }
 
@@ -1026,6 +1029,9 @@ fn sample_game(id: &str) -> Game {
         artwork_url: None,
         keyindex: 0,
         requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     }
 }
 

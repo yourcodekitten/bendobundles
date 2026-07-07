@@ -20,6 +20,19 @@ pub enum ClaimState {
     Compensated,
 }
 
+/// Source that produced a [`Game::steam_app_id`], used to decide which value wins in
+/// [`merge_sync`]. Precedence (highest first): `Manual` > `Humble` > `Title`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppidSource {
+    /// Resolved by title-matching against the Steam app list — lowest-confidence tier.
+    Title,
+    /// Sourced directly from Humble's wire data (tpk `steam_app_id` field) — mid-confidence tier.
+    Humble,
+    /// Set by an admin override — highest-confidence tier; never overwritten by a sync walk.
+    Manual,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Game {
     pub id: String,
@@ -57,6 +70,25 @@ pub struct Game {
     /// intended writer.
     #[serde(default)]
     pub requires_choice: bool,
+
+    /// Steam App ID for this game, when known. Set by one of three sources (see [`AppidSource`]).
+    /// `None` for non-steam key types and any game whose appid has not yet been resolved.
+    /// `#[serde(default)]`: records written before this field existed deserialize to `None`.
+    #[serde(default)]
+    pub steam_app_id: Option<u32>,
+
+    /// Which source produced [`steam_app_id`](Self::steam_app_id). `None` iff `steam_app_id` is
+    /// `None`. Determines merge precedence: `Manual` beats `Humble` beats `Title`.
+    /// `#[serde(default)]`: records written before this field existed deserialize to `None`.
+    #[serde(default)]
+    pub appid_source: Option<AppidSource>,
+
+    /// `true` if Ben has personally redeemed or owns this game on Steam, stamped by a dedicated
+    /// ownership-sync pass (not by the order walk). `merge_sync` ALWAYS carries this from the
+    /// existing record so the walk can never accidentally clear it.
+    /// `#[serde(default)]`: records written before this field existed deserialize to `false`.
+    #[serde(default)]
+    pub owned_by_ben: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,24 +188,45 @@ pub fn sync_status(redeemed: bool, expired: bool) -> GameStatus {
     }
 }
 
+/// Merge rule for `steam_app_id` + `appid_source`: Manual admin override wins, then a fresh
+/// Humble-sourced id beats a stale Title-sourced one, otherwise keep existing.
+///
+/// Precedence (highest wins):
+/// 1. `existing.appid_source == Some(Manual)` → keep existing's pair unconditionally.
+/// 2. `fresh.steam_app_id.is_some()` → take fresh's pair (Humble beats stale Title; new
+///    Title beats None).
+/// 3. else → keep existing's pair (fresh has no id; don't clear an existing one).
+fn merge_appid(existing: &Game, fresh: &Game) -> (Option<u32>, Option<AppidSource>) {
+    if existing.appid_source == Some(AppidSource::Manual) {
+        // Admin override — untouchable
+        (existing.steam_app_id, existing.appid_source)
+    } else if fresh.steam_app_id.is_some() {
+        // Fresh has an id: take it (Humble beats stale Title; new Title beats None)
+        (fresh.steam_app_id, fresh.appid_source)
+    } else {
+        // Fresh has no id: preserve existing
+        (existing.steam_app_id, existing.appid_source)
+    }
+}
+
 pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
     match existing {
         None => Some(fresh),
         Some(existing_game) => {
             let merged = match existing_game.status {
                 GameStatus::Pending | GameStatus::Gifted => {
-                    // App owns the record: keep status, claim_id, hidden, giftable
+                    // App owns the record: keep status, claim_id, hidden, giftable, owned_by_ben.
                     // Refresh: title, bundle, artwork_url, keyindex, key_type, requires_choice
                     // from fresh. requires_choice is Humble-derived, so fresh always wins
                     // (both branches agree on this): a key-sync fresh carries `false` because
                     // presence in order.keys proves a key exists, so a chosen game flips false
                     // on its next sync — PROVIDED the discovery ingest derives the same
                     // game id (via `game_id()`: gamekey:machine_name) as the post-choose
-                    // key record. That id
-                    // agreement is an obligation on the discovery-wiring build; if the ids
-                    // diverge, the stale `true` record lingers as a duplicate instead of
-                    // flipping. A stale `true` must never survive a fresh `false`, nor the
-                    // reverse.
+                    // key record. That id agreement is an obligation on the discovery-wiring
+                    // build; if the ids diverge, the stale `true` record lingers as a duplicate
+                    // instead of flipping. A stale `true` must never survive a fresh `false`,
+                    // nor the reverse.
+                    let (steam_app_id, appid_source) = merge_appid(existing_game, &fresh);
                     Game {
                         id: existing_game.id.clone(),
                         title: fresh.title,
@@ -188,14 +241,22 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                         artwork_url: fresh.artwork_url,
                         keyindex: fresh.keyindex,
                         requires_choice: fresh.requires_choice,
+                        steam_app_id,
+                        appid_source,
+                        owned_by_ben: existing_game.owned_by_ben,
                     }
                 }
                 GameStatus::Available | GameStatus::BenRedeemed | GameStatus::Expired => {
-                    // Humble-owned: fresh wins entirely except hidden. No catch-all `_` —
+                    // Humble-owned: fresh wins entirely except hidden, owned_by_ben, and the
+                    // appid pair (which follows its own precedence). No catch-all `_` —
                     // a future GameStatus variant must be consciously classified here,
                     // same as the no-`_` rule in fulfillment's gift_decision.
+                    let (steam_app_id, appid_source) = merge_appid(existing_game, &fresh);
                     Game {
                         hidden: existing_game.hidden,
+                        owned_by_ben: existing_game.owned_by_ben,
+                        steam_app_id,
+                        appid_source,
                         ..fresh
                     }
                 }
@@ -274,6 +335,9 @@ mod tests {
             artwork_url: None,
             keyindex: 0,
             requires_choice: false,
+            steam_app_id: None,
+            appid_source: None,
+            owned_by_ben: false,
         };
         assert!(g.is_listable());
         g.hidden = true;
@@ -356,6 +420,9 @@ mod tests {
             artwork_url: Some("new.png".into()),
             keyindex: 4,
             requires_choice: false,
+            steam_app_id: None,
+            appid_source: None,
+            owned_by_ben: false,
         }
     }
 
@@ -525,5 +592,165 @@ mod tests {
     #[test]
     fn self_link_token_is_self() {
         assert_eq!(SELF_LINK_TOKEN, "SELF");
+    }
+
+    // ── steam_app_id / appid_source / owned_by_ben field tests ────────────────
+
+    #[test]
+    fn steam_fields_default_on_old_records() {
+        // Records written before these fields existed must deserialize cleanly with defaults.
+        let mut json = serde_json::to_value(fresh_game()).unwrap();
+        json.as_object_mut().unwrap().remove("steam_app_id");
+        json.as_object_mut().unwrap().remove("appid_source");
+        json.as_object_mut().unwrap().remove("owned_by_ben");
+        assert!(json.get("steam_app_id").is_none(), "steam_app_id stripped");
+        assert!(json.get("appid_source").is_none(), "appid_source stripped");
+        assert!(json.get("owned_by_ben").is_none(), "owned_by_ben stripped");
+        let g: Game = serde_json::from_value(json).unwrap();
+        assert_eq!(g.steam_app_id, None);
+        assert_eq!(g.appid_source, None);
+        assert!(!g.owned_by_ben);
+    }
+
+    #[test]
+    fn merge_appid_humble_fresh_beats_stale_title() {
+        // existing {Some(111), Some(Title)} + fresh {Some(222), Some(Humble)} → fresh's pair wins
+        let mut existing = fresh_game();
+        existing.steam_app_id = Some(111);
+        existing.appid_source = Some(AppidSource::Title);
+        let mut fresh = fresh_game();
+        fresh.steam_app_id = Some(222);
+        fresh.appid_source = Some(AppidSource::Humble);
+        let merged = merge_sync(Some(&existing), fresh).unwrap();
+        assert_eq!(merged.steam_app_id, Some(222));
+        assert_eq!(merged.appid_source, Some(AppidSource::Humble));
+    }
+
+    #[test]
+    fn merge_appid_manual_wins_over_fresh_humble() {
+        // existing {Some(111), Some(Manual)} + fresh {Some(222), Some(Humble)} → existing's pair wins
+        // Force a title change so the merge returns Some (not a no-op).
+        let mut existing = fresh_game();
+        existing.steam_app_id = Some(111);
+        existing.appid_source = Some(AppidSource::Manual);
+        existing.title = "Old Title".into();
+        let mut fresh = fresh_game(); // title = "New Title"
+        fresh.steam_app_id = Some(222);
+        fresh.appid_source = Some(AppidSource::Humble);
+        let merged = merge_sync(Some(&existing), fresh).unwrap();
+        assert_eq!(
+            merged.steam_app_id,
+            Some(111),
+            "manual source: existing pair kept"
+        );
+        assert_eq!(merged.appid_source, Some(AppidSource::Manual));
+    }
+
+    #[test]
+    fn merge_appid_app_owned_manual_wins_over_fresh_humble() {
+        // Same manual-wins logic applies in the Pending/Gifted (app-owned) branch.
+        // Force a title change so the merge returns Some (not a no-op).
+        let mut existing = fresh_game();
+        existing.status = GameStatus::Pending;
+        existing.claim_id = Some("c1".into());
+        existing.steam_app_id = Some(111);
+        existing.appid_source = Some(AppidSource::Manual);
+        existing.title = "Old Title".into();
+        let mut fresh = fresh_game(); // title = "New Title"
+        fresh.steam_app_id = Some(222);
+        fresh.appid_source = Some(AppidSource::Humble);
+        let merged = merge_sync(Some(&existing), fresh).unwrap();
+        assert_eq!(
+            merged.steam_app_id,
+            Some(111),
+            "manual wins in app-owned branch"
+        );
+        assert_eq!(merged.appid_source, Some(AppidSource::Manual));
+        assert_eq!(merged.status, GameStatus::Pending);
+    }
+
+    #[test]
+    fn merge_appid_app_owned_humble_fresh_beats_stale_title() {
+        // Pending branch: fresh Humble id beats an existing Title id.
+        let mut existing = fresh_game();
+        existing.status = GameStatus::Pending;
+        existing.claim_id = Some("c1".into());
+        existing.steam_app_id = Some(111);
+        existing.appid_source = Some(AppidSource::Title);
+        let mut fresh = fresh_game();
+        fresh.steam_app_id = Some(222);
+        fresh.appid_source = Some(AppidSource::Humble);
+        let merged = merge_sync(Some(&existing), fresh).unwrap();
+        assert_eq!(merged.steam_app_id, Some(222));
+        assert_eq!(merged.appid_source, Some(AppidSource::Humble));
+        assert_eq!(merged.status, GameStatus::Pending);
+    }
+
+    #[test]
+    fn merge_owned_by_ben_always_preserved() {
+        // owned_by_ben is stamped by a separate sync pass; merge_sync must NEVER clobber it.
+        // Force a title change so merge returns Some (otherwise returns None for no-op).
+        let mut existing = fresh_game();
+        existing.owned_by_ben = true;
+        existing.title = "Old Title".into();
+        let merged = merge_sync(Some(&existing), fresh_game()).unwrap();
+        assert!(
+            merged.owned_by_ben,
+            "owned_by_ben must survive humble-owned merge"
+        );
+    }
+
+    #[test]
+    fn merge_owned_by_ben_app_owned_preserved() {
+        // Same in the app-owned (Pending/Gifted) branch.
+        // Force a title change so the merge returns Some (not a no-op).
+        let mut existing = fresh_game();
+        existing.status = GameStatus::Pending;
+        existing.claim_id = Some("c1".into());
+        existing.owned_by_ben = true;
+        existing.title = "Old Title".into();
+        let fresh = fresh_game(); // owned_by_ben = false (walk never sets it), title = "New Title"
+        let merged = merge_sync(Some(&existing), fresh).unwrap();
+        assert!(
+            merged.owned_by_ben,
+            "owned_by_ben preserved in app-owned branch"
+        );
+        assert_eq!(merged.status, GameStatus::Pending);
+    }
+
+    #[test]
+    fn merge_appid_fresh_none_preserves_existing_pair_both_branches() {
+        // Tier 3: fresh carries NO id — existing non-Manual pair must survive, or every
+        // key-sync clobbers the mapper's work. (Deleting merge_appid's else-branch must
+        // fail this test.) Force a title change so the merge returns Some (not a no-op).
+
+        // Humble-owned (Available) branch, Title-sourced existing:
+        let mut existing = fresh_game();
+        existing.steam_app_id = Some(413150);
+        existing.appid_source = Some(AppidSource::Title);
+        existing.title = "Old Title".into();
+        let merged = merge_sync(Some(&existing), fresh_game()).unwrap();
+        assert_eq!(
+            merged.steam_app_id,
+            Some(413150),
+            "fresh None: keep existing"
+        );
+        assert_eq!(merged.appid_source, Some(AppidSource::Title));
+
+        // App-owned (Pending) branch, Humble-sourced existing:
+        let mut existing = fresh_game();
+        existing.status = GameStatus::Pending;
+        existing.claim_id = Some("c1".into());
+        existing.steam_app_id = Some(413150);
+        existing.appid_source = Some(AppidSource::Humble);
+        existing.title = "Old Title".into();
+        let merged = merge_sync(Some(&existing), fresh_game()).unwrap();
+        assert_eq!(
+            merged.steam_app_id,
+            Some(413150),
+            "fresh None: keep existing"
+        );
+        assert_eq!(merged.appid_source, Some(AppidSource::Humble));
+        assert_eq!(merged.status, GameStatus::Pending);
     }
 }

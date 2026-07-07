@@ -1764,6 +1764,9 @@ async fn run_sync(deps: &Deps) {
                 // Sync walks order.keys — these all have a real redemption key already.
                 // Choice discovery (which sets this true) is a separate ingest path.
                 requires_choice: false,
+                steam_app_id: None,
+                appid_source: None,
+                owned_by_ben: false,
             };
             match deps.store.upsert_game_from_sync(game).await {
                 Ok(SyncWrite::Written) => games_written += 1,
@@ -1973,6 +1976,9 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
                 artwork_url: None,
                 keyindex: 0,
                 requires_choice: true,
+                steam_app_id: None,
+                appid_source: None,
+                owned_by_ben: false,
             };
             match deps.store.upsert_game_from_sync(game).await {
                 Ok(SyncWrite::Written) => written += 1,
@@ -2405,6 +2411,7 @@ mod tests {
                 giftable: !redeemed,
                 keyindex: 0,
                 redeemed_key_val: None,
+                steam_app_id: None,
             }
         }
         fn order(keys: Vec<KeyEntry>) -> Order {
