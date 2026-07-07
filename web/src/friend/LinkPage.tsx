@@ -232,15 +232,10 @@ export function LinkPage() {
         </div>
       )}
 
-      {/* Grid: shown for exhausted (disabled buttons) or active; hidden for revoked/expired */}
+      {/* Grid: shown for exhausted or active (claiming lives in the detail modal,
+          which respects link state); hidden for revoked/expired */}
       {!dead && (
-        <GameGrid
-          games={data.games}
-          active={data.state === 'active'}
-          onClaim={setClaimingGame}
-          owned={ownedSet}
-          onDetail={setDetailGame}
-        />
+        <GameGrid games={data.games} owned={ownedSet} onDetail={setDetailGame} />
       )}
 
       <ClaimsHistory claims={data.claims} />

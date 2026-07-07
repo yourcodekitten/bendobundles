@@ -14,12 +14,14 @@ vi.mock('../api', async (importOriginal) => {
     fetchLink: vi.fn(),
     claimGame: vi.fn(),
     steamOwnedForLink: vi.fn(),
+    fetchGameDetail: vi.fn(),
   };
 });
 
 vi.mock('../steamIdentity');
 
-import { fetchLink, claimGame, NotFound, FetchFailed, steamOwnedForLink } from '../api';
+import { fetchLink, claimGame, NotFound, FetchFailed, steamOwnedForLink, fetchGameDetail } from '../api';
+import { clearGameDetailCache } from '../GameDetailModal';
 import { consumeReturnFragment, loadIdentity, beginConnect } from '../steamIdentity';
 
 function renderLinkPage(token = 'abc123') {
@@ -44,6 +46,7 @@ const baseLink: LinkView = {
 describe('LinkPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearGameDetailCache();
     // Default steam state: no fragment, no stored identity
     vi.mocked(consumeReturnFragment).mockReturnValue(null);
     vi.mocked(loadIdentity).mockReturnValue(null);
@@ -101,6 +104,7 @@ describe('LinkPage', () => {
     vi.mocked(fetchLink)
       .mockResolvedValueOnce(withGame)
       .mockImplementation(() => new Promise(() => {}));
+    vi.mocked(fetchGameDetail).mockResolvedValue({ game: withGame.games[0]!, steam: null });
     vi.mocked(claimGame).mockResolvedValue({ kind: 'refused', message: 'already claimed' });
 
     renderLinkPage();
@@ -108,8 +112,12 @@ describe('LinkPage', () => {
       expect(screen.getByText('Portal')).toBeInTheDocument();
     });
 
-    // Full claim round-trip: open dialog → confirm → refused → close (triggers refresh)
-    await user.click(screen.getByRole('button', { name: /claim/i }));
+    // Full claim round-trip: details → modal claim → dialog confirm → refused → close (refresh)
+    await user.click(screen.getByRole('button', { name: /details/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /^claim$/i })).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: /^claim$/i }));
     await user.click(screen.getByRole('button', { name: /confirm/i }));
     await waitFor(() => {
       expect(screen.getByText('already claimed')).toBeInTheDocument();
@@ -131,18 +139,25 @@ describe('LinkPage', () => {
     });
   });
 
-  it('shows exhausted banner and disabled grid on state:"exhausted"', async () => {
+  it('shows exhausted banner; grid browsable but the modal claim is disabled', async () => {
+    const user = userEvent.setup();
+    const game = { id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null, steam_app_id: null };
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
       state: 'exhausted',
-      games: [{ id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null, steam_app_id: null }],
+      games: [game],
     });
+    vi.mocked(fetchGameDetail).mockResolvedValue({ game, steam: null });
     renderLinkPage();
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent("you've used all your claims");
     });
-    // grid is visible but claim button is disabled
-    expect(screen.getByRole('button', { name: /claim/i })).toBeDisabled();
+    // the grid never claims directly — details still browsable, modal claim disabled
+    expect(screen.queryByRole('button', { name: /^claim$/i })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /details/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /^claim$/i })).toBeDisabled();
+    });
   });
 
   it('shows revoked banner and no grid on state:"revoked"', async () => {
@@ -157,7 +172,8 @@ describe('LinkPage', () => {
         "this invite isn't active anymore — bug ben",
       );
     });
-    // no claim button rendered
+    // no grid rendered at all — neither details nor claim affordances
+    expect(screen.queryByRole('button', { name: /details/i })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /claim/i })).not.toBeInTheDocument();
   });
 

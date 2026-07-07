@@ -3,15 +3,15 @@ import { titleColorClass } from '../titleColor';
 
 interface GameGridProps {
   games: GameView[];
-  active: boolean;
-  onClaim: (game: GameView) => void;
   /** Set of Steam appids the viewer already owns — shows "you own this" pill. */
   owned?: Set<number>;
-  /** When provided, clicking the card body (not the claim button) opens the detail modal. */
-  onDetail?: (game: GameView) => void;
+  /** Opens the detail modal — via the details button or the card body. Claiming
+      happens inside the modal (the grid never claims directly; see DESIGN.md,
+      The Button Burgundy Rule). */
+  onDetail: (game: GameView) => void;
 }
 
-export function GameGrid({ games, active, onClaim, owned, onDetail }: GameGridProps) {
+export function GameGrid({ games, owned, onDetail }: GameGridProps) {
   // Group by title; preserve server order — first occurrence wins the card
   const seen = new Map<string, { game: GameView; count: number }>();
   for (const game of games) {
@@ -34,8 +34,8 @@ export function GameGrid({ games, active, onClaim, owned, onDetail }: GameGridPr
         return (
           <div
             key={game.title}
-            className={`rounded-lg bg-floor overflow-hidden${onDetail !== undefined ? ' cursor-pointer' : ''}`}
-            onClick={() => onDetail?.(game)}
+            className="rounded-lg bg-floor overflow-hidden cursor-pointer"
+            onClick={() => onDetail(game)}
           >
             {game.artwork_url !== null ? (
               <img
@@ -69,11 +69,10 @@ export function GameGrid({ games, active, onClaim, owned, onDetail }: GameGridPr
               </div>
               <button
                 type="button"
-                disabled={!active}
-                onClick={(e) => { e.stopPropagation(); onClaim(game); }}
-                className="mt-3 w-full rounded bg-give px-3 py-1.5 text-sm font-medium text-give-ink hover:bg-give-bright disabled:cursor-not-allowed disabled:opacity-40"
+                onClick={(e) => { e.stopPropagation(); onDetail(game); }}
+                className="mt-3 w-full rounded bg-control px-3 py-1.5 text-sm font-medium text-ink hover:bg-control-bright"
               >
-                claim
+                details
               </button>
             </div>
           </div>
