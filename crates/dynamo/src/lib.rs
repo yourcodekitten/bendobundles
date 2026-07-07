@@ -1268,6 +1268,10 @@ impl Store {
         game.appid_source = Some(source);
 
         // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
+        // Additionally guard against a concurrent admin Manual override that landed
+        // inside our read→write window: if appid_source is now Manual in DynamoDB,
+        // we must NOT clobber it. attribute_not_exists allows the write on items that
+        // predate the appid_source attribute (Title/Humble/None all still map).
         let status_str = serde_json::to_value(game.status)
             .expect("status serializes")
             .as_str()
@@ -1280,8 +1284,12 @@ impl Store {
             .table_name(&self.table)
             .set_item(Some(game_item(&game)))
             .expression_attribute_names("#st", "status")
+            .expression_attribute_names("#asrc", "appid_source")
             .expression_attribute_values(":expected", schema::s(status_str))
-            .condition_expression("#st = :expected")
+            .expression_attribute_values(":manual", schema::s("Manual".to_string()))
+            .condition_expression(
+                "#st = :expected AND (attribute_not_exists(#asrc) OR #asrc <> :manual)",
+            )
             .send()
             .await;
 

@@ -1165,6 +1165,83 @@ async fn set_game_steam_appid_if_unclaimed_contested() {
     );
 }
 
+/// I1: DynamoDB-level Manual guard — mapper cannot clobber a Manual override even
+/// under a concurrent read→write race (the condition expression rejects the write).
+///
+/// This is the DynamoDB-condition path of the guard. The in-memory check at the top
+/// of `set_game_steam_appid_if_unclaimed` catches the non-race case; this test seeds
+/// the item with `appid_source = Manual` directly so the DDB condition is what stands
+/// between the mapper and a lost admin write.
+///
+/// RED: before the `appid_source <> :manual` condition was added to the PutItem call,
+/// the in-memory guard still caught this via the pre-read, but the DDB condition did
+/// NOT independently enforce it — a true concurrent race would have clobbered Manual.
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_manual_guard_ddb_condition() {
+    let Some(store) = store_or_skip("appid-manual-guard-ddb").await else {
+        return;
+    };
+
+    // Seed a game with appid_source = Manual (admin override already set).
+    let mut manual_game = game(1, true);
+    manual_game.steam_app_id = Some(999);
+    manual_game.appid_source = Some(AppidSource::Manual);
+    let gid = manual_game.id.clone();
+    store.put_game(&manual_game).await.unwrap();
+
+    // Mapper attempt must be Skipped — Manual is untouchable.
+    let result = store
+        .set_game_steam_appid_if_unclaimed(&gid, 12345, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Skipped),
+        "Manual-sourced game must return Skipped, got {result:?}"
+    );
+
+    // Stored values must be unchanged.
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.steam_app_id,
+        Some(999),
+        "Manual steam_app_id must not be clobbered"
+    );
+    assert_eq!(
+        after.appid_source,
+        Some(AppidSource::Manual),
+        "appid_source must remain Manual"
+    );
+}
+
+/// I1-regression: Title-sourced game → mapper write still succeeds (guard must not block non-Manual).
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_title_source_still_written() {
+    let Some(store) = store_or_skip("appid-title-regression").await else {
+        return;
+    };
+
+    // Seed a game with appid_source = Title (the normal mapper case).
+    let mut title_game = game(1, true);
+    title_game.steam_app_id = Some(100);
+    title_game.appid_source = Some(AppidSource::Title);
+    let gid = title_game.id.clone();
+    store.put_game(&title_game).await.unwrap();
+
+    // Mapper update must succeed.
+    let result = store
+        .set_game_steam_appid_if_unclaimed(&gid, 200, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Written),
+        "Title-sourced game must be overwritable by mapper, got {result:?}"
+    );
+
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(after.steam_app_id, Some(200), "appid must be updated");
+    assert_eq!(after.appid_source, Some(AppidSource::Title));
+}
+
 // =================================================================================================
 // TASK 7: CONFIG#STEAM identity, STEAMOWN 7d-ttl cache, guarded owned_by_ben stamp.
 // =================================================================================================

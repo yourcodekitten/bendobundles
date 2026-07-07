@@ -1103,3 +1103,151 @@ async fn steam_login_rejects_bad_ctx() {
         );
     }
 }
+
+// ── C1: admin/ops ctx allowlist bridging tests ────────────────────────────────
+
+/// C1-GREEN: login with ctx=/admin/ops → 302 to Steam (not to /).
+/// The allowlist must accept `/admin/<subroute>` — the fix that was missing.
+#[tokio::test]
+async fn steam_login_admin_ops_ctx_accepted() {
+    let Some(store) = store_or_skip("steam-login-admin-ops").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/steam/login?ctx=%2Fadmin%2Fops")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND, "admin/ops ctx must 302");
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.contains("steamcommunity.com") || loc.contains("steampowered.com"),
+        "ctx=/admin/ops must redirect to Steam, not to /; got: {loc}"
+    );
+}
+
+/// C1-GREEN: return endpoint with valid assertion and ctx=/admin/ops →
+/// 302 to /admin/ops#steam=... (not to /).
+#[tokio::test]
+async fn steam_return_admin_ops_ctx_valid_assertion() {
+    let Some(store) = store_or_skip("steam-return-admin-ops").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .and(wiremock::matchers::body_string_contains(
+            "openid.mode=check_authentication",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("ns:http://specs.openid.net/auth/2.0\nis_valid:true\n"),
+        )
+        .mount(&server)
+        .await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/ISteamUser/GetPlayerSummaries/v0002/"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"players":[{"steamid":"76561198000000001","personaname":"bendoerr","avatarfull":null}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let ctx = "/admin/ops";
+    let expected_return_to = format!(
+        "{TEST_BASE_URL}/api/steam/return?ctx={}",
+        urlencoding::encode(ctx)
+    );
+
+    let params = assertion_params(
+        &format!("https://steamcommunity.com/openid/id/{TEST_STEAMID}"),
+        &expected_return_to,
+    );
+
+    let mut qs = format!("ctx={}", urlencoding::encode(ctx));
+    for (k, v) in &params {
+        qs.push('&');
+        qs.push_str(&urlencoding::encode(k));
+        qs.push('=');
+        qs.push_str(&urlencoding::encode(v));
+    }
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/steam/return?{qs}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND, "must redirect");
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.starts_with("/admin/ops#steam="),
+        "return with ctx=/admin/ops must redirect to /admin/ops#steam=...; got: {loc}"
+    );
+    assert!(
+        loc.contains(TEST_STEAMID),
+        "location must contain steamid; got: {loc}"
+    );
+}
+
+/// C1-REJECT: admin subroute rejections — the widening must not enable open redirect.
+/// `/admin//evil`, `/admin/ops/x`, `/admin/Ops`, `/admin/ops2`, `/admin/../etc` all → /.
+#[tokio::test]
+async fn steam_login_admin_subroute_rejections() {
+    let Some(store) = store_or_skip("steam-login-admin-reject").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    for bad_ctx in [
+        "/admin//evil",
+        "/admin/ops/x",
+        "/admin/Ops",
+        "/admin/ops2",
+        "/admin/../etc",
+        "/admin/",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/steam/login?ctx={}",
+                    urlencoding::encode(bad_ctx)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(
+            loc, "/",
+            "bad admin ctx '{bad_ctx}' must redirect to /; got: {loc}"
+        );
+    }
+}

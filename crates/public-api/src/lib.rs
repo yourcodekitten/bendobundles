@@ -148,14 +148,23 @@ async fn handle_not_found() -> Response {
 
 /// Validate a `ctx` parameter against the allowlist:
 ///   - Exactly `/admin`
-///   - Or `/l/` followed by exactly 64 lowercase hex characters
+///   - Or `/admin/` followed by exactly one path segment of one-or-more lowercase ASCII
+///     letters `[a-z]+` (the admin SPA subroutes: `catalog`, `links`, `ops`).
+///     Equivalent regex `^/admin(/[a-z]+)?$`.  No second slash, no digits, no uppercase,
+///     no dots, no backslashes — anything else is rejected.
+///   - Or `/l/` followed by exactly 64 lowercase hex characters.
 ///
 /// Returns `true` iff `ctx` is on the allowlist. ONE shared function used by
 /// BOTH the login and return endpoints — duplication-safe by construction.
-/// Equivalent to the regex `^/l/[0-9a-f]{64}$` but without a runtime regex compile.
 fn ctx_is_allowed(ctx: &str) -> bool {
     if ctx == "/admin" {
         return true;
+    }
+    if let Some(seg) = ctx.strip_prefix("/admin/") {
+        // One segment only: one-or-more lowercase ASCII letters, nothing else.
+        return !seg.is_empty()
+            && !seg.contains('/')
+            && seg.bytes().all(|b: u8| b.is_ascii_lowercase());
     }
     if let Some(token) = ctx.strip_prefix("/l/") {
         return token.len() == 64

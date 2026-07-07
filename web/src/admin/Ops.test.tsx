@@ -398,5 +398,18 @@ describe('Ops', () => {
       await user.click(screen.getByRole('button', { name: /disconnect/i }));
       await waitFor(() => expect(adminClearSteamIdentity).toHaveBeenCalled());
     });
+
+    // C1 contract: Ops must initiate connect with exactly /admin/ops so the server-side
+    // ctx_is_allowed allowlist accepts it. If this ctx ever drifts the feature silently breaks.
+    it('initiates connect with ctx=/admin/ops — must match server ctx_is_allowed allowlist', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+      renderOps();
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /connect steam/i })).toBeInTheDocument(),
+      );
+      await user.click(screen.getByRole('button', { name: /connect steam/i }));
+      expect(beginConnect).toHaveBeenCalledWith('/admin/ops');
+    });
   });
 });
