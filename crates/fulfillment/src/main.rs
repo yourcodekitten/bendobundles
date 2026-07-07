@@ -58,6 +58,11 @@ async fn main() -> Result<(), lambda_runtime::Error> {
 
     let steam_key_param = std::env::var("STEAM_KEY_PARAM").ok();
 
+    // Ben's be-nice kill switch: STEAM_ENRICH_DISABLED=1 skips the storefront enrichment pass.
+    // Read once at startup; carried on Deps so run_sync's enrichment reads config, not raw env.
+    let steam_enrich_disabled = std::env::var("STEAM_ENRICH_DISABLED").as_deref() == Ok("1");
+    tracing::info!(steam_enrich_disabled, "steam enrichment configuration");
+
     let aws_cfg = aws_config::load_from_env().await;
     let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_cfg);
     let ssm_client = aws_sdk_ssm::Client::new(&aws_cfg);
@@ -220,6 +225,8 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     http: http_client,
                     session_store,
                     steam: steam.clone(),
+                    steam_enrich_disabled,
+                    steam_enrich_pace: fulfillment::STEAM_ENRICH_PACE,
                 };
 
                 handle(&deps, req).await
