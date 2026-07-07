@@ -15,7 +15,7 @@ export type AdminOutletContext = {
 
 // One place for the nav active/inactive style — three NavLinks share it.
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
-  isActive ? 'text-zinc-100 font-medium' : 'text-zinc-400 hover:text-zinc-200';
+  isActive ? 'text-ink font-medium' : 'text-dust hover:text-ink-soft';
 
 export function AdminApp() {
   const navigate = useNavigate();
@@ -49,8 +49,8 @@ export function AdminApp() {
   const cookieAttentionNeeded = status?.sync?.cookie_ok === false;
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100">
-      <nav className="border-b border-zinc-800 px-6 py-3 flex gap-6" aria-label="admin navigation">
+    <div className="min-h-screen bg-room text-ink">
+      <nav className="border-b border-line px-6 py-3 flex gap-6" aria-label="admin navigation">
         <NavLink to="/admin/catalog" className={navLinkClass}>
           catalog
         </NavLink>

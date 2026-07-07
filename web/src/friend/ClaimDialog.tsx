@@ -106,25 +106,25 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
           onClose();
         }}
       >
-        <div className="w-full max-w-md rounded-xl bg-zinc-900 p-6 shadow-2xl ring-1 ring-zinc-700">
+        <div className="w-full max-w-md rounded-xl bg-floor p-6 shadow-2xl ring-1 ring-pixel">
           {step === 'confirm' && (
             <>
               <h2 className="text-lg font-semibold">
-                claim <span className="text-violet-300">{game.title}</span>?
+                claim <span className="text-give-soft">{game.title}</span>?
               </h2>
-              <p className="mt-2 text-sm text-zinc-400">this uses 1 of your claims</p>
+              <p className="mt-2 text-sm text-dust">this uses 1 of your claims</p>
               <div className="mt-6 flex gap-3 justify-end">
                 <button
                   type="button"
                   onClick={onClose}
-                  className="rounded px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200"
+                  className="rounded px-4 py-2 text-sm text-dust hover:text-ink-soft"
                 >
                   cancel
                 </button>
                 <button
                   type="button"
                   onClick={() => { void handleConfirm(); }}
-                  className="rounded bg-violet-700 px-4 py-2 text-sm font-medium hover:bg-violet-600"
+                  className="rounded bg-give px-4 py-2 text-sm font-medium text-give-ink hover:bg-give-bright"
                 >
                   confirm
                 </button>
@@ -133,21 +133,21 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
           )}
 
           {step === 'loading' && (
-            <p className="text-center text-zinc-400 py-4">claiming...</p>
+            <p className="text-center text-dust py-4">claiming...</p>
           )}
 
           {step === 'gifted' && result?.kind === 'gifted' && (
             <>
-              <h2 className="text-lg font-semibold text-violet-300">it&apos;s yours! ♡</h2>
-              <p className="mt-1 text-xs text-zinc-500">
+              <h2 className="text-lg font-semibold text-give-soft">it&apos;s yours! ♡</h2>
+              <p className="mt-1 text-xs text-dust-faint">
                 this link is one-time — redeem it to YOUR humble account
               </p>
-              <div className="mt-4 rounded bg-zinc-800 p-3">
+              <div className="mt-4 rounded bg-shelf p-3">
                 <a
                   href={result.gift_url}
                   target="_blank"
                   rel="noreferrer"
-                  className="block break-all text-sm text-violet-400 underline hover:text-violet-300"
+                  className="block break-all text-sm text-give-soft underline hover:text-give"
                 >
                   {result.gift_url}
                 </a>
@@ -156,7 +156,7 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
                 <button
                   type="button"
                   onClick={() => { void handleCopy(result.gift_url); }}
-                  className="flex-1 rounded bg-zinc-800 px-3 py-2 text-sm hover:bg-zinc-700"
+                  className="flex-1 rounded bg-shelf px-3 py-2 text-sm hover:bg-control"
                 >
                   {copied ? 'copied ✓' : 'copy link'}
                 </button>
@@ -164,17 +164,17 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
                   href={result.gift_url}
                   target="_blank"
                   rel="noreferrer"
-                  className="flex-1 rounded bg-violet-700 px-3 py-2 text-sm text-center hover:bg-violet-600"
+                  className="flex-1 rounded bg-give px-3 py-2 text-sm text-center text-give-ink hover:bg-give-bright"
                 >
                   open on humble
                 </a>
               </div>
-              <p className="mt-4 text-xs text-zinc-500">keys may be region-locked</p>
+              <p className="mt-4 text-xs text-dust-faint">keys may be region-locked</p>
               <div className="mt-4 flex justify-end">
                 <button
                   type="button"
                   onClick={handleCloseWithRefresh}
-                  className="rounded px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200"
+                  className="rounded px-4 py-2 text-sm text-dust hover:text-ink-soft"
                 >
                   close
                 </button>
@@ -184,14 +184,14 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
 
           {step === 'processing' && result?.kind === 'processing' && (
             <>
-              <h2 className="text-lg font-semibold text-amber-300">processing</h2>
-              <p className="mt-2 text-sm text-zinc-300">{result.message}</p>
-              <p className="mt-1 text-sm text-zinc-500">check this page later</p>
+              <h2 className="text-lg font-semibold text-amber-800">processing</h2>
+              <p className="mt-2 text-sm text-ink-soft">{result.message}</p>
+              <p className="mt-1 text-sm text-dust-faint">check this page later</p>
               <div className="mt-6 flex justify-end">
                 <button
                   type="button"
                   onClick={handleCloseWithRefresh}
-                  className="rounded px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200"
+                  className="rounded px-4 py-2 text-sm text-dust hover:text-ink-soft"
                 >
                   close
                 </button>
@@ -201,13 +201,13 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
 
           {step === 'refused' && result?.kind === 'refused' && (
             <>
-              <h2 className="text-lg font-semibold text-red-400">whoops</h2>
-              <p className="mt-2 text-sm text-zinc-300">{result.message}</p>
+              <h2 className="text-lg font-semibold text-red-700">whoops</h2>
+              <p className="mt-2 text-sm text-ink-soft">{result.message}</p>
               <div className="mt-6 flex justify-end">
                 <button
                   type="button"
                   onClick={handleCloseWithRefresh}
-                  className="rounded px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200"
+                  className="rounded px-4 py-2 text-sm text-dust hover:text-ink-soft"
                 >
                   close
                 </button>
@@ -217,13 +217,13 @@ export function ClaimDialog({ token, game, onClose, onRefresh }: ClaimDialogProp
 
           {step === 'error' && result?.kind === 'error' && (
             <>
-              <h2 className="text-lg font-semibold text-red-400">uh oh</h2>
-              <p className="mt-2 text-sm text-zinc-300">{result.message}</p>
+              <h2 className="text-lg font-semibold text-red-700">uh oh</h2>
+              <p className="mt-2 text-sm text-ink-soft">{result.message}</p>
               <div className="mt-6 flex justify-end">
                 <button
                   type="button"
                   onClick={onClose}
-                  className="rounded px-4 py-2 text-sm text-zinc-400 hover:text-zinc-200"
+                  className="rounded px-4 py-2 text-sm text-dust hover:text-ink-soft"
                 >
                   close
                 </button>

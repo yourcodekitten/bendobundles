@@ -1,1 +1,131 @@
 @import "tailwindcss";
+
+/* ── the pea soup world ─────────────────────────────────────────────────────
+   bendobundles design tokens (see DESIGN.md — "The Attic Arcade", pea soup
+   palette). The room is the light olive of an original 1989 handheld LCD;
+   the ink is its darkest shade; the accent is the burgundy-magenta of the
+   A/B buttons, reserved for giving and claiming (The Button Burgundy Rule). */
+@theme {
+  /* room — surfaces, light to dark */
+  --color-room: oklch(87% 0.085 112);           /* page background — the screen */
+  --color-floor: oklch(91% 0.07 110);           /* cards, dialogs, panels */
+  --color-shelf: oklch(80% 0.09 112);           /* chips, raised rows */
+  --color-control: oklch(73% 0.09 113);         /* neutral buttons */
+  --color-control-bright: oklch(69% 0.09 114);  /* neutral button hover */
+
+  /* ink — text, dark to light */
+  --color-ink: oklch(30% 0.06 120);             /* primary text */
+  --color-ink-soft: oklch(36% 0.06 118);        /* secondary text */
+  --color-dust: oklch(43% 0.06 116);            /* muted text */
+  --color-dust-faint: oklch(48% 0.06 114);      /* faintest legible text */
+
+  /* structure */
+  --color-line: oklch(66% 0.075 112);           /* hairline borders */
+  --color-pixel: oklch(35% 0.06 120);           /* bezel: dialog rings, focus, frames */
+
+  /* give — the DMG A/B button burgundy; claiming and gifting ONLY */
+  --color-give: oklch(46% 0.155 355);
+  --color-give-bright: oklch(52% 0.16 355);     /* hover */
+  --color-give-soft: oklch(42% 0.14 350);       /* accent text on light surfaces */
+  --color-give-ink: oklch(97% 0.012 350);       /* text on give backgrounds */
+
+  /* title-hash palette — muted earth (see titleColor.ts + DESIGN.md, The
+     Title-Hash Rule): art-fallback blocks in quiet attic materials */
+  --color-hash-clay: oklch(42% 0.06 30);
+  --color-hash-rust: oklch(48% 0.07 45);
+  --color-hash-mustard: oklch(52% 0.07 75);
+  --color-hash-moss: oklch(45% 0.06 120);
+  --color-hash-pine: oklch(40% 0.06 165);
+  --color-hash-slate: oklch(45% 0.05 230);
+  --color-hash-heather: oklch(48% 0.05 290);
+  --color-hash-mauve: oklch(50% 0.06 330);
+
+  /* type — the pixel grammar: pixel faces mark game-world things (logotype,
+     headings, labels, the key); prose stays human (see DESIGN.md) */
+  --font-sans: "Chivo Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-pixel: "Pixelify Sans Variable", ui-sans-serif, sans-serif;
+  --font-logo: "Silkscreen", ui-monospace, monospace;
+}
+
+/* headings wear the pixel display face */
+@layer base {
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-pixel);
+    letter-spacing: 0;
+  }
+}
+
+/* the label tier (chips, badges, helper text) wears the pixel face too.
+   Unlayered on purpose: it must beat the text-xs utility, and pixel faces
+   run visually small — 13px keeps them legible. */
+.text-xs {
+  font-family: var(--font-pixel);
+  font-size: 0.8125rem;
+}
+
+/* landing entrance — a single quiet rise; the ceremony budget lives in the
+   claim dialog, not here */
+@keyframes landing-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.landing-rise {
+  animation: landing-rise 0.6s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing-rise {
+    animation: none;
+  }
+}
+
+/* the logotype outline — light Silkscreen with a hard 8-direction pixel edge,
+   for wordmarks floating over the banner scene */
+.wordmark-outline {
+  color: var(--color-floor);
+  text-shadow:
+    2px 0 0 var(--color-pixel), -2px 0 0 var(--color-pixel),
+    0 2px 0 var(--color-pixel), 0 -2px 0 var(--color-pixel),
+    2px 2px 0 var(--color-pixel), -2px 2px 0 var(--color-pixel),
+    2px -2px 0 var(--color-pixel), -2px -2px 0 var(--color-pixel);
+}
+
+/* the dialog-box typing cursor — a blinking block, JRPG style */
+.tw-cursor {
+  display: inline-block;
+  margin-left: 1px;
+  animation: tw-blink 0.8s steps(1) infinite;
+}
+@keyframes tw-blink {
+  50% {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tw-cursor {
+    display: none;
+  }
+}
+
+/* the menu-selection cursor — a chunky two-frame bob, "press A to continue" */
+.menu-cursor {
+  display: inline-block;
+  animation: menu-cursor-bob 0.6s steps(1) infinite;
+}
+@keyframes menu-cursor-bob {
+  50% {
+    transform: translateX(3px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .menu-cursor {
+    animation: none;
+  }
+}

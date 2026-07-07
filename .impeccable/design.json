@@ -1,0 +1,274 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-07T17:40:00Z",
+  "title": "Design System: bendobundles",
+  "extensions": {
+    "colorMeta": {
+      "give": {
+        "role": "primary",
+        "displayName": "Button Burgundy",
+        "canonical": "oklch(46% 0.155 355)",
+        "tonalRamp": [
+          "oklch(20% 0.09 355)",
+          "oklch(28% 0.12 355)",
+          "oklch(36% 0.14 355)",
+          "oklch(46% 0.155 355)",
+          "oklch(52% 0.16 355)",
+          "oklch(64% 0.13 353)",
+          "oklch(78% 0.08 352)",
+          "oklch(92% 0.03 350)"
+        ]
+      },
+      "give-bright": {
+        "role": "primary",
+        "displayName": "Button Burgundy Bright",
+        "canonical": "oklch(52% 0.16 355)"
+      },
+      "give-soft": {
+        "role": "primary",
+        "displayName": "Burgundy Ink",
+        "canonical": "oklch(42% 0.14 350)"
+      },
+      "give-ink": {
+        "role": "primary",
+        "displayName": "On-Burgundy",
+        "canonical": "oklch(97% 0.012 350)"
+      },
+      "room": {
+        "role": "neutral",
+        "displayName": "Room",
+        "canonical": "oklch(87% 0.085 112)",
+        "tonalRamp": [
+          "oklch(30% 0.06 120)",
+          "oklch(36% 0.06 118)",
+          "oklch(43% 0.06 116)",
+          "oklch(56% 0.07 114)",
+          "oklch(66% 0.075 112)",
+          "oklch(73% 0.09 113)",
+          "oklch(80% 0.09 112)",
+          "oklch(91% 0.07 110)"
+        ]
+      },
+      "floor": {
+        "role": "neutral",
+        "displayName": "Floor",
+        "canonical": "oklch(91% 0.07 110)"
+      },
+      "shelf": {
+        "role": "neutral",
+        "displayName": "Shelf",
+        "canonical": "oklch(80% 0.09 112)"
+      },
+      "control": {
+        "role": "neutral",
+        "displayName": "Control",
+        "canonical": "oklch(73% 0.09 113)"
+      },
+      "control-bright": {
+        "role": "neutral",
+        "displayName": "Control Bright",
+        "canonical": "oklch(69% 0.09 114)"
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "oklch(30% 0.06 120)"
+      },
+      "ink-soft": {
+        "role": "neutral",
+        "displayName": "Ink Soft",
+        "canonical": "oklch(36% 0.06 118)"
+      },
+      "dust": {
+        "role": "neutral",
+        "displayName": "Dust",
+        "canonical": "oklch(43% 0.06 116)"
+      },
+      "dust-faint": {
+        "role": "neutral",
+        "displayName": "Dust Faint",
+        "canonical": "oklch(48% 0.06 114)"
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Line",
+        "canonical": "oklch(66% 0.075 112)"
+      },
+      "pixel": {
+        "role": "neutral",
+        "displayName": "Pixel",
+        "canonical": "oklch(35% 0.06 120)"
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Logotype",
+        "purpose": "Silkscreen, full caps — the landing wordmark (BENDOBUNDLES) and nowhere else."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Pixelify Sans — page-level headings."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Pixelify Sans — dialog headings, the claim question and celebration."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Chivo — every paragraph and sentence. Prose is always human."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Pixelify Sans at 13px — chips, badges, helper text."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Gift keys, link tokens, appids. Never voice copy."
+      }
+    },
+    "shadows": [
+      {
+        "name": "ceremony",
+        "value": "0 25px 50px -12px rgb(0 0 0 / 0.25)",
+        "purpose": "Dialogs and gift/claim moments only — paired with a Pixel bezel ring."
+      }
+    ],
+    "motion": [
+      {
+        "name": "landing-rise",
+        "value": "landing-rise 0.6s cubic-bezier(0.22, 1, 0.36, 1) both",
+        "purpose": "The landing's single quiet entrance; prefers-reduced-motion disables it."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Claim Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The primary action — Button Burgundy, the DMG A/B button color. Canonical instance: the claim button.",
+      "html": "<button class=\"ds-btn-give\">claim it ♡</button>",
+      "css": ".ds-btn-give { background: oklch(46% 0.155 355); color: oklch(97% 0.012 350); padding: 8px 16px; font-size: 0.875rem; font-weight: 500; border: none; border-radius: 0.25rem; cursor: pointer; } .ds-btn-give:hover { background: oklch(52% 0.16 355); } .ds-btn-give:focus-visible { outline: 2px solid oklch(35% 0.06 120); outline-offset: 2px; } .ds-btn-give:disabled { opacity: 0.4; cursor: not-allowed; }"
+    },
+    {
+      "name": "Neutral Button",
+      "kind": "button",
+      "refersTo": "button-neutral",
+      "description": "Retry / connect / cancel-type actions in the room's own green.",
+      "html": "<button class=\"ds-btn-neutral\">connect steam</button>",
+      "css": ".ds-btn-neutral { background: oklch(73% 0.09 113); color: oklch(30% 0.06 120); padding: 8px 16px; font-size: 0.875rem; border: none; border-radius: 0.25rem; cursor: pointer; } .ds-btn-neutral:hover { background: oklch(69% 0.09 114); } .ds-btn-neutral:focus-visible { outline: 2px solid oklch(35% 0.06 120); outline-offset: 2px; }"
+    },
+    {
+      "name": "Shelf Chip",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "Informational tag — platform, bundle, claim state. The gifted badge wears Button Burgundy.",
+      "html": "<span class=\"ds-chip\">steam</span> <span class=\"ds-chip ds-chip-gifted\">gifted</span>",
+      "css": ".ds-chip { display: inline-block; background: oklch(80% 0.09 112); color: oklch(36% 0.06 118); padding: 2px 8px; font-size: 0.75rem; border-radius: 0.25rem; } .ds-chip-gifted { background: oklch(46% 0.155 355); color: oklch(97% 0.012 350); }"
+    },
+    {
+      "name": "Game Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "The signature container: edge-bleed art (or title-hash block) over a matte floor frame.",
+      "html": "<article class=\"ds-game-card\"><div class=\"ds-game-art\"></div><div class=\"ds-game-body\"><h3 class=\"ds-game-title\">a short hike</h3><p class=\"ds-game-bundle\">humble choice may 2020</p><span class=\"ds-chip-mini\">steam</span></div></article>",
+      "css": ".ds-game-card { width: 260px; background: oklch(91% 0.07 110); border-radius: 0.5rem; overflow: hidden; } .ds-game-art { aspect-ratio: 16 / 9; background: oklch(48% 0.05 290); } .ds-game-body { padding: 16px; } .ds-game-title { margin: 0; color: oklch(30% 0.06 120); font-size: 0.875rem; font-weight: 600; line-height: 1.25; } .ds-game-bundle { margin: 4px 0 8px; color: oklch(43% 0.06 116); font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ds-chip-mini { display: inline-block; background: oklch(80% 0.09 112); color: oklch(36% 0.06 118); padding: 2px 8px; font-size: 0.75rem; border-radius: 0.25rem; }"
+    },
+    {
+      "name": "Gift Dialog",
+      "kind": "custom",
+      "refersTo": "dialog",
+      "description": "Where the unwrap happens: floor panel, ceremony shadow, pixel bezel, burgundy celebration.",
+      "html": "<div class=\"ds-dialog\"><h2 class=\"ds-dialog-title\">claim <span class=\"ds-dialog-game\">a short hike</span>?</h2><p class=\"ds-dialog-sub\">this uses 1 of your claims</p></div>",
+      "css": ".ds-dialog { max-width: 28rem; background: oklch(91% 0.07 110); border-radius: 0.75rem; padding: 24px; box-shadow: 0 25px 50px -12px rgb(0 0 0 / 0.25), 0 0 0 1px oklch(35% 0.06 120); } .ds-dialog-title { margin: 0; color: oklch(30% 0.06 120); font-size: 1.125rem; font-weight: 600; } .ds-dialog-game { color: oklch(42% 0.14 350); } .ds-dialog-sub { margin: 8px 0 0; color: oklch(43% 0.06 116); font-size: 0.875rem; }"
+    },
+    {
+      "name": "Admin Nav Link",
+      "kind": "nav",
+      "description": "One quiet row; dust links, ink when active. No sidebar, no chrome.",
+      "html": "<nav class=\"ds-nav\"><a class=\"ds-nav-link ds-nav-active\" href=\"#\">catalog</a><a class=\"ds-nav-link\" href=\"#\">links</a><a class=\"ds-nav-link\" href=\"#\">ops</a></nav>",
+      "css": ".ds-nav { display: flex; gap: 24px; padding: 12px 24px; border-bottom: 1px solid oklch(66% 0.075 112); background: oklch(87% 0.085 112); } .ds-nav-link { color: oklch(43% 0.06 116); font-size: 0.875rem; text-decoration: none; } .ds-nav-link:hover { color: oklch(36% 0.06 118); } .ds-nav-active { color: oklch(30% 0.06 120); font-weight: 500; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Attic Arcade — pea soup world",
+    "overview": "Fifteen years of Humble Bundle purchases live here the way a game collection lives in an attic — and the most treasured find in that attic is the original 1989 handheld, still working. The whole interface is its screen: light pea-green olive, dark-olive ink, and one saturated accent borrowed from the machine's own A/B buttons — burgundy-magenta, spent only on the act of giving. The original handheld was never backlit; a light theme is the historically honest choice, and the anti-reflex one.",
+    "keyCharacteristics": [
+      "Light, tonal, and monochrome-disciplined: the room is one green, in four-plus shades",
+      "One saturated accent (Button Burgundy) reserved for the act of giving/claiming",
+      "Games are the color: cover art and the deterministic title-hash palette pop against the olive",
+      "Lowercase voice everywhere; ceremony saved for the unwrap",
+      "Bezel as motif: chunky dark-olive frames mark ceremony surfaces"
+    ],
+    "rules": [
+      {
+        "name": "The Pixel Grammar Rule",
+        "body": "Pixel type marks game-world things — the logotype, headings, labels, and the burgundy key on the landing. Prose stays human (Chivo). A paragraph in a pixel face is forbidden.",
+        "section": "typography"
+      },
+      {
+        "name": "The Button Burgundy Rule",
+        "body": "Burgundy appears only where giving or claiming happens — never as ambient decoration, never above 10% of a screen. Its rarity is what makes the claim button feel like pressing A to accept a gift.",
+        "section": "colors"
+      },
+      {
+        "name": "The Title-Hash Rule",
+        "body": "A game without cover art gets its color from the shared deterministic hash (titleColor.ts), drawn from the muted-earth palette: heather, slate, moss, mustard, rust, mauve, pine, clay. The SAME game must render the SAME color on every surface, forever.",
+        "section": "colors"
+      },
+      {
+        "name": "The Light Text Rule",
+        "body": "Status text on light surfaces uses the deep end of its hue (green-700, amber-800, red-700) — pale 300/400 tones are invisible on olive and forbidden as inline text.",
+        "section": "colors"
+      },
+      {
+        "name": "The Lowercase Rule",
+        "body": "UI copy is lowercase. Caps exist in exactly one place: the Silkscreen logotype renders BENDOBUNDLES full caps via text-transform. Game titles render as their owners spell them.",
+        "section": "typography"
+      },
+      {
+        "name": "The One Heart Rule",
+        "body": "The ♡ appears at sincere moments — the landing line, the successful claim — never scattered as decoration. One per screen, maximum, and it must be earned.",
+        "section": "typography"
+      },
+      {
+        "name": "The Ceremony Rule",
+        "body": "A drop shadow means a gift moment is happening. Cards, chips, nav, and buttons are flat at every state.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Bezel Rule",
+        "body": "Chunky dark-olive (Pixel) borders mark the handheld's screen: the landing art frame and dialog rings wear it. A thick border on an ordinary card is costume.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do reserve Button Burgundy for giving and claiming (≤10% of any screen), pairing every bg-give with text-give-ink.",
+      "Do keep every word lowercase and in voice — playful, cozy, sincere.",
+      "Do let cover art and the Title-Hash palette carry the saturation; the room stays one green.",
+      "Do keep the thin fallback path working: name, color block, and a working claim with no enrichment.",
+      "Do use deep status text on light surfaces (green-700 / amber-800 / red-700).",
+      "Do trap and return focus in every dialog, and give any motion a prefers-reduced-motion alternative."
+    ],
+    "donts": [
+      "Don't import storefront / commerce grammar — no prices, no urgency, no deals language (PRODUCT.md anti-reference).",
+      "Don't build SaaS dashboard chrome — no metric-card grids, no sidebar-and-breadcrumb scaffolding (PRODUCT.md anti-reference).",
+      "Don't go gamer-RGB edgelord — no neon-on-black, no glow-everything (PRODUCT.md anti-reference).",
+      "Don't drift into corporate minimalism — sterile restraint is as off-brand as neon (PRODUCT.md anti-reference).",
+      "Don't reintroduce zinc+violet, and don't add new hue families to the room — one green, stepped.",
+      "Don't add shadows outside dialogs, side-stripe accent borders, gradient text, or glassmorphism.",
+      "Don't break Title-Hash determinism.",
+      "Don't scatter hearts. One ♡ per screen, earned."
+    ]
+  }
+}

@@ -16,7 +16,7 @@ const makeGame = (overrides: Partial<GameView> & { id: string }): GameView => ({
 describe('GameGrid', () => {
   it('shows a single card for a single game', () => {
     const games = [makeGame({ id: '1', title: 'Portal 2' })];
-    render(<GameGrid games={games} active={true} onClaim={vi.fn()} />);
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
     expect(screen.getByText('Portal 2')).toBeInTheDocument();
     expect(screen.queryByText(/copies/)).not.toBeInTheDocument();
   });
@@ -27,12 +27,12 @@ describe('GameGrid', () => {
       makeGame({ id: '2', title: 'Portal 2' }),
       makeGame({ id: '3', title: 'Portal 2' }),
     ];
-    render(<GameGrid games={games} active={true} onClaim={vi.fn()} />);
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
     // one card heading for Portal 2
     expect(screen.getAllByText('Portal 2')).toHaveLength(1);
     expect(screen.getByText('×3 copies')).toBeInTheDocument();
-    // one claim button (one card)
-    expect(screen.getAllByRole('button', { name: /claim/i })).toHaveLength(1);
+    // one details button (one card)
+    expect(screen.getAllByRole('button', { name: /details/i })).toHaveLength(1);
   });
 
   it('groups multiple titles independently', () => {
@@ -41,44 +41,68 @@ describe('GameGrid', () => {
       makeGame({ id: '2', title: 'Portal 2' }),
       makeGame({ id: '3', title: 'Celeste' }),
     ];
-    render(<GameGrid games={games} active={true} onClaim={vi.fn()} />);
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
     expect(screen.getByText('×2 copies')).toBeInTheDocument();
     expect(screen.queryByText('×1 copies')).not.toBeInTheDocument();
     expect(screen.getByText('Portal 2')).toBeInTheDocument();
     expect(screen.getByText('Celeste')).toBeInTheDocument();
-    expect(screen.getAllByRole('button', { name: /claim/i })).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: /details/i })).toHaveLength(2);
   });
 
-  it('claim buttons are disabled when active is false', () => {
+  it('the grid never renders a claim button — claiming lives in the detail modal', () => {
     const games = [makeGame({ id: '1', title: 'Game' })];
-    render(<GameGrid games={games} active={false} onClaim={vi.fn()} />);
-    expect(screen.getByRole('button', { name: /claim/i })).toBeDisabled();
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: /claim/i })).not.toBeInTheDocument();
   });
 
-  it('claim buttons are enabled when active is true', () => {
-    const games = [makeGame({ id: '1', title: 'Game' })];
-    render(<GameGrid games={games} active={true} onClaim={vi.fn()} />);
-    expect(screen.getByRole('button', { name: /claim/i })).not.toBeDisabled();
-  });
-
-  it('calls onClaim with the game when claim button is clicked', async () => {
+  it('calls onDetail with the game when the details button is clicked', async () => {
     const user = userEvent.setup();
-    const onClaim = vi.fn();
+    const onDetail = vi.fn();
     const game = makeGame({ id: '1', title: 'Hollow Knight' });
-    render(<GameGrid games={[game]} active={true} onClaim={onClaim} />);
-    await user.click(screen.getByRole('button', { name: /claim/i }));
-    expect(onClaim).toHaveBeenCalledWith(game);
+    render(<GameGrid games={[game]} onDetail={onDetail} />);
+    await user.click(screen.getByRole('button', { name: /details/i }));
+    expect(onDetail).toHaveBeenCalledWith(game);
+  });
+
+  it('calls onDetail with the game when the card body is clicked', async () => {
+    const user = userEvent.setup();
+    const onDetail = vi.fn();
+    const game = makeGame({ id: '1', title: 'Hollow Knight' });
+    render(<GameGrid games={[game]} onDetail={onDetail} />);
+    await user.click(screen.getByText('Hollow Knight'));
+    expect(onDetail).toHaveBeenCalledWith(game);
   });
 
   it('renders artwork image when artwork_url is present', () => {
     const games = [makeGame({ id: '1', title: 'Game', artwork_url: 'https://example.com/art.jpg' })];
-    render(<GameGrid games={games} active={true} onClaim={vi.fn()} />);
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
     expect(screen.getByRole('img', { name: /game/i })).toBeInTheDocument();
   });
 
   it('renders fallback colored div when artwork_url is null', () => {
     const games = [makeGame({ id: '1', title: 'Game', artwork_url: null })];
-    render(<GameGrid games={games} active={true} onClaim={vi.fn()} />);
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
     expect(screen.queryByRole('img')).not.toBeInTheDocument();
+  });
+
+  it('renders the steam capsule over the hash underlay when artwork_url is null but steam_app_id is set', () => {
+    const games = [makeGame({ id: '1', title: 'Game', artwork_url: null, steam_app_id: 620 })];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    const img = screen.getByRole('img', { name: /game/i });
+    expect(img).toHaveAttribute(
+      'src',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/620/capsule_616x353.jpg',
+    );
+  });
+
+  it('humble artwork_url wins over the steam capsule when both exist', () => {
+    const games = [
+      makeGame({ id: '1', title: 'Game', artwork_url: 'https://example.com/art.jpg', steam_app_id: 620 }),
+    ];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.getByRole('img', { name: /game/i })).toHaveAttribute(
+      'src',
+      'https://example.com/art.jpg',
+    );
   });
 });
