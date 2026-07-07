@@ -12,7 +12,7 @@ export function Landing() {
         <h1 className="mt-8 text-4xl font-bold tracking-tight text-balance">bendobundles</h1>
         <p className="mt-4 text-dust">
           a friend has to hand you a{' '}
-          <span className="font-semibold text-give-soft">key</span> for this door ♡
+          <span className="font-semibold text-give-soft">key</span> for this treasure ♡
         </p>
       </main>
     </div>
