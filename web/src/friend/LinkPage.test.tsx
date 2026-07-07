@@ -13,10 +13,14 @@ vi.mock('../api', async (importOriginal) => {
     ...actual,
     fetchLink: vi.fn(),
     claimGame: vi.fn(),
+    steamOwnedForLink: vi.fn(),
   };
 });
 
-import { fetchLink, claimGame, NotFound, FetchFailed } from '../api';
+vi.mock('../steamIdentity');
+
+import { fetchLink, claimGame, NotFound, FetchFailed, steamOwnedForLink } from '../api';
+import { consumeReturnFragment, loadIdentity, beginConnect } from '../steamIdentity';
 
 function renderLinkPage(token = 'abc123') {
   return render(
@@ -40,6 +44,10 @@ const baseLink: LinkView = {
 describe('LinkPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default steam state: no fragment, no stored identity
+    vi.mocked(consumeReturnFragment).mockReturnValue(null);
+    vi.mocked(loadIdentity).mockReturnValue(null);
+    vi.mocked(beginConnect).mockImplementation(() => {});
   });
 
   it('shows loading state initially', () => {
@@ -87,7 +95,7 @@ describe('LinkPage', () => {
     const user = userEvent.setup();
     const withGame: LinkView = {
       ...baseLink,
-      games: [{ id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null }],
+      games: [{ id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null, steam_app_id: null }],
     };
     // First load resolves; the refreshTick refetch hangs forever — the old view must stay.
     vi.mocked(fetchLink)
@@ -127,7 +135,7 @@ describe('LinkPage', () => {
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
       state: 'exhausted',
-      games: [{ id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null }],
+      games: [{ id: '1', title: 'Portal', bundle: 'B', key_type: 'steam', artwork_url: null, steam_app_id: null }],
     });
     renderLinkPage();
     await waitFor(() => {
@@ -172,7 +180,7 @@ describe('LinkPage', () => {
     vi.mocked(fetchLink).mockResolvedValue({
       ...baseLink,
       state: 'revoked',
-      games: [{ id: '1', title: 'Celeste', bundle: 'B', key_type: 'steam', artwork_url: null }],
+      games: [{ id: '1', title: 'Celeste', bundle: 'B', key_type: 'steam', artwork_url: null, steam_app_id: null }],
     });
     renderLinkPage();
     await waitFor(() => {
@@ -181,5 +189,120 @@ describe('LinkPage', () => {
     expect(screen.queryByText(/used all your claims/i)).not.toBeInTheDocument();
     // dead link → grid hidden regardless of games payload
     expect(screen.queryByText('Celeste')).not.toBeInTheDocument();
+  });
+
+  // ── steam identity ──────────────────────────────────────────────────────────
+
+  describe('steam identity', () => {
+    it('shows connect button when no steam identity', async () => {
+      vi.mocked(fetchLink).mockResolvedValue(baseLink);
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText('Test Bundle')).toBeInTheDocument());
+      expect(screen.getByRole('button', { name: /connect steam/i })).toBeInTheDocument();
+    });
+
+    it('shows persona chip and disconnect button when identity is stored', async () => {
+      vi.mocked(fetchLink).mockResolvedValue(baseLink);
+      vi.mocked(loadIdentity).mockReturnValue({
+        steamid: '76561198000000001',
+        persona: 'Alice',
+        owned: [],
+        fetched_at: 0,
+      });
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText('Alice')).toBeInTheDocument());
+      expect(screen.getByRole('button', { name: /disconnect/i })).toBeInTheDocument();
+    });
+
+    it('shows "you own this" pill on a card whose steam_app_id is in the owned set', async () => {
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...baseLink,
+        games: [
+          {
+            id: '1',
+            title: 'Portal',
+            bundle: 'B',
+            key_type: 'steam',
+            artwork_url: null,
+            steam_app_id: 420,
+          },
+        ],
+      });
+      vi.mocked(loadIdentity).mockReturnValue({
+        steamid: '123',
+        persona: 'Alice',
+        owned: [420],
+        fetched_at: 0,
+      });
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText('Portal')).toBeInTheDocument());
+      expect(screen.getByText(/you own this/i)).toBeInTheDocument();
+    });
+
+    it('does NOT show "you own this" pill when steam_app_id is not in owned set', async () => {
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...baseLink,
+        games: [
+          {
+            id: '1',
+            title: 'Portal',
+            bundle: 'B',
+            key_type: 'steam',
+            artwork_url: null,
+            steam_app_id: 420,
+          },
+        ],
+      });
+      vi.mocked(loadIdentity).mockReturnValue({
+        steamid: '123',
+        persona: 'Alice',
+        owned: [730],
+        fetched_at: 0,
+      });
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText('Portal')).toBeInTheDocument());
+      expect(screen.queryByText(/you own this/i)).not.toBeInTheDocument();
+    });
+
+    it('fetches owned on steam fragment, saves identity, shows persona chip', async () => {
+      vi.mocked(fetchLink).mockResolvedValue(baseLink);
+      vi.mocked(consumeReturnFragment).mockReturnValue({
+        steamid: '76561198000000001',
+        persona: 'Alice',
+      });
+      vi.mocked(steamOwnedForLink).mockResolvedValue([420, 730]);
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText('Alice')).toBeInTheDocument());
+    });
+
+    it('shows privacy message when steamOwnedForLink returns "private"', async () => {
+      vi.mocked(fetchLink).mockResolvedValue(baseLink);
+      vi.mocked(consumeReturnFragment).mockReturnValue({
+        steamid: '76561198000000001',
+        persona: 'Alice',
+      });
+      vi.mocked(steamOwnedForLink).mockResolvedValue('private');
+      renderLinkPage();
+      // The <em> tag splits the text node — check the em element directly
+      await waitFor(() =>
+        expect(screen.getByText('game details')).toBeInTheDocument(),
+      );
+      // And the surrounding paragraph contains the privacy copy
+      expect(screen.getByText(/couldn't read your library/i)).toBeInTheDocument();
+    });
+
+    it('shows error message on verify_failed fragment', async () => {
+      vi.mocked(fetchLink).mockResolvedValue(baseLink);
+      vi.mocked(consumeReturnFragment).mockReturnValue({ error: 'verify_failed' });
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText(/couldn't verify/i)).toBeInTheDocument());
+    });
+
+    it('shows error message on steam_unreachable fragment', async () => {
+      vi.mocked(fetchLink).mockResolvedValue(baseLink);
+      vi.mocked(consumeReturnFragment).mockReturnValue({ error: 'steam_unreachable' });
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText(/steam.*unavailable|unavailable.*steam/i)).toBeInTheDocument());
+    });
   });
 });

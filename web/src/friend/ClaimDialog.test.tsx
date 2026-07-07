@@ -13,6 +13,7 @@ const mockGame: GameView = {
   bundle: 'Indie Bundle',
   key_type: 'steam',
   artwork_url: null,
+  steam_app_id: null,
 };
 
 const GIFT_URL = 'https://www.humblebundle.com/gift?key=abc123xyz';

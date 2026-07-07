@@ -5,6 +5,7 @@ export type GameView = {
   bundle: string;
   key_type: string;
   artwork_url: string | null;
+  steam_app_id: number | null;
 };
 
 export type ClaimView = {
@@ -42,6 +43,8 @@ export type AdminGame = {
   claim_id: string | null;
   artwork_url: string | null;
   requires_choice: boolean;
+  steam_app_id: number | null;
+  owned_by_ben: boolean;
 };
 
 export type SelfClaimResult =
@@ -376,4 +379,82 @@ export async function adminSelfClaims(): Promise<SelfClaimView[]> {
   if (response.status === 401) throw new Unauthorized();
   if (!response.ok) throw new FetchFailed();
   return response.json();
+}
+
+// ── Steam API ────────────────────────────────────────────────────────────────
+
+/**
+ * Friend-surface: fetch the owned appids for a steam user via a link token.
+ * Returns 'private' when the user's game-details privacy is locked.
+ * Throws FetchFailed on 404 (dead link) / 409 (inactive link) / 5xx.
+ */
+export async function steamOwnedForLink(
+  token: string,
+  steamid: string,
+): Promise<number[] | 'private'> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/l/${token}/steam/owned/${encodeURIComponent(steamid)}`);
+  } catch {
+    throw new FetchFailed();
+  }
+  if (response.status === 404 || response.status === 409) throw new FetchFailed();
+  if (!response.ok) throw new FetchFailed();
+  const data = (await response.json()) as { appids?: number[]; private?: true };
+  if (data.private) return 'private';
+  return data.appids ?? [];
+}
+
+/**
+ * Admin-surface: fetch owned appids for the admin steam identity.
+ * Returns 'private' when the library is locked down.
+ */
+export async function adminSteamOwned(steamid: string): Promise<number[] | 'private'> {
+  const response = await fetch(`/admin/api/steam/owned/${encodeURIComponent(steamid)}`);
+  await checkUnauthorized(response);
+  if (!response.ok) throw new FetchFailed();
+  const data = (await response.json()) as { appids?: number[]; private?: true };
+  if (data.private) return 'private';
+  return data.appids ?? [];
+}
+
+/** Returns the admin's configured Steam steamid, or null if not set. */
+export async function adminSteamIdentity(): Promise<string | null> {
+  const response = await fetch('/admin/api/steam/identity');
+  await checkUnauthorized(response);
+  if (!response.ok) throw new FetchFailed();
+  const data = (await response.json()) as { steamid: string | null };
+  return data.steamid;
+}
+
+/** Persists the admin's Steam identity on the server. */
+export async function adminSetSteamIdentity(steamid: string): Promise<void> {
+  const response = await fetch('/admin/api/steam/identity', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ steamid }),
+  });
+  await checkUnauthorized(response);
+  if (!response.ok) throw new FetchFailed();
+}
+
+/** Removes the admin's Steam identity from the server. */
+export async function adminClearSteamIdentity(): Promise<void> {
+  const response = await fetch('/admin/api/steam/identity', { method: 'DELETE' });
+  await checkUnauthorized(response);
+  if (!response.ok) throw new FetchFailed();
+}
+
+/**
+ * Associates (or clears) a Steam app ID with a catalog game.
+ * Passing null removes the association.
+ */
+export async function adminSetAppId(gameId: string, appId: number | null): Promise<void> {
+  const response = await fetch(`/admin/api/games/${encodeURIComponent(gameId)}/steam-app-id`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId }),
+  });
+  await checkUnauthorized(response);
+  if (!response.ok) throw new FetchFailed();
 }

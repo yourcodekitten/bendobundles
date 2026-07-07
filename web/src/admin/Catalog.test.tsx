@@ -7,7 +7,7 @@ import type { AdminGame } from '../api';
 import { Unauthorized } from '../api';
 
 vi.mock('../api');
-import { adminCatalog, adminSetHidden, adminSelfClaim, adminSelfClaims } from '../api';
+import { adminCatalog, adminSetHidden, adminSelfClaim, adminSelfClaims, adminSteamIdentity } from '../api';
 
 function renderCatalog() {
   return render(
@@ -32,6 +32,8 @@ const gameFixture: AdminGame = {
   claim_id: null,
   artwork_url: null,
   requires_choice: false,
+  steam_app_id: null,
+  owned_by_ben: false,
 };
 
 const gameAvailable: AdminGame = {
@@ -45,6 +47,8 @@ const gameAvailable: AdminGame = {
   claim_id: null,
   artwork_url: null,
   requires_choice: false,
+  steam_app_id: null,
+  owned_by_ben: false,
 };
 
 const gamePending: AdminGame = {
@@ -58,6 +62,8 @@ const gamePending: AdminGame = {
   claim_id: 'c-999',
   artwork_url: 'https://example.com/celeste.jpg',
   requires_choice: false,
+  steam_app_id: null,
+  owned_by_ben: false,
 };
 
 const gameGifted: AdminGame = {
@@ -71,12 +77,16 @@ const gameGifted: AdminGame = {
   claim_id: 'c-100',
   artwork_url: null,
   requires_choice: false,
+  steam_app_id: null,
+  owned_by_ben: false,
 };
 
 describe('Catalog', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(adminSelfClaims).mockResolvedValue([]);
+    // Default: no steam identity — badges hidden. Override per steam-badge test.
+    vi.mocked(adminSteamIdentity).mockResolvedValue(null);
   });
 
   describe('loading + rendering', () => {
@@ -401,6 +411,65 @@ describe('Catalog', () => {
       fireEvent.click(await screen.findByRole('button', { name: /claim for me/i }));
       fireEvent.click(screen.getByRole('button', { name: /confirm\?/i }));
       await waitFor(() => expect(screen.getByText('login page')).toBeInTheDocument());
+    });
+  });
+
+  describe('steam ownership badges', () => {
+    it('shows owned-by-ben badge when game.owned_by_ben and adminSteamIdentity is non-null', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue('76561198000000001');
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:owned', owned_by_ben: true, steam_app_id: 730 },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      expect(screen.getByText(/already own on steam/i)).toBeInTheDocument();
+    });
+
+    it('hides owned-by-ben badge when adminSteamIdentity is null (frozen-stamps caveat)', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:owned2', owned_by_ben: true, steam_app_id: 730 },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      expect(screen.queryByText(/already own on steam/i)).not.toBeInTheDocument();
+    });
+
+    it('hides owned-by-ben badge when owned_by_ben is false', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue('76561198000000001');
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:notowned', owned_by_ben: false, steam_app_id: 730 },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      expect(screen.queryByText(/already own on steam/i)).not.toBeInTheDocument();
+    });
+
+    it('armed confirm says "you already own this on steam — sure?" when game.owned_by_ben and identity set', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue('76561198000000001');
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:armown', status: 'available', owned_by_ben: true, steam_app_id: 730 },
+      ]);
+      vi.mocked(adminSelfClaim).mockResolvedValue({ kind: 'processing' });
+      renderCatalog();
+      const btn = await screen.findByRole('button', { name: /claim for me/i });
+      fireEvent.click(btn);
+      expect(
+        screen.getByRole('button', { name: /you already own this on steam/i }),
+      ).toBeInTheDocument();
+    });
+
+    it('armed confirm still says "confirm?" when owned_by_ben is false', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue('76561198000000001');
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:notarmown', status: 'available', owned_by_ben: false },
+      ]);
+      vi.mocked(adminSelfClaim).mockResolvedValue({ kind: 'processing' });
+      renderCatalog();
+      const btn = await screen.findByRole('button', { name: /claim for me/i });
+      fireEvent.click(btn);
+      expect(screen.getByRole('button', { name: /confirm\?/i })).toBeInTheDocument();
+      expect(screen.queryByText(/you already own this on steam/i)).not.toBeInTheDocument();
     });
   });
 });
