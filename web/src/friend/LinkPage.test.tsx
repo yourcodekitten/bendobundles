@@ -214,7 +214,7 @@ describe('LinkPage', () => {
       vi.mocked(fetchLink).mockResolvedValue(baseLink);
       renderLinkPage();
       await waitFor(() => expect(screen.getByText('Test Bundle')).toBeInTheDocument());
-      expect(screen.getByRole('button', { name: /connect steam/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /connect to steam/i })).toBeInTheDocument();
     });
 
     it('shows persona chip and disconnect button when identity is stored', async () => {

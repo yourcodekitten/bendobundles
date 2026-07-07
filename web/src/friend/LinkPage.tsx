@@ -161,39 +161,41 @@ export function LinkPage() {
 
   return (
     <div className="min-h-screen bg-room text-ink">
-      <header className="flex items-center justify-between border-b border-line px-6 py-4">
-        <h1 className="text-lg font-semibold">{data.label}</h1>
-        <div className="flex items-center gap-3">
-          <span className="text-sm text-dust">
-            {data.claims_used}/{data.claims_allowed} claims used
-          </span>
-          {steamIdentity !== null ? (
-            <div className="flex items-center gap-2">
-              <span className="rounded bg-shelf px-2 py-1 text-xs text-ink-soft">
-                {steamIdentity.persona}
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  clearIdentity();
-                  setSteamIdentity(null);
-                  setSteamPrivate(false);
-                  setSteamError(null);
-                }}
-                className="text-xs text-dust-faint hover:text-ink-soft"
-              >
-                disconnect
-              </button>
+      <header className="border-b border-line">
+        <div className="relative">
+          <img src="/art/banner.png" alt="" aria-hidden="true" className="block h-40 w-full" style={{ objectFit: 'none', objectPosition: 'center 61%', backgroundColor: 'rgb(197,198,125)' }} />
+          <div className="absolute inset-x-0 top-0 flex items-center justify-between px-6 py-3">
+            <h1 className="font-logo text-sm uppercase tracking-[0.03em] text-ink">bendobundles</h1>
+            <span className="text-sm font-medium text-ink">
+              {data.claims_used}/{data.claims_allowed} claims used
+            </span>
+          </div>
+        </div>
+        <div className="bg-pixel">
+          <div className="px-6 pb-4">
+            <div className="relative -mt-12 inline-block max-w-xl rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)]">
+              <h2 className="text-xl leading-tight text-give-soft">{data.label}</h2>
+              <p className="mt-1.5 max-w-[60ch] text-sm text-ink-soft">
+                games from ben&apos;s humble stash, picked for you ♡ open one for details, claim it, and the key is yours.
+              </p>
+              {steamIdentity !== null ? (
+                <div className="mt-2 flex items-center gap-2">
+                  <span className="rounded bg-shelf px-2 py-1 text-xs text-ink-soft">{steamIdentity.persona}</span>
+                  <button type="button" onClick={() => { clearIdentity(); setSteamIdentity(null); setSteamPrivate(false); setSteamError(null); }} className="text-xs text-dust-faint hover:text-ink-soft">disconnect</button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => beginConnect(`/l/${token}`)}
+                  className="font-pixel group mt-2 -mx-1 flex items-center gap-1.5 rounded px-1 py-0.5 text-sm text-ink hover:bg-shelf"
+                >
+                  <span aria-hidden="true" className="text-give transition-transform group-hover:translate-x-0.5">▸</span>
+                  connect to steam
+                  <span className="font-sans text-xs text-dust-faint">— flags the games you already own</span>
+                </button>
+              )}
             </div>
-          ) : (
-            <button
-              type="button"
-              onClick={() => beginConnect(`/l/${token}`)}
-              className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright"
-            >
-              connect steam
-            </button>
-          )}
+          </div>
         </div>
       </header>
 
