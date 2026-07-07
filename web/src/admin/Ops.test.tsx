@@ -414,13 +414,23 @@ describe('Ops', () => {
 
     // FIX 3: error fragment from consumeReturnFragment must show an error message.
     // Before FIX 3, the 'error' case fell through silently — no message shown.
-    it('shows error message when consumeReturnFragment returns verify_failed (FIX 3)', async () => {
+    // Recovery contract (regression guard): error branch must NOT early-return before identity
+    // load — steamIdState must resolve to null so the connect button appears for retry.
+    it('shows error message AND connect button when consumeReturnFragment returns verify_failed (FIX 3 + recovery)', async () => {
       vi.mocked(consumeReturnFragment).mockReturnValue({ error: 'verify_failed' });
+      vi.mocked(adminSteamIdentity).mockResolvedValue(null);
       renderOps();
+      // (a) error message renders
       await waitFor(() =>
         expect(screen.getByRole('status')).toBeInTheDocument(),
       );
       expect(screen.getByRole('status').textContent).toMatch(/verify/i);
+      // (b) identity load was still invoked (not skipped by early return)
+      expect(adminSteamIdentity).toHaveBeenCalled();
+      // (c) connect button appears — steamIdState resolved to null, not stuck on "loading…"
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /connect steam/i })).toBeInTheDocument(),
+      );
     });
 
     it('shows error message when consumeReturnFragment returns steam_unreachable (FIX 3)', async () => {

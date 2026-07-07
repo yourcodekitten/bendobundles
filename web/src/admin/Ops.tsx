@@ -96,12 +96,13 @@ export function Ops() {
 
     if (fragment !== null && 'error' in fragment) {
       // Steam returned an error fragment (verify_failed or steam_unreachable).
+      // Show the message but do NOT return — fall through to identity load so
+      // steamIdState resolves to null and the connect button appears for retry.
       setSteamMsg(
         fragment.error === 'verify_failed'
           ? "we couldn't verify your Steam account — try again"
           : 'Steam is currently unavailable — try again later',
       );
-      return;
     }
 
     if (fragment !== null && 'steamid' in fragment) {
