@@ -11,6 +11,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
 tokio.workspace = true
+urlencoding = "2"
 
 [dev-dependencies]
 tokio.workspace = true

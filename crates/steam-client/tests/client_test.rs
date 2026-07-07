@@ -2,6 +2,17 @@ fn test_client(server: &wiremock::MockServer) -> steam_client::SteamClient {
     steam_client::SteamClient::new(
         &server.uri(),
         &server.uri(),
+        &server.uri(),
+        steam_client::SteamApiKey::new("TESTKEY".into()),
+    )
+    .unwrap()
+}
+
+fn test_openid_client(server: &wiremock::MockServer) -> steam_client::SteamClient {
+    steam_client::SteamClient::new(
+        &server.uri(),
+        &server.uri(),
+        &server.uri(),
         steam_client::SteamApiKey::new("TESTKEY".into()),
     )
     .unwrap()
@@ -110,4 +121,122 @@ async fn persona_and_vanity_parse() {
     assert_eq!(p.name, "bendoerr");
     let id = c.resolve_vanity("bendoerr").await.unwrap();
     assert_eq!(id, steam_client::SteamId64("76561198000000001".into()));
+}
+
+// ── OpenID assertion tests ────────────────────────────────────────────────────
+
+fn assertion_params(claimed: &str, return_to: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "openid.ns".into(),
+            "http://specs.openid.net/auth/2.0".into(),
+        ),
+        ("openid.mode".into(), "id_res".into()),
+        ("openid.claimed_id".into(), claimed.into()),
+        ("openid.identity".into(), claimed.into()),
+        ("openid.return_to".into(), return_to.into()),
+        (
+            "openid.response_nonce".into(),
+            "2026-07-06T00:00:00Znonce".into(),
+        ),
+        ("openid.assoc_handle".into(), "h".into()),
+        ("openid.signed".into(), "signed,fields".into()),
+        ("openid.sig".into(), "sig".into()),
+    ]
+}
+
+#[tokio::test]
+async fn openid_valid_assertion_returns_steamid() {
+    let server = wiremock::MockServer::start().await;
+    // check_authentication: Steam echoes is_valid:true in key-value form.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .and(wiremock::matchers::body_string_contains(
+            "openid.mode=check_authentication",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("ns:http://specs.openid.net/auth/2.0\nis_valid:true\n"),
+        )
+        .mount(&server)
+        .await;
+    let c = test_openid_client(&server);
+    let params = assertion_params(
+        "https://steamcommunity.com/openid/id/76561198000000001",
+        "https://bendobundles.com/api/steam/return?ctx=%2Fl%2Fabc",
+    );
+    let id = c
+        .verify_openid_assertion(
+            &params,
+            "https://bendobundles.com/api/steam/return?ctx=%2Fl%2Fabc",
+        )
+        .await
+        .unwrap();
+    assert_eq!(id, steam_client::SteamId64("76561198000000001".into()));
+}
+
+#[tokio::test]
+async fn openid_invalid_is_rejected() {
+    // is_valid:false → OpenIdRejected.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .and(wiremock::matchers::body_string_contains(
+            "openid.mode=check_authentication",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("ns:http://specs.openid.net/auth/2.0\nis_valid:false\n"),
+        )
+        .mount(&server)
+        .await;
+    let c = test_openid_client(&server);
+    let params = assertion_params(
+        "https://steamcommunity.com/openid/id/76561198000000001",
+        "https://bendobundles.com/api/steam/return",
+    );
+    let out = c
+        .verify_openid_assertion(&params, "https://bendobundles.com/api/steam/return")
+        .await;
+    assert!(matches!(
+        out,
+        Err(steam_client::SteamError::OpenIdRejected(_))
+    ));
+}
+
+#[tokio::test]
+async fn openid_wrong_claimed_id_shape_rejected_without_network() {
+    // claimed_id "https://evil.example/openid/id/123" → OpenIdRejected BEFORE any HTTP call.
+    // Mount NOTHING; a network attempt would error differently (connection refused / no mock match).
+    let server = wiremock::MockServer::start().await;
+    let c = test_openid_client(&server);
+    let params = assertion_params(
+        "https://evil.example/openid/id/123",
+        "https://bendobundles.com/api/steam/return",
+    );
+    let out = c
+        .verify_openid_assertion(&params, "https://bendobundles.com/api/steam/return")
+        .await;
+    assert!(matches!(
+        out,
+        Err(steam_client::SteamError::OpenIdRejected(_))
+    ));
+}
+
+#[tokio::test]
+async fn openid_return_to_mismatch_rejected() {
+    // params say return_to=https://evil.example/... but expected is bendobundles → OpenIdRejected.
+    let server = wiremock::MockServer::start().await;
+    let c = test_openid_client(&server);
+    let params = assertion_params(
+        "https://steamcommunity.com/openid/id/76561198000000001",
+        "https://evil.example/hijack",
+    );
+    let out = c
+        .verify_openid_assertion(&params, "https://bendobundles.com/api/steam/return")
+        .await;
+    assert!(matches!(
+        out,
+        Err(steam_client::SteamError::OpenIdRejected(_))
+    ));
 }

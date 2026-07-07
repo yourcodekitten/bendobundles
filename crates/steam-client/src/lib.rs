@@ -1,4 +1,4 @@
-//! Steam Web API client — owned-games (privacy-pinned), persona, vanity.
+//! Steam Web API client — owned-games (privacy-pinned), persona, vanity, OpenID.
 use serde::Deserialize;
 
 // ── Key newtype ──────────────────────────────────────────────────────────────
@@ -109,18 +109,32 @@ pub struct SteamClient {
     base_web_api: String,
     #[allow(dead_code)]
     base_store: String,
+    /// Base URL for Steam OpenID endpoints (prod: `https://steamcommunity.com`).
+    base_openid: String,
     http: reqwest::Client,
     key: SteamApiKey,
 }
 
 impl SteamClient {
-    pub fn new(web_api_base: &str, store_base: &str, key: SteamApiKey) -> Result<Self, SteamError> {
+    /// Create a new client.
+    ///
+    /// * `web_api_base` — Steam Web API root (prod: `https://api.steampowered.com`)
+    /// * `store_base`   — Steam store root (prod: `https://store.steampowered.com`)
+    /// * `openid_base`  — Steam community root used for OpenID (prod: `https://steamcommunity.com`)
+    /// * `key`          — Steam Web API key
+    pub fn new(
+        web_api_base: &str,
+        store_base: &str,
+        openid_base: &str,
+        key: SteamApiKey,
+    ) -> Result<Self, SteamError> {
         let http = reqwest::Client::builder()
             .build()
             .map_err(|e| SteamError::Network(e.to_string()))?;
         Ok(Self {
             base_web_api: web_api_base.to_string(),
             base_store: store_base.to_string(),
+            base_openid: openid_base.to_string(),
             http,
             key,
         })
@@ -189,6 +203,88 @@ impl SteamClient {
             Err(SteamError::NotFound)
         }
     }
+
+    /// Verify a Steam OpenID assertion. Trust ladder (spec §2, ALL must hold):
+    ///
+    /// 1. `openid.return_to` in the params EXACTLY equals the URL we're handling (standard
+    ///    OpenID rule — makes ctx tampering visible).
+    /// 2. `openid.claimed_id` matches `https://steamcommunity.com/openid/id/<17-digit>`.
+    /// 3. Steam's own `check_authentication` echo answers `is_valid:true` (this also enforces
+    ///    single-use response_nonce server-side — the replay defense).
+    pub async fn verify_openid_assertion(
+        &self,
+        params: &[(String, String)],
+        expected_return_to: &str,
+    ) -> Result<SteamId64, SteamError> {
+        let get = |k: &str| {
+            params
+                .iter()
+                .find(|(pk, _)| pk == k)
+                .map(|(_, v)| v.as_str())
+        };
+
+        let return_to = get("openid.return_to").unwrap_or("");
+        if return_to != expected_return_to {
+            return Err(SteamError::OpenIdRejected("return_to mismatch".into()));
+        }
+
+        let claimed = get("openid.claimed_id").unwrap_or("");
+        let id = claimed
+            .strip_prefix("https://steamcommunity.com/openid/id/")
+            .filter(|rest| rest.len() == 17 && rest.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| SteamError::OpenIdRejected("claimed_id shape".into()))?;
+
+        // Echo the assertion back with mode=check_authentication (form-encoded).
+        let mut form: Vec<(String, String)> = params.to_vec();
+        for (k, v) in &mut form {
+            if k == "openid.mode" {
+                *v = "check_authentication".into();
+            }
+        }
+        let resp = self
+            .http
+            .post(format!("{}/openid/login", self.base_openid))
+            .form(&form)
+            .send()
+            .await
+            .map_err(net)?;
+        if resp.status().as_u16() != 200 {
+            return Err(SteamError::Api(resp.status().as_u16()));
+        }
+        let body = resp.text().await.map_err(net)?;
+        if body.lines().any(|l| l.trim() == "is_valid:true") {
+            Ok(SteamId64(id.to_string()))
+        } else {
+            Err(SteamError::OpenIdRejected("is_valid:false".into()))
+        }
+    }
+}
+
+// ── OpenID redirect helper ────────────────────────────────────────────────────
+
+/// Build the "Sign in through Steam" redirect URL. Pure; both surfaces use it via the return
+/// endpoint. `realm` is the RP domain; `return_to` is the exact callback URL Steam will POST to.
+pub fn steam_openid_redirect_url(realm: &str, return_to: &str) -> String {
+    let q = [
+        ("openid.ns", "http://specs.openid.net/auth/2.0"),
+        ("openid.mode", "checkid_setup"),
+        (
+            "openid.claimed_id",
+            "http://specs.openid.net/auth/2.0/identifier_select",
+        ),
+        (
+            "openid.identity",
+            "http://specs.openid.net/auth/2.0/identifier_select",
+        ),
+        ("openid.return_to", return_to),
+        ("openid.realm", realm),
+    ];
+    let qs = q
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("https://steamcommunity.com/openid/login?{qs}")
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
