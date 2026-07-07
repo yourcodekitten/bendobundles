@@ -130,6 +130,7 @@ pub fn router(
             "/api/l/:token/steam/owned/:steamid",
             get(handle_steam_owned_proxy),
         )
+        .route("/api/l/:token/games/:id/detail", get(handle_game_detail))
         .route("/api/steam/login", get(handle_steam_login))
         .route("/api/steam/return", get(handle_steam_return))
         .with_state(state)
@@ -654,6 +655,109 @@ fn park_response() -> Response {
         Json(serde_json::json!({
             "status": "processing",
             "message": "your claim is recorded — the gift link is taking longer than usual; check back on this page"
+        })),
+    )
+        .into_response()
+}
+
+/// Byte-identical 404 used everywhere a token-scope check fails (no enumeration oracle).
+/// Any unknown token, unknown game ID, or inaccessible game all return this exact body
+/// so callers learn nothing about WHY access was denied.
+fn link_not_found_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "unknown link"})),
+    )
+        .into_response()
+}
+
+// ── GET /api/l/:token/games/:id/detail ───────────────────────────────────────
+
+/// Token-scoped game detail endpoint. Friend-facing, cache-only: Steam is never called.
+///
+/// Access rule (no-oracle): the link must resolve AND the game must be currently
+/// listable OR its id must appear in this specific link's claims history.
+/// Any other condition → byte-identical 404 so callers learn nothing about why.
+///
+/// Response shape:
+/// ```json
+/// { "game": { "id","title","bundle","key_type","artwork_url","steam_app_id" },
+///   "steam": { "detail":…|null, "overall":…|null, "recent":…|null } | null }
+/// ```
+/// `steam: null` ⟺ game has no steam_app_id OR no cache item exists yet.
+async fn handle_game_detail(
+    State(s): State<AppState>,
+    Path((token, game_id)): Path<(String, String)>,
+) -> Response {
+    // 1. Resolve link — same byte-identical 404 for any failure (no oracle).
+    let _link = match s.store.get_link(&token).await {
+        Ok(Some(l)) => l,
+        Ok(None) => return link_not_found_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "try again"})),
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Fetch the game — unknown game ID → byte-identical 404 (no oracle).
+    let game = match s.store.get_game(&game_id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return link_not_found_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "try again"})),
+            )
+                .into_response();
+        }
+    };
+
+    // 3. Friend access gate: currently listable OR game id in THIS link's claims history.
+    //    Inaccessible → same byte-identical 404 (no oracle: friend learns nothing).
+    let accessible = if game.is_listable() {
+        true
+    } else {
+        match s.store.claims_for_link(&token).await {
+            Ok(claims) => claims.iter().any(|c| c.game_id == game_id),
+            Err(_) => false,
+        }
+    };
+    if !accessible {
+        return link_not_found_response();
+    }
+
+    // 4. Steam cache — cache-only (Steam never called at request time).
+    //    No steam_app_id OR no cache entry yet → null.
+    let steam = match game.steam_app_id {
+        None => serde_json::Value::Null,
+        Some(app_id) => match s.store.get_steam_app(app_id).await {
+            Ok(Some(cache)) => serde_json::json!({
+                "detail": cache.detail,
+                "overall": cache.overall,
+                "recent": cache.recent,
+            }),
+            Ok(None) => serde_json::Value::Null,
+            Err(_) => serde_json::Value::Null, // degrade gracefully; Steam cache is best-effort
+        },
+    };
+
+    let game_view = GameView {
+        id: game.id,
+        title: game.title,
+        bundle: game.bundle,
+        key_type: game.key_type,
+        artwork_url: game.artwork_url,
+        steam_app_id: game.steam_app_id,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "game": game_view,
+            "steam": steam,
         })),
     )
         .into_response()

@@ -10,11 +10,11 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use domain::{Game, GameStatus, Link, game_id};
-use dynamo::Store;
+use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
+use dynamo::{SteamAppCache, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use public_api::{Invoker, router};
-use steam_client::{SteamApiKey, SteamClient};
+use steam_client::{RecentReviews, ReviewSummary, SteamApiKey, SteamAppDetail, SteamClient};
 use time::macros::datetime;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -1245,6 +1245,336 @@ async fn steam_login_unconfigured_redirects_to_steam_unreachable_fragment() {
         !loc.contains("steamcommunity.com"),
         "must NOT redirect to Steam when steam client is None; got: {loc}"
     );
+}
+
+// ── Task 4: Game detail endpoint tests ───────────────────────────────────────
+
+/// Build a minimal SteamAppCache for seeding in tests.
+fn test_steam_cache(app_id: u32) -> SteamAppCache {
+    SteamAppCache {
+        app_id,
+        detail: Some(SteamAppDetail {
+            app_id,
+            name: format!("Test Game {app_id}"),
+            developers: vec!["Dev Inc".into()],
+            publishers: vec!["Pub Ltd".into()],
+            genres: vec!["Action".into()],
+            release_date: None,
+            short_description: "A test game for detail tests.".into(),
+            header_image: None,
+            video_hls_url: None,
+            video_thumbnail: None,
+        }),
+        overall: Some(ReviewSummary {
+            desc: "Mostly Positive".into(),
+            total_positive: 100,
+            total_negative: 20,
+            total_reviews: 120,
+        }),
+        recent: Some(RecentReviews {
+            percent_positive: 83,
+            count: 50,
+        }),
+        fetched_at: 1_700_000_000,
+        reviews_fetched_at: 1_700_000_000,
+    }
+}
+
+/// GET /api/l/:token/games/:id/detail — listable game with steam cache → 200.
+/// The response carries `game` with the friend-visible fields and a `steam` object
+/// with detail/overall/recent all populated.
+#[tokio::test]
+async fn game_detail_listable_200_with_steam_blob() {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("gdl{}", &uid[..10])).await else {
+        return;
+    };
+    let mut g = test_game(50);
+    g.steam_app_id = Some(99001);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store.put_steam_app(&test_steam_cache(99001)).await.unwrap();
+
+    let tok = format!("gdl{}", &uid[..28]);
+    let lnk = test_link(&tok);
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let req = Request::get(format!("/api/l/{tok}/games/{gid}/detail"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "listable game must return 200"
+    );
+    let j = body_json(resp).await;
+
+    // game object has the friend-visible shape
+    assert_eq!(j["game"]["id"], gid);
+    assert_eq!(j["game"]["title"], "Game 50");
+    assert!(
+        j["game"].get("bundle").is_some(),
+        "game.bundle must be present"
+    );
+    assert!(
+        j["game"].get("key_type").is_some(),
+        "game.key_type must be present"
+    );
+    assert_eq!(j["game"]["steam_app_id"], 99001);
+
+    // steam blob present and populated
+    assert!(
+        !j["steam"].is_null(),
+        "steam must not be null for a mapped game with cache"
+    );
+    assert!(
+        !j["steam"]["detail"].is_null(),
+        "steam.detail must be present"
+    );
+    assert_eq!(j["steam"]["overall"]["desc"], "Mostly Positive");
+    assert_eq!(j["steam"]["recent"]["percent_positive"], 83);
+
+    // must NOT leak timestamps or order-key material
+    assert!(
+        j["steam"].get("fetched_at").is_none(),
+        "fetched_at must not leak"
+    );
+    assert!(j["game"].get("gamekey").is_none(), "gamekey must not leak");
+}
+
+/// Hidden game → 404 byte-identical to unknown-token 404 (no oracle).
+/// The detail endpoint never reveals WHY access was denied.
+#[tokio::test]
+async fn game_detail_hidden_game_404_byte_identical() {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("gdh{}", &uid[..10])).await else {
+        return;
+    };
+    let mut g = test_game(51);
+    g.hidden = true; // hidden → not listable
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let tok = format!("gdh{}", &uid[..28]);
+    let lnk = test_link(&tok);
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    // detail request for hidden game
+    let detail_req = Request::get(format!("/api/l/{tok}/games/{gid}/detail"))
+        .body(Body::empty())
+        .unwrap();
+    let detail_resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(detail_req)
+        .await
+        .unwrap();
+
+    // reference: unknown-token 404 (unknown token — never stored)
+    let ref_tok = format!("ref{}", &uid[..28]);
+    let ref_req2 = Request::get(format!("/api/l/{ref_tok}"))
+        .body(Body::empty())
+        .unwrap();
+    let ref_resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(ref_req2)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail_resp.status(),
+        StatusCode::NOT_FOUND,
+        "hidden game must yield 404"
+    );
+    assert_eq!(ref_resp.status(), StatusCode::NOT_FOUND);
+
+    let detail_bytes = axum::body::to_bytes(detail_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ref_bytes = axum::body::to_bytes(ref_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail_bytes, ref_bytes,
+        "hidden-game 404 must be byte-identical to unknown-token 404 (no oracle)"
+    );
+}
+
+/// Game in THIS link's claims history (but currently not listable) → 200.
+/// A friend who previously claimed a game (now Gifted/non-listable) can still view its detail.
+#[tokio::test]
+async fn game_detail_claimed_by_this_link_200() {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("gdcl{}", &uid[..10])).await else {
+        return;
+    };
+    // Gifted game — not listable
+    let mut g = test_game(52);
+    g.status = GameStatus::Gifted;
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let tok = format!("gdcl{}", &uid[..27]);
+    let lnk = test_link(&tok);
+    store.create_link(&lnk).await.unwrap();
+
+    // Seed a claim under THIS link for this game
+    let claim_id = format!("cl{}", &uid[..10]);
+    store
+        .put_claim(&Claim {
+            id: claim_id,
+            link_token: tok.clone(),
+            game_id: gid.clone(),
+            state: ClaimState::Fulfilled,
+            gift_url: Some("https://humble.com/g".into()),
+            created_at: datetime!(2026-07-07 00:00 UTC),
+            choice_pre_tpks: None,
+            revealed_key: None,
+        })
+        .await
+        .unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let req = Request::get(format!("/api/l/{tok}/games/{gid}/detail"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "game in this link's claims history must return 200"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(j["game"]["id"], gid);
+    // steam_app_id was None → steam: null
+    assert!(
+        j["steam"].is_null(),
+        "game with no steam_app_id must give steam: null"
+    );
+}
+
+/// Game claimed by a DIFFERENT link → 404 (no-oracle, not in this link's history).
+#[tokio::test]
+async fn game_detail_other_links_claimed_game_404() {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("gdo{}", &uid[..10])).await else {
+        return;
+    };
+    // Gifted game — not listable
+    let mut g = test_game(53);
+    g.status = GameStatus::Gifted;
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Link A: the one we'll query (no claims)
+    let tok_a = format!("gdoa{}", &uid[..27]);
+    store.create_link(&test_link(&tok_a)).await.unwrap();
+    // Link B: the one that has the claim
+    let tok_b = format!("gdob{}", &uid[..27]);
+    store.create_link(&test_link(&tok_b)).await.unwrap();
+
+    // Claim under link B
+    let claim_id = format!("co{}", &uid[..10]);
+    store
+        .put_claim(&Claim {
+            id: claim_id,
+            link_token: tok_b.clone(),
+            game_id: gid.clone(),
+            state: ClaimState::Fulfilled,
+            gift_url: Some("https://humble.com/g".into()),
+            created_at: datetime!(2026-07-07 00:00 UTC),
+            choice_pre_tpks: None,
+            revealed_key: None,
+        })
+        .await
+        .unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    // Query link A → 404
+    let detail_req = Request::get(format!("/api/l/{tok_a}/games/{gid}/detail"))
+        .body(Body::empty())
+        .unwrap();
+    let detail_resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(detail_req)
+        .await
+        .unwrap();
+
+    // Reference: unknown-token 404 (a token that was never stored)
+    let ref_tok = format!("ref{}", &uid[..28]);
+    let ref_req = Request::get(format!("/api/l/{ref_tok}"))
+        .body(Body::empty())
+        .unwrap();
+    let ref_resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(ref_req)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail_resp.status(),
+        StatusCode::NOT_FOUND,
+        "other-link claimed game must yield 404 on this link"
+    );
+    let detail_bytes = axum::body::to_bytes(detail_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ref_bytes = axum::body::to_bytes(ref_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail_bytes, ref_bytes,
+        "other-link 404 must be byte-identical to unknown-token 404"
+    );
+}
+
+/// Listable game with no steam_app_id → 200 with `steam: null`.
+#[tokio::test]
+async fn game_detail_unmapped_game_steam_null() {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("gdna{}", &uid[..10])).await else {
+        return;
+    };
+    // steam_app_id = None (unmapped)
+    let g = test_game(54);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let tok = format!("gdna{}", &uid[..27]);
+    let lnk = test_link(&tok);
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let req = Request::get(format!("/api/l/{tok}/games/{gid}/detail"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["game"]["id"], gid);
+    assert!(j["steam"].is_null(), "unmapped game must yield steam: null");
 }
 
 /// C1-REJECT: admin subroute rejections — the widening must not enable open redirect.

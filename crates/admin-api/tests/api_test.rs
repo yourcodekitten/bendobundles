@@ -15,9 +15,9 @@ use axum::{
     http::{Request, StatusCode},
 };
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
-use dynamo::Store;
+use dynamo::{SteamAppCache, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
-use steam_client::{SteamApiKey, SteamClient};
+use steam_client::{RecentReviews, ReviewSummary, SteamApiKey, SteamAppDetail, SteamClient};
 use time::macros::datetime;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -1806,5 +1806,129 @@ async fn catalog_view_steam_fields_absent_when_unset() {
     assert_eq!(
         game["owned_by_ben"], false,
         "unset owned_by_ben must be false"
+    );
+}
+
+// ── Task 4: Admin game detail endpoint tests ─────────────────────────────────
+
+/// GET /admin/api/games/:id/detail without session → 401.
+#[tokio::test]
+async fn admin_game_detail_401_without_session() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let req = Request::get("/admin/api/games/some-id/detail")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(store, invoker, test_admin_hash("pw"), None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// GET /admin/api/games/:id/detail with session + game with steam cache
+/// → 200 with CatalogGameView superset fields AND steam blob.
+#[tokio::test]
+async fn admin_game_detail_superset_fields_and_steam_blob() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+
+    let mut g = sample_game("gk-det:mn-det");
+    g.steam_app_id = Some(77770);
+    g.hidden = true; // to confirm superset (admin can see hidden)
+    g.requires_choice = false;
+    g.owned_by_ben = true;
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Seed steam cache
+    store
+        .put_steam_app(&SteamAppCache {
+            app_id: 77770,
+            detail: Some(SteamAppDetail {
+                app_id: 77770,
+                name: "Detail Test Game".into(),
+                developers: vec!["Dev".into()],
+                publishers: vec!["Pub".into()],
+                genres: vec!["RPG".into()],
+                release_date: None,
+                short_description: "Admin detail test.".into(),
+                header_image: None,
+                video_hls_url: None,
+                video_thumbnail: None,
+            }),
+            overall: Some(ReviewSummary {
+                desc: "Very Positive".into(),
+                total_positive: 900,
+                total_negative: 100,
+                total_reviews: 1000,
+            }),
+            recent: Some(RecentReviews {
+                percent_positive: 90,
+                count: 200,
+            }),
+            fetched_at: 1_700_000_000,
+            reviews_fetched_at: 1_700_000_000,
+        })
+        .await
+        .unwrap();
+
+    let resp = authed_get(&app, &format!("/admin/api/games/{gid}/detail")).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin detail must return 200"
+    );
+    let j = body_json(resp).await;
+
+    // CatalogGameView superset fields
+    for field in [
+        "id",
+        "title",
+        "bundle",
+        "key_type",
+        "giftable",
+        "hidden",
+        "status",
+        "claim_id",
+        "artwork_url",
+        "requires_choice",
+        "steam_app_id",
+        "owned_by_ben",
+    ] {
+        assert!(
+            j["game"].get(field).is_some(),
+            "game.{field} must be present"
+        );
+    }
+    assert_eq!(j["game"]["id"], gid);
+    assert_eq!(
+        j["game"]["hidden"], true,
+        "hidden must be true (superset includes hidden)"
+    );
+    assert_eq!(j["game"]["owned_by_ben"], true);
+    assert_eq!(j["game"]["steam_app_id"], 77770);
+
+    // steam blob
+    assert!(
+        !j["steam"].is_null(),
+        "steam must not be null for mapped game with cache"
+    );
+    assert_eq!(j["steam"]["detail"]["name"], "Detail Test Game");
+    assert_eq!(j["steam"]["overall"]["desc"], "Very Positive");
+    assert_eq!(j["steam"]["recent"]["percent_positive"], 90);
+
+    // must NOT leak timestamps
+    assert!(
+        j["steam"].get("fetched_at").is_none(),
+        "fetched_at must not leak"
+    );
+    // must NOT leak order-key material
+    assert!(j["game"].get("gamekey").is_none(), "gamekey must not leak");
+    assert!(
+        j["game"].get("machine_name").is_none(),
+        "machine_name must not leak"
     );
 }

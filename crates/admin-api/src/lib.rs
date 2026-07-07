@@ -89,6 +89,7 @@ pub fn router(
     // route_layer (vs layer) means 404s from unmatched paths don't hit the session check.
     let protected = Router::new()
         .route("/admin/api/catalog", get(handle_catalog))
+        .route("/admin/api/games/:id/detail", get(handle_game_detail))
         .route("/admin/api/games/:id/hidden", post(handle_game_hidden))
         .route("/admin/api/games/:id/self-claim", post(handle_self_claim))
         .route(
@@ -350,6 +351,63 @@ async fn handle_game_steam_appid(
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+// ── GET /admin/api/games/:id/detail ──────────────────────────────────────────
+
+/// Session-guarded game detail endpoint. Admin superset: any game id (including hidden,
+/// non-giftable, non-listable). Cache-only — Steam is never called at request time.
+///
+/// Response shape:
+/// ```json
+/// { "game": { …CatalogGameView… },
+///   "steam": { "detail":…|null, "overall":…|null, "recent":…|null } | null }
+/// ```
+/// `steam: null` ⟺ game has no steam_app_id OR no cache item exists yet.
+async fn handle_game_detail(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+    let game = match s.store.get_game(&id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    // Steam cache — cache-only; degrade gracefully on any read error.
+    let steam = match game.steam_app_id {
+        None => serde_json::Value::Null,
+        Some(app_id) => match s.store.get_steam_app(app_id).await {
+            Ok(Some(cache)) => serde_json::json!({
+                "detail": cache.detail,
+                "overall": cache.overall,
+                "recent": cache.recent,
+            }),
+            Ok(None) => serde_json::Value::Null,
+            Err(_) => serde_json::Value::Null,
+        },
+    };
+
+    let game_view = CatalogGameView {
+        id: game.id,
+        title: game.title,
+        bundle: game.bundle,
+        key_type: game.key_type,
+        giftable: game.giftable,
+        hidden: game.hidden,
+        status: game.status,
+        claim_id: game.claim_id,
+        artwork_url: game.artwork_url,
+        requires_choice: game.requires_choice,
+        steam_app_id: game.steam_app_id,
+        owned_by_ben: game.owned_by_ben,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "game": game_view,
+            "steam": steam,
+        })),
+    )
+        .into_response()
 }
 
 // ── POST /admin/api/links ─────────────────────────────────────────────────────
