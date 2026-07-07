@@ -39,9 +39,31 @@ const STEAM_ENRICH_MAX_APPS: usize = 75;
 /// remains, so `persist_sync` + `end_sync_run` always get to land after it.
 const STEAM_ENRICH_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// The fulfillment lambda's hard timeout (terraform-pinned). The enrichment deadline is this minus
-/// the margin, anchored at the sync's start.
+/// The fulfillment lambda's hard timeout — FALLBACK used by [`compute_enrich_deadline`] when no
+/// lambda context deadline is available (local runs, tests that inject zero). In the lambda env the
+/// real per-invoke remaining time is preferred; this const exists so a terraform-timeout change
+/// doesn't silently mis-budget when the context deadline is absent.
 const SYNC_LAMBDA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Compute how long from now until the enrichment deadline, given the lambda context's per-invoke
+/// deadline and the current wall-clock epoch (both in milliseconds).
+///
+/// - If `context_deadline_epoch_ms` is 0 (absent — local runs, tests), falls back to
+///   `SYNC_LAMBDA_TIMEOUT - STEAM_ENRICH_DEADLINE_MARGIN`.
+/// - Otherwise computes remaining time from the context deadline and subtracts the margin.
+///   Saturating on both steps: if the deadline is already past, or if remaining ≤ margin,
+///   returns `Duration::ZERO` (immediate deadline — skip the pass, protect bookkeeping).
+pub fn compute_enrich_deadline(
+    context_deadline_epoch_ms: u64,
+    now_epoch_ms: u64,
+) -> std::time::Duration {
+    if context_deadline_epoch_ms == 0 {
+        return SYNC_LAMBDA_TIMEOUT - STEAM_ENRICH_DEADLINE_MARGIN;
+    }
+    let remaining =
+        std::time::Duration::from_millis(context_deadline_epoch_ms.saturating_sub(now_epoch_ms));
+    remaining.saturating_sub(STEAM_ENRICH_DEADLINE_MARGIN)
+}
 
 /// appdetails refresh window (30 days) measured on `SteamAppCache::fetched_at`.
 const STEAM_DETAIL_TTL_SECS: i64 = 30 * 24 * 60 * 60;
@@ -343,6 +365,10 @@ pub struct Deps {
     /// against real wiremock I/O (a virtual/paused clock would auto-advance into reqwest's request
     /// timeout while a real HTTP call is in flight).
     pub steam_enrich_pace: std::time::Duration,
+    /// Per-invoke deadline for the enrichment pass — computed by the caller from the lambda
+    /// context's `deadline` epoch-ms via [`compute_enrich_deadline`]. Tests inject `far_deadline()`
+    /// so the deadline never fires during the run; prod sets it from the real lambda context.
+    pub steam_enrich_deadline: tokio::time::Instant,
 }
 
 /// Where a self-refreshed humble session is persisted, so the next cold start reads it back.
@@ -2185,11 +2211,10 @@ async fn map_missing_appids(deps: &Deps) {
 /// persists a `SyncState` — the caller holds the run marker, so this must always report.
 async fn run_sync(deps: &Deps) {
     tracing::info!("sync started (ensure session, reconcile, then order walk)");
-    // Anchor the enrichment deadline at the sync's start so the walk's own wall-clock counts
-    // against the budget — enrichment runs LAST, and this guarantees it leaves ≥180s of the 900s
-    // lambda timeout for `persist_sync` + `end_sync_run`.
-    let enrich_deadline =
-        tokio::time::Instant::now() + (SYNC_LAMBDA_TIMEOUT - STEAM_ENRICH_DEADLINE_MARGIN);
+    // Enrichment deadline is threaded from the caller via deps.steam_enrich_deadline. It was
+    // computed from the lambda context's remaining time (minus the 180s margin) so `persist_sync`
+    // + `end_sync_run` always have room to land — see compute_enrich_deadline.
+    let enrich_deadline = deps.steam_enrich_deadline;
     // Acquire the library FIRST — this is the self-heal point (a dead session logs in + persists).
     // It MUST come before reconcile: reconcile reads humble per-order, so on a session that died
     // since the last run, running it first would Unauthorized-skip every claim and recover nothing.
@@ -2316,17 +2341,18 @@ async fn run_sync(deps: &Deps) {
     // logged and swallowed; the pass is best-effort and never blocks sync.
     refresh_ben_ownership(deps).await;
 
-    // Steam enrichment pass — budgeted, politely-paced storefront reads (appdetails + reviews +
-    // histogram) into the STEAMAPP cache. Runs AFTER ownership so appid coverage is as complete as
-    // possible. Deadline-guarded so it always leaves room for the bookkeeping below; a 429 aborts
-    // it; never fails the sync.
-    enrich_steam_apps(deps, enrich_deadline).await;
-
     // Choice-discovery ingest — surface each still-claimable OFFERED game as a `requires_choice=true`
-    // catalog entry, so the gift-choice orchestration has something to run on. Runs LAST (after the
-    // order walk) so a heal it triggers can't starve the walk, and it shares the run's one-heal
-    // budget via `healed_this_run` / `cookie_ok`.
+    // catalog entry, so the gift-choice orchestration has something to run on. Runs AFTER the order
+    // walk so a heal it triggers can't starve the walk, and it shares the run's one-heal budget via
+    // `healed_this_run` / `cookie_ok`.
     games_written += discover_choice_games(deps, &mut healed_this_run, &mut cookie_ok).await;
+
+    // Steam enrichment pass — budgeted, politely-paced storefront reads (appdetails + reviews +
+    // histogram) into the STEAMAPP cache. Runs LAST (after choice discovery) so the 180s
+    // deadline margin guards only the bookkeeping (`persist_sync` + `end_sync_run`) and choice
+    // discovery's own network work is never squeezed into that margin. A 429 aborts the pass;
+    // never fails the sync.
+    enrich_steam_apps(deps, enrich_deadline).await;
 
     let msg = if cookie_ok {
         format!("sync ok: {games_written} written, {orders_failed} order(s) failed")
@@ -2839,6 +2865,36 @@ async fn ping(deps: &Deps, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------------------------
+    // compute_enrich_deadline
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn compute_enrich_deadline_normal_remaining_subtracts_margin() {
+        // context deadline = now + 900s → remaining = 900s → minus 180s margin = 720s.
+        let now_ms: u64 = 1_000_000;
+        let deadline_ms = now_ms + 900_000;
+        let d = compute_enrich_deadline(deadline_ms, now_ms);
+        assert_eq!(d, std::time::Duration::from_secs(720));
+    }
+
+    #[test]
+    fn compute_enrich_deadline_zero_context_falls_back_to_const() {
+        // context_deadline_epoch_ms == 0 means no lambda context; uses SYNC_LAMBDA_TIMEOUT -
+        // STEAM_ENRICH_DEADLINE_MARGIN = 900s - 180s = 720s.
+        let d = compute_enrich_deadline(0, 1_000_000);
+        assert_eq!(d, SYNC_LAMBDA_TIMEOUT - STEAM_ENRICH_DEADLINE_MARGIN,);
+    }
+
+    #[test]
+    fn compute_enrich_deadline_remaining_smaller_than_margin_is_zero() {
+        // remaining = 60s < 180s margin → Duration::ZERO (pass must be skipped immediately).
+        let now_ms: u64 = 1_000_000;
+        let deadline_ms = now_ms + 60_000;
+        let d = compute_enrich_deadline(deadline_ms, now_ms);
+        assert_eq!(d, std::time::Duration::ZERO);
+    }
 
     #[test]
     fn ping_content_is_prefixed_and_carries_message() {

@@ -122,6 +122,8 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         steam_enrich_disabled: false,
         // Zero pacing in tests: the paced enrichment pass runs instantly against real wiremock I/O.
         steam_enrich_pace: std::time::Duration::ZERO,
+        // Far deadline: the enrichment pass budget never fires during handler tests.
+        steam_enrich_deadline: far_deadline(),
     }
 }
 
@@ -498,6 +500,8 @@ async fn deps_with_selfheal(
         steam: None,
         steam_enrich_disabled: false,
         steam_enrich_pace: std::time::Duration::ZERO,
+        // Far deadline: the enrichment pass budget never fires during handler tests.
+        steam_enrich_deadline: far_deadline(),
     }
 }
 
@@ -4124,14 +4128,14 @@ async fn refresh_ben_ownership_transient_error_keeps_stamps_no_ping() {
 // =================================================================================================
 // TASK 3: enrich_steam_apps — budgeted, politely-paced Steam enrichment pass (spec §3)
 //
-// Driven by calling enrich_steam_apps directly with an injected tokio deadline. Pacing sleeps are
-// virtual under `start_paused` (no real 1.5s waits); staleness uses wall-clock windows (14d/30d)
-// that dwarf test runtime, so real `now` is deterministic enough. Storefront bodies are shaped
-// from the 2026-07-06 captures.
+// Driven by calling enrich_steam_apps directly with an injected tokio deadline. Pacing uses zero
+// injected pace (real clock, no start_paused) so the pass runs instantly against real wiremock
+// I/O; staleness windows (14d/30d) dwarf test runtime so real `now` is deterministic enough.
+// Storefront bodies are shaped from the 2026-07-06 captures.
 // =================================================================================================
 
 /// A deadline far enough out that the per-app pacing sleeps never trip it (budget, not deadline,
-/// is under test). Under `start_paused` this is virtual time.
+/// is under test). Real clock — zero injected pace means no actual 1.5s waits.
 fn far_deadline() -> tokio::time::Instant {
     tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
 }

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use dynamo::Store;
-use fulfillment::{Deps, FulfillRequest, FulfillResponse, SessionStore, handle};
+use fulfillment::{
+    Deps, FulfillRequest, FulfillResponse, SessionStore, compute_enrich_deadline, handle,
+};
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
 use steam_client::{SteamApiKey, SteamClient};
@@ -125,6 +127,14 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let steam = steam.clone();
 
         async move {
+            // Compute the enrichment deadline from the lambda context's per-invoke remaining time.
+            // context.deadline is epoch-ms; now_epoch_ms is the wall clock at invocation start.
+            let now_epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let steam_enrich_deadline = tokio::time::Instant::now()
+                + compute_enrich_deadline(event.context.deadline, now_epoch_ms);
             let payload = event.payload;
 
             // Try to parse as a typed request; on failure fall back to EventBridge → Sync.
@@ -227,6 +237,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     steam: steam.clone(),
                     steam_enrich_disabled,
                     steam_enrich_pace: fulfillment::STEAM_ENRICH_PACE,
+                    steam_enrich_deadline,
                 };
 
                 handle(&deps, req).await
