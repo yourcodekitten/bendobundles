@@ -80,8 +80,8 @@ components:
     padding: "{spacing.chip}"
     typography: "{typography.label}"
   card:
-    backgroundColor: "{colors.floor}"
-    rounded: "{rounded.lg}"
+    backgroundColor: "{colors.shelf}"
+    rounded: "6px 6px 20px 6px"
   dialog:
     backgroundColor: "{colors.floor}"
     rounded: "{rounded.xl}"
@@ -233,19 +233,26 @@ Tactile and cozy: quiet, pressable, unhurried — with all saved energy spent on
 - **Ghost:** transparent bg, Dust text brightening to Ink Soft on hover — the "never mind".
 
 ### Chips
-- **Style:** Shelf bg, Ink Soft text, 0.25rem radius, 2px × 8px padding, 0.75rem text.
+- **Style:** Shelf bg, Ink Soft text, 0.25rem radius, 2px × 8px padding, 0.75rem text. On the
+  Shelf-bodied game card the neutral chip steps to Floor bg instead (shelf-on-shelf vanishes).
+- **Genre chips (game card):** the first 4 cached steam genres replace the key_type chip. Each
+  genre's color rides the shared title-hash palette (The Title-Hash Rule — hashed through
+  `titleColorClass`, never a local copy): bg is the hash hue mixed 30/70 toward Floor, text is
+  the same hue deepened toward ink. Same genre, same color, every card, forever. No cached
+  genres → the plain key_type chip (delight never gates).
 - **State:** status chips swap to the deep-bg/pale-text status pairs; the "gifted" badge wears
   Button Burgundy (it records a completed act of giving).
 
 ### Cards / Containers
-- **Corner Style:** 0.5rem radius (one step softer than controls)
-- **Background:** Floor on Room
+- **The game card is a DMG cartridge** (ben's pick, live session 2026-07-07): grip ridges along
+  the top (control/shelf repeating stripes), Shelf plastic body, cover art (or Title-Hash
+  block) inset like a label sticker (12px sides, 8px top), and the cartridge's asymmetric
+  corner — `border-radius: 6px 6px 20px 6px`. Title in Pixelify (1.25rem semibold); everything
+  else in the body stays Chivo.
 - **Shadow Strategy:** none — tonal only (The Ceremony Rule)
-- **Border:** none at rest
-- **Internal Padding:** 16px body below an edge-to-edge 16:9 art area
-- The **game card** is the signature container: cover art (or Title-Hash color block) bleeding
-  to the edges on top, title + bundle + chips below, the claim button last. Against the light
-  olive room, the art carries all the saturation — the card is its matte frame.
+- **Border:** none at rest — the silhouette and ridges carry the object, not an outline
+- **Internal Padding:** 16px body below the label-sticker art
+- Non-card panels keep the quieter grammar: Floor on Room, 0.5rem radius, no border.
 
 ### Inputs / Fields
 - **Style:** Floor bg, Line 1px border, 0.25rem radius, Ink text, Dust placeholders
