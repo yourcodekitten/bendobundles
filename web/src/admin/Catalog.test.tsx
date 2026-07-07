@@ -471,5 +471,54 @@ describe('Catalog', () => {
       expect(screen.getByRole('button', { name: /confirm\?/i })).toBeInTheDocument();
       expect(screen.queryByText(/you already own this on steam/i)).not.toBeInTheDocument();
     });
+
+    // FIX 2: when both owned_by_ben=true AND requires_choice=true, the armed confirm must
+    // show the pick-cost. Before FIX 2, the owned_by_ben branch swallowed it.
+    it('armed confirm shows pick-cost when BOTH owned_by_ben and requires_choice are true (FIX 2)', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue('76561198000000001');
+      vi.mocked(adminCatalog).mockResolvedValue([
+        {
+          ...gameFixture,
+          id: 'gx:ownedchoice',
+          status: 'available',
+          owned_by_ben: true,
+          requires_choice: true,
+          steam_app_id: 730,
+        },
+      ]);
+      vi.mocked(adminSelfClaim).mockResolvedValue({ kind: 'processing' });
+      renderCatalog();
+      const btn = await screen.findByRole('button', { name: /claim for me/i });
+      fireEvent.click(btn);
+      // The pick-cost MUST appear even when owned_by_ben is true.
+      expect(
+        screen.getByRole('button', { name: /spends 1 pick/i }),
+      ).toBeInTheDocument();
+    });
+
+    // FIX 4: when owned_by_ben=true but steam identity is null, the armed confirm must NOT
+    // claim ownership (stale stamp, no connected identity).
+    it('armed confirm does NOT claim ownership when owned_by_ben=true but steam identity null (FIX 4)', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+      vi.mocked(adminCatalog).mockResolvedValue([
+        {
+          ...gameFixture,
+          id: 'gx:ownednull',
+          status: 'available',
+          owned_by_ben: true,
+          steam_app_id: 730,
+        },
+      ]);
+      vi.mocked(adminSelfClaim).mockResolvedValue({ kind: 'processing' });
+      renderCatalog();
+      const btn = await screen.findByRole('button', { name: /claim for me/i });
+      fireEvent.click(btn);
+      // Must NOT say "you already own this on steam" when steam identity is disconnected.
+      expect(
+        screen.queryByRole('button', { name: /you already own this on steam/i }),
+      ).not.toBeInTheDocument();
+      // Should fall back to plain confirm.
+      expect(screen.getByRole('button', { name: /confirm\?/i })).toBeInTheDocument();
+    });
   });
 });

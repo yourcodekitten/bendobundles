@@ -266,8 +266,10 @@ export function Catalog() {
                     } disabled:opacity-50`}
                   >
                     {isArmed
-                      ? game.owned_by_ben
-                        ? 'you already own this on steam — sure?'
+                      ? game.owned_by_ben && adminSteamId !== null
+                        ? game.requires_choice
+                          ? 'you already own this on steam — spends 1 pick, sure?'
+                          : 'you already own this on steam — sure?'
                         : game.requires_choice
                           ? 'confirm? spends 1 pick'
                           : 'confirm?'

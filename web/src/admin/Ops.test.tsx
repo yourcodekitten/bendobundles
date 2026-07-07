@@ -411,5 +411,25 @@ describe('Ops', () => {
       await user.click(screen.getByRole('button', { name: /connect steam/i }));
       expect(beginConnect).toHaveBeenCalledWith('/admin/ops');
     });
+
+    // FIX 3: error fragment from consumeReturnFragment must show an error message.
+    // Before FIX 3, the 'error' case fell through silently — no message shown.
+    it('shows error message when consumeReturnFragment returns verify_failed (FIX 3)', async () => {
+      vi.mocked(consumeReturnFragment).mockReturnValue({ error: 'verify_failed' });
+      renderOps();
+      await waitFor(() =>
+        expect(screen.getByRole('status')).toBeInTheDocument(),
+      );
+      expect(screen.getByRole('status').textContent).toMatch(/verify/i);
+    });
+
+    it('shows error message when consumeReturnFragment returns steam_unreachable (FIX 3)', async () => {
+      vi.mocked(consumeReturnFragment).mockReturnValue({ error: 'steam_unreachable' });
+      renderOps();
+      await waitFor(() =>
+        expect(screen.getByRole('status')).toBeInTheDocument(),
+      );
+      expect(screen.getByRole('status').textContent).toMatch(/unavailable|unreachable/i);
+    });
   });
 });

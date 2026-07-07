@@ -94,6 +94,16 @@ export function Ops() {
 
     const fragment = consumeReturnFragment();
 
+    if (fragment !== null && 'error' in fragment) {
+      // Steam returned an error fragment (verify_failed or steam_unreachable).
+      setSteamMsg(
+        fragment.error === 'verify_failed'
+          ? "we couldn't verify your Steam account — try again"
+          : 'Steam is currently unavailable — try again later',
+      );
+      return;
+    }
+
     if (fragment !== null && 'steamid' in fragment) {
       // Steam OpenID returned — the admin extra step: persist on server then save locally
       const { steamid, persona } = fragment;
