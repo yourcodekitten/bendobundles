@@ -1,8 +1,8 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
-    AppidWrite, ClaimTxError, HiddenWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin, SyncState,
-    SyncWrite, sync_run_is_live,
+    AppidWrite, ClaimTxError, HiddenWrite, OwnedWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin,
+    SyncState, SyncWrite, sync_run_is_live,
 };
 use std::collections::HashMap;
 use time::macros::datetime;
@@ -1162,4 +1162,154 @@ async fn set_game_steam_appid_if_unclaimed_contested() {
         after.steam_app_id, None,
         "Contested game appid must be unchanged"
     );
+}
+
+// =================================================================================================
+// TASK 7: CONFIG#STEAM identity, STEAMOWN 7d-ttl cache, guarded owned_by_ben stamp.
+// =================================================================================================
+
+/// CONFIG#STEAM: put/get/delete round-trip.
+#[tokio::test]
+async fn steam_identity_config_roundtrip() {
+    let Some(store) = store_or_skip("steam-identity-config").await else {
+        return;
+    };
+
+    // Initially absent.
+    assert_eq!(store.get_steam_identity().await.unwrap(), None);
+
+    // Put → readable back.
+    store.put_steam_identity("76561198012345678").await.unwrap();
+    assert_eq!(
+        store.get_steam_identity().await.unwrap(),
+        Some("76561198012345678".into())
+    );
+
+    // Delete → gone.
+    store.delete_steam_identity().await.unwrap();
+    assert_eq!(store.get_steam_identity().await.unwrap(), None);
+}
+
+/// STEAMOWN: put/get round-trip asserting (appids, fetched_at) AND the raw DDB `ttl`
+/// attribute equals now_epoch + 7 days.
+#[tokio::test]
+async fn steam_owned_cache_roundtrip() {
+    let Some(store) = store_or_skip("steam-owned-cache").await else {
+        return;
+    };
+    let client = raw_client("steam-owned-cache").await;
+    let table = "t-steam-owned-cache";
+
+    let steamid = "76561198012345678";
+    let appids: Vec<u32> = vec![570, 620, 400];
+    let now_epoch: i64 = 1_800_000_000;
+    const SEVEN_DAYS_SECS: i64 = 7 * 24 * 3600;
+    let expected_ttl = now_epoch + SEVEN_DAYS_SECS;
+
+    // Initially absent.
+    assert_eq!(store.get_steam_owned(steamid).await.unwrap(), None);
+
+    // Put the owned cache.
+    store
+        .put_steam_owned(steamid, &appids, now_epoch)
+        .await
+        .unwrap();
+
+    // get_steam_owned returns (appids, fetched_at).
+    let (got_appids, got_fetched_at) = store.get_steam_owned(steamid).await.unwrap().unwrap();
+    assert_eq!(got_appids, appids, "appids must round-trip");
+    assert_eq!(got_fetched_at, now_epoch, "fetched_at must equal now_epoch");
+
+    // Raw DDB item must carry a numeric `ttl` attribute = now+7d.
+    let pk = format!("STEAMOWN#{steamid}");
+    let raw = client
+        .get_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S(pk))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = raw.item.expect("STEAMOWN item must exist after put");
+    let ttl_val = item
+        .get("ttl")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<i64>().ok())
+        .expect("ttl attribute must be a numeric N");
+    assert_eq!(ttl_val, expected_ttl, "ttl must be now_epoch + 7d");
+}
+
+/// `set_game_owned_by_ben` basic: seed a game, set owned=true → Written, re-read confirms.
+/// Unknown id → NotFound.
+#[tokio::test]
+async fn set_game_owned_by_ben_basic() {
+    let Some(store) = store_or_skip("owned-by-ben-basic").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Set owned_by_ben=true → Written.
+    let result = store.set_game_owned_by_ben(&gid, true).await.unwrap();
+    assert!(
+        matches!(result, OwnedWrite::Written),
+        "set_game_owned_by_ben on available unclaimed game must be Written"
+    );
+
+    // Re-read: owned_by_ben must be true.
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        got.owned_by_ben,
+        "game must be owned_by_ben after set(true)"
+    );
+
+    // Unknown id → NotFound.
+    let nf = store
+        .set_game_owned_by_ben("no-such-id", true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(nf, OwnedWrite::NotFound),
+        "unknown game id must return NotFound"
+    );
+}
+
+/// `set_game_owned_by_ben` contested: a Pending game triggers early Contested without touching
+/// the item.
+#[tokio::test]
+async fn set_game_owned_by_ben_contested() {
+    let Some(store) = store_or_skip("owned-by-ben-contested").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store
+        .create_link(&link("tok-owned-contested"))
+        .await
+        .unwrap();
+    let now = datetime!(2026-07-06 12:00 UTC);
+    store
+        .claim_game("tok-owned-contested", &gid, "c-owned", now)
+        .await
+        .unwrap();
+    let pending = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(pending.status, GameStatus::Pending);
+
+    // set_game_owned_by_ben must detect Pending and return Contested early.
+    let result = store.set_game_owned_by_ben(&gid, true).await.unwrap();
+    assert!(
+        matches!(result, OwnedWrite::Contested),
+        "set_game_owned_by_ben on Pending game must return Contested, got {result:?}"
+    );
+
+    // game must be unchanged.
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        GameStatus::Pending,
+        "status must still be Pending"
+    );
+    assert!(!after.owned_by_ben, "owned_by_ben must be unchanged");
 }

@@ -9,7 +9,7 @@ use aws_sdk_dynamodb::types::{
 use domain::{Claim, ClaimState, Game, GameStatus, Link};
 use schema::{
     claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body, session_item,
-    session_pk, sync_state_item,
+    session_pk, steam_identity_item, steam_owned_item, sync_state_item,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -56,6 +56,19 @@ pub enum HiddenWrite {
     Contested,
 }
 
+/// Outcome of a guarded owned-by-ben write. The ONLY safe way to toggle `owned_by_ben` on a game.
+/// Closes the admin-toggle vs claim race that an unguarded `put_game` would lose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedWrite {
+    /// Flag was written (game was found and the condition passed).
+    Written,
+    /// No game with that ID exists; caller should 404.
+    NotFound,
+    /// A concurrent claim holds the game `Pending` — the conditional put's status-lock fired.
+    /// Caller should 409 and retry later.
+    Contested,
+}
+
 /// Persisted summary of a catalog-sync run. Storage-shaped (lives in dynamo, not in domain).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SyncState {
@@ -64,6 +77,14 @@ pub struct SyncState {
     pub cookie_ok: bool,
     pub games_written: u32,
     pub message: String,
+}
+
+/// Cached result of a Steam-owned-games API fetch. Stored at STEAMOWN#<steamid>; TTL-evicted
+/// after 7 days. Not part of the public domain model — storage-only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SteamOwnedCache {
+    pub appids: Vec<u32>,
+    pub fetched_at: i64,
 }
 
 /// A sync-run marker older than this is dead: the fulfillment lambda's hard timeout is 900s, so
@@ -1594,6 +1615,117 @@ impl Store {
             .send()
             .await?;
         Ok(())
+    }
+
+    /// Persist the Steam identity (SteamID string) under CONFIG#STEAM. Idempotent — overwrites any
+    /// existing record. Use this as the single source of truth for Ben's Steam account ID.
+    pub async fn put_steam_identity(&self, steamid: &str) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(steam_identity_item(steamid)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Retrieve the stored Steam identity string, or `None` if not yet configured.
+    pub async fn get_steam_identity(&self) -> Result<Option<String>, StoreError> {
+        self.get_meta("CONFIG#STEAM").await
+    }
+
+    /// Remove the Steam identity record. Idempotent — silently succeeds if absent.
+    pub async fn delete_steam_identity(&self) -> Result<(), StoreError> {
+        let (pk, sk) = schema::key_pair("CONFIG#STEAM", "META");
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Write (or refresh) the Steam-owned-games cache for the given Steam ID.
+    /// pk="STEAMOWN#<steamid>", sk="META", ttl=now_epoch+7d. Idempotent — overwrites any existing
+    /// entry. Callers must enforce staleness via `fetched_at` until DynamoDB TTL is enabled.
+    pub async fn put_steam_owned(
+        &self,
+        steamid: &str,
+        appids: &[u32],
+        now_epoch: i64,
+    ) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(steam_owned_item(steamid, appids, now_epoch)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Look up the Steam-owned-games cache. Returns `(appids, fetched_at)` or `None` if absent
+    /// (never written or TTL-evicted). `fetched_at` is seconds since Unix epoch.
+    pub async fn get_steam_owned(
+        &self,
+        steamid: &str,
+    ) -> Result<Option<(Vec<u32>, i64)>, StoreError> {
+        let pk = format!("STEAMOWN#{steamid}");
+        let cache: Option<SteamOwnedCache> = self.get_meta(&pk).await?;
+        Ok(cache.map(|c| (c.appids, c.fetched_at)))
+    }
+
+    /// Toggle a game's `owned_by_ben` flag with a guarded conditional write. Structural copy of
+    /// `set_game_hidden` — uses the same optimistic-lock-on-status pattern to close the
+    /// admin-toggle vs claim race.
+    ///
+    /// Returns `Contested` immediately if the game is `Pending` (a claim is in flight). A claim
+    /// landing AFTER the initial read flips status to `Pending`, which CCFs the condition → `Contested`.
+    pub async fn set_game_owned_by_ben(
+        &self,
+        game_id: &str,
+        owned: bool,
+    ) -> Result<OwnedWrite, StoreError> {
+        let Some(mut game) = self.get_game(game_id).await? else {
+            return Ok(OwnedWrite::NotFound);
+        };
+
+        // Pending means a claim is actively in flight — return Contested immediately.
+        if game.status == GameStatus::Pending {
+            return Ok(OwnedWrite::Contested);
+        }
+
+        game.owned_by_ben = owned;
+
+        // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
+        let status_str = serde_json::to_value(game.status)
+            .expect("status serializes")
+            .as_str()
+            .expect("status is a string")
+            .to_string();
+
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":expected", schema::s(status_str))
+            .condition_expression("#st = :expected")
+            .send()
+            .await;
+
+        match res {
+            Ok(_) => Ok(OwnedWrite::Written),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(OwnedWrite::Contested)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
     }
 
     /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).
