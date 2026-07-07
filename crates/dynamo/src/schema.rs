@@ -179,6 +179,26 @@ pub fn parse_body<T: serde::de::DeserializeOwned>(
 /// Seconds in seven days — the TTL window for STEAMOWN cache entries.
 pub const STEAM_OWNED_TTL_SECS: i64 = 7 * 24 * 3600;
 
+pub fn steam_app_pk(app_id: u32) -> String {
+    format!("STEAMAPP#{app_id}")
+}
+
+/// Build the full item for a STEAMAPP enrichment cache entry.
+/// pk="STEAMAPP#<app_id>", sk="META", body=JSON of [`crate::SteamAppCache`].
+/// Use `Store::put_steam_app` / `Store::get_steam_app` — do not write STEAMAPP# items directly.
+pub fn steam_app_item(
+    cache: &crate::SteamAppCache,
+) -> std::collections::HashMap<String, AttributeValue> {
+    std::collections::HashMap::from([
+        ("pk".into(), s(steam_app_pk(cache.app_id))),
+        ("sk".into(), s("META")),
+        (
+            "body".into(),
+            s(serde_json::to_string(cache).expect("SteamAppCache serializes")),
+        ),
+    ])
+}
+
 /// Build the full item for the CONFIG#STEAM identity record.
 /// pk="CONFIG#STEAM", sk="META", body=JSON-serialized steamid string.
 /// Use `Store::put_steam_identity` / `Store::get_steam_identity` — do not write CONFIG#STEAM items directly.
