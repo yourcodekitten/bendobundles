@@ -8,6 +8,7 @@ publish.workspace = true
 domain = { path = "../domain" }
 humble-client = { path = "../humble-client" }
 dynamo = { path = "../dynamo" }
+steam-client = { path = "../steam-client" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true

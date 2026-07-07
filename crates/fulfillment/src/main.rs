@@ -185,6 +185,10 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     webhook_url,
                     http: http_client,
                     session_store,
+                    // Task 12 wires the SteamClient when a STEAM_API_KEY env-var is present.
+                    // For now, the appid mapper title-pass is skipped; tier-1 tpk flow-through
+                    // is already active (it comes from the humble wire data, not the steam client).
+                    steam: None,
                 };
 
                 handle(&deps, req).await

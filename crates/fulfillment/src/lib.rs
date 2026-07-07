@@ -9,10 +9,12 @@
 //! variant is a compile error until someone consciously picks its decision — the invariant can't
 //! silently rot.
 
-use domain::{Claim, Game, GameStatus};
+use domain::{AppidSource, Claim, Game, GameStatus};
 use dynamo::{Store, StoreError, SyncBegin, SyncState, SyncWrite};
 use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order, RevealedKey};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// A parked (`Pending`) claim younger than this is left alone — the live fulfillment call may
@@ -306,6 +308,9 @@ pub struct Deps {
     /// replacing the human cookie-paste flow. `None` when self-login credentials aren't configured
     /// (then a dead session falls back to the old flag-and-ping behavior).
     pub session_store: Option<SessionStore>,
+    /// Steam Web API client, used by the appid mapper pass. `None` when the Steam API key is not
+    /// configured; `run_sync` skips the title-pass but still flows tier-1 tpk ids from the walk.
+    pub steam: Option<Arc<steam_client::SteamClient>>,
 }
 
 /// Where a self-refreshed humble session is persisted, so the next cold start reads it back.
@@ -1660,6 +1665,120 @@ where
     }
 }
 
+/// Lazy title-pass: for every steam-type game with no `steam_app_id` (and not `Manual` source),
+/// attempt a unique exact-title match against the Steam app list. Runs once per sync, AFTER the
+/// order walk (tier-1 tpk ids are already written) so only genuinely unmapped games are touched.
+///
+/// Lazy: if no unmapped games exist, returns WITHOUT fetching the app list.
+/// Resilient: 429 or any network/api failure from `get_app_list` logs a warning and skips the
+/// pass — the sync NEVER fails because Steam is unreachable.
+async fn map_missing_appids(deps: &Deps) {
+    let Some(steam) = deps.steam.as_ref() else {
+        // No Steam client configured — skip the title pass but keep tier-1 ids already written.
+        return;
+    };
+
+    let games = match deps.store.list_all_games().await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = ?e, "steam appid mapping: list_all_games failed — skipping pass");
+            return;
+        }
+    };
+
+    // Normalize: lowercase + trim + strip ™/®.
+    let normalize = |s: &str| -> String {
+        s.to_lowercase()
+            .trim()
+            .replace(['™', '®'], "")
+            .trim()
+            .to_string()
+    };
+
+    let manual_count = games
+        .iter()
+        .filter(|g| g.appid_source == Some(AppidSource::Manual))
+        .count();
+
+    // Candidates: steam key type, no appid, not Manual (a cleared override None/None participates).
+    let to_map: Vec<&Game> = games
+        .iter()
+        .filter(|g| {
+            g.key_type == "steam"
+                && g.steam_app_id.is_none()
+                && g.appid_source != Some(AppidSource::Manual)
+        })
+        .collect();
+
+    let already_mapped = games.iter().filter(|g| g.steam_app_id.is_some()).count();
+
+    if to_map.is_empty() {
+        tracing::info!(
+            mapped = already_mapped,
+            unmapped = 0,
+            manual = manual_count,
+            "steam appid mapping: no unmapped games — skipping app list fetch"
+        );
+        return;
+    }
+
+    // Fetch the app list — keyless endpoint, so no API key is sent.
+    let app_list = match steam.get_app_list().await {
+        Ok(list) => list,
+        Err(steam_client::SteamError::RateLimited) => {
+            tracing::warn!("steam appid mapping: 429 rate limited — skipping title pass this run");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                "steam appid mapping: network/api failure — skipping title pass this run"
+            );
+            return;
+        }
+    };
+
+    // Build name_lower → Vec<appid>. Duplicate names in Steam's list stay as duplicates — the
+    // uniqueness check below skips any title that maps to more than one appid.
+    let mut name_map: HashMap<String, Vec<u32>> = HashMap::new();
+    for (appid, name) in &app_list {
+        name_map.entry(normalize(name)).or_default().push(*appid);
+    }
+
+    let mut mapped = 0usize;
+    let mut unmapped = 0usize;
+
+    for game in &to_map {
+        let normalized = normalize(&game.title);
+        match name_map.get(&normalized) {
+            Some(ids) if ids.len() == 1 => {
+                let appid = ids[0];
+                match deps
+                    .store
+                    .set_game_steam_appid_if_unclaimed(&game.id, appid, AppidSource::Title)
+                    .await
+                {
+                    Ok(dynamo::AppidWrite::Written) => mapped += 1,
+                    Ok(_) => unmapped += 1, // NotFound / Skipped / Contested — leave unmapped
+                    Err(e) => {
+                        tracing::warn!(
+                            game_id = %game.id,
+                            error = ?e,
+                            "steam appid mapping: write failed — leaving game unmapped"
+                        );
+                        unmapped += 1;
+                    }
+                }
+            }
+            _ => unmapped += 1, // No match or ambiguous (multiple Steam entries with same name)
+        }
+    }
+
+    tracing::info!(
+        "steam appid mapping: mapped={mapped} unmapped={unmapped} manual={manual_count}"
+    );
+}
+
 /// The sync walk. Runs [`reconcile`] first (parked-claim recovery against humble truth), then
 /// walks every order and upserts each key's `Game` via the guarded sync-upsert. Every exit path
 /// persists a `SyncState` — the caller holds the run marker, so this must always report.
@@ -1764,8 +1883,9 @@ async fn run_sync(deps: &Deps) {
                 // Sync walks order.keys — these all have a real redemption key already.
                 // Choice discovery (which sets this true) is a separate ingest path.
                 requires_choice: false,
-                steam_app_id: None,
-                appid_source: None,
+                // Tier-1: flow the Steam App ID from the tpk wire data directly (78% coverage).
+                steam_app_id: key.steam_app_id,
+                appid_source: key.steam_app_id.map(|_| AppidSource::Humble),
                 owned_by_ben: false,
             };
             match deps.store.upsert_game_from_sync(game).await {
@@ -1779,6 +1899,11 @@ async fn run_sync(deps: &Deps) {
             orders_failed += 1;
         }
     }
+
+    // Title-pass: map any still-unmapped steam games by unique exact name match against the Steam
+    // app list. Lazy — skips the GetAppList fetch if no unmapped games exist. 429/network errors
+    // are logged and swallowed; the pass is best-effort and never blocks sync.
+    map_missing_appids(deps).await;
 
     // Choice-discovery ingest — surface each still-claimable OFFERED game as a `requires_choice=true`
     // catalog entry, so the gift-choice orchestration has something to run on. Runs LAST (after the

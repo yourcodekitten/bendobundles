@@ -29,6 +29,20 @@ pub enum SyncWrite {
     Unchanged,
 }
 
+/// Outcome of a guarded steam-appid write. The ONLY safe way to write `steam_app_id` /
+/// `appid_source` from the title-match or tier-1 mapper paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppidWrite {
+    /// Appid pair was written.
+    Written,
+    /// No game with that ID exists.
+    NotFound,
+    /// The game's current `appid_source` is `Manual` — the admin override is protected.
+    Skipped,
+    /// A concurrent claim holds the game `Pending` — caller should skip, not retry.
+    Contested,
+}
+
 /// Outcome of a guarded hidden-flag write. The ONLY safe way to toggle `hidden` on a game.
 /// Closes the admin-toggle vs claim race that an unguarded `put_game` would lose.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1195,6 +1209,66 @@ impl Store {
             Err(sdk_err) => {
                 if is_ccf_put(&sdk_err) {
                     Ok(HiddenWrite::Contested)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
+    /// Guarded appid write: the ONLY correct writer for the steam appid mapper. Guards against
+    /// clobbering a `Manual` admin override and against racing a concurrent claim.
+    ///
+    /// Returns `AppidWrite::Skipped` when the stored `appid_source` is `Manual` — the admin
+    /// override is never overwritten by a mapper pass. Returns `AppidWrite::Contested` when the
+    /// game is `Pending` (a claim is in flight). Uses the same optimistic-lock-on-status pattern
+    /// as `set_game_hidden` to close the read→write race.
+    pub async fn set_game_steam_appid_if_unclaimed(
+        &self,
+        game_id: &str,
+        appid: u32,
+        source: domain::AppidSource,
+    ) -> Result<AppidWrite, StoreError> {
+        let Some(mut game) = self.get_game(game_id).await? else {
+            return Ok(AppidWrite::NotFound);
+        };
+
+        // Manual guard — admin override is untouchable.
+        if game.appid_source == Some(domain::AppidSource::Manual) {
+            return Ok(AppidWrite::Skipped);
+        }
+
+        // Pending means a claim is actively in flight.
+        if game.status == GameStatus::Pending {
+            return Ok(AppidWrite::Contested);
+        }
+
+        game.steam_app_id = Some(appid);
+        game.appid_source = Some(source);
+
+        // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
+        let status_str = serde_json::to_value(game.status)
+            .expect("status serializes")
+            .as_str()
+            .expect("status is a string")
+            .to_string();
+
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":expected", schema::s(status_str))
+            .condition_expression("#st = :expected")
+            .send()
+            .await;
+
+        match res {
+            Ok(_) => Ok(AppidWrite::Written),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(AppidWrite::Contested)
                 } else {
                     Err(StoreError::Aws(format!("{sdk_err:?}")))
                 }

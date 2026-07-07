@@ -1,8 +1,8 @@
 use aws_sdk_dynamodb::types::AttributeValue;
-use domain::{Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
+use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
-    ClaimTxError, HiddenWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin, SyncState, SyncWrite,
-    sync_run_is_live,
+    AppidWrite, ClaimTxError, HiddenWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin, SyncState,
+    SyncWrite, sync_run_is_live,
 };
 use std::collections::HashMap;
 use time::macros::datetime;
@@ -1065,4 +1065,101 @@ async fn compensate_self_claim_succeeds_with_no_link_meta_item() {
     let game = store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Available);
     assert_eq!(game.claim_id, None);
+}
+
+// =================================================================================================
+// TASK 6: set_game_steam_appid_if_unclaimed — guarded appid writer.
+// =================================================================================================
+
+/// Basic: seed a game with no appid, write an appid → Written, re-read confirms the pair.
+/// Manual guard: seed a game with Manual source, write → Skipped, pair unchanged.
+/// NotFound: unknown id → NotFound.
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_basic() {
+    let Some(store) = store_or_skip("set-steam-appid-basic").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Write appid → Written.
+    let result = store
+        .set_game_steam_appid_if_unclaimed(&gid, 570, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Written),
+        "set_game_steam_appid_if_unclaimed on available unclaimed game must be Written"
+    );
+
+    // Re-read: appid pair must be set.
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(got.steam_app_id, Some(570));
+    assert_eq!(got.appid_source, Some(AppidSource::Title));
+
+    // Unknown id → NotFound.
+    let nf = store
+        .set_game_steam_appid_if_unclaimed("no-such-id", 1, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(nf, AppidWrite::NotFound),
+        "unknown game id must return NotFound"
+    );
+
+    // Manual guard: seed a game with Manual source → Skipped, pair unchanged.
+    let mut manual_game = game(2, true);
+    manual_game.steam_app_id = Some(400);
+    manual_game.appid_source = Some(AppidSource::Manual);
+    let manual_gid = manual_game.id.clone();
+    store.put_game(&manual_game).await.unwrap();
+    let skipped = store
+        .set_game_steam_appid_if_unclaimed(&manual_gid, 9999, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(skipped, AppidWrite::Skipped),
+        "Manual-sourced game must return Skipped, got {skipped:?}"
+    );
+    let after = store.get_game(&manual_gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.steam_app_id,
+        Some(400),
+        "Manual appid must be unchanged"
+    );
+    assert_eq!(after.appid_source, Some(AppidSource::Manual));
+}
+
+/// Contested: a Pending game (mid-claim) → early Contested without touching the item.
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_contested() {
+    let Some(store) = store_or_skip("set-steam-appid-contested").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    let lnk = link("tok-appid-contested");
+    store.create_link(&lnk).await.unwrap();
+    let now = datetime!(2026-07-06 12:00 UTC);
+    store
+        .claim_game("tok-appid-contested", &gid, "c-appid", now)
+        .await
+        .unwrap();
+
+    let result = store
+        .set_game_steam_appid_if_unclaimed(&gid, 570, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Contested),
+        "Pending game must return Contested, got {result:?}"
+    );
+    // appid must not have been written.
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.steam_app_id, None,
+        "Contested game appid must be unchanged"
+    );
 }
