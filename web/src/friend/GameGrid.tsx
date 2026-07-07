@@ -44,10 +44,19 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
                 className="w-full aspect-video object-cover"
               />
             ) : (
-              <div
-                className={`w-full aspect-video ${titleColorClass(game.title)}`}
-                aria-hidden="true"
-              />
+              <div className={`w-full aspect-video ${titleColorClass(game.title)}`}>
+                {game.steam_app_id !== null && (
+                  <img
+                    src={`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${game.steam_app_id}/capsule_616x353.jpg`}
+                    alt={game.title}
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                    onError={(e) => {
+                      e.currentTarget.style.display = 'none';
+                    }}
+                  />
+                )}
+              </div>
             )}
             <div className="p-4">
               <h3 className="text-xl font-medium leading-tight">{game.title}</h3>

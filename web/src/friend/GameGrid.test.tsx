@@ -84,4 +84,25 @@ describe('GameGrid', () => {
     render(<GameGrid games={games} onDetail={vi.fn()} />);
     expect(screen.queryByRole('img')).not.toBeInTheDocument();
   });
+
+  it('renders the steam capsule over the hash underlay when artwork_url is null but steam_app_id is set', () => {
+    const games = [makeGame({ id: '1', title: 'Game', artwork_url: null, steam_app_id: 620 })];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    const img = screen.getByRole('img', { name: /game/i });
+    expect(img).toHaveAttribute(
+      'src',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/620/capsule_616x353.jpg',
+    );
+  });
+
+  it('humble artwork_url wins over the steam capsule when both exist', () => {
+    const games = [
+      makeGame({ id: '1', title: 'Game', artwork_url: 'https://example.com/art.jpg', steam_app_id: 620 }),
+    ];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.getByRole('img', { name: /game/i })).toHaveAttribute(
+      'src',
+      'https://example.com/art.jpg',
+    );
+  });
 });
