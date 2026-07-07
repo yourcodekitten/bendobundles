@@ -3847,3 +3847,193 @@ async fn manual_appid_untouched_by_walk_and_title_pass() {
         "Manual appid_source must not be overwritten by the title pass"
     );
 }
+
+// =================================================================================================
+// TASK 8: refresh_ben_ownership — owned_by_ben stamping (spec M1)
+// =================================================================================================
+
+// -------------------------------------------------------------------------------------------------
+// Test 1: Successful fetch stamps intersection + unstamps disjoint.
+// Games in Ben's library → owned_by_ben=true; games NOT in his library → owned_by_ben=false.
+// Games with no steam_app_id are skipped entirely.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn refresh_ben_ownership_stamps_owned_games() {
+    let Some(store) = store_or_skip("t8-owned-games").await else {
+        return;
+    };
+
+    // game_a: appid 1001, currently NOT owned — should become owned after sync
+    let gid_a = seed_steam_game(&store, "gk-a", "mn-a", "Game A", Some(1001), None).await;
+    // game_b: appid 1002, currently owned — NOT in fetched library, should become NOT owned
+    let gid_b = seed_steam_game(&store, "gk-b", "mn-b", "Game B", Some(1002), None).await;
+    store.set_game_owned_by_ben(&gid_b, true).await.unwrap();
+    // game_c: no appid — untouched regardless of library contents
+    let gid_c = seed_steam_game(&store, "gk-c", "mn-c", "Game C", None, None).await;
+
+    // Plant Ben's Steam identity
+    store.put_steam_identity("76561198000000001").await.unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let steam_mock = MockServer::start().await;
+    // Ben owns appid 1001 only; appid 1002 is not in his library.
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": {
+                "game_count": 1,
+                "games": [{ "appid": 1001 }]
+            }
+        })))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let game_a = d.store.get_game(&gid_a).await.unwrap().unwrap();
+    assert!(
+        game_a.owned_by_ben,
+        "game_a (appid 1001, in library) must be stamped owned_by_ben=true"
+    );
+
+    let game_b = d.store.get_game(&gid_b).await.unwrap().unwrap();
+    assert!(
+        !game_b.owned_by_ben,
+        "game_b (appid 1002, NOT in library) must be unstamped to owned_by_ben=false"
+    );
+
+    let game_c = d.store.get_game(&gid_c).await.unwrap().unwrap();
+    assert!(
+        !game_c.owned_by_ben,
+        "game_c (no appid) must remain owned_by_ben=false — no stamp written"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 2: Private response keeps stamps frozen + logs + pings.
+// When Ben's library privacy blocks the fetch, existing stamps must be preserved and Ben gets
+// a single Discord ping (because a prior successful run is signalled by a STEAMOWN entry).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn refresh_ben_ownership_private_keeps_stamps_and_pings() {
+    let Some(store) = store_or_skip("t8-private").await else {
+        return;
+    };
+
+    const STEAMID: &str = "76561198000000002";
+
+    // game with an existing owned_by_ben=true stamp — must stay true after a Private response.
+    let gid = seed_steam_game(&store, "gk-p", "mn-p", "Owned Game", Some(9999), None).await;
+    store.set_game_owned_by_ben(&gid, true).await.unwrap();
+
+    store.put_steam_identity(STEAMID).await.unwrap();
+
+    // Seed STEAMOWN to simulate a prior successful fetch — the ping dedupe fires on its presence.
+    store
+        .put_steam_owned(
+            STEAMID,
+            &[9999],
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let steam_mock = MockServer::start().await;
+    // Private: response object with no game_count field.
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": {}
+        })))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), Some(discord.uri()));
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    // Stamp must be frozen — not cleared.
+    let game = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        game.owned_by_ben,
+        "Private response must NOT clear owned_by_ben stamps — they stay frozen"
+    );
+
+    // Exactly one ping must have been sent (dedupe via STEAMOWN presence).
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(
+        pings.len(),
+        1,
+        "exactly one ping must be sent on Private when a prior success exists"
+    );
+    let body = String::from_utf8(pings[0].body.clone()).unwrap();
+    assert!(
+        body.contains("privacy") || body.contains("owned badges"),
+        "ping body must mention privacy / owned badges"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 3: Transient error keeps stamps + no ping.
+// A non-2xx response from GetOwnedGames is a transient failure — stamps stay frozen and NO ping
+// is sent (it's not actionable by Ben, so don't noise the channel).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn refresh_ben_ownership_transient_error_keeps_stamps_no_ping() {
+    let Some(store) = store_or_skip("t8-error").await else {
+        return;
+    };
+
+    const STEAMID: &str = "76561198000000003";
+
+    // game with an existing owned_by_ben=true stamp — must stay true after an error response.
+    let gid = seed_steam_game(&store, "gk-e", "mn-e", "Error Game", Some(7777), None).await;
+    store.set_game_owned_by_ben(&gid, true).await.unwrap();
+
+    store.put_steam_identity(STEAMID).await.unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let steam_mock = MockServer::start().await;
+    // Transient 500 from GetOwnedGames.
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), Some(discord.uri()));
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    // Stamp must be frozen.
+    let game = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        game.owned_by_ben,
+        "transient error must NOT clear owned_by_ben stamps — they stay frozen"
+    );
+
+    // No pings must have been sent on a transient error.
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(pings.len(), 0, "no ping must be sent on a transient error");
+}

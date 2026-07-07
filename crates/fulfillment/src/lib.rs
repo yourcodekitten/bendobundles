@@ -10,7 +10,7 @@
 //! silently rot.
 
 use domain::{AppidSource, Claim, Game, GameStatus};
-use dynamo::{Store, StoreError, SyncBegin, SyncState, SyncWrite};
+use dynamo::{OwnedWrite, Store, StoreError, SyncBegin, SyncState, SyncWrite};
 use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order, RevealedKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1665,6 +1665,143 @@ where
     }
 }
 
+/// Ownership pass: stamp `owned_by_ben` on every game that has a `steam_app_id`, using Ben's
+/// Steam library fetched via the Web API.
+///
+/// Called once per sync, AFTER `map_missing_appids` (which writes tier-1 and title-pass appids),
+/// so the appid coverage is as complete as possible before we diff ownership.
+///
+/// ## Behavior (spec §3, M1)
+///
+/// - **Identity absent** → skip silently. Ben hasn't connected Steam yet.
+/// - **`Ok(Games)`** → `put_steam_owned` (refresh the 7-day cache) + diff-stamp: read the game
+///   list ONCE, write `set_game_owned_by_ben` only for games whose `owned_by_ben` value CHANGED.
+///   Games with no `steam_app_id` are skipped (nothing to compare against).
+/// - **`Ok(Private)`** → keep stamps frozen (no writes). Log at INFO. Ping Ben ONCE with a clear
+///   message so he knows why badges stopped updating.
+///
+///   **Ping dedupe:** ping only when the STEAMOWN cache entry for Ben's steamid is already
+///   present — that entry is written only on a successful `Ok(Games)` response, so its presence
+///   means "the last successful fetch returned data" and its absence means "there's never been a
+///   good fetch, so Private is not a new condition". A `Private` response does NOT touch the
+///   STEAMOWN entry, so the dedupe naturally resets when a successful fetch next overwrites it.
+///
+/// - **`Err(_)`** → keep stamps frozen, log at WARN. No ping — a transient error is not
+///   actionable by Ben and should not noise the channel.
+///
+/// ## Disconnect / frozen stamps (deliberate design)
+///
+/// When Ben's Steam identity is removed (Task 9's handler deletes `CONFIG#STEAM`), this pass
+/// skips silently on the next sync (identity absent → early return). Prior `owned_by_ben` stamps
+/// are frozen in place — they are NOT mass-cleared here. The admin UI hides the owned-badge
+/// column entirely when no Steam identity is configured (Task 11 checks identity presence), so
+/// stale frozen stamps are invisible. A fresh re-connection and the next successful
+/// `Ok(Games)` fetch will recompute and correct every stamp via the normal diff path.
+///
+/// The alternative — an HTTP-path O(catalog) mass-clear in Task 9's handler — would require
+/// iterating and conditionally writing every game on delete. That's expensive, racey, and
+/// unnecessary given the UI hides the column anyway. Keeping it here keeps the logic in one place.
+async fn refresh_ben_ownership(deps: &Deps) {
+    // No Steam client → skip. Configured by the app at startup; if absent the whole Steam
+    // feature is disabled and no identity can be fetched.
+    let Some(steam) = deps.steam.as_ref() else {
+        return;
+    };
+
+    // No identity → skip silently. Ben hasn't linked his Steam account yet.
+    let steamid = match deps.store.get_steam_identity().await {
+        Ok(Some(id)) => id,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = ?e, "steam owned refresh: get_steam_identity failed — skipping");
+            return;
+        }
+    };
+
+    match steam
+        .get_owned_games(&steam_client::SteamId64(steamid.clone()))
+        .await
+    {
+        Ok(steam_client::OwnedGames::Games(appids)) => {
+            // Refresh the 7-day owned-games cache so admin-api reads don't stale-out.
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            if let Err(e) = deps.store.put_steam_owned(&steamid, &appids, now).await {
+                tracing::warn!(error = ?e, "steam owned refresh: put_steam_owned failed — continuing with in-memory appids");
+            }
+
+            // Read game list ONCE; diff-stamp only changed values.
+            let games = match deps.store.list_all_games().await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "steam owned refresh: list_all_games failed — skipping stamps");
+                    return;
+                }
+            };
+
+            let appid_set: std::collections::HashSet<u32> = appids.into_iter().collect();
+            let mut stamped = 0usize;
+            let mut unstamped = 0usize;
+
+            for game in &games {
+                let Some(steam_app_id) = game.steam_app_id else {
+                    continue; // no appid — nothing to compare against
+                };
+                let owned = appid_set.contains(&steam_app_id);
+                if owned == game.owned_by_ben {
+                    continue; // no change — skip the conditional write
+                }
+                match deps.store.set_game_owned_by_ben(&game.id, owned).await {
+                    Ok(OwnedWrite::Written) => {
+                        if owned {
+                            stamped += 1;
+                        } else {
+                            unstamped += 1;
+                        }
+                    }
+                    // A claim is in flight — the claim path owns this game's state for now.
+                    // The next sync will re-diff and write once the claim lands.
+                    Ok(OwnedWrite::Contested) => {
+                        tracing::debug!(game_id = %game.id, "steam owned refresh: game in-flight claim — skipping stamp");
+                    }
+                    Ok(OwnedWrite::NotFound) => {} // game was deleted between list and stamp — safe no-op
+                    Err(e) => {
+                        tracing::warn!(game_id = %game.id, error = ?e, "steam owned refresh: set_game_owned_by_ben failed");
+                    }
+                }
+            }
+
+            tracing::info!(stamped, unstamped, "steam owned refresh: stamps updated");
+        }
+
+        Ok(steam_client::OwnedGames::Private) => {
+            // Stamps remain frozen. Do NOT touch owned_by_ben.
+            tracing::info!("steam owned refresh skipped: ben library reads private");
+
+            // Ping ONCE via the STEAMOWN-presence dedupe (see function-level doc).
+            let prev_success = deps
+                .store
+                .get_steam_owned(&steamid)
+                .await
+                .ok()
+                .and_then(|opt| opt)
+                .is_some();
+            if prev_success {
+                ping(
+                    deps,
+                    "your steam 'game details' privacy or the key's account changed \
+                     — owned badges are frozen until fixed",
+                )
+                .await;
+            }
+        }
+
+        Err(e) => {
+            // Transient error — keep stamps, log, no ping.
+            tracing::warn!(error = ?e, "steam owned refresh: get_owned_games failed — keeping prior stamps");
+        }
+    }
+}
+
 /// Lazy title-pass: for every steam-type game with no `steam_app_id` (and not `Manual` source),
 /// attempt a unique exact-title match against the Steam app list. Runs once per sync, AFTER the
 /// order walk (tier-1 tpk ids are already written) so only genuinely unmapped games are touched.
@@ -1904,6 +2041,11 @@ async fn run_sync(deps: &Deps) {
     // app list. Lazy — skips the GetAppList fetch if no unmapped games exist. 429/network errors
     // are logged and swallowed; the pass is best-effort and never blocks sync.
     map_missing_appids(deps).await;
+
+    // Ownership pass: stamp owned_by_ben on every game with a steam_app_id. Runs AFTER the
+    // mapper pass so appid coverage is as complete as possible before the diff. Failures are
+    // logged and swallowed; the pass is best-effort and never blocks sync.
+    refresh_ben_ownership(deps).await;
 
     // Choice-discovery ingest — surface each still-claimable OFFERED game as a `requires_choice=true`
     // catalog entry, so the gift-choice orchestration has something to run on. Runs LAST (after the
