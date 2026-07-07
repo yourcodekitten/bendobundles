@@ -346,11 +346,7 @@ async fn handle_steam_owned_proxy(
         Ok(Some(l)) => l,
         Ok(None) => {
             // Byte-identical to the standard unknown-link 404.
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "unknown link"})),
-            )
-                .into_response();
+            return link_not_found_response();
         }
         Err(_) => {
             return (
@@ -428,11 +424,7 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
         Ok(Some(l)) => l,
         Ok(None) => {
             // Byte-identical for ANY invalid token — no enumeration oracle.
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "unknown link"})),
-            )
-                .into_response();
+            return link_not_found_response();
         }
         Err(_) => {
             return (
@@ -531,11 +523,7 @@ async fn handle_post_claim(
     let link = match s.store.get_link(&token).await {
         Ok(Some(l)) => l,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "unknown link"})),
-            )
-                .into_response();
+            return link_not_found_response();
         }
         Err(_) => {
             return (

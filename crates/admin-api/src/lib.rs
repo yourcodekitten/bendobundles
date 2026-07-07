@@ -245,6 +245,10 @@ async fn handle_login(State(s): State<AppState>, Json(body): Json<LoginBody>) ->
 /// struct carries `gamekey`/`machine_name`/`keyindex` — the humble order-key
 /// material used to build `FulfillRequest::Gift` — which no client needs and
 /// which must not leak into browser network tabs, session-gated or not.
+/// Caveat: `id` IS the composite `"{gamekey}:{machine_name}"` (domain
+/// `game_id()`), so the gamekey still reaches the client inside the id — a
+/// documented-accepted exposure (game-detail-modal spec §4). The field
+/// exclusions above keep the order-key FIELDS off the wire, not the id.
 #[derive(serde::Serialize)]
 struct CatalogGameView {
     id: String,
