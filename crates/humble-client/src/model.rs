@@ -39,6 +39,8 @@ pub(crate) struct TpkWire {
     pub is_expired: bool,
     #[serde(default)]
     pub keyindex: u32,
+    #[serde(default)]
+    pub steam_app_id: Option<u32>,
 }
 
 #[derive(Deserialize)]
