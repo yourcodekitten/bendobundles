@@ -56,6 +56,19 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
             .expect("status is a string")
             .to_string()),
     );
+    // Top-level `appid_source` mirrors the body so the mapper's PutItem condition can guard
+    // against a concurrent admin Manual override. Only written when Some — attribute_not_exists
+    // then correctly matches unmapped/legacy items (None → no attribute, condition fires).
+    if let Some(src) = g.appid_source {
+        item.insert(
+            "appid_source".into(),
+            s(serde_json::to_value(src)
+                .expect("appid_source serializes")
+                .as_str()
+                .expect("appid_source is a string")
+                .to_string()),
+        );
+    }
     // Top-level `claim_id` mirrors the body so fulfill's flip can condition on ownership
     // (`claim_id = :cid`). Omitted when None so compensate's re-list transparently clears it.
     if let Some(cid) = &g.claim_id {

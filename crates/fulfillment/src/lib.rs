@@ -1823,13 +1823,15 @@ async fn map_missing_appids(deps: &Deps) {
         }
     };
 
-    // Normalize: lowercase + trim + strip ™/®.
+    // Normalize: lowercase + trim + strip ™/® + collapse internal whitespace.
+    // Stripping ™/® can leave a double space (e.g. "Cities: Skylines ™ II" →
+    // "cities: skylines  ii"); split_whitespace().join(" ") collapses it.
     let normalize = |s: &str| -> String {
         s.to_lowercase()
-            .trim()
             .replace(['™', '®'], "")
-            .trim()
-            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     };
 
     let manual_count = games
@@ -1866,7 +1868,14 @@ async fn map_missing_appids(deps: &Deps) {
             tracing::warn!("steam appid mapping: 429 rate limited — skipping title pass this run");
             return;
         }
-        Err(e) => {
+        Err(
+            e @ (steam_client::SteamError::Network(_)
+            | steam_client::SteamError::Api(_)
+            | steam_client::SteamError::Parse(_)
+            | steam_client::SteamError::KeyRejected
+            | steam_client::SteamError::NotFound
+            | steam_client::SteamError::OpenIdRejected(_)),
+        ) => {
             tracing::warn!(
                 error = ?e,
                 "steam appid mapping: network/api failure — skipping title pass this run"

@@ -3848,6 +3848,66 @@ async fn manual_appid_untouched_by_walk_and_title_pass() {
     );
 }
 
+// -------------------------------------------------------------------------------------------------
+// FIX 5: normalize collapses internal whitespace left by ™/® stripping.
+// "Cities: Skylines ™ II" → after strip becomes "cities: skylines  ii" (double space),
+// which never matched "cities: skylines ii". Fix: split_whitespace().join(" ").
+// RED: before the fix, the catalog title with embedded ™ fails to match the Steam app name.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn title_pass_maps_title_with_trademark_symbol() {
+    let Some(store) = store_or_skip("t6-trademark-normalize").await else {
+        return;
+    };
+
+    // Catalog title contains ™ with surrounding spaces (as Humble often formats it).
+    seed_steam_game(
+        &store,
+        "gk-tm",
+        "mn-tm",
+        "Cities: Skylines ™ II",
+        None,
+        None,
+    )
+    .await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let steam_mock = MockServer::start().await;
+    // Steam app list has the same title WITHOUT the ™.
+    Mock::given(method("GET"))
+        .and(path("/ISteamApps/GetAppList/v2/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "applist": { "apps": [
+                { "appid": 5555, "name": "Cities: Skylines II" }
+            ]}
+        })))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let tm_game = d
+        .store
+        .get_game(&game_id("gk-tm", "mn-tm"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tm_game.steam_app_id,
+        Some(5555),
+        "title with ™ must match after internal whitespace collapse — FIX 5"
+    );
+    assert_eq!(
+        tm_game.appid_source,
+        Some(AppidSource::Title),
+        "appid_source must be Title for the trademark-normalized match"
+    );
+}
+
 // =================================================================================================
 // TASK 8: refresh_ben_ownership — owned_by_ben stamping (spec M1)
 // =================================================================================================

@@ -216,6 +216,12 @@ async fn handle_steam_login(
         return redirect_to("/");
     }
 
+    // Guard: steam must be configured. If not, redirect back to ctx with an error fragment
+    // so the SPA can show a polite message instead of a dead-end 503 on return.
+    if s.steam.is_none() {
+        return redirect_to(&format!("{ctx}#steam_error=steam_unreachable"));
+    }
+
     let return_to = build_return_to(&s.base_url, &ctx);
     let redirect_url = steam_client::steam_openid_redirect_url(&s.base_url, &return_to);
 
@@ -276,7 +282,14 @@ async fn handle_steam_return(
         Err(steam_client::SteamError::OpenIdRejected(_)) => {
             return redirect_to(&format!("{ctx}#steam_error=verify_failed"));
         }
-        Err(_) => {
+        Err(
+            steam_client::SteamError::Network(_)
+            | steam_client::SteamError::Api(_)
+            | steam_client::SteamError::RateLimited
+            | steam_client::SteamError::KeyRejected
+            | steam_client::SteamError::NotFound
+            | steam_client::SteamError::Parse(_),
+        ) => {
             // Network, API, or other Steam unreachability.
             return redirect_to(&format!("{ctx}#steam_error=steam_unreachable"));
         }
@@ -286,7 +299,15 @@ async fn handle_steam_return(
     // steamids/personas are not secrets; do NOT log persona free-text at info level.
     let persona = match steam.get_player_summary(&steamid).await {
         Ok(p) => p.name,
-        Err(_) => String::new(),
+        Err(
+            steam_client::SteamError::Network(_)
+            | steam_client::SteamError::Api(_)
+            | steam_client::SteamError::RateLimited
+            | steam_client::SteamError::KeyRejected
+            | steam_client::SteamError::NotFound
+            | steam_client::SteamError::Parse(_)
+            | steam_client::SteamError::OpenIdRejected(_),
+        ) => String::new(),
     };
 
     // No key material in Location.
@@ -387,7 +408,15 @@ async fn handle_steam_owned_proxy(
         Ok(OwnedGames::Private) => {
             (StatusCode::OK, Json(serde_json::json!({"private": true}))).into_response()
         }
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(
+            steam_client::SteamError::Network(_)
+            | steam_client::SteamError::Api(_)
+            | steam_client::SteamError::RateLimited
+            | steam_client::SteamError::KeyRejected
+            | steam_client::SteamError::NotFound
+            | steam_client::SteamError::Parse(_)
+            | steam_client::SteamError::OpenIdRejected(_),
+        ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 

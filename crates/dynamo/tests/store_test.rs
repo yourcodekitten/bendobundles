@@ -1242,6 +1242,186 @@ async fn set_game_steam_appid_if_unclaimed_title_source_still_written() {
     assert_eq!(after.appid_source, Some(AppidSource::Title));
 }
 
+// -------------------------------------------------------------------------------------------------
+// FIX 1 new tests: DDB-condition race guard + top-level appid_source attribute.
+// -------------------------------------------------------------------------------------------------
+
+/// FIX 1 — race guard via admin path: after `set_game_steam_appid_admin(..Some(appid))` stamps
+/// appid_source=Manual at the DDB level, a subsequent `set_game_steam_appid_if_unclaimed` MUST
+/// return Skipped and the stored appid must be unchanged. Before FIX 1 the DDB condition used
+/// "Manual" (PascalCase) which never matched the snake_case serialized "manual", so the condition
+/// was dead; only the in-memory guard in `set_game_steam_appid_if_unclaimed` caught it.
+/// After FIX 1, both the in-memory guard AND the DDB condition use "manual".
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_after_admin_set_returns_skipped() {
+    let Some(store) = store_or_skip("appid-admin-then-unclaimed").await else {
+        return;
+    };
+
+    // Start with no appid — mapper can write.
+    let mut g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Admin sets appid + Manual source.
+    let result = store
+        .set_game_steam_appid_admin(&gid, Some(77777))
+        .await
+        .unwrap();
+    assert!(matches!(result, AppidWrite::Written));
+
+    // Verify admin stamp is in DDB.
+    let after_admin = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(after_admin.steam_app_id, Some(77777));
+    assert_eq!(after_admin.appid_source, Some(AppidSource::Manual));
+
+    // Mapper attempt — in-memory guard fires on the read, OR DDB condition fires on the write.
+    // Either way, must return Skipped and not clobber the admin appid.
+    let skipped = store
+        .set_game_steam_appid_if_unclaimed(&gid, 99999, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(skipped, AppidWrite::Skipped),
+        "after admin set Manual, if_unclaimed must return Skipped, got {skipped:?}"
+    );
+
+    // Stored appid must be unchanged.
+    let final_game = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        final_game.steam_app_id,
+        Some(77777),
+        "admin appid must not be clobbered by mapper"
+    );
+    assert_eq!(
+        final_game.appid_source,
+        Some(AppidSource::Manual),
+        "appid_source must remain Manual"
+    );
+
+    // ── Manual-set game with stale in-memory view ──────────────────────────────
+    // Re-use the game: craft a stale copy where appid_source reads as None
+    // (simulates the mapper reading before the admin write landed). Then call
+    // set_game_steam_appid_if_unclaimed *on the same game id* — the function
+    // will re-read from DDB internally and the in-memory guard will also see Manual.
+    // This confirms the guard path is exercised regardless of the caller's stale
+    // in-memory view. The DDB condition is the safety net for the true race.
+    g.appid_source = None; // simulate stale read
+    g.steam_app_id = None;
+    // We do NOT write g back to DDB — the DDB item still has Manual.
+    let skipped2 = store
+        .set_game_steam_appid_if_unclaimed(&gid, 55555, AppidSource::Humble)
+        .await
+        .unwrap();
+    assert!(
+        matches!(skipped2, AppidWrite::Skipped),
+        "stale-view attempt must still be Skipped, got {skipped2:?}"
+    );
+    let still_77777 = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(still_77777.steam_app_id, Some(77777));
+}
+
+/// FIX 1 — top-level attribute: after `put_game` with `appid_source = Some(Manual)`,
+/// the raw DDB item MUST contain a top-level `appid_source` attribute with value "manual".
+/// RED before the schema change (appid_source was only inside the `body` JSON blob).
+#[tokio::test]
+async fn appid_source_is_top_level_attribute() {
+    let Some(store) = store_or_skip("appid-toplevel-attr").await else {
+        return;
+    };
+    let client = raw_client("appid-toplevel-attr").await;
+    let table = "t-appid-toplevel-attr";
+
+    // Put a game with Manual appid_source.
+    let mut g = game(1, true);
+    g.steam_app_id = Some(12345);
+    g.appid_source = Some(AppidSource::Manual);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Fetch the raw DDB item — NOT via the store API (which only reads body).
+    let pk = format!("GAME#{gid}");
+    let raw = client
+        .get_item()
+        .table_name(table)
+        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(pk))
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("item must exist");
+
+    // Top-level `appid_source` must be present with value "manual" (snake_case).
+    let top_level_src = raw
+        .get("appid_source")
+        .expect("appid_source must be a top-level DDB attribute after FIX 1")
+        .as_s()
+        .expect("appid_source must be a String AttributeValue");
+    assert_eq!(
+        top_level_src, "manual",
+        "top-level appid_source must be \"manual\" (snake_case), got \"{top_level_src}\""
+    );
+
+    // Top-level `appid_source` must also be present for Title.
+    let mut g2 = game(2, true);
+    g2.steam_app_id = Some(9001);
+    g2.appid_source = Some(AppidSource::Title);
+    let gid2 = g2.id.clone();
+    store.put_game(&g2).await.unwrap();
+
+    let pk2 = format!("GAME#{gid2}");
+    let raw2 = client
+        .get_item()
+        .table_name(table)
+        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(pk2))
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("item must exist");
+
+    let top_level_src2 = raw2
+        .get("appid_source")
+        .expect("appid_source must be top-level for Title source too")
+        .as_s()
+        .expect("appid_source must be a String AttributeValue");
+    assert_eq!(top_level_src2, "title");
+
+    // When appid_source is None, the attribute must be ABSENT (so attribute_not_exists fires).
+    let mut g3 = game(3, true);
+    g3.appid_source = None;
+    let gid3 = g3.id.clone();
+    store.put_game(&g3).await.unwrap();
+
+    let pk3 = format!("GAME#{gid3}");
+    let raw3 = client
+        .get_item()
+        .table_name(table)
+        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(pk3))
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("item must exist");
+
+    assert!(
+        !raw3.contains_key("appid_source"),
+        "appid_source must NOT be present at top level when game.appid_source is None"
+    );
+}
+
 // =================================================================================================
 // TASK 7: CONFIG#STEAM identity, STEAMOWN 7d-ttl cache, guarded owned_by_ben stamp.
 // =================================================================================================

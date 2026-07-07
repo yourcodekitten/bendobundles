@@ -1210,6 +1210,43 @@ async fn steam_return_admin_ops_ctx_valid_assertion() {
     );
 }
 
+/// FIX 6: handle_steam_login with steam=None must redirect to `{ctx}#steam_error=steam_unreachable`
+/// instead of forwarding to Steam and then returning a 503.
+/// RED: before FIX 6, handle_steam_login redirected to steamcommunity.com even with steam=None.
+#[tokio::test]
+async fn steam_login_unconfigured_redirects_to_steam_unreachable_fragment() {
+    let Some(store) = store_or_skip("steam-login-none").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    // plain_router has steam=None
+    let app = plain_router(Arc::clone(&store), mock);
+
+    // Use a valid ctx so the ctx allowlist check passes.
+    let ctx = "/l/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/steam/login?ctx={}", urlencoding::encode(ctx)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.contains("#steam_error=steam_unreachable"),
+        "unconfigured steam must redirect to ctx#steam_error=steam_unreachable; got: {loc}"
+    );
+    assert!(
+        !loc.contains("steamcommunity.com"),
+        "must NOT redirect to Steam when steam client is None; got: {loc}"
+    );
+}
+
 /// C1-REJECT: admin subroute rejections — the widening must not enable open redirect.
 /// `/admin//evil`, `/admin/ops/x`, `/admin/Ops`, `/admin/ops2`, `/admin/../etc` all → /.
 #[tokio::test]

@@ -1286,7 +1286,7 @@ impl Store {
             .expression_attribute_names("#st", "status")
             .expression_attribute_names("#asrc", "appid_source")
             .expression_attribute_values(":expected", schema::s(status_str))
-            .expression_attribute_values(":manual", schema::s("Manual".to_string()))
+            .expression_attribute_values(":manual", schema::s("manual".to_string()))
             .condition_expression(
                 "#st = :expected AND (attribute_not_exists(#asrc) OR #asrc <> :manual)",
             )

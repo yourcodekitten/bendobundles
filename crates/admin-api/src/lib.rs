@@ -837,6 +837,14 @@ async fn handle_steam_owned_proxy(
             // Do NOT overwrite a previous good cache — return private signal only.
             (StatusCode::OK, Json(serde_json::json!({"private": true}))).into_response()
         }
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(
+            steam_client::SteamError::Network(_)
+            | steam_client::SteamError::Api(_)
+            | steam_client::SteamError::RateLimited
+            | steam_client::SteamError::KeyRejected
+            | steam_client::SteamError::NotFound
+            | steam_client::SteamError::Parse(_)
+            | steam_client::SteamError::OpenIdRejected(_),
+        ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
