@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { fetchLink, steamOwnedForLink, NotFound, type GameView, type LinkView } from '../api';
+import { fetchLink, fetchGameDetail, steamOwnedForLink, NotFound, type GameView, type LinkView } from '../api';
 import {
   consumeReturnFragment,
   loadIdentity,
@@ -12,6 +12,7 @@ import {
 import { ClaimDialog } from './ClaimDialog';
 import { ClaimsHistory } from './ClaimsHistory';
 import { GameGrid } from './GameGrid';
+import { GameDetailModal } from '../GameDetailModal';
 
 type ViewState =
   | { kind: 'loading' }
@@ -23,6 +24,7 @@ export function LinkPage() {
   const { token } = useParams<{ token: string }>();
   const [view, setView] = useState<ViewState>({ kind: 'loading' });
   const [claimingGame, setClaimingGame] = useState<GameView | null>(null);
+  const [detailGame, setDetailGame] = useState<GameView | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const prevTokenRef = useRef<string | undefined>(undefined);
 
@@ -237,10 +239,26 @@ export function LinkPage() {
           active={data.state === 'active'}
           onClaim={setClaimingGame}
           owned={ownedSet}
+          onDetail={setDetailGame}
         />
       )}
 
       <ClaimsHistory claims={data.claims} />
+
+      {detailGame !== null && token !== undefined && (
+        <GameDetailModal
+          mount="friend"
+          token={token}
+          game={detailGame}
+          active={data.state === 'active'}
+          loadDetail={(gameId) => fetchGameDetail(token, gameId)}
+          onClaim={(g) => {
+            setDetailGame(null);
+            setClaimingGame(g);
+          }}
+          onClose={() => setDetailGame(null)}
+        />
+      )}
 
       {claimingGame !== null && token !== undefined && (
         <ClaimDialog

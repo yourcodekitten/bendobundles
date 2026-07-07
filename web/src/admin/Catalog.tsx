@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   adminCatalog,
+  adminGameDetail,
   adminSetHidden,
   adminSelfClaim,
   adminSelfClaims,
@@ -12,6 +13,7 @@ import {
 } from '../api';
 import { withAuth } from './withAuth';
 import { titleColorClass } from '../titleColor';
+import { GameDetailModal } from '../GameDetailModal';
 
 // Status badge — exact color mapping from plan (snake_case serde values)
 //   available=green, pending=amber, gifted=violet, ben_redeemed=slate, expired=red
@@ -55,6 +57,9 @@ export function Catalog() {
 
   // Admin steam identity — controls owned_by_ben badge visibility (frozen-stamps caveat)
   const [adminSteamId, setAdminSteamId] = useState<string | null>(null);
+
+  // Detail modal — opens on row click
+  const [detailGame, setDetailGame] = useState<AdminGame | null>(null);
 
   const load = useCallback(() => {
     setState({ phase: 'loading' });
@@ -206,7 +211,10 @@ export function Catalog() {
           const r = rowResult;
           return (
             <div key={game.id} className="space-y-1">
-              <div className="flex flex-wrap items-center gap-3 rounded bg-zinc-900 px-4 py-3">
+              <div
+                className="flex flex-wrap items-center gap-3 rounded bg-zinc-900 px-4 py-3 cursor-pointer"
+                onClick={() => setDetailGame(game)}
+              >
                 {/* Artwork thumbnail — colored fallback when url absent */}
                 {game.artwork_url !== null ? (
                   <img
@@ -258,7 +266,7 @@ export function Catalog() {
                   <button
                     type="button"
                     disabled={isClaiming}
-                    onClick={() => void handleSelfClaim(game)}
+                    onClick={(e) => { e.stopPropagation(); void handleSelfClaim(game); }}
                     className={`rounded px-3 py-1 text-xs ${
                       isArmed
                         ? 'bg-emerald-700 text-emerald-100 hover:bg-emerald-600'
@@ -279,8 +287,11 @@ export function Catalog() {
                   </button>
                 )}
 
-                {/* Hidden toggle switch */}
-                <label className="flex cursor-pointer items-center gap-1.5">
+                {/* Hidden toggle switch — stopPropagation prevents row click from opening modal */}
+                <label
+                  className="flex cursor-pointer items-center gap-1.5"
+                  onClick={(e) => e.stopPropagation()}
+                >
                   <input
                     type="checkbox"
                     role="switch"
@@ -356,6 +367,21 @@ export function Catalog() {
           );
         })}
       </div>
+
+      {/* Game detail modal — opens on row click */}
+      {detailGame !== null && (
+        <GameDetailModal
+          mount="admin"
+          game={detailGame}
+          loadDetail={(gameId) => withAuth(() => adminGameDetail(gameId), navigate)}
+          onClose={() => setDetailGame(null)}
+          armedId={armedId}
+          claiming={claiming}
+          onSelfClaim={(g) => void handleSelfClaim(g)}
+          adminSteamId={adminSteamId}
+          selfClaimResult={result}
+        />
+      )}
 
       {/* Self-claims section */}
       {selfClaims.length > 0 && (

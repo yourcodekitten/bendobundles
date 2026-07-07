@@ -7,9 +7,11 @@ interface GameGridProps {
   onClaim: (game: GameView) => void;
   /** Set of Steam appids the viewer already owns — shows "you own this" pill. */
   owned?: Set<number>;
+  /** When provided, clicking the card body (not the claim button) opens the detail modal. */
+  onDetail?: (game: GameView) => void;
 }
 
-export function GameGrid({ games, active, onClaim, owned }: GameGridProps) {
+export function GameGrid({ games, active, onClaim, owned, onDetail }: GameGridProps) {
   // Group by title; preserve server order — first occurrence wins the card
   const seen = new Map<string, { game: GameView; count: number }>();
   for (const game of games) {
@@ -30,7 +32,11 @@ export function GameGrid({ games, active, onClaim, owned }: GameGridProps) {
           owned.has(game.steam_app_id);
 
         return (
-          <div key={game.title} className="rounded-lg bg-zinc-900 overflow-hidden">
+          <div
+            key={game.title}
+            className={`rounded-lg bg-zinc-900 overflow-hidden${onDetail !== undefined ? ' cursor-pointer' : ''}`}
+            onClick={() => onDetail?.(game)}
+          >
             {game.artwork_url !== null ? (
               <img
                 src={game.artwork_url}
@@ -64,7 +70,7 @@ export function GameGrid({ games, active, onClaim, owned }: GameGridProps) {
               <button
                 type="button"
                 disabled={!active}
-                onClick={() => onClaim(game)}
+                onClick={(e) => { e.stopPropagation(); onClaim(game); }}
                 className="mt-3 w-full rounded bg-violet-700 px-3 py-1.5 text-sm font-medium hover:bg-violet-600 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 claim

@@ -535,3 +535,167 @@ fn redirect_url_encodes_special_chars() {
         "/ in return_to must be encoded as %2F; got: {url}"
     );
 }
+
+// ── Storefront reads: get_app_details, get_review_summary, get_recent_reviews ───────────────
+
+const APPDETAILS_FIXTURE: &str = include_str!("fixtures/appdetails-413150-trimmed.json");
+const APPREVIEWS_FIXTURE: &str = include_str!("fixtures/appreviews-overall-413150.json");
+const APPREVIEWHISTOGRAM_FIXTURE: &str = include_str!("fixtures/appreviewhistogram-413150.json");
+
+// ── get_app_details ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn app_details_found_parses_fields() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(APPDETAILS_FIXTURE))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert_eq!(detail.app_id, 413150);
+    assert_eq!(detail.developers, vec!["ConcernedApe".to_string()]);
+    assert_eq!(detail.release_date, Some("Feb 26, 2016".to_string()));
+    assert!(
+        detail.genres.contains(&"RPG".to_string()),
+        "genres must contain RPG; got {:?}",
+        detail.genres
+    );
+    let hls = detail.video_hls_url.expect("video_hls_url must be Some");
+    assert!(
+        hls.ends_with("hls_264_master.m3u8?t=1754692862"),
+        "hls url must end with hls_264_master.m3u8?t=1754692862; got: {hls}"
+    );
+}
+
+#[tokio::test]
+async fn app_details_delisted_is_success_false() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_string(r#"{"413150":{"success":false}}"#),
+        )
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    assert!(
+        matches!(result, steam_client::AppDetails::Delisted),
+        "expected Delisted; got Found"
+    );
+}
+
+#[tokio::test]
+async fn app_details_rate_limited() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .respond_with(wiremock::ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    let out = test_client(&server).get_app_details(413150).await;
+    assert!(
+        matches!(out, Err(steam_client::SteamError::RateLimited)),
+        "expected RateLimited; got {out:?}"
+    );
+}
+
+// ── get_review_summary ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn review_summary_parses_overall() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/appreviews/413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(APPREVIEWS_FIXTURE))
+        .mount(&server)
+        .await;
+    let summary = test_client(&server)
+        .get_review_summary(413150)
+        .await
+        .unwrap();
+    assert_eq!(summary.desc, "Overwhelmingly Positive");
+    assert_eq!(summary.total_reviews, 460881);
+}
+
+#[tokio::test]
+async fn review_summary_rate_limited() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/appreviews/413150"))
+        .respond_with(wiremock::ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    let out = test_client(&server).get_review_summary(413150).await;
+    assert!(
+        matches!(out, Err(steam_client::SteamError::RateLimited)),
+        "expected RateLimited; got {out:?}"
+    );
+}
+
+// ── get_recent_reviews ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recent_reviews_histogram_derived() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/appreviewhistogram/413150"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_string(APPREVIEWHISTOGRAM_FIXTURE),
+        )
+        .mount(&server)
+        .await;
+    let recent = test_client(&server)
+        .get_recent_reviews(413150)
+        .await
+        .unwrap();
+    assert_eq!(recent.percent_positive, 98);
+    assert_eq!(recent.count, 9200);
+}
+
+#[tokio::test]
+async fn recent_reviews_rate_limited() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/appreviewhistogram/413150"))
+        .respond_with(wiremock::ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    let out = test_client(&server).get_recent_reviews(413150).await;
+    assert!(
+        matches!(out, Err(steam_client::SteamError::RateLimited)),
+        "expected RateLimited; got {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn recent_reviews_percent_rounds_not_floors() {
+    // Spec pin: percent = round(100*up/(up+down)), not floor.
+    // Case: up=2, down=1 → 2/3=66.667% → rounds to 67, floors to 66.
+    // Verifies the fix: uses (100*up + total/2) / total integer math.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/appreviewhistogram/413150"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_string(
+                r#"{"success":1,"results":{"recent":[{"recommendations_up":2,"recommendations_down":1}]}}"#,
+            ),
+        )
+        .mount(&server)
+        .await;
+    let recent = test_client(&server)
+        .get_recent_reviews(413150)
+        .await
+        .unwrap();
+    assert_eq!(
+        recent.percent_positive, 67,
+        "66.67% must round to 67, not floor to 66"
+    );
+    assert_eq!(recent.count, 3);
+}

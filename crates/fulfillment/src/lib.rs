@@ -26,6 +26,51 @@ const RECONCILE_MIN_AGE: time::Duration = time::Duration::minutes(15);
 /// stay under humble's bot-detection radar.
 const SYNC_PACE: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Politeness floor between EVERY Steam storefront call in the enrichment pass (Ben's be-nice
+/// rule). The storefront endpoints are hit ONLY inside [`enrich_steam_apps`], never at request time.
+/// This is the prod default for `Deps::steam_enrich_pace`.
+pub const STEAM_ENRICH_PACE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Per-sync cap on how many distinct appids the enrichment pass fetches. Everything past this is
+/// deferred to the next sync — logged, never silently truncated.
+const STEAM_ENRICH_MAX_APPS: usize = 75;
+
+/// The enrichment pass stops STARTING new apps once fewer than this much of the lambda budget
+/// remains, so `persist_sync` + `end_sync_run` always get to land after it.
+const STEAM_ENRICH_DEADLINE_MARGIN: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The fulfillment lambda's hard timeout — FALLBACK used by [`compute_enrich_deadline`] when no
+/// lambda context deadline is available (local runs, tests that inject zero). In the lambda env the
+/// real per-invoke remaining time is preferred; this const exists so a terraform-timeout change
+/// doesn't silently mis-budget when the context deadline is absent.
+const SYNC_LAMBDA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Compute how long from now until the enrichment deadline, given the lambda context's per-invoke
+/// deadline and the current wall-clock epoch (both in milliseconds).
+///
+/// - If `context_deadline_epoch_ms` is 0 (absent — local runs, tests), falls back to
+///   `SYNC_LAMBDA_TIMEOUT - STEAM_ENRICH_DEADLINE_MARGIN`.
+/// - Otherwise computes remaining time from the context deadline and subtracts the margin.
+///   Saturating on both steps: if the deadline is already past, or if remaining ≤ margin,
+///   returns `Duration::ZERO` (immediate deadline — skip the pass, protect bookkeeping).
+pub fn compute_enrich_deadline(
+    context_deadline_epoch_ms: u64,
+    now_epoch_ms: u64,
+) -> std::time::Duration {
+    if context_deadline_epoch_ms == 0 {
+        return SYNC_LAMBDA_TIMEOUT - STEAM_ENRICH_DEADLINE_MARGIN;
+    }
+    let remaining =
+        std::time::Duration::from_millis(context_deadline_epoch_ms.saturating_sub(now_epoch_ms));
+    remaining.saturating_sub(STEAM_ENRICH_DEADLINE_MARGIN)
+}
+
+/// appdetails refresh window (30 days) measured on `SteamAppCache::fetched_at`.
+const STEAM_DETAIL_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// reviews+histogram refresh window (14 days) measured on `SteamAppCache::reviews_fetched_at`.
+const STEAM_REVIEWS_TTL_SECS: i64 = 14 * 24 * 60 * 60;
+
 /// How many pages of the Choice-months list walk the discovery pass enumerates. The walk is
 /// ~26 pages for the full membership history (3 months/page) and self-terminates early with
 /// `complete = true` once it runs out, so this is a ceiling, not a target. It has to reach back far
@@ -311,6 +356,19 @@ pub struct Deps {
     /// Steam Web API client, used by the appid mapper pass. `None` when the Steam API key is not
     /// configured; `run_sync` skips the title-pass but still flows tier-1 tpk ids from the walk.
     pub steam: Option<Arc<steam_client::SteamClient>>,
+    /// Kill switch for the Steam enrichment pass (Ben's be-nice rule): `STEAM_ENRICH_DISABLED=1`
+    /// in the lambda env sets this `true` and [`enrich_steam_apps`] skips entirely. Read via config
+    /// here (not raw env) so tests can toggle it without touching process state.
+    pub steam_enrich_disabled: bool,
+    /// Politeness floor between EVERY Steam storefront call in the enrichment pass. Prod uses
+    /// [`STEAM_ENRICH_PACE`] (1.5s); tests inject `Duration::ZERO` so the paced pass runs instantly
+    /// against real wiremock I/O (a virtual/paused clock would auto-advance into reqwest's request
+    /// timeout while a real HTTP call is in flight).
+    pub steam_enrich_pace: std::time::Duration,
+    /// Per-invoke deadline for the enrichment pass — computed by the caller from the lambda
+    /// context's `deadline` epoch-ms via [`compute_enrich_deadline`]. Tests inject `far_deadline()`
+    /// so the deadline never fires during the run; prod sets it from the real lambda context.
+    pub steam_enrich_deadline: tokio::time::Instant,
 }
 
 /// Where a self-refreshed humble session is persisted, so the next cold start reads it back.
@@ -1802,6 +1860,229 @@ async fn refresh_ben_ownership(deps: &Deps) {
     }
 }
 
+/// The budgeted, politely-paced Steam enrichment pass (spec §3). Runs in [`run_sync`] AFTER the
+/// ownership pass, and hits the Steam storefront endpoints ONLY here — never at request time
+/// (Ben's be-nice rule). Everything about it is throttled: `≥1.5s` between every storefront call,
+/// a per-run cap of [`STEAM_ENRICH_MAX_APPS`] appids, a deadline guard so the sync's bookkeeping
+/// always lands, and a hard abort on the first `429`.
+///
+/// `deadline` is the [`tokio::time::Instant`] past which no NEW app is started — the caller
+/// computes it from the lambda budget (timeout − margin, anchored at the sync's start) so that
+/// `persist_sync` + `end_sync_run` always run. Passed in (not read from a global clock) so tests
+/// can drive the guard without a real 900s wait.
+///
+/// **Work list.** Every distinct `steam_app_id` across games whose STEAMAPP cache item is missing,
+/// or whose `fetched_at` is older than 30d, or whose `reviews_fetched_at` is older than 14d. Sorted
+/// ascending for a deterministic, resumable order. Capped at [`STEAM_ENRICH_MAX_APPS`]; the overflow
+/// is counted into `deferred` and logged, never silently dropped.
+///
+/// **Fresh halves are preserved.** appdetails is refetched only when ITS clock is stale;
+/// reviews+histogram only when THEIRS is. The two halves merge into the existing cache item, which
+/// is written per-app as each one completes, so a mid-pass abort/timeout keeps the progress already
+/// made.
+///
+/// **Negative cache.** A `Delisted` app writes a stub (`detail: None`) with BOTH clocks stamped, so
+/// it's retried on the 30d window rather than every sync, and its (non-existent) reviews are skipped.
+///
+/// **Error semantics.** A `429` (`RateLimited`) on ANY call aborts the whole pass — what's already
+/// written stays, the rest waits for the next sync. Any other per-app error logs and skips just that
+/// app. The `SteamError` match names every variant (no `_` arm) — the crate convention.
+///
+/// One summary log line per run: `steam enrichment: fetched=<n> fresh=<n> negative=<n>
+/// aborted_429=<bool>` (`fetched` = apps whose cache item was written this run, `fresh` = of those,
+/// how many pulled live appdetails, `negative` = delisted stubs), plus a `deferred` field.
+pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
+    // Kill switch (read via config, not raw env) → skip entirely.
+    if deps.steam_enrich_disabled {
+        tracing::info!("steam enrichment: disabled (STEAM_ENRICH_DISABLED) — skipping pass");
+        return;
+    }
+    // No Steam client configured → the whole Steam feature is off; nothing to enrich.
+    let Some(steam) = deps.steam.as_ref() else {
+        return;
+    };
+
+    let games = match deps.store.list_all_games().await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = ?e, "steam enrichment: list_all_games failed — skipping pass");
+            return;
+        }
+    };
+
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+
+    // Distinct appids across all games, sorted ascending (BTreeSet) for a deterministic order —
+    // so a 429 abort or deadline stop resumes predictably on the next sync.
+    let appids: std::collections::BTreeSet<u32> =
+        games.iter().filter_map(|g| g.steam_app_id).collect();
+
+    /// One appid's decided work: which half(s) are stale, plus the cache item to merge into.
+    struct Work {
+        app_id: u32,
+        need_detail: bool,
+        need_reviews: bool,
+        cache: dynamo::SteamAppCache,
+    }
+
+    // Decide the work list up front (cheap store reads only — no storefront calls yet).
+    let mut worklist: Vec<Work> = Vec::new();
+    for app_id in appids {
+        let existing = match deps.store.get_steam_app(app_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(app_id, error = ?e, "steam enrichment: get_steam_app failed — skipping app");
+                continue;
+            }
+        };
+        let (need_detail, need_reviews) = match &existing {
+            // Missing item → fetch both halves.
+            None => (true, true),
+            Some(c) => (
+                now - c.fetched_at >= STEAM_DETAIL_TTL_SECS,
+                now - c.reviews_fetched_at >= STEAM_REVIEWS_TTL_SECS,
+            ),
+        };
+        if !need_detail && !need_reviews {
+            continue; // both halves fresh — nothing to do
+        }
+        let cache = existing.unwrap_or(dynamo::SteamAppCache {
+            app_id,
+            detail: None,
+            overall: None,
+            recent: None,
+            fetched_at: 0,
+            reviews_fetched_at: 0,
+        });
+        worklist.push(Work {
+            app_id,
+            need_detail,
+            need_reviews,
+            cache,
+        });
+    }
+
+    let deferred_by_cap = worklist.len().saturating_sub(STEAM_ENRICH_MAX_APPS);
+    worklist.truncate(STEAM_ENRICH_MAX_APPS);
+
+    let mut fetched = 0u32;
+    let mut fresh = 0u32;
+    let mut negative = 0u32;
+    let mut aborted_429 = false;
+    let mut deferred_unstarted = 0usize;
+
+    let mut it = worklist.into_iter();
+    'apps: for work in it.by_ref() {
+        // Deadline guard: never START a new app once the budget's nearly spent — this one and the
+        // rest are deferred to the next sync.
+        if tokio::time::Instant::now() >= deadline {
+            deferred_unstarted += 1;
+            break 'apps;
+        }
+        let Work {
+            app_id,
+            need_detail,
+            need_reviews,
+            mut cache,
+        } = work;
+        let mut delisted = false;
+
+        if need_detail {
+            tokio::time::sleep(deps.steam_enrich_pace).await;
+            match steam.get_app_details(app_id).await {
+                Ok(steam_client::AppDetails::Found(d)) => {
+                    cache.detail = Some(*d);
+                    cache.fetched_at = now;
+                    fresh += 1;
+                }
+                // Delisted: negative-cache stub. Stamp BOTH clocks so it's retried on the 30d
+                // window (not every sync), and skip reviews — a dead app has none.
+                Ok(steam_client::AppDetails::Delisted) => {
+                    cache.detail = None;
+                    cache.fetched_at = now;
+                    cache.reviews_fetched_at = now;
+                    negative += 1;
+                    delisted = true;
+                }
+                Err(steam_client::SteamError::RateLimited) => {
+                    aborted_429 = true;
+                    break 'apps;
+                }
+                Err(
+                    e @ (steam_client::SteamError::Api(_)
+                    | steam_client::SteamError::Network(_)
+                    | steam_client::SteamError::Parse(_)
+                    | steam_client::SteamError::KeyRejected
+                    | steam_client::SteamError::NotFound
+                    | steam_client::SteamError::OpenIdRejected(_)),
+                ) => {
+                    tracing::warn!(app_id, error = ?e, "steam enrichment: appdetails failed — skipping app");
+                    continue 'apps;
+                }
+            }
+        }
+
+        if need_reviews && !delisted {
+            tokio::time::sleep(deps.steam_enrich_pace).await;
+            let overall = match steam.get_review_summary(app_id).await {
+                Ok(s) => s,
+                Err(steam_client::SteamError::RateLimited) => {
+                    aborted_429 = true;
+                    break 'apps;
+                }
+                Err(
+                    e @ (steam_client::SteamError::Api(_)
+                    | steam_client::SteamError::Network(_)
+                    | steam_client::SteamError::Parse(_)
+                    | steam_client::SteamError::KeyRejected
+                    | steam_client::SteamError::NotFound
+                    | steam_client::SteamError::OpenIdRejected(_)),
+                ) => {
+                    tracing::warn!(app_id, error = ?e, "steam enrichment: appreviews failed — skipping app");
+                    continue 'apps;
+                }
+            };
+            tokio::time::sleep(deps.steam_enrich_pace).await;
+            let recent = match steam.get_recent_reviews(app_id).await {
+                Ok(r) => r,
+                Err(steam_client::SteamError::RateLimited) => {
+                    aborted_429 = true;
+                    break 'apps;
+                }
+                Err(
+                    e @ (steam_client::SteamError::Api(_)
+                    | steam_client::SteamError::Network(_)
+                    | steam_client::SteamError::Parse(_)
+                    | steam_client::SteamError::KeyRejected
+                    | steam_client::SteamError::NotFound
+                    | steam_client::SteamError::OpenIdRejected(_)),
+                ) => {
+                    tracing::warn!(app_id, error = ?e, "steam enrichment: histogram failed — skipping app");
+                    continue 'apps;
+                }
+            };
+            cache.overall = Some(overall);
+            cache.recent = Some(recent);
+            cache.reviews_fetched_at = now;
+        }
+
+        // Merge write per-item: partial progress survives an abort/timeout later in the pass.
+        if let Err(e) = deps.store.put_steam_app(&cache).await {
+            tracing::warn!(app_id, error = ?e, "steam enrichment: put_steam_app failed — this app not persisted");
+            continue 'apps;
+        }
+        fetched += 1;
+    }
+    // Whatever's left unstarted (deadline stop, or the tail after a 429 abort) is deferred too.
+    deferred_unstarted += it.count();
+
+    let deferred = deferred_by_cap + deferred_unstarted;
+    tracing::info!(
+        deferred,
+        "steam enrichment: fetched={fetched} fresh={fresh} negative={negative} aborted_429={aborted_429}"
+    );
+}
+
 /// Lazy title-pass: for every steam-type game with no `steam_app_id` (and not `Manual` source),
 /// attempt a unique exact-title match against the Steam app list. Runs once per sync, AFTER the
 /// order walk (tier-1 tpk ids are already written) so only genuinely unmapped games are touched.
@@ -1930,6 +2211,10 @@ async fn map_missing_appids(deps: &Deps) {
 /// persists a `SyncState` — the caller holds the run marker, so this must always report.
 async fn run_sync(deps: &Deps) {
     tracing::info!("sync started (ensure session, reconcile, then order walk)");
+    // Enrichment deadline is threaded from the caller via deps.steam_enrich_deadline. It was
+    // computed from the lambda context's remaining time (minus the 180s margin) so `persist_sync`
+    // + `end_sync_run` always have room to land — see compute_enrich_deadline.
+    let enrich_deadline = deps.steam_enrich_deadline;
     // Acquire the library FIRST — this is the self-heal point (a dead session logs in + persists).
     // It MUST come before reconcile: reconcile reads humble per-order, so on a session that died
     // since the last run, running it first would Unauthorized-skip every claim and recover nothing.
@@ -2057,10 +2342,17 @@ async fn run_sync(deps: &Deps) {
     refresh_ben_ownership(deps).await;
 
     // Choice-discovery ingest — surface each still-claimable OFFERED game as a `requires_choice=true`
-    // catalog entry, so the gift-choice orchestration has something to run on. Runs LAST (after the
-    // order walk) so a heal it triggers can't starve the walk, and it shares the run's one-heal
-    // budget via `healed_this_run` / `cookie_ok`.
+    // catalog entry, so the gift-choice orchestration has something to run on. Runs AFTER the order
+    // walk so a heal it triggers can't starve the walk, and it shares the run's one-heal budget via
+    // `healed_this_run` / `cookie_ok`.
     games_written += discover_choice_games(deps, &mut healed_this_run, &mut cookie_ok).await;
+
+    // Steam enrichment pass — budgeted, politely-paced storefront reads (appdetails + reviews +
+    // histogram) into the STEAMAPP cache. Runs LAST (after choice discovery) so the 180s
+    // deadline margin guards only the bookkeeping (`persist_sync` + `end_sync_run`) and choice
+    // discovery's own network work is never squeezed into that margin. A 429 aborts the pass;
+    // never fails the sync.
+    enrich_steam_apps(deps, enrich_deadline).await;
 
     let msg = if cookie_ok {
         format!("sync ok: {games_written} written, {orders_failed} order(s) failed")
@@ -2573,6 +2865,36 @@ async fn ping(deps: &Deps, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------------------------
+    // compute_enrich_deadline
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn compute_enrich_deadline_normal_remaining_subtracts_margin() {
+        // context deadline = now + 900s → remaining = 900s → minus 180s margin = 720s.
+        let now_ms: u64 = 1_000_000;
+        let deadline_ms = now_ms + 900_000;
+        let d = compute_enrich_deadline(deadline_ms, now_ms);
+        assert_eq!(d, std::time::Duration::from_secs(720));
+    }
+
+    #[test]
+    fn compute_enrich_deadline_zero_context_falls_back_to_const() {
+        // context_deadline_epoch_ms == 0 means no lambda context; uses SYNC_LAMBDA_TIMEOUT -
+        // STEAM_ENRICH_DEADLINE_MARGIN = 900s - 180s = 720s.
+        let d = compute_enrich_deadline(0, 1_000_000);
+        assert_eq!(d, SYNC_LAMBDA_TIMEOUT - STEAM_ENRICH_DEADLINE_MARGIN,);
+    }
+
+    #[test]
+    fn compute_enrich_deadline_remaining_smaller_than_margin_is_zero() {
+        // remaining = 60s < 180s margin → Duration::ZERO (pass must be skipped immediately).
+        let now_ms: u64 = 1_000_000;
+        let deadline_ms = now_ms + 60_000;
+        let d = compute_enrich_deadline(deadline_ms, now_ms);
+        assert_eq!(d, std::time::Duration::ZERO);
+    }
 
     #[test]
     fn ping_content_is_prefixed_and_carries_message() {

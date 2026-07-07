@@ -9,10 +9,12 @@ aws-sdk-dynamodb = "1"
 domain = { path = "../domain" }
 serde.workspace = true
 serde_json.workspace = true
+steam-client = { path = "../steam-client" }
 thiserror.workspace = true
 time.workspace = true
 
 [dev-dependencies]
 aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
+steam-client = { path = "../steam-client" }
 tokio.workspace = true
 uuid.workspace = true

@@ -1,5 +1,5 @@
 //! Steam Web API client — owned-games (privacy-pinned), persona, vanity, OpenID.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ── Key newtype ──────────────────────────────────────────────────────────────
 
@@ -26,6 +26,44 @@ impl std::fmt::Debug for SteamApiKey {
 pub struct SteamId64(pub String);
 
 // ── Domain types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SteamAppDetail {
+    pub app_id: u32,
+    pub name: String,
+    pub developers: Vec<String>,
+    pub publishers: Vec<String>,
+    /// genres + categories descriptions, deduped order-preserving
+    pub genres: Vec<String>,
+    pub release_date: Option<String>,
+    pub short_description: String,
+    pub header_image: Option<String>,
+    /// First movie's hls_h264 URL (movies are HLS/DASH-only now, no mp4/webm)
+    pub video_hls_url: Option<String>,
+    pub video_thumbnail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppDetails {
+    Found(Box<SteamAppDetail>),
+    /// `success: false` from the API — app is delisted or never existed
+    Delisted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReviewSummary {
+    pub desc: String,
+    pub total_positive: u64,
+    pub total_negative: u64,
+    pub total_reviews: u64,
+}
+
+/// Computed from histogram `results.recent` buckets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecentReviews {
+    pub percent_positive: u8,
+    pub count: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnedGames {
@@ -123,11 +161,83 @@ struct AppEntry {
     name: String,
 }
 
+// ── Storefront wire types ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AppDetailsEntry {
+    success: bool,
+    data: Option<AppDetailDataWire>,
+}
+
+#[derive(Deserialize)]
+struct AppDetailDataWire {
+    name: String,
+    #[serde(default)]
+    developers: Vec<String>,
+    #[serde(default)]
+    publishers: Vec<String>,
+    #[serde(default)]
+    genres: Vec<DescriptionWire>,
+    #[serde(default)]
+    categories: Vec<DescriptionWire>,
+    release_date: Option<ReleaseDateWire>,
+    #[serde(default)]
+    short_description: String,
+    header_image: Option<String>,
+    #[serde(default)]
+    movies: Vec<MovieWire>,
+}
+
+#[derive(Deserialize)]
+struct DescriptionWire {
+    description: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseDateWire {
+    date: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MovieWire {
+    hls_h264: Option<String>,
+    thumbnail: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AppReviewsWire {
+    query_summary: AppReviewsQuerySummary,
+}
+
+#[derive(Deserialize)]
+struct AppReviewsQuerySummary {
+    review_score_desc: String,
+    total_positive: u64,
+    total_negative: u64,
+    total_reviews: u64,
+}
+
+#[derive(Deserialize)]
+struct ReviewHistogramWire {
+    results: ReviewHistogramResults,
+}
+
+#[derive(Deserialize)]
+struct ReviewHistogramResults {
+    #[serde(default)]
+    recent: Vec<ReviewHistogramBucket>,
+}
+
+#[derive(Deserialize)]
+struct ReviewHistogramBucket {
+    recommendations_up: u64,
+    recommendations_down: u64,
+}
+
 // ── Client ───────────────────────────────────────────────────────────────────
 
 pub struct SteamClient {
     base_web_api: String,
-    #[allow(dead_code)]
     base_store: String,
     /// Base URL for Steam OpenID endpoints (prod: `https://steamcommunity.com`).
     base_openid: String,
@@ -269,6 +379,115 @@ impl SteamClient {
             }
         }
         Ok(out)
+    }
+
+    /// Fetch storefront detail for `app_id`. Returns `Delisted` when the response carries
+    /// `success: false` (removed or private app) rather than erroring.
+    pub async fn get_app_details(&self, app_id: u32) -> Result<AppDetails, SteamError> {
+        let url = format!("{}/api/appdetails", self.base_store);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[
+                ("appids", app_id.to_string().as_str()),
+                ("cc", "us"),
+                ("l", "english"),
+            ])
+            .send()
+            .await
+            .map_err(net)?;
+        let map: std::collections::HashMap<String, AppDetailsEntry> = keyed_json(resp).await?;
+        let key = app_id.to_string();
+        let entry = map
+            .into_values()
+            .next()
+            .ok_or_else(|| SteamError::Parse(format!("missing key {key} in appdetails")))?;
+        if !entry.success {
+            return Ok(AppDetails::Delisted);
+        }
+        let data = entry
+            .data
+            .ok_or_else(|| SteamError::Parse("success:true but no data field".into()))?;
+        let mut genres: Vec<String> = data.genres.into_iter().map(|g| g.description).collect();
+        for cat in data.categories {
+            if !genres.contains(&cat.description) {
+                genres.push(cat.description);
+            }
+        }
+        let first_movie = data.movies.into_iter().next();
+        Ok(AppDetails::Found(Box::new(SteamAppDetail {
+            app_id,
+            name: data.name,
+            developers: data.developers,
+            publishers: data.publishers,
+            genres,
+            release_date: data.release_date.and_then(|r| r.date),
+            short_description: data.short_description,
+            header_image: data.header_image,
+            video_hls_url: first_movie.as_ref().and_then(|m| m.hls_h264.clone()),
+            video_thumbnail: first_movie.and_then(|m| m.thumbnail),
+        })))
+    }
+
+    /// Fetch overall review summary for `app_id` from the store `/appreviews/` endpoint.
+    pub async fn get_review_summary(&self, app_id: u32) -> Result<ReviewSummary, SteamError> {
+        let url = format!("{}/appreviews/{}", self.base_store, app_id);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[
+                ("json", "1"),
+                ("num_per_page", "0"),
+                ("language", "english"),
+                ("purchase_type", "all"),
+            ])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: AppReviewsWire = keyed_json(resp).await?;
+        let qs = wire.query_summary;
+        Ok(ReviewSummary {
+            desc: qs.review_score_desc,
+            total_positive: qs.total_positive,
+            total_negative: qs.total_negative,
+            total_reviews: qs.total_reviews,
+        })
+    }
+
+    /// Fetch recent review sentiment for `app_id` by summing histogram buckets.
+    ///
+    /// `percent_positive` and `count` are both 0 when there are no recent reviews.
+    pub async fn get_recent_reviews(&self, app_id: u32) -> Result<RecentReviews, SteamError> {
+        let url = format!("{}/appreviewhistogram/{}", self.base_store, app_id);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("l", "english")])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: ReviewHistogramWire = keyed_json(resp).await?;
+        let up: u64 = wire
+            .results
+            .recent
+            .iter()
+            .map(|b| b.recommendations_up)
+            .sum();
+        let down: u64 = wire
+            .results
+            .recent
+            .iter()
+            .map(|b| b.recommendations_down)
+            .sum();
+        let total = up + down;
+        let percent_positive = (100 * up + total / 2)
+            .checked_div(total)
+            .and_then(|n| u8::try_from(n).ok())
+            .unwrap_or(0);
+        Ok(RecentReviews {
+            percent_positive,
+            count: total,
+        })
     }
 
     /// Verify a Steam OpenID assertion. Trust ladder (spec §2, ALL must hold):

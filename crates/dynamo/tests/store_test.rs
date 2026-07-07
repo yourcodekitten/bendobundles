@@ -1,8 +1,8 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
-    AppidWrite, ClaimTxError, HiddenWrite, OwnedWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin,
-    SyncState, SyncWrite, sync_run_is_live,
+    AppidWrite, ClaimTxError, HiddenWrite, OwnedWrite, SYNC_RUN_STALE_SECS, SteamAppCache, Store,
+    SyncBegin, SyncState, SyncWrite, sync_run_is_live,
 };
 use std::collections::HashMap;
 use time::macros::datetime;
@@ -1714,5 +1714,127 @@ async fn set_game_steam_appid_admin_bypasses_manual_guard() {
         got.appid_source,
         Some(AppidSource::Manual),
         "source must remain Manual after override"
+    );
+}
+
+// =================================================================================================
+// TASK 2 (game-detail-modal plan): STEAMAPP enrichment cache — put/get/list round-trips.
+// =================================================================================================
+
+fn steam_app_cache_full(app_id: u32) -> SteamAppCache {
+    SteamAppCache {
+        app_id,
+        detail: Some(steam_client::SteamAppDetail {
+            app_id,
+            name: format!("Test Game {app_id}"),
+            developers: vec!["Dev Studio".into()],
+            publishers: vec!["Pub Corp".into()],
+            genres: vec!["Action".into(), "Indie".into()],
+            release_date: Some("1 Jan, 2020".into()),
+            short_description: "A test game.".into(),
+            header_image: Some("https://cdn.steam/header.jpg".into()),
+            video_hls_url: None,
+            video_thumbnail: None,
+        }),
+        overall: Some(steam_client::ReviewSummary {
+            desc: "Mostly Positive".into(),
+            total_positive: 900,
+            total_negative: 100,
+            total_reviews: 1000,
+        }),
+        recent: Some(steam_client::RecentReviews {
+            percent_positive: 88,
+            count: 50,
+        }),
+        fetched_at: 1_800_000_000,
+        reviews_fetched_at: 1_800_001_000,
+    }
+}
+
+fn steam_app_cache_stub(app_id: u32) -> SteamAppCache {
+    SteamAppCache {
+        app_id,
+        detail: None, // negative-cache: app delisted or never existed
+        overall: None,
+        recent: None,
+        fetched_at: 1_800_000_000,
+        reviews_fetched_at: 1_800_000_000,
+    }
+}
+
+/// Full STEAMAPP cache item round-trips through put/get: with detail populated AND
+/// the negative-cache stub (detail=None). get on a missing id returns Ok(None).
+#[tokio::test]
+async fn steam_app_cache_roundtrip() {
+    let Some(store) = store_or_skip("steam-app-roundtrip").await else {
+        return;
+    };
+
+    let full = steam_app_cache_full(570);
+    let stub = steam_app_cache_stub(620);
+
+    // Initially absent.
+    assert_eq!(store.get_steam_app(570).await.unwrap(), None);
+    assert_eq!(store.get_steam_app(620).await.unwrap(), None);
+
+    // Put both.
+    store.put_steam_app(&full).await.unwrap();
+    store.put_steam_app(&stub).await.unwrap();
+
+    // Full item round-trips exactly.
+    let got_full = store.get_steam_app(570).await.unwrap().unwrap();
+    assert_eq!(got_full, full, "full cache item must round-trip exactly");
+
+    // Negative-cache stub round-trips (detail=None preserved).
+    let got_stub = store.get_steam_app(620).await.unwrap().unwrap();
+    assert_eq!(
+        got_stub, stub,
+        "negative-cache stub must round-trip with detail=None"
+    );
+
+    // Missing id → Ok(None).
+    assert_eq!(store.get_steam_app(999999).await.unwrap(), None);
+}
+
+/// list_steam_app_ids returns exactly the written app_ids and does NOT include
+/// non-STEAMAPP items (games) — the begins_with("STEAMAPP#") filter is the gate.
+#[tokio::test]
+async fn list_steam_app_ids_excludes_non_steamapp_items() {
+    let Some(store) = store_or_skip("steam-app-list").await else {
+        return;
+    };
+
+    // Write two STEAMAPP items (one full, one stub).
+    store
+        .put_steam_app(&steam_app_cache_full(100))
+        .await
+        .unwrap();
+    store
+        .put_steam_app(&steam_app_cache_stub(200))
+        .await
+        .unwrap();
+
+    // Also write a GAME item to confirm it is excluded from the list.
+    store.put_game(&game(1, true)).await.unwrap();
+
+    let ids = store.list_steam_app_ids().await.unwrap();
+    let mut sorted_ids = ids.clone();
+    sorted_ids.sort();
+    assert_eq!(
+        sorted_ids,
+        vec![100u32, 200u32],
+        "list must return exactly the two STEAMAPP ids"
+    );
+
+    // Idempotent overwrite: re-put one item, list must not grow.
+    store
+        .put_steam_app(&steam_app_cache_full(100))
+        .await
+        .unwrap();
+    let ids2 = store.list_steam_app_ids().await.unwrap();
+    assert_eq!(
+        ids2.len(),
+        2,
+        "idempotent overwrite must not duplicate entries"
     );
 }

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use dynamo::Store;
-use fulfillment::{Deps, FulfillRequest, FulfillResponse, SessionStore, handle};
+use fulfillment::{
+    Deps, FulfillRequest, FulfillResponse, SessionStore, compute_enrich_deadline, handle,
+};
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
 use steam_client::{SteamApiKey, SteamClient};
@@ -57,6 +59,11 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     tracing::info!(step_up_enabled, "secure-area step-up configuration");
 
     let steam_key_param = std::env::var("STEAM_KEY_PARAM").ok();
+
+    // Ben's be-nice kill switch: STEAM_ENRICH_DISABLED=1 skips the storefront enrichment pass.
+    // Read once at startup; carried on Deps so run_sync's enrichment reads config, not raw env.
+    let steam_enrich_disabled = std::env::var("STEAM_ENRICH_DISABLED").as_deref() == Ok("1");
+    tracing::info!(steam_enrich_disabled, "steam enrichment configuration");
 
     let aws_cfg = aws_config::load_from_env().await;
     let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_cfg);
@@ -120,6 +127,14 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let steam = steam.clone();
 
         async move {
+            // Compute the enrichment deadline from the lambda context's per-invoke remaining time.
+            // context.deadline is epoch-ms; now_epoch_ms is the wall clock at invocation start.
+            let now_epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let steam_enrich_deadline = tokio::time::Instant::now()
+                + compute_enrich_deadline(event.context.deadline, now_epoch_ms);
             let payload = event.payload;
 
             // Try to parse as a typed request; on failure fall back to EventBridge → Sync.
@@ -220,6 +235,9 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     http: http_client,
                     session_store,
                     steam: steam.clone(),
+                    steam_enrich_disabled,
+                    steam_enrich_pace: fulfillment::STEAM_ENRICH_PACE,
+                    steam_enrich_deadline,
                 };
 
                 handle(&deps, req).await

@@ -9,7 +9,8 @@ use aws_sdk_dynamodb::types::{
 use domain::{Claim, ClaimState, Game, GameStatus, Link};
 use schema::{
     claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body, session_item,
-    session_pk, steam_identity_item, steam_owned_item, sync_state_item,
+    session_pk, steam_app_item, steam_app_pk, steam_identity_item, steam_owned_item,
+    sync_state_item,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -85,6 +86,23 @@ pub struct SyncState {
 pub struct SteamOwnedCache {
     pub appids: Vec<u32>,
     pub fetched_at: i64,
+}
+
+/// Cached enrichment data for a single Steam app, written at sync time.
+/// Stored at pk="STEAMAPP#<app_id>", sk="META"; body is the full JSON of this struct.
+/// `detail: None` is a negative-cache stub — the app was delisted or never existed when last
+/// fetched, and the staleness windows still apply. Tasks 3-4 consume this type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SteamAppCache {
+    pub app_id: u32,
+    /// `None` means the app was delisted (negative-cache stub).
+    pub detail: Option<steam_client::SteamAppDetail>,
+    pub overall: Option<steam_client::ReviewSummary>,
+    pub recent: Option<steam_client::RecentReviews>,
+    /// Unix epoch seconds: timestamp of the last `get_app_details` fetch (30-day refresh window).
+    pub fetched_at: i64,
+    /// Unix epoch seconds: timestamp of the last reviews+histogram fetch (14-day refresh window).
+    pub reviews_fetched_at: i64,
 }
 
 /// A sync-run marker older than this is dead: the fulfillment lambda's hard timeout is 900s, so
@@ -1682,6 +1700,67 @@ impl Store {
         let pk = format!("STEAMOWN#{steamid}");
         let cache: Option<SteamOwnedCache> = self.get_meta(&pk).await?;
         Ok(cache.map(|c| (c.appids, c.fetched_at)))
+    }
+
+    /// Write (or refresh) a Steam app enrichment cache entry.
+    /// pk="STEAMAPP#<app_id>", sk="META", body=JSON of [`SteamAppCache`].
+    /// Idempotent — overwrites any existing entry. `detail: None` is a valid negative-cache stub.
+    pub async fn put_steam_app(&self, cache: &SteamAppCache) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(steam_app_item(cache)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Look up a Steam app enrichment cache entry by app_id, or `None` if absent.
+    /// `detail: None` in the returned struct means the app is a negative-cache stub (delisted).
+    pub async fn get_steam_app(&self, app_id: u32) -> Result<Option<SteamAppCache>, StoreError> {
+        self.get_meta(&steam_app_pk(app_id)).await
+    }
+
+    /// Return all cached Steam app_ids. Paged Scan filtered on `begins_with(pk, "STEAMAPP#")` —
+    /// the same rationale as `list_all_games` (at ~700 items a Scan is fine). Does NOT include
+    /// non-STEAMAPP items (games, links, etc.).
+    pub async fn list_steam_app_ids(&self) -> Result<Vec<u32>, StoreError> {
+        let mut ids: Vec<u32> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .filter_expression("begins_with(pk, :pfx) AND sk = :meta")
+                .expression_attribute_values(
+                    ":pfx",
+                    aws_sdk_dynamodb::types::AttributeValue::S("STEAMAPP#".into()),
+                )
+                .expression_attribute_values(
+                    ":meta",
+                    aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+                )
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await?;
+            for item in out.items() {
+                // Parse app_id from the pk attribute ("STEAMAPP#<id>") — avoids decoding the
+                // full body JSON just to extract the id.
+                let app_id = item
+                    .get("pk")
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|s| s.strip_prefix("STEAMAPP#"))
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .ok_or(StoreError::Corrupt("STEAMAPP item missing or bad pk"))?;
+                ids.push(app_id);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(ids)
     }
 
     /// Admin appid override: the ONLY writer allowed to bypass the `Manual` guard and clear

@@ -7,13 +7,13 @@
 use domain::{AppidSource, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{Store, SyncState};
 use fulfillment::{
-    Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, gift_decision, handle,
-    reveal_decision,
+    Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, enrich_steam_apps,
+    gift_decision, handle, reveal_decision,
 };
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use std::sync::Arc;
 use time::OffsetDateTime;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ---------------------------------------------------------------------------------------------
@@ -119,6 +119,11 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         session_store: None,
         // No Steam client in these handler tests — appid mapper pass is skipped.
         steam: None,
+        steam_enrich_disabled: false,
+        // Zero pacing in tests: the paced enrichment pass runs instantly against real wiremock I/O.
+        steam_enrich_pace: std::time::Duration::ZERO,
+        // Far deadline: the enrichment pass budget never fires during handler tests.
+        steam_enrich_deadline: far_deadline(),
     }
 }
 
@@ -493,6 +498,10 @@ async fn deps_with_selfheal(
             cookie_param: "/bendobundles/humble-cookie".into(),
         }),
         steam: None,
+        steam_enrich_disabled: false,
+        steam_enrich_pace: std::time::Duration::ZERO,
+        // Far deadline: the enrichment pass budget never fires during handler tests.
+        steam_enrich_deadline: far_deadline(),
     }
 }
 
@@ -4114,4 +4123,458 @@ async fn refresh_ben_ownership_transient_error_keeps_stamps_no_ping() {
     // No pings must have been sent on a transient error.
     let pings = discord.received_requests().await.unwrap();
     assert_eq!(pings.len(), 0, "no ping must be sent on a transient error");
+}
+
+// =================================================================================================
+// TASK 3: enrich_steam_apps — budgeted, politely-paced Steam enrichment pass (spec §3)
+//
+// Driven by calling enrich_steam_apps directly with an injected tokio deadline. Pacing uses zero
+// injected pace (real clock, no start_paused) so the pass runs instantly against real wiremock
+// I/O; staleness windows (14d/30d) dwarf test runtime so real `now` is deterministic enough.
+// Storefront bodies are shaped from the 2026-07-06 captures.
+// =================================================================================================
+
+/// A deadline far enough out that the per-app pacing sleeps never trip it (budget, not deadline,
+/// is under test). Real clock — zero injected pace means no actual 1.5s waits.
+fn far_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+}
+
+fn appdetails_found_body(name: &str) -> serde_json::Value {
+    // Key is ignored by the client (it reads the first value); shape mirrors the capture.
+    serde_json::json!({
+        "0": {
+            "success": true,
+            "data": {
+                "steam_appid": 1,
+                "name": name,
+                "developers": ["ConcernedApe"],
+                "publishers": ["ConcernedApe"],
+                "genres": [{ "id": "23", "description": "Indie" }],
+                "categories": [{ "id": 2, "description": "Single-player" }],
+                "release_date": { "coming_soon": false, "date": "Feb 26, 2016" },
+                "short_description": "desc",
+                "header_image": "https://img.example/header.jpg",
+                "movies": [{
+                    "id": 1, "name": "Trailer",
+                    "thumbnail": "https://img.example/thumb.jpg",
+                    "hls_h264": "https://vid.example/master.m3u8"
+                }]
+            }
+        }
+    })
+}
+
+fn appdetails_delisted_body() -> serde_json::Value {
+    serde_json::json!({ "0": { "success": false } })
+}
+
+fn reviews_body() -> serde_json::Value {
+    serde_json::json!({
+        "success": 1,
+        "query_summary": {
+            "num_reviews": 0,
+            "review_score": 9,
+            "review_score_desc": "Overwhelmingly Positive",
+            "total_positive": 455578,
+            "total_negative": 5303,
+            "total_reviews": 460881
+        },
+        "reviews": []
+    })
+}
+
+fn histogram_body() -> serde_json::Value {
+    serde_json::json!({
+        "success": 1,
+        "results": {
+            "start_date": 0,
+            "end_date": 0,
+            "weeks": [],
+            "rollups": [],
+            "recent": [
+                { "date": 1, "recommendations_up": 293, "recommendations_down": 3 },
+                { "date": 2, "recommendations_up": 285, "recommendations_down": 5 }
+            ]
+        }
+    })
+}
+
+/// Mount success storefront mocks (appdetails + appreviews + histogram) for one appid.
+async fn mount_steam_ok(steam: &MockServer, app_id: u32) {
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", app_id.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(appdetails_found_body("Game")))
+        .mount(steam)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/appreviews/{app_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(reviews_body()))
+        .mount(steam)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/appreviewhistogram/{app_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(histogram_body()))
+        .mount(steam)
+        .await;
+}
+
+/// A fully-fresh cache item stamped `now` on both clocks (so it's never in the work list).
+fn fresh_cache(app_id: u32, now: i64) -> dynamo::SteamAppCache {
+    dynamo::SteamAppCache {
+        app_id,
+        detail: Some(steam_client::SteamAppDetail {
+            app_id,
+            name: "Cached".into(),
+            developers: vec![],
+            publishers: vec![],
+            genres: vec![],
+            release_date: None,
+            short_description: "cached".into(),
+            header_image: None,
+            video_hls_url: None,
+            video_thumbnail: None,
+        }),
+        overall: Some(steam_client::ReviewSummary {
+            desc: "Positive".into(),
+            total_positive: 10,
+            total_negative: 1,
+            total_reviews: 11,
+        }),
+        recent: Some(steam_client::RecentReviews {
+            percent_positive: 90,
+            count: 11,
+        }),
+        fetched_at: now,
+        reviews_fetched_at: now,
+    }
+}
+
+fn days_ago(days: i64) -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp() - days * 24 * 60 * 60
+}
+
+/// A steam mock that 404s everything, so any storefront call is a countable miss.
+async fn steam_mock_empty() -> MockServer {
+    MockServer::start().await
+}
+
+// -------------------------------------------------------------------------------------------------
+// (a) Fresh cache items → ZERO storefront calls.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_fresh_items_make_zero_storefront_calls() {
+    let Some(store) = store_or_skip("t3-fresh-zero").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    seed_steam_game(&store, "gk-f", "mn-f", "Fresh Game", Some(413150), None).await;
+    store
+        .put_steam_app(&fresh_cache(413150, now))
+        .await
+        .unwrap();
+
+    let steam_mock = steam_mock_empty().await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        0,
+        "fresh cache item must trigger ZERO storefront calls, got {}",
+        reqs.len()
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// (b) Stale-reviews-only → exactly 2 calls (appreviews + histogram), NO appdetails refetch.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_stale_reviews_only_skips_appdetails() {
+    let Some(store) = store_or_skip("t3-stale-reviews").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let app_id = 413150;
+    seed_steam_game(&store, "gk-r", "mn-r", "Reviews Game", Some(app_id), None).await;
+    // Detail fresh (now), reviews stale (15 days old > 14d window).
+    let mut cache = fresh_cache(app_id, now);
+    cache.reviews_fetched_at = days_ago(15);
+    store.put_steam_app(&cache).await.unwrap();
+
+    let steam_mock = steam_mock_empty().await;
+    mount_steam_ok(&steam_mock, app_id).await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/api/appdetails"),
+        0,
+        "fresh appdetails clock must NOT be refetched"
+    );
+    assert_eq!(
+        count_path(&reqs, &format!("/appreviews/{app_id}")),
+        1,
+        "stale reviews must fetch the review summary"
+    );
+    assert_eq!(
+        count_path(&reqs, &format!("/appreviewhistogram/{app_id}")),
+        1,
+        "stale reviews must fetch the histogram"
+    );
+    assert_eq!(reqs.len(), 2, "exactly two storefront calls total");
+}
+
+// -------------------------------------------------------------------------------------------------
+// (c) 429 on the 3rd app aborts — apps 1-2 persisted, 4+ untouched.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_429_on_third_app_aborts_pass() {
+    let Some(store) = store_or_skip("t3-429-abort").await else {
+        return;
+    };
+    // Ascending appid order = processing order: 100, 200, 300, 400.
+    seed_steam_game(&store, "gk1", "mn1", "G1", Some(100), None).await;
+    seed_steam_game(&store, "gk2", "mn2", "G2", Some(200), None).await;
+    seed_steam_game(&store, "gk3", "mn3", "G3", Some(300), None).await;
+    seed_steam_game(&store, "gk4", "mn4", "G4", Some(400), None).await;
+
+    let steam_mock = steam_mock_empty().await;
+    mount_steam_ok(&steam_mock, 100).await;
+    mount_steam_ok(&steam_mock, 200).await;
+    // 3rd app: appdetails 429 → whole pass aborts.
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", "300"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&steam_mock)
+        .await;
+    mount_steam_ok(&steam_mock, 400).await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    assert!(
+        d.store.get_steam_app(100).await.unwrap().is_some(),
+        "app 100 must be persisted before the abort"
+    );
+    assert!(
+        d.store.get_steam_app(200).await.unwrap().is_some(),
+        "app 200 must be persisted before the abort"
+    );
+    assert!(
+        d.store.get_steam_app(300).await.unwrap().is_none(),
+        "app 300 (429) must NOT be persisted"
+    );
+    assert!(
+        d.store.get_steam_app(400).await.unwrap().is_none(),
+        "app 400 must be untouched — the pass aborted before reaching it"
+    );
+    // App 400's storefront must never have been hit.
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/appreviews/400"),
+        0,
+        "app 400 must never be fetched after the 429 abort"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// (d) Delisted → stub written, and NOT refetched on a fresh-window rerun.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_delisted_writes_stub_and_does_not_refetch() {
+    let Some(store) = store_or_skip("t3-delisted").await else {
+        return;
+    };
+    let app_id = 999888;
+    seed_steam_game(&store, "gk-d", "mn-d", "Delisted Game", Some(app_id), None).await;
+
+    let steam_mock = steam_mock_empty().await;
+    // appdetails → success:false (delisted). No reviews mounts — a delisted app must skip them.
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", app_id.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(appdetails_delisted_body()))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    // First run: writes the negative-cache stub.
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let stub = d
+        .store
+        .get_steam_app(app_id)
+        .await
+        .unwrap()
+        .expect("delisted app must write a negative-cache stub");
+    assert!(
+        stub.detail.is_none(),
+        "delisted stub must have detail: None"
+    );
+    assert!(stub.fetched_at > 0, "delisted stub must stamp fetched_at");
+    assert!(
+        stub.reviews_fetched_at > 0,
+        "delisted stub must stamp reviews_fetched_at too, so it isn't retried every sync"
+    );
+
+    // Second run on the same fresh window → the stub is fresh, so ZERO further calls.
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/api/appdetails"),
+        1,
+        "delisted stub must NOT be refetched on a fresh-window rerun (exactly one appdetails call total)"
+    );
+    // And a delisted app never fetches reviews.
+    assert_eq!(
+        count_path(&reqs, &format!("/appreviews/{app_id}")),
+        0,
+        "a delisted app must never fetch reviews"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// (e) Budget: 80 mapped games → 75 processed, deferral logged (asserted via persisted item count).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_budget_caps_at_75_apps() {
+    let Some(store) = store_or_skip("t3-budget-75").await else {
+        return;
+    };
+    let steam_mock = steam_mock_empty().await;
+    // 80 distinct appids, all missing from cache → all need work. Mount success for every one so
+    // the cap (not a fetch failure) is what limits processing.
+    for i in 0..80u32 {
+        let app_id = 10_000 + i;
+        seed_steam_game(
+            &store,
+            &format!("gk-{i}"),
+            &format!("mn-{i}"),
+            &format!("Game {i}"),
+            Some(app_id),
+            None,
+        )
+        .await;
+        mount_steam_ok(&steam_mock, app_id).await;
+    }
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    // Exactly 75 STEAMAPP items persisted — 5 deferred to the next sync.
+    let ids = d.store.list_steam_app_ids().await.unwrap();
+    assert_eq!(
+        ids.len(),
+        75,
+        "budget must cap at 75 processed apps per pass, got {}",
+        ids.len()
+    );
+    // The 5 deferred are the tail of the ascending order (10075..10079).
+    for i in 75..80u32 {
+        assert!(
+            !ids.contains(&(10_000 + i)),
+            "appid {} must be deferred (beyond the 75 cap)",
+            10_000 + i
+        );
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Deadline guard: an already-passed deadline processes ZERO apps (behavior 6).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_deadline_stops_before_starting_apps() {
+    let Some(store) = store_or_skip("t3-deadline").await else {
+        return;
+    };
+    seed_steam_game(&store, "gk-dl", "mn-dl", "Deadline Game", Some(555), None).await;
+
+    let steam_mock = steam_mock_empty().await;
+    mount_steam_ok(&steam_mock, 555).await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    // Deadline already reached → no new app is started.
+    let past = tokio::time::Instant::now();
+    enrich_steam_apps(&d, past).await;
+
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        0,
+        "an already-passed deadline must make ZERO storefront calls"
+    );
+    assert!(
+        d.store.get_steam_app(555).await.unwrap().is_none(),
+        "no cache item may be written once the deadline is spent"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Kill switch: STEAM_ENRICH_DISABLED → ZERO storefront calls even with stale work (behavior 1).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_kill_switch_skips_pass() {
+    let Some(store) = store_or_skip("t3-killswitch").await else {
+        return;
+    };
+    seed_steam_game(&store, "gk-k", "mn-k", "Kill Game", Some(777), None).await;
+
+    let steam_mock = steam_mock_empty().await;
+    mount_steam_ok(&steam_mock, 777).await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    d.steam_enrich_disabled = true;
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        0,
+        "kill switch must skip the pass entirely — ZERO storefront calls"
+    );
+    assert!(
+        d.store.get_steam_app(777).await.unwrap().is_none(),
+        "kill switch must write nothing"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// steam=None: no client → the pass is a silent no-op (behavior 1).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_no_steam_client_is_noop() {
+    let Some(store) = store_or_skip("t3-none").await else {
+        return;
+    };
+    seed_steam_game(&store, "gk-n", "mn-n", "No Client Game", Some(888), None).await;
+
+    // steam stays None (deps default).
+    let d = deps(store, "http://unused", None);
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    assert!(
+        d.store.get_steam_app(888).await.unwrap().is_none(),
+        "with no Steam client the pass must write nothing"
+    );
 }
