@@ -163,17 +163,25 @@ export function LinkPage() {
     <div className="min-h-screen bg-room text-ink">
       <header className="border-b border-line">
         <div className="relative">
-          <img src="/art/banner.png" alt="" aria-hidden="true" className="block h-40 w-full" style={{ objectFit: 'none', objectPosition: 'center 61%', backgroundColor: 'rgb(197,198,125)' }} />
+          <div
+            aria-hidden="true"
+            className="h-60 w-full"
+            style={{
+              backgroundImage: 'url(/art/banner.png)',
+              backgroundRepeat: 'repeat-x',
+              /* pin the banner's center (the chest) 200px from the right edge;
+                 the scene tiles horizontally for wide viewports */
+              backgroundPosition: 'calc(100% + 824px) 62%',
+              backgroundColor: 'rgb(197,198,125)',
+            }}
+          />
           <div className="absolute inset-x-0 top-0 flex items-center justify-between px-6 py-3">
             <h1 className="font-logo text-sm uppercase tracking-[0.03em] text-ink">bendobundles</h1>
             <span className="text-sm font-medium text-ink">
               {data.claims_used}/{data.claims_allowed} claims used
             </span>
           </div>
-        </div>
-        <div className="bg-pixel">
-          <div className="px-6 pb-4">
-            <div className="relative -mt-12 inline-block max-w-xl rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)]">
+          <div className="absolute bottom-4 left-6 max-w-xl rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)]">
               <h2 className="text-xl leading-tight text-give-soft">{data.label}</h2>
               <p className="mt-1.5 max-w-[60ch] text-sm text-ink-soft">
                 games from ben&apos;s humble stash, picked for you ♡ open one for details, claim it, and the key is yours.
@@ -194,7 +202,6 @@ export function LinkPage() {
                   <span className="font-sans text-xs text-dust-faint">— flags the games you already own</span>
                 </button>
               )}
-            </div>
           </div>
         </div>
       </header>
