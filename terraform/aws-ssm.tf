@@ -78,6 +78,20 @@ resource "aws_ssm_parameter" "humble_totp_secret" {
   }
 }
 
+# Steam Web API key — terraform creates the CONTAINER only; the value is set out of
+# band (operator PutParameter / kitten-deploy). `UNSET` placeholder fails steam auth
+# cleanly until a real key lands. Standard tier.
+resource "aws_ssm_parameter" "steam_web_api_key" {
+  name  = "/${module.label_param.id}/steam-web-api-key"
+  type  = "SecureString"
+  value = "UNSET"
+  tags  = module.label_param.tags
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 resource "aws_ssm_parameter" "discord_webhook" {
   count = var.discord_webhook_url == null ? 0 : 1
   name  = "/${module.label_param.id}/discord-webhook"

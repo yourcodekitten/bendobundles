@@ -17,6 +17,7 @@ axum = "0.7"
 lambda_http = "0.14"
 aws-sdk-lambda = "1"
 aws-sdk-dynamodb = "1"
+aws-sdk-ssm = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 async-trait = "0.1"
 serde.workspace = true
