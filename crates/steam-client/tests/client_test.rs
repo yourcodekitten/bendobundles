@@ -673,3 +673,29 @@ async fn recent_reviews_rate_limited() {
         "expected RateLimited; got {out:?}"
     );
 }
+
+#[tokio::test]
+async fn recent_reviews_percent_rounds_not_floors() {
+    // Spec pin: percent = round(100*up/(up+down)), not floor.
+    // Case: up=2, down=1 → 2/3=66.667% → rounds to 67, floors to 66.
+    // Verifies the fix: uses (100*up + total/2) / total integer math.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/appreviewhistogram/413150"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_string(
+                r#"{"success":1,"results":{"recent":[{"recommendations_up":2,"recommendations_down":1}]}}"#,
+            ),
+        )
+        .mount(&server)
+        .await;
+    let recent = test_client(&server)
+        .get_recent_reviews(413150)
+        .await
+        .unwrap();
+    assert_eq!(
+        recent.percent_positive, 67,
+        "66.67% must round to 67, not floor to 66"
+    );
+    assert_eq!(recent.count, 3);
+}

@@ -480,11 +480,10 @@ impl SteamClient {
             .map(|b| b.recommendations_down)
             .sum();
         let total = up + down;
-        let percent_positive = if total == 0 {
-            0
-        } else {
-            u8::try_from((100 * up).div_euclid(total)).unwrap_or(100)
-        };
+        let percent_positive = (100 * up + total / 2)
+            .checked_div(total)
+            .and_then(|n| u8::try_from(n).ok())
+            .unwrap_or(0);
         Ok(RecentReviews {
             percent_positive,
             count: total,
