@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { fetchLink, steamOwnedForLink, NotFound, type GameView, type LinkView } from '../api';
+import { fetchLink, fetchGameDetail, steamOwnedForLink, NotFound, type GameView, type LinkView } from '../api';
 import {
   consumeReturnFragment,
   loadIdentity,
@@ -251,6 +251,7 @@ export function LinkPage() {
           token={token}
           game={detailGame}
           active={data.state === 'active'}
+          loadDetail={(gameId) => fetchGameDetail(token, gameId)}
           onClaim={(g) => {
             setDetailGame(null);
             setClaimingGame(g);

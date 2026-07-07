@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   adminCatalog,
+  adminGameDetail,
   adminSetHidden,
   adminSelfClaim,
   adminSelfClaims,
@@ -372,6 +373,7 @@ export function Catalog() {
         <GameDetailModal
           mount="admin"
           game={detailGame}
+          loadDetail={(gameId) => withAuth(() => adminGameDetail(gameId), navigate)}
           onClose={() => setDetailGame(null)}
           armedId={armedId}
           claiming={claiming}

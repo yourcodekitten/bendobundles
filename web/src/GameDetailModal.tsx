@@ -1,8 +1,18 @@
 import { useState, useEffect, useRef } from 'react';
 import type Hls from 'hls.js';
 import type { GameView, AdminGame, SteamDetailBlob, SelfClaimResult } from './api';
-import { fetchGameDetail, adminGameDetail } from './api';
 import { titleColorClass } from './titleColor';
+
+// ── Per-session module-level detail cache ─────────────────────────────────────
+// Keyed by scope:token:gameId (friend) or admin:gameId so different links and
+// the admin surface never collide. Survives close/reopen since the Map lives
+// outside the component — unmounting does not destroy it.
+
+const gameDetailCache = new Map<string, SteamDetailBlob | null>();
+
+export function clearGameDetailCache(): void {
+  gameDetailCache.clear();
+}
 
 // ── Status badge — mirrors Catalog's mapping ──────────────────────────────────
 
@@ -27,6 +37,7 @@ function statusBadgeClass(status: string): string {
 
 type FriendMountProps = {
   mount: 'friend';
+  /** Link token — used as part of the per-session cache key. */
   token: string;
   game: GameView;
   /** Honors the grid's disabled rules — disables the claim button when false. */
@@ -47,6 +58,16 @@ type AdminMountProps = {
 
 export type GameDetailModalProps = (FriendMountProps | AdminMountProps) & {
   onClose: () => void;
+  /**
+   * Caller-supplied fetch function for the Steam detail blob.
+   * Friend mount: `(id) => fetchGameDetail(token, id)`
+   * Admin mount: `(id) => withAuth(() => adminGameDetail(id), navigate)`
+   *
+   * withAuth returns a forever-pending promise on 401 (navigation is already
+   * in flight) — the modal stays in the "loading" phase and unmounts naturally
+   * when the router transitions. Never shows an error on the 401 path.
+   */
+  loadDetail: (gameId: string) => Promise<{ steam: SteamDetailBlob | null }>;
 };
 
 // ── Load state ────────────────────────────────────────────────────────────────
@@ -59,7 +80,7 @@ type LoadState =
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export function GameDetailModal(props: GameDetailModalProps) {
-  const { onClose } = props;
+  const { onClose, loadDetail } = props;
   const game = props.game;
   const mount = props.mount;
   // Extract token early so the useEffect dep array is stable
@@ -70,39 +91,37 @@ export function GameDetailModal(props: GameDetailModalProps) {
   const [videoPlaying, setVideoPlaying] = useState(false);
   const [hlsFailed, setHlsFailed] = useState(false);
 
+  const containerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
-  // Per-instance session cache (keyed by game id)
-  const cacheRef = useRef<Map<string, SteamDetailBlob | null>>(new Map());
+
+  // ── Focus on open (a11y) ──────────────────────────────────────────────────
+
+  useEffect(() => {
+    containerRef.current?.focus();
+  }, []);
 
   // ── Load detail data ──────────────────────────────────────────────────────
 
   useEffect(() => {
     let cancelled = false;
     const gameId = game.id;
+    const cKey = token !== null ? `friend:${token}:${gameId}` : `admin:${gameId}`;
 
     async function doLoad() {
-      if (cacheRef.current.has(gameId)) {
+      // Cache hit — serve immediately (skip on retry so stale data is overwritten)
+      if (retryKey === 0 && gameDetailCache.has(cKey)) {
         if (!cancelled) {
-          setLoadState({ phase: 'loaded', steam: cacheRef.current.get(gameId) ?? null });
+          setLoadState({ phase: 'loaded', steam: gameDetailCache.get(cKey) ?? null });
         }
         return;
       }
       if (!cancelled) setLoadState({ phase: 'loading' });
       try {
-        let steam: SteamDetailBlob | null;
-        if (mount === 'friend' && token !== null) {
-          const res = await fetchGameDetail(token, gameId);
-          steam = res.steam;
-        } else if (mount === 'admin') {
-          const res = await adminGameDetail(gameId);
-          steam = res.steam;
-        } else {
-          return;
-        }
+        const res = await loadDetail(gameId);
         if (!cancelled) {
-          cacheRef.current.set(gameId, steam);
-          setLoadState({ phase: 'loaded', steam });
+          gameDetailCache.set(cKey, res.steam);
+          setLoadState({ phase: 'loaded', steam: res.steam });
         }
       } catch {
         if (!cancelled) setLoadState({ phase: 'error' });
@@ -113,8 +132,10 @@ export function GameDetailModal(props: GameDetailModalProps) {
     return () => {
       cancelled = true;
     };
-    // retryKey bumps a refetch without changing the other deps
-  }, [game.id, mount, token, retryKey]);
+    // retryKey bumps a refetch without changing the other deps.
+    // loadDetail is the caller-supplied loader — changes when scope changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [game.id, mount, token, loadDetail, retryKey]);
 
   // ── HLS cleanup on unmount ────────────────────────────────────────────────
 
@@ -177,12 +198,14 @@ export function GameDetailModal(props: GameDetailModalProps) {
       {/* Backdrop */}
       <div className="fixed inset-0 z-40 bg-black/60" aria-hidden="true" />
 
-      {/* Dialog container — backdrop click closes */}
+      {/* Dialog container — backdrop click closes; tabIndex=-1 + ref for focus management */}
       <div
+        ref={containerRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
         aria-label={game.title}
-        className="fixed inset-0 z-50 flex items-center justify-center p-4"
+        className="fixed inset-0 z-50 flex items-center justify-center p-4 outline-none"
         onClick={(e) => {
           if (e.target === e.currentTarget) onClose();
         }}
