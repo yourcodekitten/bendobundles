@@ -8,7 +8,7 @@ import type { StatusView } from '../api';
 vi.mock('../api');
 vi.mock('../steamIdentity');
 import { adminSync, adminSteamIdentity, adminSetSteamIdentity, adminClearSteamIdentity, adminSteamOwned } from '../api';
-import { consumeReturnFragment, loadIdentity, saveIdentity, beginConnect } from '../steamIdentity';
+import { consumeReturnFragment, loadIdentity, beginConnect } from '../steamIdentity';
 
 // Provides the Outlet context that Ops requires without needing the real AdminApp.
 // Using <Outlet context={...} /> (react-router-dom) is the canonical approach
