@@ -155,10 +155,11 @@ ambient decoration, never above 10% of a screen. Its rarity is what makes the cl
 like pressing A to accept a gift.
 
 **The Title-Hash Rule.** A game without cover art gets its color from the shared deterministic
-hash (`titleColor.ts`): violet, blue, green, amber, red, pink, teal, indigo — all at the -800
-step. The SAME game must render the SAME color on every surface, forever. Any palette change must
-preserve determinism and cross-surface agreement. (The hash palette deliberately survived the
-pea soup repaint: deep art-blocks read as cartridge labels against the light olive.)
+hash (`titleColorClass` in `titleColor.ts`), drawn from the **muted-earth** palette: heather,
+slate, moss, mustard, rust, mauve, pine, clay (`--color-hash-*` tokens) — quiet attic materials
+at matched mid-tones. The SAME game must render the SAME color on every surface, forever. Any
+palette change must preserve determinism and cross-surface agreement, and goes through the
+shared module, never a local copy.
 
 **The Light Text Rule.** Status *text* on light surfaces uses the deep end of its hue
 (green-700, amber-800, red-700) — the pale 300/400 tones that read on dark are invisible on

@@ -182,7 +182,7 @@
       "refersTo": "card",
       "description": "The signature container: edge-bleed art (or title-hash block) over a matte floor frame.",
       "html": "<article class=\"ds-game-card\"><div class=\"ds-game-art\"></div><div class=\"ds-game-body\"><h3 class=\"ds-game-title\">a short hike</h3><p class=\"ds-game-bundle\">humble choice may 2020</p><span class=\"ds-chip-mini\">steam</span></div></article>",
-      "css": ".ds-game-card { width: 260px; background: oklch(91% 0.07 110); border-radius: 0.5rem; overflow: hidden; } .ds-game-art { aspect-ratio: 16 / 9; background: oklch(43.2% 0.232 292.759); } .ds-game-body { padding: 16px; } .ds-game-title { margin: 0; color: oklch(30% 0.06 120); font-size: 0.875rem; font-weight: 600; line-height: 1.25; } .ds-game-bundle { margin: 4px 0 8px; color: oklch(43% 0.06 116); font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ds-chip-mini { display: inline-block; background: oklch(80% 0.09 112); color: oklch(36% 0.06 118); padding: 2px 8px; font-size: 0.75rem; border-radius: 0.25rem; }"
+      "css": ".ds-game-card { width: 260px; background: oklch(91% 0.07 110); border-radius: 0.5rem; overflow: hidden; } .ds-game-art { aspect-ratio: 16 / 9; background: oklch(48% 0.05 290); } .ds-game-body { padding: 16px; } .ds-game-title { margin: 0; color: oklch(30% 0.06 120); font-size: 0.875rem; font-weight: 600; line-height: 1.25; } .ds-game-bundle { margin: 4px 0 8px; color: oklch(43% 0.06 116); font-size: 0.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ds-chip-mini { display: inline-block; background: oklch(80% 0.09 112); color: oklch(36% 0.06 118); padding: 2px 8px; font-size: 0.75rem; border-radius: 0.25rem; }"
     },
     {
       "name": "Gift Dialog",
@@ -223,7 +223,7 @@
       },
       {
         "name": "The Title-Hash Rule",
-        "body": "A game without cover art gets its color from the shared deterministic hash (titleColor.ts). The SAME game must render the SAME color on every surface, forever.",
+        "body": "A game without cover art gets its color from the shared deterministic hash (titleColor.ts), drawn from the muted-earth palette: heather, slate, moss, mustard, rust, mauve, pine, clay. The SAME game must render the SAME color on every surface, forever.",
         "section": "colors"
       },
       {

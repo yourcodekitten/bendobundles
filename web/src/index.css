@@ -29,6 +29,17 @@
   --color-give-soft: oklch(42% 0.14 350);       /* accent text on light surfaces */
   --color-give-ink: oklch(97% 0.012 350);       /* text on give backgrounds */
 
+  /* title-hash palette — muted earth (see titleColor.ts + DESIGN.md, The
+     Title-Hash Rule): art-fallback blocks in quiet attic materials */
+  --color-hash-clay: oklch(42% 0.06 30);
+  --color-hash-rust: oklch(48% 0.07 45);
+  --color-hash-mustard: oklch(52% 0.07 75);
+  --color-hash-moss: oklch(45% 0.06 120);
+  --color-hash-pine: oklch(40% 0.06 165);
+  --color-hash-slate: oklch(45% 0.05 230);
+  --color-hash-heather: oklch(48% 0.05 290);
+  --color-hash-mauve: oklch(50% 0.06 330);
+
   /* type — the pixel grammar: pixel faces mark game-world things (logotype,
      headings, labels, the key); prose stays human (see DESIGN.md) */
   --font-sans: "Chivo Variable", ui-sans-serif, system-ui, sans-serif;
