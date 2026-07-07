@@ -12,10 +12,12 @@ path = "src/main.rs"
 domain = { path = "../domain" }
 dynamo = { path = "../dynamo" }
 fulfillment = { path = "../fulfillment" }
+steam-client = { path = "../steam-client" }
 axum = "0.7"
 lambda_http = "0.14"
 aws-sdk-lambda = "1"
 aws-sdk-dynamodb = "1"
+aws-sdk-ssm = "1"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 async-trait = "0.1"
 serde.workspace = true
@@ -25,8 +27,10 @@ uuid.workspace = true
 time.workspace = true
 tracing = "0.1"
 tracing-subscriber = "0.3"
+urlencoding = "2"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
 aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
 tokio.workspace = true
+wiremock = "0.6"

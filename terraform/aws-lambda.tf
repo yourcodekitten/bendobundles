@@ -20,6 +20,7 @@ module "lambda_fulfillment" {
     {
       TABLE_NAME          = aws_dynamodb_table.this.name
       HUMBLE_COOKIE_PARAM = aws_ssm_parameter.humble_cookie.name
+      STEAM_KEY_PARAM     = aws_ssm_parameter.steam_web_api_key.name
     },
     local.discord_webhook_param_name == null ? {} : {
       DISCORD_WEBHOOK_PARAM = local.discord_webhook_param_name
@@ -35,8 +36,8 @@ module "lambda_fulfillment" {
         [{
           Effect = "Allow"
           Action = ["ssm:GetParameter"]
-          # The cookie plus, when step-up is enabled, the password + TOTP seed.
-          Resource = concat([aws_ssm_parameter.humble_cookie.arn], local.humble_step_up_param_arns)
+          # The cookie plus steam key plus, when step-up is enabled, the password + TOTP seed.
+          Resource = concat([aws_ssm_parameter.humble_cookie.arn, aws_ssm_parameter.steam_web_api_key.arn], local.humble_step_up_param_arns)
         }],
         # Self-login writes the refreshed session back to the cookie param (fulfillment is the
         # SOLE writer now that the admin cookie-paste flow is retired). Scoped to the cookie
@@ -75,8 +76,12 @@ module "lambda_public_api" {
   timeout              = 29 # API Gateway's integration ceiling; gift invoke must fit inside
 
   environment_variables = {
-    TABLE_NAME     = aws_dynamodb_table.this.name
-    FULFILLMENT_FN = module.lambda_fulfillment.lambda_function_name
+    TABLE_NAME      = aws_dynamodb_table.this.name
+    FULFILLMENT_FN  = module.lambda_fulfillment.lambda_function_name
+    STEAM_KEY_PARAM = aws_ssm_parameter.steam_web_api_key.name
+    # Public site origin for building the steam OpenID return_to URL — server-trusted,
+    # never derived from request headers. CloudFront routes /api/* from the apex back here.
+    BASE_URL = "https://${var.domain_zone_name}"
     # REST API GW puts the stage in the path; lambda_http PREPENDS it (turning
     # /api/l/x into /live/api/l/x), which axum then 404s. This flag makes
     # lambda_http return the stage-less path so the routes match. Verified
@@ -87,6 +92,16 @@ module "lambda_public_api" {
   addl_inline_policies = {
     dynamo             = data.aws_iam_policy_document.dynamo_rw.json
     invoke_fulfillment = data.aws_iam_policy_document.invoke_fulfillment.json
+    ssm = jsonencode({
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Effect   = "Allow"
+          Action   = ["ssm:GetParameter"]
+          Resource = [aws_ssm_parameter.steam_web_api_key.arn]
+        }
+      ]
+    })
   }
 }
 
@@ -112,6 +127,7 @@ module "lambda_admin_api" {
     TABLE_NAME       = aws_dynamodb_table.this.name
     FULFILLMENT_FN   = module.lambda_fulfillment.lambda_function_name
     ADMIN_HASH_PARAM = aws_ssm_parameter.admin_hash.name
+    STEAM_KEY_PARAM  = aws_ssm_parameter.steam_web_api_key.name
     # See public-api: strips the REST stage prefix so axum's /admin/api/* routes match.
     AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
   }
@@ -127,7 +143,7 @@ module "lambda_admin_api" {
         {
           Effect   = "Allow"
           Action   = ["ssm:GetParameter"]
-          Resource = [aws_ssm_parameter.admin_hash.arn]
+          Resource = [aws_ssm_parameter.admin_hash.arn, aws_ssm_parameter.steam_web_api_key.arn]
         }
       ]
     })

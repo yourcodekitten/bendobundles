@@ -9,6 +9,7 @@ const makeGame = (overrides: Partial<GameView> & { id: string }): GameView => ({
   bundle: 'Default Bundle',
   key_type: 'steam',
   artwork_url: null,
+  steam_app_id: null,
   ...overrides,
 });
 

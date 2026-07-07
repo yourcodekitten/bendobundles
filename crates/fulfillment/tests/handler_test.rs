@@ -4,13 +4,14 @@
 //! integration tests SKIP locally when there's no dynamodb-local reachable — CI is the receipt,
 //! never a local pass.
 
-use domain::{ClaimState, GameStatus, Link, SELF_LINK_TOKEN, game_id};
+use domain::{AppidSource, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{Store, SyncState};
 use fulfillment::{
     Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, gift_decision, handle,
     reveal_decision,
 };
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
+use std::sync::Arc;
 use time::OffsetDateTime;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -116,6 +117,8 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         http: reqwest::Client::new(),
         // No self-login in these handler tests — a dead session keeps the flag-and-ping path.
         session_store: None,
+        // No Steam client in these handler tests — appid mapper pass is skipped.
+        steam: None,
     }
 }
 
@@ -136,6 +139,9 @@ async fn seed_pending_claim(store: &Store, gamekey: &str, machine: &str) -> Stri
         artwork_url: None,
         keyindex: 0,
         requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     };
     store.put_game(&g).await.unwrap();
     store.create_link(&link("tok1")).await.unwrap();
@@ -486,6 +492,7 @@ async fn deps_with_selfheal(
             ssm: ssm_at(ssm_uri).await,
             cookie_param: "/bendobundles/humble-cookie".into(),
         }),
+        steam: None,
     }
 }
 
@@ -849,6 +856,9 @@ async fn seed_aged_pending(
         artwork_url: None,
         keyindex: 0,
         requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     };
     store.put_game(&g).await.unwrap();
     store.create_link(&link(token)).await.unwrap();
@@ -1468,6 +1478,9 @@ async fn seed_pending_choice_claim(
         artwork_url: None,
         keyindex: 0,
         requires_choice: true,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     };
     store.put_game(&g).await.unwrap();
     store.create_link(&link("tok1")).await.unwrap();
@@ -2709,6 +2722,9 @@ async fn seed_available_game(store: &Store, game_id_str: &str, title: &str) {
         artwork_url: None,
         keyindex: 0,
         requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     };
     store.put_game(&g).await.unwrap();
 }
@@ -3209,6 +3225,9 @@ async fn seed_choice_game(store: &Store, game_id_str: &str, title: &str) {
         artwork_url: None,
         keyindex: 0,
         requires_choice: true,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     };
     store.put_game(&g).await.unwrap();
 }
@@ -3597,4 +3616,484 @@ async fn reconcile_self_bundle_not_redeemed_reveals() {
         0,
         "reconcile must never call choosecontent"
     );
+}
+
+// =================================================================================================
+// TASK 6: steam appid mapper — tier-1 walk flow-through + lazy unique-exact-title pass
+// =================================================================================================
+
+fn steam_client_at(uri: &str) -> Arc<steam_client::SteamClient> {
+    Arc::new(
+        steam_client::SteamClient::new(
+            uri,
+            uri,
+            uri,
+            steam_client::SteamApiKey::new("test-api-key".into()),
+        )
+        .unwrap(),
+    )
+}
+
+async fn seed_steam_game(
+    store: &Store,
+    gamekey: &str,
+    machine_name: &str,
+    title: &str,
+    steam_app_id: Option<u32>,
+    appid_source: Option<AppidSource>,
+) -> String {
+    let gid = game_id(gamekey, machine_name);
+    let g = Game {
+        id: gid.clone(),
+        title: title.into(),
+        bundle: "Some Bundle".into(),
+        gamekey: gamekey.into(),
+        machine_name: machine_name.into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id,
+        appid_source,
+        owned_by_ben: false,
+    };
+    store.put_game(&g).await.unwrap();
+    gid
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 1: Walk carries tier-1 appid.
+// An order walk with a KeyEntry that has steam_app_id: Some(570) → the stored game ends up with
+// steam_app_id: Some(570) and appid_source: Some(AppidSource::Humble).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn sync_walk_carries_tier1_appid() {
+    let Some(store) = store_or_skip("t6-tier1-walk").await else {
+        return;
+    };
+
+    let humble = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"gamekey": "gk-tier1"}
+        ])))
+        .mount(&humble)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk-tier1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "gk-tier1",
+            "product": { "human_name": "Test Bundle" },
+            "tpkd_dict": { "all_tpks": [{
+                "machine_name": "dota2_steam",
+                "human_name": "Dota 2",
+                "key_type": "steam",
+                "is_expired": false,
+                "keyindex": 0,
+                "steam_app_id": 570
+            }] },
+            "subproducts": [],
+        })))
+        .mount(&humble)
+        .await;
+
+    // No Steam client — tier-1 flows from the tpk wire data directly, not from the title pass.
+    let deps = deps(store, &humble.uri(), None);
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let gid = game_id("gk-tier1", "dota2_steam");
+    let game = deps
+        .store
+        .get_game(&gid)
+        .await
+        .unwrap()
+        .expect("game must be written by the order walk");
+    assert_eq!(
+        game.steam_app_id,
+        Some(570),
+        "tier-1: steam_app_id must be carried from the tpk wire data"
+    );
+    assert_eq!(
+        game.appid_source,
+        Some(AppidSource::Humble),
+        "tier-1: appid_source must be Humble"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 2: Title pass maps unique match + leaves ambiguous (duplicate name) unmapped.
+// Given two games — one whose title appears exactly once in the Steam app list, one whose title
+// appears twice — the unique one gets mapped (appid_source: Title), the dup stays unmapped.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn title_pass_maps_unique_leaves_dup_unmapped() {
+    let Some(store) = store_or_skip("t6-title-pass").await else {
+        return;
+    };
+
+    // Seed two games with no appid — no orders, so the walk won't touch them.
+    seed_steam_game(&store, "gk-uniq", "mn-uniq", "Unique Game", None, None).await;
+    seed_steam_game(&store, "gk-dup", "mn-dup", "Dup Game", None, None).await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let steam_mock = MockServer::start().await;
+    // "Unique Game" appears once → appid 1001. "Dup Game" appears twice → ambiguous, skip.
+    Mock::given(method("GET"))
+        .and(path("/ISteamApps/GetAppList/v2/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "applist": { "apps": [
+                { "appid": 1001, "name": "Unique Game" },
+                { "appid": 2001, "name": "Dup Game" },
+                { "appid": 2002, "name": "Dup Game" }
+            ]}
+        })))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let unique = d
+        .store
+        .get_game(&game_id("gk-uniq", "mn-uniq"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unique.steam_app_id,
+        Some(1001),
+        "unique exact title match must be mapped by the title pass"
+    );
+    assert_eq!(
+        unique.appid_source,
+        Some(AppidSource::Title),
+        "appid_source must be Title for a title-pass write"
+    );
+
+    let dup = d
+        .store
+        .get_game(&game_id("gk-dup", "mn-dup"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        dup.steam_app_id, None,
+        "ambiguous title (multiple Steam entries) must remain unmapped"
+    );
+    assert_eq!(
+        dup.appid_source, None,
+        "appid_source must remain None for an unmapped game"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 3: Manual appid untouched by both walk and title pass.
+// A game with appid_source: Some(Manual) must survive sync unchanged — the walk's merge rule
+// and the title pass's guard both refuse to overwrite a Manual-sourced appid.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn manual_appid_untouched_by_walk_and_title_pass() {
+    let Some(store) = store_or_skip("t6-manual-guard").await else {
+        return;
+    };
+
+    // Game with Manual appid — must not be touched.
+    let gid = seed_steam_game(
+        &store,
+        "gk-man",
+        "mn-man",
+        "Portal",
+        Some(400),
+        Some(AppidSource::Manual),
+    )
+    .await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let steam_mock = MockServer::start().await;
+    // GetAppList returns "Portal" → 9999: would overwrite if the guard failed.
+    Mock::given(method("GET"))
+        .and(path("/ISteamApps/GetAppList/v2/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "applist": { "apps": [
+                { "appid": 9999, "name": "Portal" }
+            ]}
+        })))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let game = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        game.steam_app_id,
+        Some(400),
+        "Manual appid must not be overwritten by the title pass"
+    );
+    assert_eq!(
+        game.appid_source,
+        Some(AppidSource::Manual),
+        "Manual appid_source must not be overwritten by the title pass"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// FIX 5: normalize collapses internal whitespace left by ™/® stripping.
+// "Cities: Skylines ™ II" → after strip becomes "cities: skylines  ii" (double space),
+// which never matched "cities: skylines ii". Fix: split_whitespace().join(" ").
+// RED: before the fix, the catalog title with embedded ™ fails to match the Steam app name.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn title_pass_maps_title_with_trademark_symbol() {
+    let Some(store) = store_or_skip("t6-trademark-normalize").await else {
+        return;
+    };
+
+    // Catalog title contains ™ with surrounding spaces (as Humble often formats it).
+    seed_steam_game(
+        &store,
+        "gk-tm",
+        "mn-tm",
+        "Cities: Skylines ™ II",
+        None,
+        None,
+    )
+    .await;
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let steam_mock = MockServer::start().await;
+    // Steam app list has the same title WITHOUT the ™.
+    Mock::given(method("GET"))
+        .and(path("/ISteamApps/GetAppList/v2/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "applist": { "apps": [
+                { "appid": 5555, "name": "Cities: Skylines II" }
+            ]}
+        })))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let tm_game = d
+        .store
+        .get_game(&game_id("gk-tm", "mn-tm"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        tm_game.steam_app_id,
+        Some(5555),
+        "title with ™ must match after internal whitespace collapse — FIX 5"
+    );
+    assert_eq!(
+        tm_game.appid_source,
+        Some(AppidSource::Title),
+        "appid_source must be Title for the trademark-normalized match"
+    );
+}
+
+// =================================================================================================
+// TASK 8: refresh_ben_ownership — owned_by_ben stamping (spec M1)
+// =================================================================================================
+
+// -------------------------------------------------------------------------------------------------
+// Test 1: Successful fetch stamps intersection + unstamps disjoint.
+// Games in Ben's library → owned_by_ben=true; games NOT in his library → owned_by_ben=false.
+// Games with no steam_app_id are skipped entirely.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn refresh_ben_ownership_stamps_owned_games() {
+    let Some(store) = store_or_skip("t8-owned-games").await else {
+        return;
+    };
+
+    // game_a: appid 1001, currently NOT owned — should become owned after sync
+    let gid_a = seed_steam_game(&store, "gk-a", "mn-a", "Game A", Some(1001), None).await;
+    // game_b: appid 1002, currently owned — NOT in fetched library, should become NOT owned
+    let gid_b = seed_steam_game(&store, "gk-b", "mn-b", "Game B", Some(1002), None).await;
+    store.set_game_owned_by_ben(&gid_b, true).await.unwrap();
+    // game_c: no appid — untouched regardless of library contents
+    let gid_c = seed_steam_game(&store, "gk-c", "mn-c", "Game C", None, None).await;
+
+    // Plant Ben's Steam identity
+    store.put_steam_identity("76561198000000001").await.unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let steam_mock = MockServer::start().await;
+    // Ben owns appid 1001 only; appid 1002 is not in his library.
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": {
+                "game_count": 1,
+                "games": [{ "appid": 1001 }]
+            }
+        })))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let game_a = d.store.get_game(&gid_a).await.unwrap().unwrap();
+    assert!(
+        game_a.owned_by_ben,
+        "game_a (appid 1001, in library) must be stamped owned_by_ben=true"
+    );
+
+    let game_b = d.store.get_game(&gid_b).await.unwrap().unwrap();
+    assert!(
+        !game_b.owned_by_ben,
+        "game_b (appid 1002, NOT in library) must be unstamped to owned_by_ben=false"
+    );
+
+    let game_c = d.store.get_game(&gid_c).await.unwrap().unwrap();
+    assert!(
+        !game_c.owned_by_ben,
+        "game_c (no appid) must remain owned_by_ben=false — no stamp written"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 2: Private response keeps stamps frozen + logs + pings.
+// When Ben's library privacy blocks the fetch, existing stamps must be preserved and Ben gets
+// a single Discord ping (because a prior successful run is signalled by a STEAMOWN entry).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn refresh_ben_ownership_private_keeps_stamps_and_pings() {
+    let Some(store) = store_or_skip("t8-private").await else {
+        return;
+    };
+
+    const STEAMID: &str = "76561198000000002";
+
+    // game with an existing owned_by_ben=true stamp — must stay true after a Private response.
+    let gid = seed_steam_game(&store, "gk-p", "mn-p", "Owned Game", Some(9999), None).await;
+    store.set_game_owned_by_ben(&gid, true).await.unwrap();
+
+    store.put_steam_identity(STEAMID).await.unwrap();
+
+    // Seed STEAMOWN to simulate a prior successful fetch — the ping dedupe fires on its presence.
+    store
+        .put_steam_owned(
+            STEAMID,
+            &[9999],
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let steam_mock = MockServer::start().await;
+    // Private: response object with no game_count field.
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": {}
+        })))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), Some(discord.uri()));
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    // Stamp must be frozen — not cleared.
+    let game = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        game.owned_by_ben,
+        "Private response must NOT clear owned_by_ben stamps — they stay frozen"
+    );
+
+    // Exactly one ping must have been sent (dedupe via STEAMOWN presence).
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(
+        pings.len(),
+        1,
+        "exactly one ping must be sent on Private when a prior success exists"
+    );
+    let body = String::from_utf8(pings[0].body.clone()).unwrap();
+    assert!(
+        body.contains("privacy") || body.contains("owned badges"),
+        "ping body must mention privacy / owned badges"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Test 3: Transient error keeps stamps + no ping.
+// A non-2xx response from GetOwnedGames is a transient failure — stamps stay frozen and NO ping
+// is sent (it's not actionable by Ben, so don't noise the channel).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn refresh_ben_ownership_transient_error_keeps_stamps_no_ping() {
+    let Some(store) = store_or_skip("t8-error").await else {
+        return;
+    };
+
+    const STEAMID: &str = "76561198000000003";
+
+    // game with an existing owned_by_ben=true stamp — must stay true after an error response.
+    let gid = seed_steam_game(&store, "gk-e", "mn-e", "Error Game", Some(7777), None).await;
+    store.set_game_owned_by_ben(&gid, true).await.unwrap();
+
+    store.put_steam_identity(STEAMID).await.unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let steam_mock = MockServer::start().await;
+    // Transient 500 from GetOwnedGames.
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), Some(discord.uri()));
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    // Stamp must be frozen.
+    let game = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        game.owned_by_ben,
+        "transient error must NOT clear owned_by_ben stamps — they stay frozen"
+    );
+
+    // No pings must have been sent on a transient error.
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(pings.len(), 0, "no ping must be sent on a transient error");
 }

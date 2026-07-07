@@ -60,6 +60,10 @@ async fn parses_order_key_states() {
     assert_eq!(order.keys[0].keyindex, 0);
     assert_eq!(order.keys[1].keyindex, 1);
     assert_eq!(order.keys[2].keyindex, 2);
+
+    // steam_app_id flows wire→public: present on stardew (413150), absent on already_revealed.
+    assert_eq!(order.keys[0].steam_app_id, Some(413150));
+    assert_eq!(order.keys[1].steam_app_id, None);
     assert_eq!(order.subproducts.len(), 2);
     assert_eq!(order.subproducts[0].human_name, "Stardew Valley");
     assert_eq!(

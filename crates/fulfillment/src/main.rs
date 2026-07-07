@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use dynamo::Store;
 use fulfillment::{Deps, FulfillRequest, FulfillResponse, SessionStore, handle};
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
+use steam_client::{SteamApiKey, SteamClient};
 
 /// Fetch one decrypted SSM SecureString. Returns `None` (with a warn) on any error, an empty value,
 /// or the `"UNSET"` placeholder that terraform seeds these containers with — so a param that exists
@@ -53,10 +56,40 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         step_up_username.is_some() && password_param.is_some() && totp_param.is_some();
     tracing::info!(step_up_enabled, "secure-area step-up configuration");
 
+    let steam_key_param = std::env::var("STEAM_KEY_PARAM").ok();
+
     let aws_cfg = aws_config::load_from_env().await;
     let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_cfg);
     let ssm_client = aws_sdk_ssm::Client::new(&aws_cfg);
     let http_client = reqwest::Client::new();
+
+    let steam: Option<Arc<SteamClient>> = if let Some(ref param) = steam_key_param {
+        match get_secret(&ssm_client, param).await {
+            Some(key) => match SteamClient::new(
+                "https://api.steampowered.com",
+                "https://store.steampowered.com",
+                "https://steamcommunity.com",
+                SteamApiKey::new(key),
+            ) {
+                Ok(c) => {
+                    tracing::info!("steam client: configured");
+                    Some(Arc::new(c))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "SteamClient construction failed");
+                    tracing::info!("steam client: absent");
+                    None
+                }
+            },
+            None => {
+                tracing::info!("steam client: absent");
+                None
+            }
+        }
+    } else {
+        tracing::info!("steam client: absent");
+        None
+    };
 
     // Webhook URL fetched ONCE at startup — non-secret, cache it. On missing/failed param, warn
     // and continue without webhooks; never crash.
@@ -84,6 +117,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let step_up_username = step_up_username.clone();
         let password_param = password_param.clone();
         let totp_param = totp_param.clone();
+        let steam = steam.clone();
 
         async move {
             let payload = event.payload;
@@ -185,6 +219,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     webhook_url,
                     http: http_client,
                     session_store,
+                    steam: steam.clone(),
                 };
 
                 handle(&deps, req).await

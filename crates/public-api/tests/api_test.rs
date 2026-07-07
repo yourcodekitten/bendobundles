@@ -14,6 +14,7 @@ use domain::{Game, GameStatus, Link, game_id};
 use dynamo::Store;
 use fulfillment::{FulfillRequest, FulfillResponse};
 use public_api::{Invoker, router};
+use steam_client::{SteamApiKey, SteamClient};
 use time::macros::datetime;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -65,6 +66,9 @@ fn test_game(n: u32) -> Game {
         artwork_url: Some(format!("art{n}.png")),
         keyindex: n,
         requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     }
 }
 
@@ -79,6 +83,15 @@ fn test_link(token: &str) -> Link {
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }
+
+/// A hex token suitable as a valid ctx path `/l/<token>` — exactly 64 lowercase hex chars.
+const CTX_TOKEN: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+/// Steam ID used across OpenID tests.
+const TEST_STEAMID: &str = "76561198000000001";
+
+/// Base URL used for all router instances in tests.
+const TEST_BASE_URL: &str = "https://test.bendobundles.com";
 
 // ── MockInvoker ───────────────────────────────────────────────────────────────
 
@@ -114,6 +127,30 @@ impl Invoker for MockInvoker {
     }
 }
 
+// ── Router builder helpers ────────────────────────────────────────────────────
+
+/// Build a plain router (no steam client) for tests that don't need steam.
+fn plain_router(store: Arc<Store>, invoker: Arc<dyn Invoker>) -> axum::Router {
+    router(store, invoker, None, TEST_BASE_URL.to_string())
+}
+
+/// Build a router with a steam client pointed at a wiremock server.
+fn steam_router(store: Arc<Store>, invoker: Arc<dyn Invoker>, steam_base: &str) -> axum::Router {
+    let steam = SteamClient::new(
+        steam_base,
+        steam_base,
+        steam_base,
+        SteamApiKey::new("TESTKEY".into()),
+    )
+    .unwrap();
+    router(
+        store,
+        invoker,
+        Some(Arc::new(steam)),
+        TEST_BASE_URL.to_string(),
+    )
+}
+
 // ── Body helper ───────────────────────────────────────────────────────────────
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -139,7 +176,7 @@ async fn unknown_token_is_404() {
     let req = Request::get("/api/l/no-such-token")
         .body(Body::empty())
         .unwrap();
-    let resp = router(store, mock).oneshot(req).await.unwrap();
+    let resp = plain_router(store, mock).oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let j = body_json(resp).await;
@@ -164,7 +201,7 @@ async fn revoked_link_active_false_games_empty() {
     });
 
     let req = Request::get("/api/l/rev-tok").body(Body::empty()).unwrap();
-    let resp = router(Arc::clone(&store), mock.clone())
+    let resp = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(req)
         .await
         .unwrap();
@@ -195,7 +232,7 @@ async fn exhausted_link_state_exhausted_games_visible() {
     });
 
     let req = Request::get("/api/l/exh-tok").body(Body::empty()).unwrap();
-    let resp = router(Arc::clone(&store), mock.clone())
+    let resp = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(req)
         .await
         .unwrap();
@@ -222,7 +259,7 @@ async fn expired_link_state_expired_games_empty() {
     });
 
     let req = Request::get("/api/l/exp-tok").body(Body::empty()).unwrap();
-    let resp = router(Arc::clone(&store), mock.clone())
+    let resp = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(req)
         .await
         .unwrap();
@@ -258,7 +295,7 @@ async fn happy_claim_gift_url_and_fields_verified() {
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
         .unwrap();
-    let post_resp = router(Arc::clone(&store), Arc::clone(&invoker))
+    let post_resp = plain_router(Arc::clone(&store), Arc::clone(&invoker))
         .oneshot(post_req)
         .await
         .unwrap();
@@ -270,7 +307,7 @@ async fn happy_claim_gift_url_and_fields_verified() {
     let get_req = Request::get("/api/l/happy-tok")
         .body(Body::empty())
         .unwrap();
-    let get_resp = router(Arc::clone(&store), Arc::clone(&invoker))
+    let get_resp = plain_router(Arc::clone(&store), Arc::clone(&invoker))
         .oneshot(get_req)
         .await
         .unwrap();
@@ -338,7 +375,7 @@ async fn race_loser_gets_409() {
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
         .unwrap();
-    let resp1 = router(Arc::clone(&store), mock.clone())
+    let resp1 = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(r1)
         .await
         .unwrap();
@@ -349,7 +386,7 @@ async fn race_loser_gets_409() {
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
         .unwrap();
-    let resp2 = router(Arc::clone(&store), mock.clone())
+    let resp2 = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(r2)
         .await
         .unwrap();
@@ -387,7 +424,7 @@ async fn parked_claim_returns_202_and_appears_pending() {
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
         .unwrap();
-    let post_resp = router(Arc::clone(&store), mock.clone())
+    let post_resp = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(post_req)
         .await
         .unwrap();
@@ -401,7 +438,7 @@ async fn parked_claim_returns_202_and_appears_pending() {
 
     // GET: claim visible in pending state (fulfillment didn't complete).
     let get_req = Request::get("/api/l/park-tok").body(Body::empty()).unwrap();
-    let get_resp = router(Arc::clone(&store), mock.clone())
+    let get_resp = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(get_req)
         .await
         .unwrap();
@@ -426,7 +463,7 @@ async fn unknown_route_is_404() {
         url: "https://x.com/g".into(),
     });
     let req = Request::get("/not/a/route").body(Body::empty()).unwrap();
-    let resp = router(store, mock).oneshot(req).await.unwrap();
+    let resp = plain_router(store, mock).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -442,7 +479,7 @@ async fn self_reserved_token_is_a_plain_404() {
     });
 
     let req_self = Request::get("/api/l/SELF").body(Body::empty()).unwrap();
-    let resp_self = router(Arc::clone(&store), mock.clone())
+    let resp_self = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(req_self)
         .await
         .unwrap();
@@ -451,7 +488,7 @@ async fn self_reserved_token_is_a_plain_404() {
         Request::get("/api/l/nonexistent0000000000000000000000000000000000000000000000000000")
             .body(Body::empty())
             .unwrap();
-    let resp_other = router(Arc::clone(&store), mock.clone())
+    let resp_other = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(req_other)
         .await
         .unwrap();
@@ -469,4 +506,785 @@ async fn self_reserved_token_is_a_plain_404() {
         bytes_self, bytes_other,
         "SELF and unknown token must return byte-identical 404 (no oracle)"
     );
+}
+
+// ── Task 10: Steam tests ───────────────────────────────────────────────────────
+
+/// Build assertion params for a wiremock-backed OpenID check_authentication test.
+fn assertion_params(claimed: &str, return_to: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "openid.ns".into(),
+            "http://specs.openid.net/auth/2.0".into(),
+        ),
+        ("openid.mode".into(), "id_res".into()),
+        ("openid.claimed_id".into(), claimed.into()),
+        ("openid.identity".into(), claimed.into()),
+        ("openid.return_to".into(), return_to.into()),
+        (
+            "openid.response_nonce".into(),
+            "2026-07-06T00:00:00Znonce".into(),
+        ),
+        ("openid.assoc_handle".into(), "h".into()),
+        (
+            "openid.signed".into(),
+            "signed,op_endpoint,claimed_id,identity,return_to,response_nonce,assoc_handle".into(),
+        ),
+        ("openid.sig".into(), "sig".into()),
+    ]
+}
+
+/// Owned proxy: unknown token → byte-identical 404 (no oracle).
+/// Security gate B1: unknown token → same body as any unknown-token 404.
+#[tokio::test]
+async fn owned_proxy_404s_without_live_link_byte_identical() {
+    let Some(store) = store_or_skip("owned-proxy-404").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    // Request the owned proxy with a non-existent token.
+    let proxy_req = Request::get(format!("/api/l/{CTX_TOKEN}/steam/owned/{TEST_STEAMID}"))
+        .body(Body::empty())
+        .unwrap();
+    let proxy_resp = app.clone().oneshot(proxy_req).await.unwrap();
+
+    // Request standard unknown-link 404.
+    let link_req = Request::get(format!("/api/l/{CTX_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let link_resp = app.clone().oneshot(link_req).await.unwrap();
+
+    assert_eq!(proxy_resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(link_resp.status(), StatusCode::NOT_FOUND);
+
+    let proxy_bytes = axum::body::to_bytes(proxy_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let link_bytes = axum::body::to_bytes(link_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        proxy_bytes, link_bytes,
+        "owned proxy unknown-token 404 must be byte-identical to standard unknown-link 404"
+    );
+}
+
+/// Owned proxy: fresh cache served without hitting Steam (wiremock expect(0) discipline).
+/// Stale cache: exactly one Steam fetch, cache refreshed.
+#[tokio::test]
+async fn owned_proxy_serves_cache_then_fetches_on_stale() {
+    let Some(store) = store_or_skip("owned-proxy-cache").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+
+    // Register owned-games mock with expect(1) — exactly one call for the stale phase.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/IPlayerService/GetOwnedGames/v0001/",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"game_count":2,"games":[{"appid":730},{"appid":440}]}}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    // Seed a live link.
+    let token = CTX_TOKEN;
+    let lnk = test_link(token);
+    store.create_link(&lnk).await.unwrap();
+
+    // Phase 1: seed a FRESH cache — no Steam call expected.
+    let now_epoch = time::OffsetDateTime::now_utc().unix_timestamp();
+    let fresh_at = now_epoch - 3600; // 1 hour ago
+    store
+        .put_steam_owned(TEST_STEAMID, &[12345], fresh_at)
+        .await
+        .unwrap();
+
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/{token}/steam/owned/{TEST_STEAMID}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert!(
+        j["appids"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(12345)),
+        "fresh cache must be served: {j}"
+    );
+
+    // Phase 2: make cache stale, force a fetch.
+    let stale_at = now_epoch - (25 * 3600);
+    store
+        .put_steam_owned(TEST_STEAMID, &[99999], stale_at)
+        .await
+        .unwrap();
+
+    let resp2 = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/{token}/steam/owned/{TEST_STEAMID}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let j2 = body_json(resp2).await;
+    let appids2 = j2["appids"].as_array().unwrap();
+    assert!(
+        appids2.contains(&serde_json::json!(730)),
+        "stale cache must trigger fetch: {j2}"
+    );
+
+    server.verify().await;
+}
+
+/// Steam return: valid assertion → 302 Location `{ctx}#steam=<id64>&persona=<urlencoded>`.
+#[tokio::test]
+async fn steam_return_valid_redirects_with_fragment() {
+    let Some(store) = store_or_skip("steam-return-valid").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+
+    // check_authentication mock: is_valid:true
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .and(wiremock::matchers::body_string_contains(
+            "openid.mode=check_authentication",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("ns:http://specs.openid.net/auth/2.0\nis_valid:true\n"),
+        )
+        .mount(&server)
+        .await;
+
+    // Persona mock.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/ISteamUser/GetPlayerSummaries/v0002/"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"players":[{"steamid":"76561198000000001","personaname":"bendoerr","avatarfull":null}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let ctx = format!("/l/{CTX_TOKEN}");
+    let expected_return_to = format!(
+        "{TEST_BASE_URL}/api/steam/return?ctx={}",
+        urlencoding::encode(&ctx)
+    );
+
+    // Build the assertion params with the expected_return_to.
+    let params = assertion_params(
+        &format!("https://steamcommunity.com/openid/id/{TEST_STEAMID}"),
+        &expected_return_to,
+    );
+
+    // Build query string for GET /api/steam/return
+    let mut qs = format!("ctx={}", urlencoding::encode(&ctx));
+    for (k, v) in &params {
+        qs.push('&');
+        qs.push_str(&urlencoding::encode(k));
+        qs.push('=');
+        qs.push_str(&urlencoding::encode(v));
+    }
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/steam/return?{qs}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND, "must redirect");
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.starts_with(&format!("/l/{CTX_TOKEN}#steam=")),
+        "location must start with ctx + #steam=; got: {loc}"
+    );
+    assert!(
+        loc.contains(TEST_STEAMID),
+        "location must contain steamid; got: {loc}"
+    );
+    assert!(
+        loc.contains("persona=bendoerr"),
+        "location must contain persona=bendoerr; got: {loc}"
+    );
+}
+
+/// Steam return: bad ctx → 302 `/` (no fragment).
+#[tokio::test]
+async fn steam_return_bad_ctx_redirects_root_no_fragment() {
+    let Some(store) = store_or_skip("steam-return-bad-ctx").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/steam/return?ctx=%2Fevil")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert_eq!(loc, "/", "bad ctx must redirect to /; got: {loc}");
+}
+
+/// Steam return: is_valid:false → 302 `{ctx}#steam_error=verify_failed`.
+#[tokio::test]
+async fn steam_return_invalid_assertion_gets_steam_error_fragment() {
+    let Some(store) = store_or_skip("steam-return-invalid").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+
+    // check_authentication: is_valid:false
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .and(wiremock::matchers::body_string_contains(
+            "openid.mode=check_authentication",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("ns:http://specs.openid.net/auth/2.0\nis_valid:false\n"),
+        )
+        .mount(&server)
+        .await;
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let ctx = format!("/l/{CTX_TOKEN}");
+    let expected_return_to = format!(
+        "{TEST_BASE_URL}/api/steam/return?ctx={}",
+        urlencoding::encode(&ctx)
+    );
+
+    let params = assertion_params(
+        &format!("https://steamcommunity.com/openid/id/{TEST_STEAMID}"),
+        &expected_return_to,
+    );
+
+    let mut qs = format!("ctx={}", urlencoding::encode(&ctx));
+    for (k, v) in &params {
+        qs.push('&');
+        qs.push_str(&urlencoding::encode(k));
+        qs.push('=');
+        qs.push_str(&urlencoding::encode(v));
+    }
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/steam/return?{qs}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.contains("#steam_error=verify_failed"),
+        "invalid assertion must get #steam_error=verify_failed; got: {loc}"
+    );
+    assert!(
+        loc.starts_with(&format!("/l/{CTX_TOKEN}")),
+        "must redirect back to ctx; got: {loc}"
+    );
+}
+
+/// GameView carries steam_app_id field.
+#[tokio::test]
+async fn game_view_carries_steam_app_id() {
+    let Some(store) = store_or_skip("game-view-appid").await else {
+        return;
+    };
+    let mut g = test_game(1);
+    g.steam_app_id = Some(413150);
+    store.put_game(&g).await.unwrap();
+    let lnk = test_link("appid-tok");
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let req = Request::get("/api/l/appid-tok")
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let games = j["games"].as_array().unwrap();
+    assert_eq!(games.len(), 1, "must have one game");
+    assert_eq!(
+        games[0]["steam_app_id"], 413150,
+        "GameView must carry steam_app_id; got: {}",
+        games[0]
+    );
+}
+
+// ── I1: steamid validation on public owned proxy ──────────────────────────────
+
+/// I1-RED: live link + 16-digit steamid → 400 (must fail before fix).
+/// Security invariant 8: steamid must be validated as exactly 17 ASCII digits.
+#[tokio::test]
+async fn owned_proxy_steamid_16digit_gets_400() {
+    let Some(store) = store_or_skip("owned-proxy-i1-16digit").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    // Seed a live (active) link.
+    store.create_link(&test_link(CTX_TOKEN)).await.unwrap();
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/l/{CTX_TOKEN}/steam/owned/1234567890123456"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "16-digit steamid on live link must get 400"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["error"], "steamid must be exactly 17 ASCII digits",
+        "error message must match admin twin: {j}"
+    );
+}
+
+/// I1-RED: live link + steamid containing non-digit → 400.
+#[tokio::test]
+async fn owned_proxy_steamid_nondigit_gets_400() {
+    let Some(store) = store_or_skip("owned-proxy-i1-nondigit").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    store.create_link(&test_link(CTX_TOKEN)).await.unwrap();
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/l/{CTX_TOKEN}/steam/owned/7656119800000000x"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "non-digit steamid on live link must get 400"
+    );
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["error"], "steamid must be exactly 17 ASCII digits",
+        "error message must match admin twin: {j}"
+    );
+}
+
+/// I1-ordering-pin: unknown token + bad steamid → byte-identical 404 (not 400).
+/// The token liveness check must run BEFORE steamid validation — a bad steamid
+/// on a dead/unknown token must never reveal that the steamid was rejected.
+#[tokio::test]
+async fn owned_proxy_unknown_token_bad_steamid_is_still_404() {
+    let Some(store) = store_or_skip("owned-proxy-i1-order").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    // No link seeded — unknown token.
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    // Request with a KNOWN-BAD steamid (16 digits) but unknown token.
+    let proxy_req = Request::get(format!("/api/l/{CTX_TOKEN}/steam/owned/1234567890123456"))
+        .body(Body::empty())
+        .unwrap();
+    let proxy_resp = app.clone().oneshot(proxy_req).await.unwrap();
+
+    // Request the standard unknown-link 404 for byte comparison.
+    let link_req = Request::get(format!("/api/l/{CTX_TOKEN}"))
+        .body(Body::empty())
+        .unwrap();
+    let link_resp = app.clone().oneshot(link_req).await.unwrap();
+
+    assert_eq!(
+        proxy_resp.status(),
+        StatusCode::NOT_FOUND,
+        "unknown token + bad steamid must still return 404, not 400"
+    );
+    assert_eq!(link_resp.status(), StatusCode::NOT_FOUND);
+
+    let proxy_bytes = axum::body::to_bytes(proxy_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let link_bytes = axum::body::to_bytes(link_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        proxy_bytes, link_bytes,
+        "unknown-token + bad-steamid 404 must be byte-identical to standard unknown-link 404 \
+         (ordering proof: token gate fires before steamid validation)"
+    );
+}
+
+// ── I2: preserve duplicate query params so DUP_GUARD fires ────────────────────
+
+/// I2-RED: a genuine-shaped assertion with a SECOND `openid.claimed_id` appended
+/// must be rejected with `#steam_error=verify_failed` (DUP_GUARD firing through
+/// the endpoint), NOT succeed. WireMock answers is_valid:true — rejection must
+/// happen locally before the Steam roundtrip.
+#[tokio::test]
+async fn steam_return_duplicate_claimed_id_gets_verify_failed() {
+    let Some(store) = store_or_skip("steam-return-i2-dup").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+
+    // Mount check_authentication to answer is_valid:true — so any success would
+    // mean the DUP_GUARD is dead; we want to prove it fires BEFORE this call.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .and(wiremock::matchers::body_string_contains(
+            "openid.mode=check_authentication",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("ns:http://specs.openid.net/auth/2.0\nis_valid:true\n"),
+        )
+        .expect(0) // DUP_GUARD must reject locally — Steam must NOT be called.
+        .mount(&server)
+        .await;
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let ctx = format!("/l/{CTX_TOKEN}");
+    let expected_return_to = format!(
+        "{TEST_BASE_URL}/api/steam/return?ctx={}",
+        urlencoding::encode(&ctx)
+    );
+
+    // Build the standard assertion params.
+    let params = assertion_params(
+        &format!("https://steamcommunity.com/openid/id/{TEST_STEAMID}"),
+        &expected_return_to,
+    );
+
+    // Build query string with a DUPLICATE openid.claimed_id injected at the end.
+    let mut qs = format!("ctx={}", urlencoding::encode(&ctx));
+    for (k, v) in &params {
+        qs.push('&');
+        qs.push_str(&urlencoding::encode(k));
+        qs.push('=');
+        qs.push_str(&urlencoding::encode(v));
+    }
+    // Inject a second claimed_id (attacker's forgery attempt).
+    qs.push_str(
+        "&openid.claimed_id=https%3A%2F%2Fsteamcommunity.com%2Fopenid%2Fid%2F99999999999999999",
+    );
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/steam/return?{qs}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND, "must redirect");
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.contains("#steam_error=verify_failed"),
+        "duplicate claimed_id must fire the DUP_GUARD → verify_failed; got: {loc}"
+    );
+    assert!(
+        loc.starts_with(&format!("/l/{CTX_TOKEN}")),
+        "must redirect back to ctx; got: {loc}"
+    );
+
+    // Verify Steam was NOT called (DUP_GUARD rejected locally).
+    server.verify().await;
+}
+
+/// Login endpoint rejects a bad ctx (allowlist enforced initiation-side too).
+#[tokio::test]
+async fn steam_login_rejects_bad_ctx() {
+    let Some(store) = store_or_skip("steam-login-bad-ctx").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    for bad_ctx in [
+        "/evil",
+        "/l/",
+        "/l/tooshort",
+        "/l/UPPERCASE1234567890123456789012345678901234567890123456789012",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/steam/login?ctx={}",
+                    urlencoding::encode(bad_ctx)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(
+            loc, "/",
+            "bad ctx '{bad_ctx}' must redirect to /; got: {loc}"
+        );
+    }
+}
+
+// ── C1: admin/ops ctx allowlist bridging tests ────────────────────────────────
+
+/// C1-GREEN: login with ctx=/admin/ops → 302 to Steam (not to /).
+/// The allowlist must accept `/admin/<subroute>` — the fix that was missing.
+#[tokio::test]
+async fn steam_login_admin_ops_ctx_accepted() {
+    let Some(store) = store_or_skip("steam-login-admin-ops").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let resp = app
+        .oneshot(
+            Request::get("/api/steam/login?ctx=%2Fadmin%2Fops")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND, "admin/ops ctx must 302");
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.contains("steamcommunity.com") || loc.contains("steampowered.com"),
+        "ctx=/admin/ops must redirect to Steam, not to /; got: {loc}"
+    );
+}
+
+/// C1-GREEN: return endpoint with valid assertion and ctx=/admin/ops →
+/// 302 to /admin/ops#steam=... (not to /).
+#[tokio::test]
+async fn steam_return_admin_ops_ctx_valid_assertion() {
+    let Some(store) = store_or_skip("steam-return-admin-ops").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/openid/login"))
+        .and(wiremock::matchers::body_string_contains(
+            "openid.mode=check_authentication",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string("ns:http://specs.openid.net/auth/2.0\nis_valid:true\n"),
+        )
+        .mount(&server)
+        .await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/ISteamUser/GetPlayerSummaries/v0002/"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"players":[{"steamid":"76561198000000001","personaname":"bendoerr","avatarfull":null}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    let ctx = "/admin/ops";
+    let expected_return_to = format!(
+        "{TEST_BASE_URL}/api/steam/return?ctx={}",
+        urlencoding::encode(ctx)
+    );
+
+    let params = assertion_params(
+        &format!("https://steamcommunity.com/openid/id/{TEST_STEAMID}"),
+        &expected_return_to,
+    );
+
+    let mut qs = format!("ctx={}", urlencoding::encode(ctx));
+    for (k, v) in &params {
+        qs.push('&');
+        qs.push_str(&urlencoding::encode(k));
+        qs.push('=');
+        qs.push_str(&urlencoding::encode(v));
+    }
+
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/steam/return?{qs}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND, "must redirect");
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.starts_with("/admin/ops#steam="),
+        "return with ctx=/admin/ops must redirect to /admin/ops#steam=...; got: {loc}"
+    );
+    assert!(
+        loc.contains(TEST_STEAMID),
+        "location must contain steamid; got: {loc}"
+    );
+}
+
+/// FIX 6: handle_steam_login with steam=None must redirect to `{ctx}#steam_error=steam_unreachable`
+/// instead of forwarding to Steam and then returning a 503.
+/// RED: before FIX 6, handle_steam_login redirected to steamcommunity.com even with steam=None.
+#[tokio::test]
+async fn steam_login_unconfigured_redirects_to_steam_unreachable_fragment() {
+    let Some(store) = store_or_skip("steam-login-none").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    // plain_router has steam=None
+    let app = plain_router(Arc::clone(&store), mock);
+
+    // Use a valid ctx so the ctx allowlist check passes.
+    let ctx = "/l/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let resp = app
+        .oneshot(
+            Request::get(format!("/api/steam/login?ctx={}", urlencoding::encode(ctx)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+    assert!(
+        loc.contains("#steam_error=steam_unreachable"),
+        "unconfigured steam must redirect to ctx#steam_error=steam_unreachable; got: {loc}"
+    );
+    assert!(
+        !loc.contains("steamcommunity.com"),
+        "must NOT redirect to Steam when steam client is None; got: {loc}"
+    );
+}
+
+/// C1-REJECT: admin subroute rejections — the widening must not enable open redirect.
+/// `/admin//evil`, `/admin/ops/x`, `/admin/Ops`, `/admin/ops2`, `/admin/../etc` all → /.
+#[tokio::test]
+async fn steam_login_admin_subroute_rejections() {
+    let Some(store) = store_or_skip("steam-login-admin-reject").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
+
+    for bad_ctx in [
+        "/admin//evil",
+        "/admin/ops/x",
+        "/admin/Ops",
+        "/admin/ops2",
+        "/admin/../etc",
+        "/admin/",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/steam/login?ctx={}",
+                    urlencoding::encode(bad_ctx)
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(
+            loc, "/",
+            "bad admin ctx '{bad_ctx}' must redirect to /; got: {loc}"
+        );
+    }
 }

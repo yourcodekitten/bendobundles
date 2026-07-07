@@ -56,6 +56,19 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
             .expect("status is a string")
             .to_string()),
     );
+    // Top-level `appid_source` mirrors the body so the mapper's PutItem condition can guard
+    // against a concurrent admin Manual override. Only written when Some — attribute_not_exists
+    // then correctly matches unmapped/legacy items (None → no attribute, condition fires).
+    if let Some(src) = g.appid_source {
+        item.insert(
+            "appid_source".into(),
+            s(serde_json::to_value(src)
+                .expect("appid_source serializes")
+                .as_str()
+                .expect("appid_source is a string")
+                .to_string()),
+        );
+    }
     // Top-level `claim_id` mirrors the body so fulfill's flip can condition on ownership
     // (`claim_id = :cid`). Omitted when None so compensate's re-list transparently clears it.
     if let Some(cid) = &g.claim_id {
@@ -161,4 +174,45 @@ pub fn parse_body<T: serde::de::DeserializeOwned>(
         .and_then(|v| v.as_s().ok())
         .ok_or(crate::StoreError::Corrupt("missing body"))?;
     serde_json::from_str(body).map_err(|_| crate::StoreError::Corrupt("bad body json"))
+}
+
+/// Seconds in seven days — the TTL window for STEAMOWN cache entries.
+pub const STEAM_OWNED_TTL_SECS: i64 = 7 * 24 * 3600;
+
+/// Build the full item for the CONFIG#STEAM identity record.
+/// pk="CONFIG#STEAM", sk="META", body=JSON-serialized steamid string.
+/// Use `Store::put_steam_identity` / `Store::get_steam_identity` — do not write CONFIG#STEAM items directly.
+pub fn steam_identity_item(steamid: &str) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        ("pk".into(), s("CONFIG#STEAM")),
+        ("sk".into(), s("META")),
+        (
+            "body".into(),
+            s(serde_json::to_string(steamid).expect("steamid serializes")),
+        ),
+    ])
+}
+
+/// Build the full item for a STEAMOWN cache entry.
+/// pk="STEAMOWN#<steamid>", sk="META", body=JSON of [`crate::SteamOwnedCache`],
+/// `ttl` N = now_epoch + [`STEAM_OWNED_TTL_SECS`] (DynamoDB TTL attribute; terraform enables it
+/// in plan 4 — until then, callers must check `fetched_at` manually).
+pub fn steam_owned_item(
+    steamid: &str,
+    appids: &[u32],
+    now_epoch: i64,
+) -> HashMap<String, AttributeValue> {
+    let ttl = now_epoch + STEAM_OWNED_TTL_SECS;
+    let body = serde_json::to_string(&crate::SteamOwnedCache {
+        appids: appids.to_vec(),
+        fetched_at: now_epoch,
+    })
+    .expect("SteamOwnedCache serializes");
+    let ttl_str = ttl.to_string();
+    HashMap::from([
+        ("pk".into(), s(format!("STEAMOWN#{steamid}"))),
+        ("sk".into(), s("META")),
+        ("body".into(), s(body)),
+        ("ttl".into(), AttributeValue::N(ttl_str)),
+    ])
 }

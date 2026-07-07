@@ -1,18 +1,18 @@
 [package]
-name = "dynamo"
+name = "steam-client"
 version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-aws-sdk-dynamodb = "1"
-domain = { path = "../domain" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-time.workspace = true
+tracing = "0.1"
+tokio.workspace = true
+urlencoding = "2"
 
 [dev-dependencies]
-aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
 tokio.workspace = true
-uuid.workspace = true
+wiremock = "0.6"

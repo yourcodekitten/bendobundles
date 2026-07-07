@@ -7,6 +7,7 @@
         "machine_name": "stardew_valley_steam",
         "human_name": "Stardew Valley",
         "key_type": "steam",
+        "steam_app_id": 413150,
         "keyindex": 0
       },
       {

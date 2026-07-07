@@ -5,6 +5,7 @@
 //! - GET   /admin/api/catalog            — full game catalog (all statuses)
 //! - POST  /admin/api/games/:id/hidden   — toggle hidden flag
 //! - POST  /admin/api/games/:id/self-claim — intake + synchronous reveal (RequestResponse)
+//! - POST  /admin/api/games/:id/steam-app-id — admin override for steam_app_id (null clears)
 //! - POST  /admin/api/links              — create link (64-char token)
 //! - GET   /admin/api/links              — list all links with used/allowed counts
 //! - POST  /admin/api/links/:token/revoke
@@ -12,8 +13,13 @@
 //! - GET   /admin/api/claims/self        — Ben's own self-claimed keys (SELF partition)
 //! - POST  /admin/api/sync               — trigger catalog sync now
 //! - GET   /admin/api/status             — sync state + game counts by status
+//! - POST  /admin/api/steam/identity     — set Ben's SteamID (17-digit validation)
+//! - DELETE /admin/api/steam/identity    — clear Ben's SteamID
+//! - GET   /admin/api/steam/identity     — read Ben's SteamID (null if unset)
+//! - GET   /admin/api/steam/owned/:steamid — session-guarded proxy: serve cache (≤24h) or fetch
 //!
 //! All routes except `/login` require a valid session cookie (`session=<token>`).
+//! All `/admin/api/steam/*` routes additionally require a configured steam client; absent → 503.
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,9 +31,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dynamo::{ClaimTxError, HiddenWrite, Store};
+use dynamo::{AppidWrite, ClaimTxError, HiddenWrite, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::Deserialize;
+use steam_client::{OwnedGames, SteamClient, SteamId64};
 use time::OffsetDateTime;
 
 // ── Traits ────────────────────────────────────────────────────────────────────
@@ -55,18 +62,27 @@ struct AppState {
     invoker: Arc<dyn AdminInvoker>,
     /// Argon2 PHC string loaded from SSM at lambda boot. Never written to logs.
     admin_hash: String,
+    /// Steam client. `None` ⇒ all `/admin/api/steam/*` endpoints return 503.
+    steam: Option<Arc<SteamClient>>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
 /// Build the axum router. `admin_hash` is the argon2 PHC string for the admin password
 /// (loaded from SSM at startup by `main.rs`). All routes except `/login` require a valid
-/// session cookie set by the login endpoint.
-pub fn router(store: Arc<Store>, invoker: Arc<dyn AdminInvoker>, admin_hash: String) -> Router {
+/// session cookie set by the login endpoint. `steam` may be `None` — in that case all steam
+/// endpoints return 503.
+pub fn router(
+    store: Arc<Store>,
+    invoker: Arc<dyn AdminInvoker>,
+    admin_hash: String,
+    steam: Option<Arc<SteamClient>>,
+) -> Router {
     let state = AppState {
         store,
         invoker,
         admin_hash,
+        steam,
     };
 
     // Protected sub-router: session middleware applied to every route via route_layer.
@@ -76,6 +92,10 @@ pub fn router(store: Arc<Store>, invoker: Arc<dyn AdminInvoker>, admin_hash: Str
         .route("/admin/api/games/:id/hidden", post(handle_game_hidden))
         .route("/admin/api/games/:id/self-claim", post(handle_self_claim))
         .route(
+            "/admin/api/games/:id/steam-app-id",
+            post(handle_game_steam_appid),
+        )
+        .route(
             "/admin/api/links",
             post(handle_create_link).get(handle_list_links),
         )
@@ -84,6 +104,16 @@ pub fn router(store: Arc<Store>, invoker: Arc<dyn AdminInvoker>, admin_hash: Str
         .route("/admin/api/claims/self", get(handle_self_claims))
         .route("/admin/api/sync", post(handle_sync))
         .route("/admin/api/status", get(handle_status))
+        .route(
+            "/admin/api/steam/identity",
+            post(handle_steam_identity_post)
+                .delete(handle_steam_identity_delete)
+                .get(handle_steam_identity_get),
+        )
+        .route(
+            "/admin/api/steam/owned/:steamid",
+            get(handle_steam_owned_proxy),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             session_middleware,
@@ -126,6 +156,30 @@ async fn session_middleware(State(s): State<AppState>, request: Request, next: N
     }
 
     next.run(request).await
+}
+
+// ── Steam helper ──────────────────────────────────────────────────────────────
+
+/// Validate that `s` is exactly 17 ASCII digit characters — mirrors steam-client's
+/// `claimed_id` digit rule from `verify_openid_assertion`.
+fn is_valid_steamid(s: &str) -> bool {
+    s.len() == 17 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Extract the steam client from state or return a 503 response.
+macro_rules! require_steam {
+    ($state:expr) => {
+        match $state.steam.as_ref() {
+            Some(c) => c,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "steam not configured"})),
+                )
+                    .into_response();
+            }
+        }
+    };
 }
 
 // ── POST /admin/api/login ─────────────────────────────────────────────────────
@@ -202,6 +256,8 @@ struct CatalogGameView {
     claim_id: Option<String>,
     artwork_url: Option<String>,
     requires_choice: bool,
+    steam_app_id: Option<u32>,
+    owned_by_ben: bool,
 }
 
 async fn handle_catalog(State(s): State<AppState>) -> Response {
@@ -220,6 +276,8 @@ async fn handle_catalog(State(s): State<AppState>) -> Response {
                     claim_id: g.claim_id,
                     artwork_url: g.artwork_url,
                     requires_choice: g.requires_choice,
+                    steam_app_id: g.steam_app_id,
+                    owned_by_ben: g.owned_by_ben,
                 })
                 .collect();
             (StatusCode::OK, Json(views)).into_response()
@@ -254,6 +312,42 @@ async fn handle_game_hidden(
             Json(serde_json::json!({"error": "game is mid-claim — try again in a moment"})),
         )
             .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── POST /admin/api/games/:id/steam-app-id ────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SteamAppIdBody {
+    app_id: Option<u32>,
+}
+
+/// Admin override for a game's `steam_app_id`.
+/// - `{app_id: <number>}` → sets `steam_app_id = number, appid_source = Manual`.
+/// - `{app_id: null}`     → clears both fields; auto-resolution reruns on the next sync walk.
+///
+/// Uses `set_game_steam_appid_admin`, which bypasses the `Manual` guard (the admin IS the
+/// override) and uses the same optimistic-lock-on-status pattern as `set_game_hidden`.
+async fn handle_game_steam_appid(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SteamAppIdBody>,
+) -> Response {
+    match s.store.set_game_steam_appid_admin(&id, body.app_id).await {
+        Ok(AppidWrite::Written) => {
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
+        Ok(AppidWrite::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Ok(AppidWrite::Contested) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "game is mid-claim — try again in a moment"})),
+        )
+            .into_response(),
+        Ok(AppidWrite::Skipped) => {
+            // Should never happen from this path (admin bypasses Manual guard) but handle it.
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -631,4 +725,126 @@ async fn handle_status(State(s): State<AppState>) -> Response {
         })),
     )
         .into_response()
+}
+
+// ── POST /admin/api/steam/identity ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SteamIdentityBody {
+    steamid: String,
+}
+
+/// Set Ben's Steam identity. Validates that `steamid` is exactly 17 ASCII digits (the Steam
+/// 64-bit ID format) — mirrors steam-client's OpenID claimed_id digit rule. Returns 400 on
+/// invalid input. Returns 503 if the steam client is not configured.
+async fn handle_steam_identity_post(
+    State(s): State<AppState>,
+    Json(body): Json<SteamIdentityBody>,
+) -> Response {
+    let _steam = require_steam!(s);
+
+    if !is_valid_steamid(&body.steamid) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "steamid must be exactly 17 ASCII digits"})),
+        )
+            .into_response();
+    }
+
+    match s.store.put_steam_identity(&body.steamid).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── DELETE /admin/api/steam/identity ─────────────────────────────────────────
+
+/// Clear Ben's Steam identity. Idempotent — succeeds even if none was set.
+/// Returns 503 if the steam client is not configured.
+async fn handle_steam_identity_delete(State(s): State<AppState>) -> Response {
+    let _steam = require_steam!(s);
+
+    match s.store.delete_steam_identity().await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── GET /admin/api/steam/identity ─────────────────────────────────────────────
+
+/// Read Ben's stored Steam identity. Returns `{"steamid": "<17-digit>"}` or
+/// `{"steamid": null}` if not yet configured.
+/// Returns 503 if the steam client is not configured.
+async fn handle_steam_identity_get(State(s): State<AppState>) -> Response {
+    let _steam = require_steam!(s);
+
+    match s.store.get_steam_identity().await {
+        Ok(steamid) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"steamid": steamid})),
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── GET /admin/api/steam/owned/:steamid ───────────────────────────────────────
+
+/// Session-guarded proxy to the Steam owned-games endpoint.
+///
+/// Freshness rule: serve `get_steam_owned` if `fetched_at` ≤ 24h old; else call
+/// `get_owned_games` + `put_steam_owned` + serve. `Private` → `{"private":true}` (do NOT
+/// overwrite a previous good cache with a Private response — the cache keeps its old
+/// `fetched_at`).
+///
+/// Returns 503 if the steam client is not configured.
+/// Returns 400 if `steamid` is not exactly 17 ASCII digits.
+async fn handle_steam_owned_proxy(
+    State(s): State<AppState>,
+    Path(steamid): Path<String>,
+) -> Response {
+    let steam = require_steam!(s);
+
+    if !is_valid_steamid(&steamid) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "steamid must be exactly 17 ASCII digits"})),
+        )
+            .into_response();
+    }
+
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    const FRESH_SECS: i64 = 86400; // 24 hours
+
+    // Try the cache first.
+    match s.store.get_steam_owned(&steamid).await {
+        Ok(Some((appids, fetched_at))) if now - fetched_at <= FRESH_SECS => {
+            // Cache is fresh — serve it without hitting Steam.
+            return (StatusCode::OK, Json(serde_json::json!({"appids": appids}))).into_response();
+        }
+        Ok(_) => {}  // absent or stale — fall through to fetch
+        Err(_) => {} // read error — fall through to fetch (degraded, not fatal)
+    }
+
+    // Cache miss or stale: call Steam.
+    match steam.get_owned_games(&SteamId64(steamid.clone())).await {
+        Ok(OwnedGames::Games(appids)) => {
+            // Write-through cache — ignore write errors (degraded cache, not fatal).
+            let _ = s.store.put_steam_owned(&steamid, &appids, now).await;
+            (StatusCode::OK, Json(serde_json::json!({"appids": appids}))).into_response()
+        }
+        Ok(OwnedGames::Private) => {
+            // Do NOT overwrite a previous good cache — return private signal only.
+            (StatusCode::OK, Json(serde_json::json!({"private": true}))).into_response()
+        }
+        Err(
+            steam_client::SteamError::Network(_)
+            | steam_client::SteamError::Api(_)
+            | steam_client::SteamError::RateLimited
+            | steam_client::SteamError::KeyRejected
+            | steam_client::SteamError::NotFound
+            | steam_client::SteamError::Parse(_)
+            | steam_client::SteamError::OpenIdRejected(_),
+        ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }

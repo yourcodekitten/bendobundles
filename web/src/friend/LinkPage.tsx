@@ -1,6 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { fetchLink, NotFound, type GameView, type LinkView } from '../api';
+import { fetchLink, steamOwnedForLink, NotFound, type GameView, type LinkView } from '../api';
+import {
+  consumeReturnFragment,
+  loadIdentity,
+  saveIdentity,
+  clearIdentity,
+  beginConnect,
+  type SteamIdentity,
+} from '../steamIdentity';
 import { ClaimDialog } from './ClaimDialog';
 import { ClaimsHistory } from './ClaimsHistory';
 import { GameGrid } from './GameGrid';
@@ -18,8 +26,55 @@ export function LinkPage() {
   const [refreshTick, setRefreshTick] = useState(0);
   const prevTokenRef = useRef<string | undefined>(undefined);
 
+  // ── steam identity state ────────────────────────────────────────────────────
+  const [steamIdentity, setSteamIdentity] = useState<SteamIdentity | null>(null);
+  const [steamPrivate, setSteamPrivate] = useState(false);
+  const [steamError, setSteamError] = useState<string | null>(null);
+
   const refresh = useCallback(() => setRefreshTick((t) => t + 1), []);
 
+  // ── steam identity effect — runs once on mount (per token) ──────────────────
+  useEffect(() => {
+    let cancelled = false;
+
+    const fragment = consumeReturnFragment();
+
+    if (fragment === null) {
+      // No return fragment — restore from localStorage
+      const stored = loadIdentity();
+      if (!cancelled) setSteamIdentity(stored);
+      return;
+    }
+
+    if ('error' in fragment) {
+      if (!cancelled) setSteamError(fragment.error);
+      return;
+    }
+
+    // Steam OpenID return with steamid + persona
+    const { steamid, persona } = fragment;
+
+    async function fetchOwned() {
+      try {
+        const result = await steamOwnedForLink(token!, steamid);
+        if (cancelled) return;
+        const owned = result === 'private' ? [] : result;
+        const id: SteamIdentity = { steamid, persona, owned, fetched_at: Date.now() };
+        saveIdentity(id);
+        setSteamIdentity(id);
+        if (result === 'private') setSteamPrivate(true);
+      } catch {
+        if (!cancelled) setSteamError('steam_unreachable');
+      }
+    }
+
+    void fetchOwned();
+    return () => {
+      cancelled = true;
+    };
+  }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── link load effect ────────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
 
@@ -53,6 +108,12 @@ export function LinkPage() {
       cancelled = true;
     };
   }, [token, refreshTick]);
+
+  // Derived owned set for GameGrid
+  const ownedSet = useMemo(
+    () => new Set<number>(steamIdentity?.owned ?? []),
+    [steamIdentity],
+  );
 
   if (view.kind === 'loading') {
     return (
@@ -100,10 +161,56 @@ export function LinkPage() {
     <div className="min-h-screen bg-zinc-950 text-zinc-100">
       <header className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
         <h1 className="text-lg font-semibold">{data.label}</h1>
-        <span className="text-sm text-zinc-400">
-          {data.claims_used}/{data.claims_allowed} claims used
-        </span>
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-zinc-400">
+            {data.claims_used}/{data.claims_allowed} claims used
+          </span>
+          {steamIdentity !== null ? (
+            <div className="flex items-center gap-2">
+              <span className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-200">
+                {steamIdentity.persona}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  clearIdentity();
+                  setSteamIdentity(null);
+                  setSteamPrivate(false);
+                  setSteamError(null);
+                }}
+                className="text-xs text-zinc-500 hover:text-zinc-300"
+              >
+                disconnect
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => beginConnect(`/l/${token}`)}
+              className="rounded bg-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-600"
+            >
+              connect steam
+            </button>
+          )}
+        </div>
       </header>
+
+      {/* Steam privacy notice — spec §4 wording verbatim */}
+      {steamPrivate && (
+        <p className="mx-6 mt-4 text-sm text-zinc-400">
+          couldn&apos;t read your library — check Steam&apos;s <em>game details</em> privacy
+          setting
+        </p>
+      )}
+
+      {/* Steam connect error */}
+      {steamError !== null && (
+        <p className="mx-6 mt-4 text-sm text-zinc-400">
+          {steamError === 'verify_failed'
+            ? "we couldn't verify your Steam account — try again"
+            : 'Steam is currently unavailable — try again later'}
+        </p>
+      )}
 
       {exhausted && (
         <div
@@ -125,7 +232,12 @@ export function LinkPage() {
 
       {/* Grid: shown for exhausted (disabled buttons) or active; hidden for revoked/expired */}
       {!dead && (
-        <GameGrid games={data.games} active={data.state === 'active'} onClaim={setClaimingGame} />
+        <GameGrid
+          games={data.games}
+          active={data.state === 'active'}
+          onClaim={setClaimingGame}
+          owned={ownedSet}
+        />
       )}
 
       <ClaimsHistory claims={data.claims} />

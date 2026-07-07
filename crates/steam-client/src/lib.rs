@@ -1,0 +1,398 @@
+//! Steam Web API client — owned-games (privacy-pinned), persona, vanity, OpenID.
+use serde::Deserialize;
+
+// ── Key newtype ──────────────────────────────────────────────────────────────
+
+pub struct SteamApiKey(String);
+
+impl SteamApiKey {
+    pub fn new(v: String) -> Self {
+        Self(v)
+    }
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SteamApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SteamApiKey(REDACTED)")
+    }
+}
+
+// ── ID newtype ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteamId64(pub String);
+
+// ── Domain types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedGames {
+    /// "game details" privacy hides the library: the response carries NO `game_count` at all.
+    /// Distinct from an empty library (`game_count: 0`) — spec M4; do NOT infer privacy from
+    /// GetPlayerSummaries' communityvisibilitystate (profile visibility is a different setting).
+    Private,
+    Games(Vec<u32>),
+}
+
+#[derive(Debug)]
+pub struct Persona {
+    pub name: String,
+    pub avatar_url: Option<String>,
+}
+
+// ── Error ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub enum SteamError {
+    #[error("steam api http {0}")]
+    Api(u16),
+    #[error("network: {0}")]
+    Network(String),
+    #[error("parse: {0}")]
+    Parse(String),
+    #[error("rate limited")]
+    RateLimited,
+    #[error("bad api key")]
+    KeyRejected,
+    #[error("no such vanity/steamid")]
+    NotFound,
+    #[error("openid verification failed: {0}")]
+    OpenIdRejected(String),
+}
+
+// ── Wire types ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct OwnedWire {
+    response: OwnedResp,
+}
+#[derive(Deserialize)]
+struct OwnedResp {
+    game_count: Option<u64>,
+    #[serde(default)]
+    games: Vec<OwnedGame>,
+}
+#[derive(Deserialize)]
+struct OwnedGame {
+    appid: u32,
+}
+
+#[derive(Deserialize)]
+struct PlayerSummariesWire {
+    response: PlayerSummariesResp,
+}
+#[derive(Deserialize)]
+struct PlayerSummariesResp {
+    players: Vec<PlayerWire>,
+}
+#[derive(Deserialize)]
+struct PlayerWire {
+    personaname: String,
+    avatarfull: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VanityWire {
+    response: VanityResp,
+}
+#[derive(Deserialize)]
+struct VanityResp {
+    success: u8,
+    steamid: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AppListWire {
+    applist: AppListInner,
+}
+#[derive(Deserialize)]
+struct AppListInner {
+    apps: Vec<AppEntry>,
+}
+#[derive(Deserialize)]
+struct AppEntry {
+    appid: u32,
+    name: String,
+}
+
+// ── Client ───────────────────────────────────────────────────────────────────
+
+pub struct SteamClient {
+    base_web_api: String,
+    #[allow(dead_code)]
+    base_store: String,
+    /// Base URL for Steam OpenID endpoints (prod: `https://steamcommunity.com`).
+    base_openid: String,
+    http: reqwest::Client,
+    key: SteamApiKey,
+}
+
+impl SteamClient {
+    /// Create a new client.
+    ///
+    /// * `web_api_base` — Steam Web API root (prod: `https://api.steampowered.com`)
+    /// * `store_base`   — Steam store root (prod: `https://store.steampowered.com`)
+    /// * `openid_base`  — Steam community root used for OpenID (prod: `https://steamcommunity.com`)
+    /// * `key`          — Steam Web API key
+    ///
+    /// The HTTP client carries hard ceilings — 10s total-request timeout, 5s connect
+    /// timeout — so a hung steamcommunity connection cannot pin a request handler open
+    /// forever. This matters most for the unauthenticated OpenID return endpoint, which
+    /// makes one outbound `check_authentication` call per hit: without a timeout, slow-drip
+    /// connections become a trivial resource-exhaustion vector, and the spec's
+    /// `steam_unreachable` contract could never fire.
+    pub fn new(
+        web_api_base: &str,
+        store_base: &str,
+        openid_base: &str,
+        key: SteamApiKey,
+    ) -> Result<Self, SteamError> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| SteamError::Network(e.to_string()))?;
+        Ok(Self {
+            base_web_api: web_api_base.to_string(),
+            base_store: store_base.to_string(),
+            base_openid: openid_base.to_string(),
+            http,
+            key,
+        })
+    }
+
+    pub async fn get_owned_games(&self, steamid: &SteamId64) -> Result<OwnedGames, SteamError> {
+        let url = format!("{}/IPlayerService/GetOwnedGames/v0001/", self.base_web_api);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[
+                ("key", self.key.expose()),
+                ("steamid", &steamid.0),
+                ("include_played_free_games", "1"),
+                ("format", "json"),
+            ])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: OwnedWire = keyed_json(resp).await?;
+        match wire.response.game_count {
+            None => Ok(OwnedGames::Private),
+            Some(_) => Ok(OwnedGames::Games(
+                wire.response.games.into_iter().map(|g| g.appid).collect(),
+            )),
+        }
+    }
+
+    pub async fn get_player_summary(&self, steamid: &SteamId64) -> Result<Persona, SteamError> {
+        let url = format!("{}/ISteamUser/GetPlayerSummaries/v0002/", self.base_web_api);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("key", self.key.expose()), ("steamids", &steamid.0)])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: PlayerSummariesWire = keyed_json(resp).await?;
+        wire.response
+            .players
+            .into_iter()
+            .next()
+            .map(|p| Persona {
+                name: p.personaname,
+                avatar_url: p.avatarfull,
+            })
+            .ok_or(SteamError::NotFound)
+    }
+
+    pub async fn resolve_vanity(&self, name: &str) -> Result<SteamId64, SteamError> {
+        let url = format!("{}/ISteamUser/ResolveVanityURL/v0001/", self.base_web_api);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("key", self.key.expose()), ("vanityurl", name)])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: VanityWire = keyed_json(resp).await?;
+        if wire.response.success == 1 {
+            wire.response
+                .steamid
+                .map(SteamId64)
+                .ok_or(SteamError::NotFound)
+        } else {
+            Err(SteamError::NotFound)
+        }
+    }
+
+    /// Return all `(appid, name)` pairs from `ISteamApps/GetAppList/v2`.
+    ///
+    /// This is a keyless endpoint — no API key is sent. Duplicate names are returned verbatim;
+    /// deduplication is the caller's (title-match mapper's) responsibility.
+    pub async fn get_app_list(&self) -> Result<Vec<(u32, String)>, SteamError> {
+        let url = format!("{}/ISteamApps/GetAppList/v2/", self.base_web_api);
+        let resp = self.http.get(url).send().await.map_err(net)?;
+        let wire: AppListWire = keyed_json(resp).await?;
+        Ok(wire
+            .applist
+            .apps
+            .into_iter()
+            .map(|a| (a.appid, a.name))
+            .collect())
+    }
+
+    /// Verify a Steam OpenID assertion. Trust ladder (spec §2, ALL must hold):
+    ///
+    /// 1. `openid.return_to` in the params EXACTLY equals the URL we're handling (standard
+    ///    OpenID rule — makes ctx tampering visible).
+    /// 2. `openid.claimed_id` matches `https://steamcommunity.com/openid/id/<17-digit>`.
+    /// 3. Steam's own `check_authentication` echo answers `is_valid:true`. The trust of the
+    ///    returned `SteamId64` rests entirely on Steam's server re-validating the OpenID
+    ///    signature over the SIGNED fields and enforcing single-use `response_nonce`
+    ///    server-side (the replay defense). Do NOT trust `claimed_id` without this round-trip.
+    ///
+    /// Fail-closed behavior: missing or empty `openid.mode` is a no-op in the mode-rewrite
+    /// loop, so the POST goes out without `mode=check_authentication`; Steam does not treat it
+    /// as a check_authentication request, answers not-valid, and this function returns
+    /// `OpenIdRejected`. Any missing required field falls through to rejection — there is no
+    /// partially-trusted path.
+    pub async fn verify_openid_assertion(
+        &self,
+        params: &[(String, String)],
+        expected_return_to: &str,
+    ) -> Result<SteamId64, SteamError> {
+        // Reject duplicate security-relevant openid.* keys BEFORE any processing.
+        // Our get() takes the FIRST occurrence while check_authentication echoes ALL pairs
+        // to Steam. If Steam's parser resolves a duplicate key to a different occurrence,
+        // an attacker can forge an identity: sign their own assertion (id Y), inject a second
+        // claimed_id = X (victim) before it, have get() return X while Steam validates Y.
+        // Rejecting any duplication upfront kills the class entirely.
+        const DUP_GUARD: &[&str] = &[
+            "openid.mode",
+            "openid.claimed_id",
+            "openid.identity",
+            "openid.return_to",
+            "openid.sig",
+            "openid.signed",
+            "openid.response_nonce",
+            "openid.assoc_handle",
+            "openid.ns",
+        ];
+        for key in DUP_GUARD {
+            if params.iter().filter(|(k, _)| k == key).count() > 1 {
+                return Err(SteamError::OpenIdRejected(
+                    "duplicate openid parameter".into(),
+                ));
+            }
+        }
+
+        let get = |k: &str| {
+            params
+                .iter()
+                .find(|(pk, _)| pk == k)
+                .map(|(_, v)| v.as_str())
+        };
+
+        let return_to = get("openid.return_to").unwrap_or("");
+        if return_to != expected_return_to {
+            return Err(SteamError::OpenIdRejected("return_to mismatch".into()));
+        }
+
+        let claimed = get("openid.claimed_id").unwrap_or("");
+        let id = claimed
+            .strip_prefix("https://steamcommunity.com/openid/id/")
+            .filter(|rest| rest.len() == 17 && rest.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| SteamError::OpenIdRejected("claimed_id shape".into()))?;
+
+        // claimed_id must be in the signed field set (names in openid.signed omit the
+        // "openid." prefix per OpenID 2.0). If it isn't, Steam's check_authentication would
+        // not recompute the signature over it — is_valid:true would then vouch for the
+        // assertion WITHOUT vouching for the id we're about to return. Reject before HTTP.
+        let signed = get("openid.signed").unwrap_or("");
+        if !signed.split(',').any(|f| f == "claimed_id") {
+            return Err(SteamError::OpenIdRejected("claimed_id not signed".into()));
+        }
+
+        // Echo the assertion back with mode=check_authentication (form-encoded).
+        let mut form: Vec<(String, String)> = params.to_vec();
+        for (k, v) in &mut form {
+            if k == "openid.mode" {
+                *v = "check_authentication".into();
+            }
+        }
+        let resp = self
+            .http
+            .post(format!("{}/openid/login", self.base_openid))
+            .form(&form)
+            .send()
+            .await
+            .map_err(net)?;
+        if resp.status().as_u16() != 200 {
+            return Err(SteamError::Api(resp.status().as_u16()));
+        }
+        let body = resp.text().await.map_err(net)?;
+        if body.lines().any(|l| l.trim() == "is_valid:true") {
+            Ok(SteamId64(id.to_string()))
+        } else {
+            Err(SteamError::OpenIdRejected("is_valid:false".into()))
+        }
+    }
+}
+
+// ── OpenID redirect helper ────────────────────────────────────────────────────
+
+/// Build the "Sign in through Steam" redirect URL. Pure; both surfaces use it via the return
+/// endpoint. `realm` is the RP domain; `return_to` is the exact callback URL Steam will POST to.
+///
+/// Deliberate asymmetry: this helper hardcodes prod `https://steamcommunity.com/openid/login`
+/// while `verify_openid_assertion` uses the injectable `self.base_openid`. Users always
+/// authenticate against real Steam even when running from a dev origin — which is also why
+/// this helper is not wiremock-pointable (its output is pinned by a pure string test instead).
+pub fn steam_openid_redirect_url(realm: &str, return_to: &str) -> String {
+    let q = [
+        ("openid.ns", "http://specs.openid.net/auth/2.0"),
+        ("openid.mode", "checkid_setup"),
+        (
+            "openid.claimed_id",
+            "http://specs.openid.net/auth/2.0/identifier_select",
+        ),
+        (
+            "openid.identity",
+            "http://specs.openid.net/auth/2.0/identifier_select",
+        ),
+        ("openid.return_to", return_to),
+        ("openid.realm", realm),
+    ];
+    let qs = q
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("https://steamcommunity.com/openid/login?{qs}")
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Shared keyed-endpoint status mapping: 429 → RateLimited, 401/403 → KeyRejected,
+/// other non-2xx → Api(status), body → serde or Parse. The key never appears in any error string.
+async fn keyed_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, SteamError> {
+    match resp.status().as_u16() {
+        200 => resp
+            .json::<T>()
+            .await
+            .map_err(|e| SteamError::Parse(e.to_string())),
+        429 => Err(SteamError::RateLimited),
+        401 | 403 => Err(SteamError::KeyRejected),
+        s => Err(SteamError::Api(s)),
+    }
+}
+
+fn net(e: reqwest::Error) -> SteamError {
+    // Strip the request URL before stringifying: keyed endpoints embed ?key=... in the URL,
+    // and reqwest::Error::Display can include the full URL → key leak into error strings.
+    SteamError::Network(e.without_url().to_string())
+}

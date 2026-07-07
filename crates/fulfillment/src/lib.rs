@@ -9,10 +9,12 @@
 //! variant is a compile error until someone consciously picks its decision — the invariant can't
 //! silently rot.
 
-use domain::{Claim, Game, GameStatus};
-use dynamo::{Store, StoreError, SyncBegin, SyncState, SyncWrite};
+use domain::{AppidSource, Claim, Game, GameStatus};
+use dynamo::{OwnedWrite, Store, StoreError, SyncBegin, SyncState, SyncWrite};
 use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order, RevealedKey};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
 
 /// A parked (`Pending`) claim younger than this is left alone — the live fulfillment call may
@@ -306,6 +308,9 @@ pub struct Deps {
     /// replacing the human cookie-paste flow. `None` when self-login credentials aren't configured
     /// (then a dead session falls back to the old flag-and-ping behavior).
     pub session_store: Option<SessionStore>,
+    /// Steam Web API client, used by the appid mapper pass. `None` when the Steam API key is not
+    /// configured; `run_sync` skips the title-pass but still flows tier-1 tpk ids from the walk.
+    pub steam: Option<Arc<steam_client::SteamClient>>,
 }
 
 /// Where a self-refreshed humble session is persisted, so the next cold start reads it back.
@@ -1660,6 +1665,266 @@ where
     }
 }
 
+/// Ownership pass: stamp `owned_by_ben` on every game that has a `steam_app_id`, using Ben's
+/// Steam library fetched via the Web API.
+///
+/// Called once per sync, AFTER `map_missing_appids` (which writes tier-1 and title-pass appids),
+/// so the appid coverage is as complete as possible before we diff ownership.
+///
+/// ## Behavior (spec §3, M1)
+///
+/// - **Identity absent** → skip silently. Ben hasn't connected Steam yet.
+/// - **`Ok(Games)`** → `put_steam_owned` (refresh the 7-day cache) + diff-stamp: read the game
+///   list ONCE, write `set_game_owned_by_ben` only for games whose `owned_by_ben` value CHANGED.
+///   Games with no `steam_app_id` are skipped (nothing to compare against).
+/// - **`Ok(Private)`** → keep stamps frozen (no writes). Log at INFO. Ping Ben ONCE with a clear
+///   message so he knows why badges stopped updating.
+///
+///   **Ping dedupe:** ping only when the STEAMOWN cache entry for Ben's steamid is already
+///   present — that entry is written only on a successful `Ok(Games)` response, so its presence
+///   means "the last successful fetch returned data" and its absence means "there's never been a
+///   good fetch, so Private is not a new condition". A `Private` response does NOT touch the
+///   STEAMOWN entry, so the dedupe naturally resets when a successful fetch next overwrites it.
+///
+/// - **`Err(_)`** → keep stamps frozen, log at WARN. No ping — a transient error is not
+///   actionable by Ben and should not noise the channel.
+///
+/// ## Disconnect / frozen stamps (deliberate design)
+///
+/// When Ben's Steam identity is removed (Task 9's handler deletes `CONFIG#STEAM`), this pass
+/// skips silently on the next sync (identity absent → early return). Prior `owned_by_ben` stamps
+/// are frozen in place — they are NOT mass-cleared here. The admin UI hides the owned-badge
+/// column entirely when no Steam identity is configured (Task 11 checks identity presence), so
+/// stale frozen stamps are invisible. A fresh re-connection and the next successful
+/// `Ok(Games)` fetch will recompute and correct every stamp via the normal diff path.
+///
+/// The alternative — an HTTP-path O(catalog) mass-clear in Task 9's handler — would require
+/// iterating and conditionally writing every game on delete. That's expensive, racey, and
+/// unnecessary given the UI hides the column anyway. Keeping it here keeps the logic in one place.
+async fn refresh_ben_ownership(deps: &Deps) {
+    // No Steam client → skip. Configured by the app at startup; if absent the whole Steam
+    // feature is disabled and no identity can be fetched.
+    let Some(steam) = deps.steam.as_ref() else {
+        return;
+    };
+
+    // No identity → skip silently. Ben hasn't linked his Steam account yet.
+    let steamid = match deps.store.get_steam_identity().await {
+        Ok(Some(id)) => id,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = ?e, "steam owned refresh: get_steam_identity failed — skipping");
+            return;
+        }
+    };
+
+    match steam
+        .get_owned_games(&steam_client::SteamId64(steamid.clone()))
+        .await
+    {
+        Ok(steam_client::OwnedGames::Games(appids)) => {
+            // Refresh the 7-day owned-games cache so admin-api reads don't stale-out.
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            if let Err(e) = deps.store.put_steam_owned(&steamid, &appids, now).await {
+                tracing::warn!(error = ?e, "steam owned refresh: put_steam_owned failed — continuing with in-memory appids");
+            }
+
+            // Read game list ONCE; diff-stamp only changed values.
+            let games = match deps.store.list_all_games().await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "steam owned refresh: list_all_games failed — skipping stamps");
+                    return;
+                }
+            };
+
+            let appid_set: std::collections::HashSet<u32> = appids.into_iter().collect();
+            let mut stamped = 0usize;
+            let mut unstamped = 0usize;
+
+            for game in &games {
+                let Some(steam_app_id) = game.steam_app_id else {
+                    continue; // no appid — nothing to compare against
+                };
+                let owned = appid_set.contains(&steam_app_id);
+                if owned == game.owned_by_ben {
+                    continue; // no change — skip the conditional write
+                }
+                match deps.store.set_game_owned_by_ben(&game.id, owned).await {
+                    Ok(OwnedWrite::Written) => {
+                        if owned {
+                            stamped += 1;
+                        } else {
+                            unstamped += 1;
+                        }
+                    }
+                    // A claim is in flight — the claim path owns this game's state for now.
+                    // The next sync will re-diff and write once the claim lands.
+                    Ok(OwnedWrite::Contested) => {
+                        tracing::debug!(game_id = %game.id, "steam owned refresh: game in-flight claim — skipping stamp");
+                    }
+                    Ok(OwnedWrite::NotFound) => {} // game was deleted between list and stamp — safe no-op
+                    Err(e) => {
+                        tracing::warn!(game_id = %game.id, error = ?e, "steam owned refresh: set_game_owned_by_ben failed");
+                    }
+                }
+            }
+
+            tracing::info!(stamped, unstamped, "steam owned refresh: stamps updated");
+        }
+
+        Ok(steam_client::OwnedGames::Private) => {
+            // Stamps remain frozen. Do NOT touch owned_by_ben.
+            tracing::info!("steam owned refresh skipped: ben library reads private");
+
+            // Ping ONCE via the STEAMOWN-presence dedupe (see function-level doc).
+            let prev_success = deps
+                .store
+                .get_steam_owned(&steamid)
+                .await
+                .ok()
+                .and_then(|opt| opt)
+                .is_some();
+            if prev_success {
+                ping(
+                    deps,
+                    "your steam 'game details' privacy or the key's account changed \
+                     — owned badges are frozen until fixed",
+                )
+                .await;
+            }
+        }
+
+        Err(e) => {
+            // Transient error — keep stamps, log, no ping.
+            tracing::warn!(error = ?e, "steam owned refresh: get_owned_games failed — keeping prior stamps");
+        }
+    }
+}
+
+/// Lazy title-pass: for every steam-type game with no `steam_app_id` (and not `Manual` source),
+/// attempt a unique exact-title match against the Steam app list. Runs once per sync, AFTER the
+/// order walk (tier-1 tpk ids are already written) so only genuinely unmapped games are touched.
+///
+/// Lazy: if no unmapped games exist, returns WITHOUT fetching the app list.
+/// Resilient: 429 or any network/api failure from `get_app_list` logs a warning and skips the
+/// pass — the sync NEVER fails because Steam is unreachable.
+async fn map_missing_appids(deps: &Deps) {
+    let Some(steam) = deps.steam.as_ref() else {
+        // No Steam client configured — skip the title pass but keep tier-1 ids already written.
+        return;
+    };
+
+    let games = match deps.store.list_all_games().await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = ?e, "steam appid mapping: list_all_games failed — skipping pass");
+            return;
+        }
+    };
+
+    // Normalize: lowercase + trim + strip ™/® + collapse internal whitespace.
+    // Stripping ™/® can leave a double space (e.g. "Cities: Skylines ™ II" →
+    // "cities: skylines  ii"); split_whitespace().join(" ") collapses it.
+    let normalize = |s: &str| -> String {
+        s.to_lowercase()
+            .replace(['™', '®'], "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let manual_count = games
+        .iter()
+        .filter(|g| g.appid_source == Some(AppidSource::Manual))
+        .count();
+
+    // Candidates: steam key type, no appid, not Manual (a cleared override None/None participates).
+    let to_map: Vec<&Game> = games
+        .iter()
+        .filter(|g| {
+            g.key_type == "steam"
+                && g.steam_app_id.is_none()
+                && g.appid_source != Some(AppidSource::Manual)
+        })
+        .collect();
+
+    let already_mapped = games.iter().filter(|g| g.steam_app_id.is_some()).count();
+
+    if to_map.is_empty() {
+        tracing::info!(
+            mapped = already_mapped,
+            unmapped = 0,
+            manual = manual_count,
+            "steam appid mapping: no unmapped games — skipping app list fetch"
+        );
+        return;
+    }
+
+    // Fetch the app list — keyless endpoint, so no API key is sent.
+    let app_list = match steam.get_app_list().await {
+        Ok(list) => list,
+        Err(steam_client::SteamError::RateLimited) => {
+            tracing::warn!("steam appid mapping: 429 rate limited — skipping title pass this run");
+            return;
+        }
+        Err(
+            e @ (steam_client::SteamError::Network(_)
+            | steam_client::SteamError::Api(_)
+            | steam_client::SteamError::Parse(_)
+            | steam_client::SteamError::KeyRejected
+            | steam_client::SteamError::NotFound
+            | steam_client::SteamError::OpenIdRejected(_)),
+        ) => {
+            tracing::warn!(
+                error = ?e,
+                "steam appid mapping: network/api failure — skipping title pass this run"
+            );
+            return;
+        }
+    };
+
+    // Build name_lower → Vec<appid>. Duplicate names in Steam's list stay as duplicates — the
+    // uniqueness check below skips any title that maps to more than one appid.
+    let mut name_map: HashMap<String, Vec<u32>> = HashMap::new();
+    for (appid, name) in &app_list {
+        name_map.entry(normalize(name)).or_default().push(*appid);
+    }
+
+    let mut mapped = 0usize;
+    let mut unmapped = 0usize;
+
+    for game in &to_map {
+        let normalized = normalize(&game.title);
+        match name_map.get(&normalized) {
+            Some(ids) if ids.len() == 1 => {
+                let appid = ids[0];
+                match deps
+                    .store
+                    .set_game_steam_appid_if_unclaimed(&game.id, appid, AppidSource::Title)
+                    .await
+                {
+                    Ok(dynamo::AppidWrite::Written) => mapped += 1,
+                    Ok(_) => unmapped += 1, // NotFound / Skipped / Contested — leave unmapped
+                    Err(e) => {
+                        tracing::warn!(
+                            game_id = %game.id,
+                            error = ?e,
+                            "steam appid mapping: write failed — leaving game unmapped"
+                        );
+                        unmapped += 1;
+                    }
+                }
+            }
+            _ => unmapped += 1, // No match or ambiguous (multiple Steam entries with same name)
+        }
+    }
+
+    tracing::info!(
+        "steam appid mapping: mapped={mapped} unmapped={unmapped} manual={manual_count}"
+    );
+}
+
 /// The sync walk. Runs [`reconcile`] first (parked-claim recovery against humble truth), then
 /// walks every order and upserts each key's `Game` via the guarded sync-upsert. Every exit path
 /// persists a `SyncState` — the caller holds the run marker, so this must always report.
@@ -1764,6 +2029,10 @@ async fn run_sync(deps: &Deps) {
                 // Sync walks order.keys — these all have a real redemption key already.
                 // Choice discovery (which sets this true) is a separate ingest path.
                 requires_choice: false,
+                // Tier-1: flow the Steam App ID from the tpk wire data directly (78% coverage).
+                steam_app_id: key.steam_app_id,
+                appid_source: key.steam_app_id.map(|_| AppidSource::Humble),
+                owned_by_ben: false,
             };
             match deps.store.upsert_game_from_sync(game).await {
                 Ok(SyncWrite::Written) => games_written += 1,
@@ -1776,6 +2045,16 @@ async fn run_sync(deps: &Deps) {
             orders_failed += 1;
         }
     }
+
+    // Title-pass: map any still-unmapped steam games by unique exact name match against the Steam
+    // app list. Lazy — skips the GetAppList fetch if no unmapped games exist. 429/network errors
+    // are logged and swallowed; the pass is best-effort and never blocks sync.
+    map_missing_appids(deps).await;
+
+    // Ownership pass: stamp owned_by_ben on every game with a steam_app_id. Runs AFTER the
+    // mapper pass so appid coverage is as complete as possible before the diff. Failures are
+    // logged and swallowed; the pass is best-effort and never blocks sync.
+    refresh_ben_ownership(deps).await;
 
     // Choice-discovery ingest — surface each still-claimable OFFERED game as a `requires_choice=true`
     // catalog entry, so the gift-choice orchestration has something to run on. Runs LAST (after the
@@ -1973,6 +2252,9 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
                 artwork_url: None,
                 keyindex: 0,
                 requires_choice: true,
+                steam_app_id: None,
+                appid_source: None,
+                owned_by_ben: false,
             };
             match deps.store.upsert_game_from_sync(game).await {
                 Ok(SyncWrite::Written) => written += 1,
@@ -2405,6 +2687,7 @@ mod tests {
                 giftable: !redeemed,
                 keyindex: 0,
                 redeemed_key_val: None,
+                steam_app_id: None,
             }
         }
         fn order(keys: Vec<KeyEntry>) -> Order {

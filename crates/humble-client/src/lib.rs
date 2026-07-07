@@ -274,6 +274,9 @@ pub struct KeyEntry {
     /// The raw key value from the wire, present only when the tpk has been redeemed. Used by the
     /// self-claim recover path to record the value without a second reveal call.
     pub redeemed_key_val: Option<String>,
+    /// Steam App ID for this tpk, when the wire carries it (78% of steam keytypes in HAR capture).
+    /// `None` for non-steam keytypes and the ~22% of steam tpks the wire omits it for.
+    pub steam_app_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,6 +568,7 @@ impl HumbleClient {
                         expired,
                         keyindex: t.keyindex,
                         redeemed_key_val: t.redeemed_key_val,
+                        steam_app_id: t.steam_app_id,
                     }
                 })
                 .collect(),

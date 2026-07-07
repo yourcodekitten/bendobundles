@@ -1,6 +1,13 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useOutletContext } from 'react-router-dom';
-import { adminSync } from '../api';
+import { adminSync, adminSteamIdentity, adminSetSteamIdentity, adminClearSteamIdentity, adminSteamOwned } from '../api';
+import {
+  consumeReturnFragment,
+  loadIdentity,
+  saveIdentity,
+  clearIdentity,
+  beginConnect,
+} from '../steamIdentity';
 import { withAuth } from './withAuth';
 import type { AdminOutletContext } from './AdminApp';
 
@@ -47,7 +54,7 @@ export function Ops() {
         refreshStatus();
       })
       .catch((err: unknown) => {
-        setSyncMsg(err instanceof Error ? err.message : 'couldn’t start sync — try again');
+        setSyncMsg(err instanceof Error ? err.message : "couldn't start sync — try again");
         setSyncing(false);
       });
   };
@@ -74,6 +81,90 @@ export function Ops() {
     return () => clearInterval(id);
   }, [syncing, syncRunning, refreshStatus]);
 
+  // ── steam connect panel state ───────────────────────────────────────────────
+  // undefined = still loading from server; null = not connected; string = steamid
+  const [steamIdState, setSteamIdState] = useState<string | null | undefined>(undefined);
+  const [steamPersona, setSteamPersona] = useState<string | null>(null);
+  const [steamConnecting, setSteamConnecting] = useState(false);
+  const [steamMsg, setSteamMsg] = useState<string | null>(null);
+
+  // Load steam identity on mount + consume any return fragment from Steam OpenID
+  useEffect(() => {
+    let cancelled = false;
+
+    const fragment = consumeReturnFragment();
+
+    if (fragment !== null && 'error' in fragment) {
+      // Steam returned an error fragment (verify_failed or steam_unreachable).
+      // Show the message but do NOT return — fall through to identity load so
+      // steamIdState resolves to null and the connect button appears for retry.
+      setSteamMsg(
+        fragment.error === 'verify_failed'
+          ? "we couldn't verify your Steam account — try again"
+          : 'Steam is currently unavailable — try again later',
+      );
+    }
+
+    if (fragment !== null && 'steamid' in fragment) {
+      // Steam OpenID returned — the admin extra step: persist on server then save locally
+      const { steamid, persona } = fragment;
+      setSteamConnecting(true);
+
+      withAuth(() => adminSetSteamIdentity(steamid), navigate)
+        .then(() => withAuth(() => adminSteamOwned(steamid), navigate))
+        .then((ownedResult) => {
+          if (cancelled) return;
+          const owned = ownedResult === 'private' ? [] : ownedResult;
+          saveIdentity({ steamid, persona, owned, fetched_at: Date.now() });
+          setSteamIdState(steamid);
+          setSteamPersona(persona);
+          setSteamConnecting(false);
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setSteamConnecting(false);
+            setSteamMsg('connect failed — try again');
+            setSteamIdState(null);
+          }
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // No fragment — load current identity from server
+    withAuth(() => adminSteamIdentity(), navigate)
+      .then((id) => {
+        if (cancelled) return;
+        setSteamIdState(id);
+        if (id !== null) {
+          const local = loadIdentity();
+          if (local?.steamid === id) {
+            setSteamPersona(local.persona);
+          }
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSteamIdState(null);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [navigate]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleDisconnect = () => {
+    withAuth(() => adminClearSteamIdentity(), navigate)
+      .then(() => {
+        clearIdentity();
+        setSteamIdState(null);
+        setSteamPersona(null);
+      })
+      .catch((err: unknown) => {
+        setSteamMsg(err instanceof Error ? err.message : 'disconnect failed — try again');
+      });
+  };
+
   return (
     <div className="flex flex-col gap-8">
       {/* ── Sync panel ──────────────────────────────────────────────────── */}
@@ -90,6 +181,42 @@ export function Ops() {
         {syncMsg !== null && (
           <p role="status" className="text-sm text-zinc-300">
             {syncMsg}
+          </p>
+        )}
+      </section>
+
+      {/* ── Steam connect panel ──────────────────────────────────────────── */}
+      <section className="flex flex-col gap-3 rounded bg-zinc-900 p-4">
+        <h2 className="text-sm font-medium text-zinc-300">steam identity</h2>
+        {steamIdState === undefined ? (
+          <p className="text-xs text-zinc-500">loading…</p>
+        ) : steamConnecting ? (
+          <p className="text-xs text-zinc-500">connecting…</p>
+        ) : steamIdState !== null ? (
+          <div className="flex items-center gap-3">
+            <span className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-200">
+              {steamPersona ?? steamIdState}
+            </span>
+            <button
+              type="button"
+              onClick={handleDisconnect}
+              className="rounded bg-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-600"
+            >
+              disconnect
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => beginConnect('/admin/ops')}
+            className="w-fit rounded bg-zinc-700 px-4 py-2 text-sm hover:bg-zinc-600"
+          >
+            connect steam
+          </button>
+        )}
+        {steamMsg !== null && (
+          <p role="status" className="text-sm text-zinc-300">
+            {steamMsg}
           </p>
         )}
       </section>

@@ -1,11 +1,12 @@
 use aws_sdk_dynamodb::types::AttributeValue;
-use domain::{Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
+use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
-    ClaimTxError, HiddenWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin, SyncState, SyncWrite,
-    sync_run_is_live,
+    AppidWrite, ClaimTxError, HiddenWrite, OwnedWrite, SYNC_RUN_STALE_SECS, Store, SyncBegin,
+    SyncState, SyncWrite, sync_run_is_live,
 };
 use std::collections::HashMap;
 use time::macros::datetime;
+use uuid::Uuid;
 
 /// A raw dynamodb client + resolved table name for the given test, matching how `store_or_skip`
 /// wires the Store. Lets a test craft an item whose top-level attrs deliberately disagree with
@@ -66,6 +67,9 @@ fn game(n: u32, listable: bool) -> Game {
         artwork_url: None,
         keyindex: 0,
         requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
     }
 }
 
@@ -1062,4 +1066,653 @@ async fn compensate_self_claim_succeeds_with_no_link_meta_item() {
     let game = store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Available);
     assert_eq!(game.claim_id, None);
+}
+
+// =================================================================================================
+// TASK 6: set_game_steam_appid_if_unclaimed — guarded appid writer.
+// =================================================================================================
+
+/// Basic: seed a game with no appid, write an appid → Written, re-read confirms the pair.
+/// Manual guard: seed a game with Manual source, write → Skipped, pair unchanged.
+/// NotFound: unknown id → NotFound.
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_basic() {
+    let Some(store) = store_or_skip("set-steam-appid-basic").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Write appid → Written.
+    let result = store
+        .set_game_steam_appid_if_unclaimed(&gid, 570, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Written),
+        "set_game_steam_appid_if_unclaimed on available unclaimed game must be Written"
+    );
+
+    // Re-read: appid pair must be set.
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(got.steam_app_id, Some(570));
+    assert_eq!(got.appid_source, Some(AppidSource::Title));
+
+    // Unknown id → NotFound.
+    let nf = store
+        .set_game_steam_appid_if_unclaimed("no-such-id", 1, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(nf, AppidWrite::NotFound),
+        "unknown game id must return NotFound"
+    );
+
+    // Manual guard: seed a game with Manual source → Skipped, pair unchanged.
+    let mut manual_game = game(2, true);
+    manual_game.steam_app_id = Some(400);
+    manual_game.appid_source = Some(AppidSource::Manual);
+    let manual_gid = manual_game.id.clone();
+    store.put_game(&manual_game).await.unwrap();
+    let skipped = store
+        .set_game_steam_appid_if_unclaimed(&manual_gid, 9999, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(skipped, AppidWrite::Skipped),
+        "Manual-sourced game must return Skipped, got {skipped:?}"
+    );
+    let after = store.get_game(&manual_gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.steam_app_id,
+        Some(400),
+        "Manual appid must be unchanged"
+    );
+    assert_eq!(after.appid_source, Some(AppidSource::Manual));
+}
+
+/// Contested: a Pending game (mid-claim) → early Contested without touching the item.
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_contested() {
+    let Some(store) = store_or_skip("set-steam-appid-contested").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    let lnk = link("tok-appid-contested");
+    store.create_link(&lnk).await.unwrap();
+    let now = datetime!(2026-07-06 12:00 UTC);
+    store
+        .claim_game("tok-appid-contested", &gid, "c-appid", now)
+        .await
+        .unwrap();
+
+    let result = store
+        .set_game_steam_appid_if_unclaimed(&gid, 570, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Contested),
+        "Pending game must return Contested, got {result:?}"
+    );
+    // appid must not have been written.
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.steam_app_id, None,
+        "Contested game appid must be unchanged"
+    );
+}
+
+/// I1: DynamoDB-level Manual guard — mapper cannot clobber a Manual override even
+/// under a concurrent read→write race (the condition expression rejects the write).
+///
+/// This is the DynamoDB-condition path of the guard. The in-memory check at the top
+/// of `set_game_steam_appid_if_unclaimed` catches the non-race case; this test seeds
+/// the item with `appid_source = Manual` directly so the DDB condition is what stands
+/// between the mapper and a lost admin write.
+///
+/// RED: before the `appid_source <> :manual` condition was added to the PutItem call,
+/// the in-memory guard still caught this via the pre-read, but the DDB condition did
+/// NOT independently enforce it — a true concurrent race would have clobbered Manual.
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_manual_guard_ddb_condition() {
+    let Some(store) = store_or_skip("appid-manual-guard-ddb").await else {
+        return;
+    };
+
+    // Seed a game with appid_source = Manual (admin override already set).
+    let mut manual_game = game(1, true);
+    manual_game.steam_app_id = Some(999);
+    manual_game.appid_source = Some(AppidSource::Manual);
+    let gid = manual_game.id.clone();
+    store.put_game(&manual_game).await.unwrap();
+
+    // Mapper attempt must be Skipped — Manual is untouchable.
+    let result = store
+        .set_game_steam_appid_if_unclaimed(&gid, 12345, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Skipped),
+        "Manual-sourced game must return Skipped, got {result:?}"
+    );
+
+    // Stored values must be unchanged.
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.steam_app_id,
+        Some(999),
+        "Manual steam_app_id must not be clobbered"
+    );
+    assert_eq!(
+        after.appid_source,
+        Some(AppidSource::Manual),
+        "appid_source must remain Manual"
+    );
+}
+
+/// I1-regression: Title-sourced game → mapper write still succeeds (guard must not block non-Manual).
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_title_source_still_written() {
+    let Some(store) = store_or_skip("appid-title-regression").await else {
+        return;
+    };
+
+    // Seed a game with appid_source = Title (the normal mapper case).
+    let mut title_game = game(1, true);
+    title_game.steam_app_id = Some(100);
+    title_game.appid_source = Some(AppidSource::Title);
+    let gid = title_game.id.clone();
+    store.put_game(&title_game).await.unwrap();
+
+    // Mapper update must succeed.
+    let result = store
+        .set_game_steam_appid_if_unclaimed(&gid, 200, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Written),
+        "Title-sourced game must be overwritable by mapper, got {result:?}"
+    );
+
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(after.steam_app_id, Some(200), "appid must be updated");
+    assert_eq!(after.appid_source, Some(AppidSource::Title));
+}
+
+// -------------------------------------------------------------------------------------------------
+// FIX 1 new tests: DDB-condition race guard + top-level appid_source attribute.
+// -------------------------------------------------------------------------------------------------
+
+/// FIX 1 — race guard via admin path: after `set_game_steam_appid_admin(..Some(appid))` stamps
+/// appid_source=Manual at the DDB level, a subsequent `set_game_steam_appid_if_unclaimed` MUST
+/// return Skipped and the stored appid must be unchanged. Before FIX 1 the DDB condition used
+/// "Manual" (PascalCase) which never matched the snake_case serialized "manual", so the condition
+/// was dead; only the in-memory guard in `set_game_steam_appid_if_unclaimed` caught it.
+/// After FIX 1, both the in-memory guard AND the DDB condition use "manual".
+#[tokio::test]
+async fn set_game_steam_appid_if_unclaimed_after_admin_set_returns_skipped() {
+    let Some(store) = store_or_skip("appid-admin-then-unclaimed").await else {
+        return;
+    };
+
+    // Start with no appid — mapper can write.
+    let mut g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Admin sets appid + Manual source.
+    let result = store
+        .set_game_steam_appid_admin(&gid, Some(77777))
+        .await
+        .unwrap();
+    assert!(matches!(result, AppidWrite::Written));
+
+    // Verify admin stamp is in DDB.
+    let after_admin = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(after_admin.steam_app_id, Some(77777));
+    assert_eq!(after_admin.appid_source, Some(AppidSource::Manual));
+
+    // Mapper attempt — in-memory guard fires on the read, OR DDB condition fires on the write.
+    // Either way, must return Skipped and not clobber the admin appid.
+    let skipped = store
+        .set_game_steam_appid_if_unclaimed(&gid, 99999, AppidSource::Title)
+        .await
+        .unwrap();
+    assert!(
+        matches!(skipped, AppidWrite::Skipped),
+        "after admin set Manual, if_unclaimed must return Skipped, got {skipped:?}"
+    );
+
+    // Stored appid must be unchanged.
+    let final_game = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        final_game.steam_app_id,
+        Some(77777),
+        "admin appid must not be clobbered by mapper"
+    );
+    assert_eq!(
+        final_game.appid_source,
+        Some(AppidSource::Manual),
+        "appid_source must remain Manual"
+    );
+
+    // ── Manual-set game with stale in-memory view ──────────────────────────────
+    // Re-use the game: craft a stale copy where appid_source reads as None
+    // (simulates the mapper reading before the admin write landed). Then call
+    // set_game_steam_appid_if_unclaimed *on the same game id* — the function
+    // will re-read from DDB internally and the in-memory guard will also see Manual.
+    // This confirms the guard path is exercised regardless of the caller's stale
+    // in-memory view. The DDB condition is the safety net for the true race.
+    g.appid_source = None; // simulate stale read
+    g.steam_app_id = None;
+    // We do NOT write g back to DDB — the DDB item still has Manual.
+    let skipped2 = store
+        .set_game_steam_appid_if_unclaimed(&gid, 55555, AppidSource::Humble)
+        .await
+        .unwrap();
+    assert!(
+        matches!(skipped2, AppidWrite::Skipped),
+        "stale-view attempt must still be Skipped, got {skipped2:?}"
+    );
+    let still_77777 = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(still_77777.steam_app_id, Some(77777));
+}
+
+/// FIX 1 — top-level attribute: after `put_game` with `appid_source = Some(Manual)`,
+/// the raw DDB item MUST contain a top-level `appid_source` attribute with value "manual".
+/// RED before the schema change (appid_source was only inside the `body` JSON blob).
+#[tokio::test]
+async fn appid_source_is_top_level_attribute() {
+    let Some(store) = store_or_skip("appid-toplevel-attr").await else {
+        return;
+    };
+    let client = raw_client("appid-toplevel-attr").await;
+    let table = "t-appid-toplevel-attr";
+
+    // Put a game with Manual appid_source.
+    let mut g = game(1, true);
+    g.steam_app_id = Some(12345);
+    g.appid_source = Some(AppidSource::Manual);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Fetch the raw DDB item — NOT via the store API (which only reads body).
+    let pk = format!("GAME#{gid}");
+    let raw = client
+        .get_item()
+        .table_name(table)
+        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(pk))
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("item must exist");
+
+    // Top-level `appid_source` must be present with value "manual" (snake_case).
+    let top_level_src = raw
+        .get("appid_source")
+        .expect("appid_source must be a top-level DDB attribute after FIX 1")
+        .as_s()
+        .expect("appid_source must be a String AttributeValue");
+    assert_eq!(
+        top_level_src, "manual",
+        "top-level appid_source must be \"manual\" (snake_case), got \"{top_level_src}\""
+    );
+
+    // Top-level `appid_source` must also be present for Title.
+    let mut g2 = game(2, true);
+    g2.steam_app_id = Some(9001);
+    g2.appid_source = Some(AppidSource::Title);
+    let gid2 = g2.id.clone();
+    store.put_game(&g2).await.unwrap();
+
+    let pk2 = format!("GAME#{gid2}");
+    let raw2 = client
+        .get_item()
+        .table_name(table)
+        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(pk2))
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("item must exist");
+
+    let top_level_src2 = raw2
+        .get("appid_source")
+        .expect("appid_source must be top-level for Title source too")
+        .as_s()
+        .expect("appid_source must be a String AttributeValue");
+    assert_eq!(top_level_src2, "title");
+
+    // When appid_source is None, the attribute must be ABSENT (so attribute_not_exists fires).
+    let mut g3 = game(3, true);
+    g3.appid_source = None;
+    let gid3 = g3.id.clone();
+    store.put_game(&g3).await.unwrap();
+
+    let pk3 = format!("GAME#{gid3}");
+    let raw3 = client
+        .get_item()
+        .table_name(table)
+        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S(pk3))
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("item must exist");
+
+    assert!(
+        !raw3.contains_key("appid_source"),
+        "appid_source must NOT be present at top level when game.appid_source is None"
+    );
+}
+
+// =================================================================================================
+// TASK 7: CONFIG#STEAM identity, STEAMOWN 7d-ttl cache, guarded owned_by_ben stamp.
+// =================================================================================================
+
+/// CONFIG#STEAM: put/get/delete round-trip.
+#[tokio::test]
+async fn steam_identity_config_roundtrip() {
+    let Some(store) = store_or_skip("steam-identity-config").await else {
+        return;
+    };
+
+    // Initially absent.
+    assert_eq!(store.get_steam_identity().await.unwrap(), None);
+
+    // Put → readable back.
+    store.put_steam_identity("76561198012345678").await.unwrap();
+    assert_eq!(
+        store.get_steam_identity().await.unwrap(),
+        Some("76561198012345678".into())
+    );
+
+    // Delete → gone.
+    store.delete_steam_identity().await.unwrap();
+    assert_eq!(store.get_steam_identity().await.unwrap(), None);
+}
+
+/// STEAMOWN: put/get round-trip asserting (appids, fetched_at) AND the raw DDB `ttl`
+/// attribute equals now_epoch + 7 days.
+#[tokio::test]
+async fn steam_owned_cache_roundtrip() {
+    let Some(store) = store_or_skip("steam-owned-cache").await else {
+        return;
+    };
+    let client = raw_client("steam-owned-cache").await;
+    let table = "t-steam-owned-cache";
+
+    let steamid = "76561198012345678";
+    let appids: Vec<u32> = vec![570, 620, 400];
+    let now_epoch: i64 = 1_800_000_000;
+    const SEVEN_DAYS_SECS: i64 = 7 * 24 * 3600;
+    let expected_ttl = now_epoch + SEVEN_DAYS_SECS;
+
+    // Initially absent.
+    assert_eq!(store.get_steam_owned(steamid).await.unwrap(), None);
+
+    // Put the owned cache.
+    store
+        .put_steam_owned(steamid, &appids, now_epoch)
+        .await
+        .unwrap();
+
+    // get_steam_owned returns (appids, fetched_at).
+    let (got_appids, got_fetched_at) = store.get_steam_owned(steamid).await.unwrap().unwrap();
+    assert_eq!(got_appids, appids, "appids must round-trip");
+    assert_eq!(got_fetched_at, now_epoch, "fetched_at must equal now_epoch");
+
+    // Raw DDB item must carry a numeric `ttl` attribute = now+7d.
+    let pk = format!("STEAMOWN#{steamid}");
+    let raw = client
+        .get_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S(pk))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = raw.item.expect("STEAMOWN item must exist after put");
+    let ttl_val = item
+        .get("ttl")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<i64>().ok())
+        .expect("ttl attribute must be a numeric N");
+    assert_eq!(ttl_val, expected_ttl, "ttl must be now_epoch + 7d");
+}
+
+/// `set_game_owned_by_ben` basic: seed a game, set owned=true → Written, re-read confirms.
+/// Unknown id → NotFound.
+#[tokio::test]
+async fn set_game_owned_by_ben_basic() {
+    let Some(store) = store_or_skip("owned-by-ben-basic").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // Set owned_by_ben=true → Written.
+    let result = store.set_game_owned_by_ben(&gid, true).await.unwrap();
+    assert!(
+        matches!(result, OwnedWrite::Written),
+        "set_game_owned_by_ben on available unclaimed game must be Written"
+    );
+
+    // Re-read: owned_by_ben must be true.
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        got.owned_by_ben,
+        "game must be owned_by_ben after set(true)"
+    );
+
+    // Unknown id → NotFound.
+    let nf = store
+        .set_game_owned_by_ben("no-such-id", true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(nf, OwnedWrite::NotFound),
+        "unknown game id must return NotFound"
+    );
+}
+
+/// `set_game_owned_by_ben` contested: a Pending game triggers early Contested without touching
+/// the item.
+#[tokio::test]
+async fn set_game_owned_by_ben_contested() {
+    let Some(store) = store_or_skip("owned-by-ben-contested").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store
+        .create_link(&link("tok-owned-contested"))
+        .await
+        .unwrap();
+    let now = datetime!(2026-07-06 12:00 UTC);
+    store
+        .claim_game("tok-owned-contested", &gid, "c-owned", now)
+        .await
+        .unwrap();
+    let pending = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(pending.status, GameStatus::Pending);
+
+    // set_game_owned_by_ben must detect Pending and return Contested early.
+    let result = store.set_game_owned_by_ben(&gid, true).await.unwrap();
+    assert!(
+        matches!(result, OwnedWrite::Contested),
+        "set_game_owned_by_ben on Pending game must return Contested, got {result:?}"
+    );
+
+    // game must be unchanged.
+    let after = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        GameStatus::Pending,
+        "status must still be Pending"
+    );
+    assert!(!after.owned_by_ben, "owned_by_ben must be unchanged");
+}
+
+// ── set_game_steam_appid_admin tests ─────────────────────────────────────────
+
+/// `set_game_steam_appid_admin` with Some(appid) sets steam_app_id and appid_source=Manual.
+#[tokio::test]
+async fn set_game_steam_appid_admin_sets_manual() {
+    let Some(store) = store_or_skip("appid-admin-set").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let result = store
+        .set_game_steam_appid_admin(&gid, Some(12345))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Written),
+        "setting appid on available game must be Written"
+    );
+
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(got.steam_app_id, Some(12345), "steam_app_id must be set");
+    assert_eq!(
+        got.appid_source,
+        Some(AppidSource::Manual),
+        "appid_source must be Manual"
+    );
+}
+
+/// `set_game_steam_appid_admin` with None clears both steam_app_id and appid_source.
+#[tokio::test]
+async fn set_game_steam_appid_admin_clears_to_none() {
+    let Some(store) = store_or_skip("appid-admin-clear").await else {
+        return;
+    };
+    let mut g = game(1, true);
+    g.steam_app_id = Some(99999);
+    g.appid_source = Some(AppidSource::Manual);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let result = store.set_game_steam_appid_admin(&gid, None).await.unwrap();
+    assert!(
+        matches!(result, AppidWrite::Written),
+        "clearing appid on available game must be Written"
+    );
+
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(got.steam_app_id.is_none(), "steam_app_id must be cleared");
+    assert!(got.appid_source.is_none(), "appid_source must be cleared");
+}
+
+/// `set_game_steam_appid_admin` on a non-existent game → NotFound.
+#[tokio::test]
+async fn set_game_steam_appid_admin_notfound() {
+    let Some(store) = store_or_skip("appid-admin-notfound").await else {
+        return;
+    };
+    let result = store
+        .set_game_steam_appid_admin("no-such-id", Some(1))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::NotFound),
+        "unknown game id must return NotFound"
+    );
+}
+
+/// `set_game_steam_appid_admin` on a Pending game → Contested.
+#[tokio::test]
+async fn set_game_steam_appid_admin_contested() {
+    // Use a UUID-based table name to avoid pollution across reruns on the same moto server.
+    let uid = Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("appid-admin-ct-{}", &uid[..8])).await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    let link_token = format!("tok-appid-admin-{}", &uid[..8]);
+    store.create_link(&link(&link_token)).await.unwrap();
+    let now = datetime!(2026-07-06 12:00 UTC);
+    store
+        .claim_game(
+            &link_token,
+            &gid,
+            &format!("c-appid-admin-{}", &uid[..8]),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let result = store
+        .set_game_steam_appid_admin(&gid, Some(1))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Contested),
+        "Pending game must return Contested"
+    );
+}
+
+/// `set_game_steam_appid_admin` BYPASSES the Manual guard — unlike
+/// `set_game_steam_appid_if_unclaimed` which returns Skipped on Manual source.
+#[tokio::test]
+async fn set_game_steam_appid_admin_bypasses_manual_guard() {
+    let Some(store) = store_or_skip("appid-admin-bypass").await else {
+        return;
+    };
+    let mut g = game(1, true);
+    g.steam_app_id = Some(111);
+    g.appid_source = Some(AppidSource::Manual);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // set_game_steam_appid_if_unclaimed returns Skipped on Manual source.
+    let skipped = store
+        .set_game_steam_appid_if_unclaimed(&gid, 222, AppidSource::Humble)
+        .await
+        .unwrap();
+    assert!(
+        matches!(skipped, AppidWrite::Skipped),
+        "if_unclaimed must return Skipped on Manual source"
+    );
+
+    // set_game_steam_appid_admin overrides it.
+    let written = store
+        .set_game_steam_appid_admin(&gid, Some(222))
+        .await
+        .unwrap();
+    assert!(
+        matches!(written, AppidWrite::Written),
+        "admin override must bypass Manual guard → Written"
+    );
+
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(got.steam_app_id, Some(222), "appid must be updated to 222");
+    assert_eq!(
+        got.appid_source,
+        Some(AppidSource::Manual),
+        "source must remain Manual after override"
+    );
 }

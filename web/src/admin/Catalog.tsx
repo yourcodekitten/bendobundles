@@ -5,6 +5,7 @@ import {
   adminSetHidden,
   adminSelfClaim,
   adminSelfClaims,
+  adminSteamIdentity,
   type AdminGame,
   type SelfClaimResult,
   type SelfClaimView,
@@ -52,6 +53,9 @@ export function Catalog() {
   const [result, setResult] = useState<{ gameId: string; r: SelfClaimResult } | null>(null);
   const [selfClaims, setSelfClaims] = useState<SelfClaimView[]>([]);
 
+  // Admin steam identity — controls owned_by_ben badge visibility (frozen-stamps caveat)
+  const [adminSteamId, setAdminSteamId] = useState<string | null>(null);
+
   const load = useCallback(() => {
     setState({ phase: 'loading' });
     // withAuth re-throws non-Unauthorized errors → .catch sets error state
@@ -71,7 +75,11 @@ export function Catalog() {
   useEffect(() => {
     load();
     loadSelfClaims();
-  }, [load, loadSelfClaims]);
+    // Load admin steam identity — non-critical; if it fails, badges just stay hidden
+    withAuth(() => adminSteamIdentity(), navigate)
+      .then((id) => setAdminSteamId(id))
+      .catch(() => {});
+  }, [load, loadSelfClaims, navigate]);
 
   const handleSelfClaim = async (g: AdminGame) => {
     if (armedId !== g.id) {
@@ -238,6 +246,13 @@ export function Catalog() {
                   </span>
                 )}
 
+                {/* owned_by_ben badge — hidden when adminSteamIdentity is null (frozen-stamps caveat) */}
+                {game.owned_by_ben && adminSteamId !== null && (
+                  <span className="rounded bg-blue-900 px-2 py-0.5 text-xs text-blue-200">
+                    already own on steam
+                  </span>
+                )}
+
                 {/* Self-claim button — available games only, arm/confirm two-step */}
                 {game.status === 'available' && (
                   <button
@@ -251,9 +266,13 @@ export function Catalog() {
                     } disabled:opacity-50`}
                   >
                     {isArmed
-                      ? game.requires_choice
-                        ? 'confirm? spends 1 pick'
-                        : 'confirm?'
+                      ? game.owned_by_ben && adminSteamId !== null
+                        ? game.requires_choice
+                          ? 'you already own this on steam — spends 1 pick, sure?'
+                          : 'you already own this on steam — sure?'
+                        : game.requires_choice
+                          ? 'confirm? spends 1 pick'
+                          : 'confirm?'
                       : isClaiming
                         ? 'claiming…'
                         : 'claim for me'}

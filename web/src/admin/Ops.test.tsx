@@ -6,7 +6,9 @@ import { Ops } from './Ops';
 import type { StatusView } from '../api';
 
 vi.mock('../api');
-import { adminSync } from '../api';
+vi.mock('../steamIdentity');
+import { adminSync, adminSteamIdentity, adminSetSteamIdentity, adminClearSteamIdentity, adminSteamOwned } from '../api';
+import { consumeReturnFragment, loadIdentity, beginConnect } from '../steamIdentity';
 
 // Provides the Outlet context that Ops requires without needing the real AdminApp.
 // Using <Outlet context={...} /> (react-router-dom) is the canonical approach
@@ -41,6 +43,11 @@ function renderOps(opts: { status?: StatusView | null; refreshStatus?: () => voi
 describe('Ops', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Default: no fragment, no steam identity
+    vi.mocked(consumeReturnFragment).mockReturnValue(null);
+    vi.mocked(loadIdentity).mockReturnValue(null);
+    vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+    vi.mocked(beginConnect).mockImplementation(() => {});
   });
 
   afterEach(() => {
@@ -338,6 +345,101 @@ describe('Ops', () => {
       await waitFor(() => {
         expect(refreshStatus).toHaveBeenCalled();
       });
+    });
+  });
+
+  // ── steam connect panel ─────────────────────────────────────────────────────
+
+  describe('steam connect panel', () => {
+    it('shows connect button when no steam identity is configured', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+      renderOps();
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /connect steam/i })).toBeInTheDocument(),
+      );
+    });
+
+    it('shows persona chip and disconnect button when identity is set', async () => {
+      vi.mocked(adminSteamIdentity).mockResolvedValue('76561198000000001');
+      vi.mocked(loadIdentity).mockReturnValue({
+        steamid: '76561198000000001',
+        persona: 'TestUser',
+        owned: [],
+        fetched_at: 0,
+      });
+      renderOps();
+      await waitFor(() => expect(screen.getByText('TestUser')).toBeInTheDocument());
+      expect(screen.getByRole('button', { name: /disconnect/i })).toBeInTheDocument();
+    });
+
+    it('calls adminSetSteamIdentity when steam fragment arrives on mount', async () => {
+      vi.mocked(consumeReturnFragment).mockReturnValue({
+        steamid: '76561198000000001',
+        persona: 'Alice',
+      });
+      vi.mocked(adminSteamOwned).mockResolvedValue([]);
+      vi.mocked(adminSetSteamIdentity).mockResolvedValue(undefined);
+      renderOps();
+      await waitFor(() => expect(adminSetSteamIdentity).toHaveBeenCalledWith('76561198000000001'));
+    });
+
+    it('calls adminClearSteamIdentity and removes local identity on disconnect', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminSteamIdentity).mockResolvedValue('76561198000000001');
+      vi.mocked(loadIdentity).mockReturnValue({
+        steamid: '76561198000000001',
+        persona: 'TestUser',
+        owned: [],
+        fetched_at: 0,
+      });
+      vi.mocked(adminClearSteamIdentity).mockResolvedValue(undefined);
+      renderOps();
+      await waitFor(() => expect(screen.getByText('TestUser')).toBeInTheDocument());
+      await user.click(screen.getByRole('button', { name: /disconnect/i }));
+      await waitFor(() => expect(adminClearSteamIdentity).toHaveBeenCalled());
+    });
+
+    // C1 contract: Ops must initiate connect with exactly /admin/ops so the server-side
+    // ctx_is_allowed allowlist accepts it. If this ctx ever drifts the feature silently breaks.
+    it('initiates connect with ctx=/admin/ops — must match server ctx_is_allowed allowlist', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+      renderOps();
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /connect steam/i })).toBeInTheDocument(),
+      );
+      await user.click(screen.getByRole('button', { name: /connect steam/i }));
+      expect(beginConnect).toHaveBeenCalledWith('/admin/ops');
+    });
+
+    // FIX 3: error fragment from consumeReturnFragment must show an error message.
+    // Before FIX 3, the 'error' case fell through silently — no message shown.
+    // Recovery contract (regression guard): error branch must NOT early-return before identity
+    // load — steamIdState must resolve to null so the connect button appears for retry.
+    it('shows error message AND connect button when consumeReturnFragment returns verify_failed (FIX 3 + recovery)', async () => {
+      vi.mocked(consumeReturnFragment).mockReturnValue({ error: 'verify_failed' });
+      vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+      renderOps();
+      // (a) error message renders
+      await waitFor(() =>
+        expect(screen.getByRole('status')).toBeInTheDocument(),
+      );
+      expect(screen.getByRole('status').textContent).toMatch(/verify/i);
+      // (b) identity load was still invoked (not skipped by early return)
+      expect(adminSteamIdentity).toHaveBeenCalled();
+      // (c) connect button appears — steamIdState resolved to null, not stuck on "loading…"
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: /connect steam/i })).toBeInTheDocument(),
+      );
+    });
+
+    it('shows error message when consumeReturnFragment returns steam_unreachable (FIX 3)', async () => {
+      vi.mocked(consumeReturnFragment).mockReturnValue({ error: 'steam_unreachable' });
+      renderOps();
+      await waitFor(() =>
+        expect(screen.getByRole('status')).toBeInTheDocument(),
+      );
+      expect(screen.getByRole('status').textContent).toMatch(/unavailable|unreachable/i);
     });
   });
 });
