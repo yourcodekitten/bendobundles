@@ -209,13 +209,46 @@ impl SteamClient {
     /// 1. `openid.return_to` in the params EXACTLY equals the URL we're handling (standard
     ///    OpenID rule — makes ctx tampering visible).
     /// 2. `openid.claimed_id` matches `https://steamcommunity.com/openid/id/<17-digit>`.
-    /// 3. Steam's own `check_authentication` echo answers `is_valid:true` (this also enforces
-    ///    single-use response_nonce server-side — the replay defense).
+    /// 3. Steam's own `check_authentication` echo answers `is_valid:true`. The trust of the
+    ///    returned `SteamId64` rests entirely on Steam's server re-validating the OpenID
+    ///    signature over the SIGNED fields and enforcing single-use `response_nonce`
+    ///    server-side (the replay defense). Do NOT trust `claimed_id` without this round-trip.
+    ///
+    /// Fail-closed behavior: missing or empty `openid.mode` is a no-op in the mode-rewrite
+    /// loop, so the POST goes out without `mode=check_authentication`; Steam does not treat it
+    /// as a check_authentication request, answers not-valid, and this function returns
+    /// `OpenIdRejected`. Any missing required field falls through to rejection — there is no
+    /// partially-trusted path.
     pub async fn verify_openid_assertion(
         &self,
         params: &[(String, String)],
         expected_return_to: &str,
     ) -> Result<SteamId64, SteamError> {
+        // Reject duplicate security-relevant openid.* keys BEFORE any processing.
+        // Our get() takes the FIRST occurrence while check_authentication echoes ALL pairs
+        // to Steam. If Steam's parser resolves a duplicate key to a different occurrence,
+        // an attacker can forge an identity: sign their own assertion (id Y), inject a second
+        // claimed_id = X (victim) before it, have get() return X while Steam validates Y.
+        // Rejecting any duplication upfront kills the class entirely.
+        const DUP_GUARD: &[&str] = &[
+            "openid.mode",
+            "openid.claimed_id",
+            "openid.identity",
+            "openid.return_to",
+            "openid.sig",
+            "openid.signed",
+            "openid.response_nonce",
+            "openid.assoc_handle",
+            "openid.ns",
+        ];
+        for key in DUP_GUARD {
+            if params.iter().filter(|(k, _)| k == key).count() > 1 {
+                return Err(SteamError::OpenIdRejected(
+                    "duplicate openid parameter".into(),
+                ));
+            }
+        }
+
         let get = |k: &str| {
             params
                 .iter()
@@ -306,5 +339,7 @@ async fn keyed_json<T: serde::de::DeserializeOwned>(
 }
 
 fn net(e: reqwest::Error) -> SteamError {
-    SteamError::Network(e.to_string())
+    // Strip the request URL before stringifying: keyed endpoints embed ?key=... in the URL,
+    // and reqwest::Error::Display can include the full URL → key leak into error strings.
+    SteamError::Network(e.without_url().to_string())
 }

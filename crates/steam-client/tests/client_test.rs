@@ -240,3 +240,113 @@ async fn openid_return_to_mismatch_rejected() {
         Err(steam_client::SteamError::OpenIdRejected(_))
     ));
 }
+
+// ── F1: duplicate security-relevant openid.* keys must be rejected without network ─────────
+
+#[tokio::test]
+async fn openid_duplicate_claimed_id_rejected_without_network() {
+    // Attack: attacker completes a genuine Steam login for their own id Y, then injects a
+    // second openid.claimed_id = X (victim's id) BEFORE the real one.  Our get() takes
+    // the first occurrence → returns X; Steam validates Y's signature → is_valid:true.
+    // Without a dup guard this would be Ok(SteamId64(X)) — identity forgery.
+    //
+    // No wiremock mock is mounted. Any network attempt yields SteamError::Api(404) (not
+    // OpenIdRejected), so passing this test proves the dup check fires BEFORE HTTP.
+    let server = wiremock::MockServer::start().await;
+    let c = test_openid_client(&server);
+    let mut params = assertion_params(
+        "https://steamcommunity.com/openid/id/76561198000000001",
+        "https://bendobundles.com/api/steam/return",
+    );
+    // Prepend attacker-chosen victim id as a second claimed_id.
+    params.insert(
+        0,
+        (
+            "openid.claimed_id".into(),
+            "https://steamcommunity.com/openid/id/76561198999999999".into(),
+        ),
+    );
+    let out = c
+        .verify_openid_assertion(&params, "https://bendobundles.com/api/steam/return")
+        .await;
+    assert!(
+        matches!(out, Err(steam_client::SteamError::OpenIdRejected(_))),
+        "duplicate claimed_id must be rejected before any network call; got: {out:?}"
+    );
+}
+
+#[tokio::test]
+async fn openid_duplicate_return_to_rejected_without_network() {
+    // A second openid.return_to could confuse which value Steam validated vs which we checked.
+    // No mock mounted — proves pre-network rejection.
+    let server = wiremock::MockServer::start().await;
+    let c = test_openid_client(&server);
+    let mut params = assertion_params(
+        "https://steamcommunity.com/openid/id/76561198000000001",
+        "https://bendobundles.com/api/steam/return",
+    );
+    params.push((
+        "openid.return_to".into(),
+        "https://evil.example/hijack".into(),
+    ));
+    let out = c
+        .verify_openid_assertion(&params, "https://bendobundles.com/api/steam/return")
+        .await;
+    assert!(
+        matches!(out, Err(steam_client::SteamError::OpenIdRejected(_))),
+        "duplicate return_to must be rejected before any network call; got: {out:?}"
+    );
+}
+
+// ── F8: network errors must not leak the API key embedded in the request URL ────────────────
+
+#[tokio::test]
+async fn network_error_does_not_leak_api_key() {
+    // Port 1 (tcpmux) is refused on any sane Linux box — immediate ECONNREFUSED, no timeout.
+    let c = steam_client::SteamClient::new(
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        steam_client::SteamApiKey::new("SECRETKEY".into()),
+    )
+    .unwrap();
+    let out = c
+        .get_owned_games(&steam_client::SteamId64("76561198000000001".into()))
+        .await;
+    let err_str = format!("{:?}", out.unwrap_err());
+    assert!(
+        !err_str.contains("SECRETKEY"),
+        "network error must not contain the API key; got: {err_str}"
+    );
+}
+
+// ── F2: steam_openid_redirect_url percent-encodes & = / in the return_to value ─────────────
+
+#[test]
+fn redirect_url_encodes_special_chars() {
+    let realm = "https://bendobundles.com";
+    // return_to carries &, =, and / chars — they must be percent-encoded so they cannot
+    // inject extra OpenID params, split the URL, or enable header injection.
+    let return_to = "https://bendobundles.com/api/steam/return?ctx=%2Fl%2Fabc&foo=a=b";
+    let url = steam_client::steam_openid_redirect_url(realm, return_to);
+
+    assert!(
+        url.starts_with("https://steamcommunity.com/openid/login?"),
+        "must start with Steam login endpoint; got: {url}"
+    );
+    // & in the return_to value → %26 (not a literal & that would inject a new query param)
+    assert!(
+        url.contains("%26foo"),
+        "& in return_to must be encoded as %26; got: {url}"
+    );
+    // = in the return_to value → %3D
+    assert!(
+        url.contains("a%3Db"),
+        "= in return_to must be encoded as %3D; got: {url}"
+    );
+    // / in the path → %2F (no URL-split vector)
+    assert!(
+        url.contains("%2F"),
+        "/ in return_to must be encoded as %2F; got: {url}"
+    );
+}
