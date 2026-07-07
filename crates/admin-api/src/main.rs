@@ -91,7 +91,8 @@ async fn main() {
         fn_name,
     });
 
-    lambda_http::run(router(store, invoker, admin_hash))
+    // Task 12 will wire the real steam client from SSM/env; for now steam is disabled.
+    lambda_http::run(router(store, invoker, admin_hash, None))
         .await
         .expect("lambda_http::run failed");
 }

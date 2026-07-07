@@ -1676,6 +1676,62 @@ impl Store {
         Ok(cache.map(|c| (c.appids, c.fetched_at)))
     }
 
+    /// Admin appid override: the ONLY writer allowed to bypass the `Manual` guard and clear
+    /// `steam_app_id` to `None`. Called by the admin `POST /admin/api/games/:id/steam-app-id`
+    /// endpoint.
+    ///
+    /// - `appid = Some(id)` → sets `steam_app_id = id, appid_source = Manual`.
+    /// - `appid = None`     → clears both fields to `None`; auto-resolution reruns next sync.
+    ///
+    /// Uses the same optimistic-lock-on-status pattern as `set_game_hidden` — a concurrent
+    /// claim that lands between our read and the put CCFs the condition → `Contested`.
+    /// Returns `Contested` immediately if the game is already `Pending` at read time.
+    pub async fn set_game_steam_appid_admin(
+        &self,
+        game_id: &str,
+        appid: Option<u32>,
+    ) -> Result<AppidWrite, StoreError> {
+        let Some(mut game) = self.get_game(game_id).await? else {
+            return Ok(AppidWrite::NotFound);
+        };
+
+        if game.status == GameStatus::Pending {
+            return Ok(AppidWrite::Contested);
+        }
+
+        game.steam_app_id = appid;
+        game.appid_source = appid.map(|_| domain::AppidSource::Manual);
+
+        // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
+        let status_str = serde_json::to_value(game.status)
+            .expect("status serializes")
+            .as_str()
+            .expect("status is a string")
+            .to_string();
+
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":expected", schema::s(status_str))
+            .condition_expression("#st = :expected")
+            .send()
+            .await;
+
+        match res {
+            Ok(_) => Ok(AppidWrite::Written),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(AppidWrite::Contested)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
     /// Toggle a game's `owned_by_ben` flag with a guarded conditional write. Structural copy of
     /// `set_game_hidden` — uses the same optimistic-lock-on-status pattern to close the
     /// admin-toggle vs claim race.

@@ -25,10 +25,12 @@ dependencies = [
  "lambda_http",
  "serde",
  "serde_json",
+ "steam-client",
  "time",
  "tokio",
  "tower 0.4.13",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -1155,6 +1157,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

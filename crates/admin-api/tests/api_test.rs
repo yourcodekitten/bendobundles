@@ -17,6 +17,7 @@ use axum::{
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
 use dynamo::Store;
 use fulfillment::{FulfillRequest, FulfillResponse};
+use steam_client::{SteamApiKey, SteamClient};
 use time::macros::datetime;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
@@ -147,6 +148,7 @@ async fn admin_login(
         Arc::clone(store),
         Arc::clone(invoker),
         admin_hash.to_string(),
+        None,
     )
     .oneshot(req)
     .await
@@ -221,7 +223,7 @@ async fn login_wrong_password_returns_401() {
         .body(Body::from(r#"{"password":"wrong-pw"}"#))
         .unwrap();
 
-    let resp = router(store, invoker, admin_hash)
+    let resp = router(store, invoker, admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -241,7 +243,7 @@ async fn no_session_cookie_on_protected_route_returns_401() {
         .body(Body::empty())
         .unwrap();
 
-    let resp = router(store, invoker, admin_hash)
+    let resp = router(store, invoker, admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -261,7 +263,7 @@ async fn no_session_cookie_on_self_claim_returns_401() {
         .body(Body::from("{}"))
         .unwrap();
 
-    let resp = router(store, invoker, admin_hash)
+    let resp = router(store, invoker, admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -280,7 +282,7 @@ async fn no_session_cookie_on_claims_self_returns_401() {
         .body(Body::empty())
         .unwrap();
 
-    let resp = router(store, invoker, admin_hash)
+    let resp = router(store, invoker, admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -315,7 +317,7 @@ async fn login_correct_password_sets_cookie_and_enables_auth() {
         .body(Body::empty())
         .unwrap();
 
-    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(catalog_req)
         .await
         .unwrap();
@@ -345,10 +347,15 @@ async fn create_link_token_is_64_chars_and_visible_in_list() {
         ))
         .unwrap();
 
-    let create_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash.clone())
-        .oneshot(create_req)
-        .await
-        .unwrap();
+    let create_resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(create_req)
+    .await
+    .unwrap();
 
     assert_eq!(create_resp.status(), StatusCode::OK);
     let j = body_json(create_resp).await;
@@ -366,7 +373,7 @@ async fn create_link_token_is_64_chars_and_visible_in_list() {
         .body(Body::empty())
         .unwrap();
 
-    let list_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let list_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(list_req)
         .await
         .unwrap();
@@ -397,6 +404,7 @@ async fn post_create_link(
         Arc::clone(store),
         Arc::clone(invoker),
         admin_hash.to_string(),
+        None,
     )
     .oneshot(req)
     .await
@@ -591,7 +599,7 @@ async fn link_claims_unknown_token_returns_404() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -621,10 +629,15 @@ async fn catalog_and_hidden_toggle_reflected() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let cat1_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash.clone())
-        .oneshot(cat1_req)
-        .await
-        .unwrap();
+    let cat1_resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(cat1_req)
+    .await
+    .unwrap();
     assert_eq!(cat1_resp.status(), StatusCode::OK);
     let cat1 = body_json(cat1_resp).await;
     let game_in_cat = cat1
@@ -641,10 +654,15 @@ async fn catalog_and_hidden_toggle_reflected() {
         .header("cookie", format!("session={session}"))
         .body(Body::from(r#"{"hidden":true}"#))
         .unwrap();
-    let hide_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash.clone())
-        .oneshot(hide_req)
-        .await
-        .unwrap();
+    let hide_resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(hide_req)
+    .await
+    .unwrap();
     assert_eq!(hide_resp.status(), StatusCode::OK);
 
     // GET /admin/api/catalog again: game must now show hidden=true
@@ -652,7 +670,7 @@ async fn catalog_and_hidden_toggle_reflected() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let cat2_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let cat2_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(cat2_req)
         .await
         .unwrap();
@@ -686,7 +704,7 @@ async fn revoke_link_is_reflected_in_store() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let revoke_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let revoke_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(revoke_req)
         .await
         .unwrap();
@@ -720,7 +738,7 @@ async fn status_never_synced_serializes_sync_null() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -755,7 +773,7 @@ async fn catalog_does_not_leak_order_key_material() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -821,7 +839,7 @@ async fn link_claims_redact_gift_url_to_issued_bool() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -866,7 +884,7 @@ async fn sync_now_fires_async_and_returns_202() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -907,7 +925,7 @@ async fn sync_now_refuses_while_run_live() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -951,7 +969,7 @@ async fn sync_now_fires_past_stale_run_marker() {
         .header("cookie", format!("session={session}"))
         .body(Body::empty())
         .unwrap();
-    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash)
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
         .oneshot(req)
         .await
         .unwrap();
@@ -1006,7 +1024,7 @@ async fn test_app_with_call_invoker(
         log: Arc::clone(&log),
     });
     let admin_hash = test_admin_hash(TEST_ADMIN_PW);
-    let app = router(Arc::clone(&store), mock, admin_hash);
+    let app = router(Arc::clone(&store), mock, admin_hash, None);
     (app, store, log)
 }
 
@@ -1245,5 +1263,548 @@ async fn gift_link_claims_still_hide_gift_url() {
     assert!(
         raw.contains("issued"),
         "sanity: the response is the AdminClaimView shape: {raw}"
+    );
+}
+
+// ── Steam test infrastructure ─────────────────────────────────────────────────
+
+/// Build a router whose steam client points at the given wiremock base URL.
+fn steam_router(
+    store: Arc<Store>,
+    invoker: Arc<dyn AdminInvoker>,
+    admin_hash: String,
+    steam_base: &str,
+) -> axum::Router {
+    let steam = SteamClient::new(
+        steam_base,
+        steam_base,
+        steam_base,
+        SteamApiKey::new("TESTKEY".into()),
+    )
+    .unwrap();
+    router(store, invoker, admin_hash, Some(Arc::new(steam)))
+}
+
+/// Standard valid 17-digit steamid used across steam tests.
+const TEST_STEAMID: &str = "76561198000000001";
+
+/// Build a test app with steam wired to `steam_base`. Returns (app, store).
+async fn steam_test_app(steam_base: &str) -> Option<(axum::Router, Arc<Store>)> {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let store = store_or_skip(&format!("steam{}", &uid[..8])).await?;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash(TEST_ADMIN_PW);
+    let app = steam_router(Arc::clone(&store), invoker, admin_hash, steam_base);
+    Some((app, store))
+}
+
+/// Register a stub for GET /IPlayerService/GetOwnedGames/v0001/ returning the given body.
+async fn mock_owned_games(server: &wiremock::MockServer, body: &str, expect: u64) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/IPlayerService/GetOwnedGames/v0001/",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body.to_string()))
+        .expect(expect)
+        .mount(server)
+        .await;
+}
+
+// ── Steam 401 without session tests (pure-mock, no dynamo) ───────────────────
+
+/// POST /admin/api/steam/identity without session → 401.
+#[tokio::test]
+async fn steam_identity_post_401_without_session() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let req = Request::post("/admin/api/steam/identity")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"steamid": TEST_STEAMID})).unwrap(),
+        ))
+        .unwrap();
+    let resp = router(store, invoker, test_admin_hash("pw"), None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// DELETE /admin/api/steam/identity without session → 401.
+#[tokio::test]
+async fn steam_identity_delete_401_without_session() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let req = Request::delete("/admin/api/steam/identity")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(store, invoker, test_admin_hash("pw"), None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// GET /admin/api/steam/identity without session → 401.
+#[tokio::test]
+async fn steam_identity_get_401_without_session() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let req = Request::get("/admin/api/steam/identity")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(store, invoker, test_admin_hash("pw"), None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// GET /admin/api/steam/owned/:steamid without session → 401.
+#[tokio::test]
+async fn steam_owned_proxy_401_without_session() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let req = Request::get(format!("/admin/api/steam/owned/{TEST_STEAMID}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(store, invoker, test_admin_hash("pw"), None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// POST /admin/api/games/:id/steam-app-id without session → 401.
+#[tokio::test]
+async fn steam_appid_override_401_without_session() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let req = Request::post("/admin/api/games/some-id/steam-app-id")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"app_id": 12345})).unwrap(),
+        ))
+        .unwrap();
+    let resp = router(store, invoker, test_admin_hash("pw"), None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ── Steam 503 when not configured ─────────────────────────────────────────────
+
+/// Steam endpoints return 503 {"error":"steam not configured"} when steam is None.
+#[tokio::test]
+async fn steam_endpoints_503_when_not_configured() {
+    let Some(store) = store_or_skip("steam-503").await else {
+        return;
+    };
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash(TEST_ADMIN_PW);
+    // Build router WITHOUT a steam client.
+    let app = router(Arc::clone(&store), invoker, admin_hash, None);
+    let session = get_session(&app).await;
+
+    for (method, path, body) in [
+        (
+            "POST",
+            "/admin/api/steam/identity",
+            r#"{"steamid":"76561198000000001"}"#,
+        ),
+        ("DELETE", "/admin/api/steam/identity", ""),
+        ("GET", "/admin/api/steam/identity", ""),
+        (
+            "GET",
+            format!("/admin/api/steam/owned/{TEST_STEAMID}").as_str(),
+            "",
+        ),
+    ] {
+        let req = if method == "GET" || method == "DELETE" {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("cookie", format!("session={session}"))
+                .body(Body::empty())
+                .unwrap()
+        } else {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("cookie", format!("session={session}"))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {path} must return 503 when steam not configured"
+        );
+        let j = body_json(resp).await;
+        assert_eq!(
+            j["error"], "steam not configured",
+            "{method} {path} must carry steam not configured error"
+        );
+    }
+}
+
+// ── Steam identity round-trip ──────────────────────────────────────────────────
+
+/// POST /admin/api/steam/identity → GET shows steamid → DELETE → GET shows null.
+#[tokio::test]
+async fn steam_identity_roundtrip() {
+    let server = wiremock::MockServer::start().await;
+    let Some((app, _store)) = steam_test_app(&server.uri()).await else {
+        return;
+    };
+
+    // GET before POST → null
+    let resp = authed_get(&app, "/admin/api/steam/identity").await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    assert!(j["steamid"].is_null(), "before POST, steamid must be null");
+
+    // POST → 200 {ok: true}
+    let resp = authed_post(
+        &app,
+        "/admin/api/steam/identity",
+        &serde_json::to_string(&serde_json::json!({"steamid": TEST_STEAMID})).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    assert_eq!(j["ok"], true);
+
+    // GET → returns steamid
+    let resp = authed_get(&app, "/admin/api/steam/identity").await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    assert_eq!(j["steamid"], TEST_STEAMID);
+
+    // DELETE → 200 {ok: true}
+    let session = get_session(&app).await;
+    let req = Request::delete("/admin/api/steam/identity")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    assert_eq!(j["ok"], true);
+
+    // GET after DELETE → null
+    let resp = authed_get(&app, "/admin/api/steam/identity").await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    assert!(j["steamid"].is_null(), "after DELETE, steamid must be null");
+}
+
+/// POST /admin/api/steam/identity with a steamid that isn't exactly 17 ASCII digits → 400.
+#[tokio::test]
+async fn steam_identity_invalid_steamid_returns_400() {
+    let server = wiremock::MockServer::start().await;
+    let Some((app, _store)) = steam_test_app(&server.uri()).await else {
+        return;
+    };
+
+    for bad in [
+        "1234567890123456",
+        "123456789012345678",
+        "7656119800000000a",
+        "",
+    ] {
+        let resp = authed_post(
+            &app,
+            "/admin/api/steam/identity",
+            &serde_json::to_string(&serde_json::json!({"steamid": bad})).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "steamid='{}' must return 400",
+            bad
+        );
+    }
+}
+
+// ── Steam owned proxy tests ────────────────────────────────────────────────────
+
+/// Owned proxy serves the CACHE when `fetched_at` ≤ 24h old — no HTTP to Steam.
+#[tokio::test]
+async fn steam_owned_proxy_fresh_cache_served_without_hitting_steam() {
+    let server = wiremock::MockServer::start().await;
+    // Register the mock with expect(0) — any call fails the test.
+    mock_owned_games(
+        &server,
+        r#"{"response":{"game_count":1,"games":[{"appid":440}]}}"#,
+        0,
+    )
+    .await;
+
+    let Some((app, store)) = steam_test_app(&server.uri()).await else {
+        return;
+    };
+
+    // Seed fresh cache: fetched_at = now - 1 hour (well within 24h).
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let fresh_at = now - 3600; // 1 hour ago
+    store
+        .put_steam_owned(TEST_STEAMID, &[12345, 67890], fresh_at)
+        .await
+        .unwrap();
+
+    let resp = authed_get(&app, &format!("/admin/api/steam/owned/{TEST_STEAMID}")).await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    let appids = j["appids"].as_array().unwrap();
+    assert_eq!(appids.len(), 2);
+    assert!(appids.contains(&serde_json::json!(12345)));
+    assert!(appids.contains(&serde_json::json!(67890)));
+
+    // expect(0) is verified at server drop — no requests to Steam.
+    server.verify().await;
+}
+
+/// Owned proxy FETCHES from Steam when cache is stale (> 24h), caches the result.
+#[tokio::test]
+async fn steam_owned_proxy_stale_cache_fetches_and_caches() {
+    let server = wiremock::MockServer::start().await;
+    // expect(1): exactly one call must be made.
+    mock_owned_games(
+        &server,
+        r#"{"response":{"game_count":2,"games":[{"appid":730},{"appid":570}]}}"#,
+        1,
+    )
+    .await;
+
+    let Some((app, store)) = steam_test_app(&server.uri()).await else {
+        return;
+    };
+
+    // Seed stale cache: fetched_at = now - 25 hours (beyond 24h window).
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let stale_at = now - (25 * 3600); // 25 hours ago
+    store
+        .put_steam_owned(TEST_STEAMID, &[99999], stale_at)
+        .await
+        .unwrap();
+
+    let resp = authed_get(&app, &format!("/admin/api/steam/owned/{TEST_STEAMID}")).await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    let appids = j["appids"].as_array().unwrap();
+    assert_eq!(appids.len(), 2, "must return fresh steam data");
+    assert!(appids.contains(&serde_json::json!(730)));
+    assert!(appids.contains(&serde_json::json!(570)));
+
+    // Cache must have been updated.
+    let (cached, cached_at) = store
+        .get_steam_owned(TEST_STEAMID)
+        .await
+        .unwrap()
+        .expect("cache must exist after fetch");
+    assert!(cached.contains(&730));
+    assert!(cached_at > stale_at, "fetched_at must be updated");
+
+    server.verify().await;
+}
+
+/// Owned proxy returns {"private":true} when Steam says the library is private,
+/// and does NOT overwrite a previously-good cache.
+#[tokio::test]
+async fn steam_owned_proxy_private_returns_private_and_preserves_cache() {
+    let server = wiremock::MockServer::start().await;
+    // Private response: no game_count field.
+    mock_owned_games(&server, r#"{"response":{}}"#, 1).await;
+
+    let Some((app, store)) = steam_test_app(&server.uri()).await else {
+        return;
+    };
+
+    // Seed stale cache with real data — it must survive the Private response.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let stale_at = now - (25 * 3600);
+    store
+        .put_steam_owned(TEST_STEAMID, &[440], stale_at)
+        .await
+        .unwrap();
+
+    let resp = authed_get(&app, &format!("/admin/api/steam/owned/{TEST_STEAMID}")).await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    assert_eq!(j["private"], true, "Private must return {{private:true}}");
+    assert!(
+        j.get("appids").is_none(),
+        "private response must not carry appids"
+    );
+
+    // Old cache must still be intact (fetched_at unchanged = still stale_at).
+    let (_, cached_at) = store
+        .get_steam_owned(TEST_STEAMID)
+        .await
+        .unwrap()
+        .expect("cache must still exist after Private response");
+    assert_eq!(
+        cached_at, stale_at,
+        "Private must not overwrite cache fetched_at"
+    );
+
+    server.verify().await;
+}
+
+/// GET /admin/api/steam/owned/:steamid with an invalid steamid (not 17 digits) → 400.
+#[tokio::test]
+async fn steam_owned_proxy_invalid_steamid_returns_400() {
+    let server = wiremock::MockServer::start().await;
+    let Some((app, _store)) = steam_test_app(&server.uri()).await else {
+        return;
+    };
+
+    for bad in ["1234", "765611980000000012", "7656119800000000x"] {
+        let resp = authed_get(&app, &format!("/admin/api/steam/owned/{bad}")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "invalid steamid '{bad}' must return 400"
+        );
+    }
+}
+
+// ── Steam appid override tests ─────────────────────────────────────────────────
+
+/// POST /admin/api/games/:id/steam-app-id {app_id: 12345} → {ok:true}, game has Manual appid.
+#[tokio::test]
+async fn steam_appid_override_sets_manual() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+    let g = sample_game("gk-appid-set:mn");
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let resp = authed_post(
+        &app,
+        &format!("/admin/api/games/{gid}/steam-app-id"),
+        &serde_json::to_string(&serde_json::json!({"app_id": 12345})).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    assert_eq!(j["ok"], true);
+
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(got.steam_app_id, Some(12345));
+    assert_eq!(got.appid_source, Some(domain::AppidSource::Manual));
+}
+
+/// POST /admin/api/games/:id/steam-app-id {app_id: null} → {ok:true}, clears both fields.
+#[tokio::test]
+async fn steam_appid_override_null_clears() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+    let mut g = sample_game("gk-appid-clr:mn");
+    g.steam_app_id = Some(99999);
+    g.appid_source = Some(domain::AppidSource::Manual);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let resp = authed_post(
+        &app,
+        &format!("/admin/api/games/{gid}/steam-app-id"),
+        &serde_json::to_string(&serde_json::json!({"app_id": null})).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let j = body_json(resp).await;
+    assert_eq!(j["ok"], true);
+
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(got.steam_app_id.is_none(), "steam_app_id must be cleared");
+    assert!(got.appid_source.is_none(), "appid_source must be cleared");
+}
+
+/// POST /admin/api/games/:id/steam-app-id on unknown game → 404.
+#[tokio::test]
+async fn steam_appid_override_unknown_game_returns_404() {
+    let (app, _store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+
+    let resp = authed_post(
+        &app,
+        "/admin/api/games/no-such-game/steam-app-id",
+        &serde_json::to_string(&serde_json::json!({"app_id": 1})).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── Catalog view steam fields ──────────────────────────────────────────────────
+
+/// GET /admin/api/catalog returns steam_app_id and owned_by_ben on each game view.
+#[tokio::test]
+async fn catalog_view_carries_steam_app_id_and_owned_by_ben() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+
+    let mut g = sample_game("gk-steam-cat:mn");
+    g.steam_app_id = Some(730);
+    g.owned_by_ben = true;
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let resp = authed_get(&app, "/admin/api/catalog").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = body_json(resp).await;
+    let game = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == gid)
+        .expect("game must appear in catalog");
+
+    assert_eq!(game["steam_app_id"], 730, "steam_app_id must be 730");
+    assert_eq!(game["owned_by_ben"], true, "owned_by_ben must be true");
+}
+
+/// Catalog game with no steam_app_id → steam_app_id is null (not missing), owned_by_ben is false.
+#[tokio::test]
+async fn catalog_view_steam_fields_absent_when_unset() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+        key: "unused".into(),
+    })
+    .await;
+
+    let g = sample_game("gk-no-steam:mn");
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let resp = authed_get(&app, "/admin/api/catalog").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = body_json(resp).await;
+    let game = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["id"] == gid)
+        .expect("game must appear in catalog");
+
+    assert!(
+        game["steam_app_id"].is_null(),
+        "unset steam_app_id must serialize as null, not missing"
+    );
+    assert_eq!(
+        game["owned_by_ben"], false,
+        "unset owned_by_ben must be false"
     );
 }

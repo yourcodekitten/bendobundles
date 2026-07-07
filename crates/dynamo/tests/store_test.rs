@@ -6,6 +6,7 @@ use dynamo::{
 };
 use std::collections::HashMap;
 use time::macros::datetime;
+use uuid::Uuid;
 
 /// A raw dynamodb client + resolved table name for the given test, matching how `store_or_skip`
 /// wires the Store. Lets a test craft an item whose top-level attrs deliberately disagree with
@@ -1312,4 +1313,149 @@ async fn set_game_owned_by_ben_contested() {
         "status must still be Pending"
     );
     assert!(!after.owned_by_ben, "owned_by_ben must be unchanged");
+}
+
+// ── set_game_steam_appid_admin tests ─────────────────────────────────────────
+
+/// `set_game_steam_appid_admin` with Some(appid) sets steam_app_id and appid_source=Manual.
+#[tokio::test]
+async fn set_game_steam_appid_admin_sets_manual() {
+    let Some(store) = store_or_skip("appid-admin-set").await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let result = store
+        .set_game_steam_appid_admin(&gid, Some(12345))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Written),
+        "setting appid on available game must be Written"
+    );
+
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(got.steam_app_id, Some(12345), "steam_app_id must be set");
+    assert_eq!(
+        got.appid_source,
+        Some(AppidSource::Manual),
+        "appid_source must be Manual"
+    );
+}
+
+/// `set_game_steam_appid_admin` with None clears both steam_app_id and appid_source.
+#[tokio::test]
+async fn set_game_steam_appid_admin_clears_to_none() {
+    let Some(store) = store_or_skip("appid-admin-clear").await else {
+        return;
+    };
+    let mut g = game(1, true);
+    g.steam_app_id = Some(99999);
+    g.appid_source = Some(AppidSource::Manual);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    let result = store.set_game_steam_appid_admin(&gid, None).await.unwrap();
+    assert!(
+        matches!(result, AppidWrite::Written),
+        "clearing appid on available game must be Written"
+    );
+
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(got.steam_app_id.is_none(), "steam_app_id must be cleared");
+    assert!(got.appid_source.is_none(), "appid_source must be cleared");
+}
+
+/// `set_game_steam_appid_admin` on a non-existent game → NotFound.
+#[tokio::test]
+async fn set_game_steam_appid_admin_notfound() {
+    let Some(store) = store_or_skip("appid-admin-notfound").await else {
+        return;
+    };
+    let result = store
+        .set_game_steam_appid_admin("no-such-id", Some(1))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::NotFound),
+        "unknown game id must return NotFound"
+    );
+}
+
+/// `set_game_steam_appid_admin` on a Pending game → Contested.
+#[tokio::test]
+async fn set_game_steam_appid_admin_contested() {
+    // Use a UUID-based table name to avoid pollution across reruns on the same moto server.
+    let uid = Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("appid-admin-ct-{}", &uid[..8])).await else {
+        return;
+    };
+    let g = game(1, true);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    let link_token = format!("tok-appid-admin-{}", &uid[..8]);
+    store.create_link(&link(&link_token)).await.unwrap();
+    let now = datetime!(2026-07-06 12:00 UTC);
+    store
+        .claim_game(
+            &link_token,
+            &gid,
+            &format!("c-appid-admin-{}", &uid[..8]),
+            now,
+        )
+        .await
+        .unwrap();
+
+    let result = store
+        .set_game_steam_appid_admin(&gid, Some(1))
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, AppidWrite::Contested),
+        "Pending game must return Contested"
+    );
+}
+
+/// `set_game_steam_appid_admin` BYPASSES the Manual guard — unlike
+/// `set_game_steam_appid_if_unclaimed` which returns Skipped on Manual source.
+#[tokio::test]
+async fn set_game_steam_appid_admin_bypasses_manual_guard() {
+    let Some(store) = store_or_skip("appid-admin-bypass").await else {
+        return;
+    };
+    let mut g = game(1, true);
+    g.steam_app_id = Some(111);
+    g.appid_source = Some(AppidSource::Manual);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+
+    // set_game_steam_appid_if_unclaimed returns Skipped on Manual source.
+    let skipped = store
+        .set_game_steam_appid_if_unclaimed(&gid, 222, AppidSource::Humble)
+        .await
+        .unwrap();
+    assert!(
+        matches!(skipped, AppidWrite::Skipped),
+        "if_unclaimed must return Skipped on Manual source"
+    );
+
+    // set_game_steam_appid_admin overrides it.
+    let written = store
+        .set_game_steam_appid_admin(&gid, Some(222))
+        .await
+        .unwrap();
+    assert!(
+        matches!(written, AppidWrite::Written),
+        "admin override must bypass Manual guard → Written"
+    );
+
+    let got = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(got.steam_app_id, Some(222), "appid must be updated to 222");
+    assert_eq!(
+        got.appid_source,
+        Some(AppidSource::Manual),
+        "source must remain Manual after override"
+    );
 }
