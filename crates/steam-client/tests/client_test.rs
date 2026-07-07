@@ -406,17 +406,20 @@ async fn openid_is_valid_substring_line_is_not_trusted() {
     );
 }
 
-// ── Task 3: get_app_list returns verbatim (appid, name) pairs including duplicates ───────────
+// ── #48: get_app_list via IStoreService/GetAppList/v1 (keyed, paginated) ────────────────────
+// Steam removed ISteamApps/GetAppList (404 for everyone, live-observed 2026-07-07); the
+// replacement requires the API key and pages via have_more_results/last_appid.
 
 #[tokio::test]
-async fn get_app_list_returns_all_pairs_including_dup_names() {
-    // Tier-2 data source for the title-match mapper: keyless endpoint, dup names INCLUDED —
-    // dedup is the mapper's job downstream (unique-only rule), not this method's.
+async fn get_app_list_single_page_returns_all_pairs_including_dup_names() {
+    // Tier-2 data source for the title-match mapper: dup names INCLUDED — dedup is the
+    // mapper's job downstream (unique-only rule), not this method's. Endpoint is KEYED.
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/ISteamApps/GetAppList/v2/"))
+        .and(wiremock::matchers::path("/IStoreService/GetAppList/v1/"))
+        .and(wiremock::matchers::query_param("key", "TESTKEY"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
-            r#"{"applist":{"apps":[{"appid":413150,"name":"Stardew Valley"},{"appid":999,"name":"Stardew Valley"},{"appid":602320,"name":"Train Valley 2"}]}}"#,
+            r#"{"response":{"apps":[{"appid":413150,"name":"Stardew Valley","last_modified":1,"price_change_number":2},{"appid":999,"name":"Stardew Valley"},{"appid":602320,"name":"Train Valley 2"}],"have_more_results":false}}"#,
         ))
         .mount(&server)
         .await;
@@ -427,6 +430,77 @@ async fn get_app_list_returns_all_pairs_including_dup_names() {
             (413150u32, "Stardew Valley".to_string()),
             (999u32, "Stardew Valley".to_string()),
             (602320u32, "Train Valley 2".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn get_app_list_follows_last_appid_cursor_until_exhausted() {
+    // Page 1 (no last_appid param) → have_more_results:true + last_appid cursor;
+    // page 2 (last_appid=999) → final page with have_more_results ABSENT (Steam omits it
+    // on the last page rather than sending false). Results concatenate in order.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/IStoreService/GetAppList/v1/"))
+        .and(wiremock::matchers::query_param("key", "TESTKEY"))
+        .and(wiremock::matchers::query_param_is_missing("last_appid"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"apps":[{"appid":10,"name":"Counter-Strike"},{"appid":999,"name":"Stardew Valley"}],"have_more_results":true,"last_appid":999}}"#,
+        ))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/IStoreService/GetAppList/v1/"))
+        .and(wiremock::matchers::query_param("key", "TESTKEY"))
+        .and(wiremock::matchers::query_param("last_appid", "999"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_string(
+                r#"{"response":{"apps":[{"appid":602320,"name":"Train Valley 2"}]}}"#,
+            ),
+        )
+        .mount(&server)
+        .await;
+    let out = test_client(&server).get_app_list().await.unwrap();
+    assert_eq!(
+        out,
+        vec![
+            (10u32, "Counter-Strike".to_string()),
+            (999u32, "Stardew Valley".to_string()),
+            (602320u32, "Train Valley 2".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn get_app_list_stalled_cursor_terminates_with_partial_results() {
+    // Loop guard: a page that claims have_more_results:true but repeats the SAME last_appid
+    // cursor would loop forever (each request matches the same mock). Must terminate and
+    // return what was collected — tier-2 is best-effort; partial data beats a hung sync.
+    // The stalled page is fetched once (its apps land in the result) before the
+    // non-advancing cursor is detected, hence the duplicate entry below.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/IStoreService/GetAppList/v1/"))
+        .and(wiremock::matchers::query_param_is_missing("last_appid"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"apps":[{"appid":10,"name":"Counter-Strike"}],"have_more_results":true,"last_appid":10}}"#,
+        ))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/IStoreService/GetAppList/v1/"))
+        .and(wiremock::matchers::query_param("last_appid", "10"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"apps":[{"appid":10,"name":"Counter-Strike"}],"have_more_results":true,"last_appid":10}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = test_client(&server).get_app_list().await.unwrap();
+    assert_eq!(
+        out,
+        vec![
+            (10u32, "Counter-Strike".to_string()),
+            (10u32, "Counter-Strike".to_string()),
         ]
     );
 }
