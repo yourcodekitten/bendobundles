@@ -80,6 +80,30 @@ struct GameView {
     key_type: String,
     artwork_url: Option<String>,
     steam_app_id: Option<u32>,
+    /// First ~5 steam genres from the enrichment cache (cache-only,
+    /// best-effort). Empty → omitted from the wire. The detail endpoint
+    /// always leaves this empty — the modal reads the full steam blob.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    genres: Vec<String>,
+}
+
+impl GameView {
+    /// The ONE friend-visible projection of a game — both the list and the
+    /// detail endpoint build their `game` objects here so the two wire shapes
+    /// can't drift field-by-field. `genres` is the list endpoint's enrichment;
+    /// the detail endpoint passes an empty vec (key omitted on the wire — the
+    /// modal reads the full steam blob instead).
+    fn from_game(g: domain::Game, genres: Vec<String>) -> Self {
+        Self {
+            id: g.id,
+            title: g.title,
+            bundle: g.bundle,
+            key_type: g.key_type,
+            artwork_url: g.artwork_url,
+            steam_app_id: g.steam_app_id,
+            genres,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -460,20 +484,35 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             if hide_games {
                 return vec![];
             }
-            match s.store.list_listable_games().await {
-                Ok(gs) => gs
-                    .into_iter()
-                    .map(|g| GameView {
-                        id: g.id,
-                        title: g.title,
-                        bundle: g.bundle,
-                        key_type: g.key_type,
-                        artwork_url: g.artwork_url,
-                        steam_app_id: g.steam_app_id,
-                    })
-                    .collect(),
-                Err(_) => vec![],
-            }
+            let gs = match s.store.list_listable_games().await {
+                Ok(gs) => gs,
+                Err(_) => return vec![],
+            };
+            // Genres ride the same steam cache the detail endpoint reads, via
+            // ONE BatchGetItem over the distinct appids (the games list is the
+            // whole listable catalog — N serial GetItems here would put the
+            // client's old N+1 inside the lambda). Cache-only: Steam is never
+            // called at request time. Best-effort: a failed batch or a
+            // missing/stub entry degrades to chip-less cards, never an error.
+            let mut app_ids: Vec<u32> = gs.iter().filter_map(|g| g.steam_app_id).collect();
+            app_ids.sort_unstable();
+            app_ids.dedup();
+            let caches = s
+                .store
+                .batch_get_steam_apps(&app_ids)
+                .await
+                .unwrap_or_default();
+            gs.into_iter()
+                .map(|g| {
+                    let genres = g
+                        .steam_app_id
+                        .and_then(|id| caches.get(&id))
+                        .and_then(|c| c.detail.as_ref())
+                        .map(|d| d.genres.iter().take(5).cloned().collect())
+                        .unwrap_or_default();
+                    GameView::from_game(g, genres)
+                })
+                .collect()
         },
         async {
             let cs = match s.store.claims_for_link(&token).await {
@@ -732,14 +771,9 @@ async fn handle_game_detail(
         },
     };
 
-    let game_view = GameView {
-        id: game.id,
-        title: game.title,
-        bundle: game.bundle,
-        key_type: game.key_type,
-        artwork_url: game.artwork_url,
-        steam_app_id: game.steam_app_id,
-    };
+    // Genres deliberately empty (key omitted on the wire): the modal reads
+    // steam.detail.genres from the full blob below instead.
+    let game_view = GameView::from_game(game, vec![]);
 
     (
         StatusCode::OK,

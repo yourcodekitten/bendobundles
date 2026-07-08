@@ -1618,3 +1618,102 @@ async fn steam_login_admin_subroute_rejections() {
         );
     }
 }
+
+/// GET /api/l/:token — games in the list payload carry `genres` from the steam
+/// cache (first 5, cache-only), games without an appid omit the key entirely,
+/// and the detail endpoint's `game` object stays wire-identical (no `genres`).
+#[tokio::test]
+async fn link_list_carries_genres_from_steam_cache() {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("gnr{}", &uid[..10])).await else {
+        return;
+    };
+
+    // game A: steam appid + warm cache with 6 genres (proves the 5-cap)
+    let mut a = test_game(60);
+    a.steam_app_id = Some(99101);
+    let aid = a.id.clone();
+    store.put_game(&a).await.unwrap();
+    let mut cache = test_steam_cache(99101);
+    cache.detail.as_mut().unwrap().genres = vec![
+        "Action".into(),
+        "Indie".into(),
+        "Platformer".into(),
+        "Adventure".into(),
+        "Casual".into(),
+        "Sports".into(),
+    ];
+    store.put_steam_app(&cache).await.unwrap();
+
+    // game B: no steam appid → genres key must be absent
+    let b = test_game(61);
+    let bid = b.id.clone();
+    store.put_game(&b).await.unwrap();
+
+    // game C: appid but cache-cold (no put_steam_app) → genres key absent too
+    let mut c = test_game(62);
+    c.steam_app_id = Some(99102);
+    let cid = c.id.clone();
+    store.put_game(&c).await.unwrap();
+
+    let tok = format!("gnr{}", &uid[..28]);
+    store.create_link(&test_link(&tok)).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let req = Request::get(format!("/api/l/{tok}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+
+    let games = j["games"].as_array().expect("games must be an array");
+    let ga = games
+        .iter()
+        .find(|g| g["id"] == aid.as_str())
+        .expect("game A must be in the list");
+    let gb = games
+        .iter()
+        .find(|g| g["id"] == bid.as_str())
+        .expect("game B must be in the list");
+
+    assert_eq!(
+        ga["genres"],
+        serde_json::json!(["Action", "Indie", "Platformer", "Adventure", "Casual"]),
+        "cache-warm game carries the first 5 genres, in cache order"
+    );
+    assert!(
+        gb.get("genres").is_none(),
+        "game without appid must omit the genres key entirely"
+    );
+    let gc = games
+        .iter()
+        .find(|g| g["id"] == cid.as_str())
+        .expect("game C must be in the list");
+    assert!(
+        gc.get("genres").is_none(),
+        "appid with a cold cache must degrade to no genres key (best-effort)"
+    );
+
+    // detail endpoint wire shape unchanged: game object has NO genres key,
+    // and the modal still reads the full steam blob.
+    let dreq = Request::get(format!("/api/l/{tok}/games/{aid}/detail"))
+        .body(Body::empty())
+        .unwrap();
+    let dresp = plain_router(Arc::clone(&store), mock)
+        .oneshot(dreq)
+        .await
+        .unwrap();
+    assert_eq!(dresp.status(), StatusCode::OK);
+    let dj = body_json(dresp).await;
+    assert!(
+        dj["game"].get("genres").is_none(),
+        "detail game object must stay wire-identical (no genres key)"
+    );
+    assert_eq!(dj["steam"]["detail"]["genres"][0], "Action");
+}

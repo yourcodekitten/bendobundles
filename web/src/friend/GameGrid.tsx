@@ -1,51 +1,5 @@
-import { useEffect, useSyncExternalStore, type ReactNode } from 'react';
-import { useParams } from 'react-router-dom';
-import { fetchGameDetail, type GameView } from '../api';
-import { titleColorClass } from '../titleColor';
-
-// Steam genres per game, fetched once and cached for the page's lifetime.
-// Chips mount once per card, so the cache + external store keeps every
-// instance in sync off a single fetch per game.
-const genreCache = new Map<string, string[]>();
-let genreVersion = 0;
-const genreListeners = new Set<() => void>();
-const genreSubscribe = (fn: () => void) => {
-  genreListeners.add(fn);
-  return () => genreListeners.delete(fn);
-};
-const genreSnapshot = () => genreVersion;
-const genreNotify = () => {
-  genreVersion += 1;
-  genreListeners.forEach((fn) => fn());
-};
-
-function GenreChips({
-  game,
-  children,
-}: {
-  game: GameView;
-  /** Called with the first 4 steam genres, or null when unavailable (no
-      appid, not yet fetched, or no enrichment) — render the thin fallback. */
-  children: (genres: string[] | null) => ReactNode;
-}) {
-  const { token } = useParams<{ token: string }>();
-  useSyncExternalStore(genreSubscribe, genreSnapshot, genreSnapshot);
-  useEffect(() => {
-    if (game.steam_app_id === null || token === undefined || genreCache.has(game.id)) return;
-    genreCache.set(game.id, []); // pending sentinel — dedupes concurrent mounts
-    fetchGameDetail(token, game.id)
-      .then((d) => {
-        genreCache.set(game.id, d.steam?.detail?.genres ?? []);
-        genreNotify();
-      })
-      .catch(() => {
-        genreCache.set(game.id, []);
-        genreNotify();
-      });
-  }, [game.id, game.steam_app_id, token]);
-  const cached = genreCache.get(game.id);
-  return children(cached !== undefined && cached.length > 0 ? cached.slice(0, 4) : null);
-}
+import { type GameView } from '../api';
+import { titleColorClass, titleHueVar } from '../titleColor';
 
 interface GameGridProps {
   games: GameView[];
@@ -77,7 +31,7 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
           owned !== undefined &&
           owned.has(game.steam_app_id);
         // the game's shell hue for the 'clear' variant — same shared hash
-        const shellHue = `var(${titleColorClass(game.title).replace('bg-', '--color-')})`;
+        const shellHue = titleHueVar(game.title);
 
         const art =
           game.artwork_url !== null ? (
@@ -102,6 +56,10 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
             </div>
           );
 
+        // genres ride the list payload now (issue #55) — no per-card fetch.
+        // max 4 chips on the card; absent/empty falls back to the key_type chip.
+        const genres = game.genres?.length ? game.genres.slice(0, 4) : null;
+
         const titleBlock = (
           <>
             <h3 className="font-pixel text-xl font-semibold leading-tight">{game.title}</h3>
@@ -111,37 +69,31 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
 
         const chipsRow = (
           <div className="mt-2 flex flex-wrap gap-1.5">
-            {/* genre chips replace the key_type chip when steam genres are
-                cached; tag colors ride the shared title-hash palette
+            {/* genre chips replace the key_type chip when the payload carries
+                genres; tag colors ride the shared title-hash palette
                 (The Title-Hash Rule) tinted toward floor for chip duty */}
-            <GenreChips game={game}>
-              {(genres) =>
-                genres === null ? (
-                  /* floor chip — the shelf chip vanishes on the shelf card */
-                  <span className="rounded bg-floor px-2 py-0.5 text-xs text-ink-soft">
-                    {game.key_type}
+            {genres === null ? (
+              /* floor chip — the shelf chip vanishes on the shelf card */
+              <span className="rounded bg-floor px-2 py-0.5 text-xs text-ink-soft">
+                {game.key_type}
+              </span>
+            ) : (
+              genres.map((genre) => {
+                const hue = titleHueVar(genre);
+                return (
+                  <span
+                    key={genre}
+                    className="rounded px-2 py-0.5 text-xs"
+                    style={{
+                      background: `color-mix(in oklch, ${hue}, var(--color-floor) 70%)`,
+                      color: `color-mix(in oklch, ${hue}, oklch(15% 0.02 110) 35%)`,
+                    }}
+                  >
+                    {genre}
                   </span>
-                ) : (
-                  <>
-                    {genres.map((genre) => {
-                      const hue = `var(${titleColorClass(genre).replace('bg-', '--color-')})`;
-                      return (
-                        <span
-                          key={genre}
-                          className="rounded px-2 py-0.5 text-xs"
-                          style={{
-                            background: `color-mix(in oklch, ${hue}, var(--color-floor) 70%)`,
-                            color: `color-mix(in oklch, ${hue}, oklch(15% 0.02 110) 35%)`,
-                          }}
-                        >
-                          {genre}
-                        </span>
-                      );
-                    })}
-                  </>
-                )
-              }
-            </GenreChips>
+                );
+              })
+            )}
             {count > 1 && (
               <span className="rounded bg-control px-2 py-0.5 text-xs text-ink-soft">
                 ×{count} copies

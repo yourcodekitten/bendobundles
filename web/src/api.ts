@@ -6,6 +6,8 @@ export type GameView = {
   key_type: string;
   artwork_url: string | null;
   steam_app_id: number | null;
+  /** First ~5 steam genres from the server's enrichment cache; absent when unknown. */
+  genres?: string[];
 };
 
 export type ClaimView = {
