@@ -791,12 +791,16 @@ async fn app_details_parses_screenshots_thumb_and_full_capped_at_10() {
     );
     let first = &detail.screenshots[0];
     assert!(
-        first.thumbnail.contains("ss_b887651a93b0525739049eb4194f633de2df75be.600x338"),
+        first
+            .thumbnail
+            .contains("ss_b887651a93b0525739049eb4194f633de2df75be.600x338"),
         "first thumbnail must be the capture's path_thumbnail; got {}",
         first.thumbnail
     );
     assert!(
-        first.full.contains("ss_b887651a93b0525739049eb4194f633de2df75be.1920x1080"),
+        first
+            .full
+            .contains("ss_b887651a93b0525739049eb4194f633de2df75be.1920x1080"),
         "first full must be the capture's path_full; got {}",
         first.full
     );
