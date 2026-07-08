@@ -1,7 +1,9 @@
-# ── kitten-debug role (READ-ONLY) ─────────────────────────────────────────────
+# ── kitten-debug role (READ-ONLY + one scoped write) ──────────────────────────
 # Everything needed to diagnose the live stack — tail logs, read Lambda config,
 # inspect DynamoDB item/claim state, look at API Gateway / CloudFront / S3 /
-# EventBridge — and NOTHING that mutates or decrypts app secrets.
+# EventBridge — and NOTHING that mutates or decrypts app secrets, with a single
+# deliberate carve-out: PutItem confined to STEAMAPP#* cache items, so the
+# fulfillment backfill bin can rebuild the Steam cache (see SteamCacheWrite).
 module "label_debug" {
   source  = "bendoerr-terraform-modules/label/null"
   version = "1.0.1"
@@ -95,6 +97,27 @@ data "aws_iam_policy_document" "debug" {
       "arn:aws:s3:::${local.app_prefix}*",
       "arn:aws:s3:::${local.app_prefix}*/*",
     ]
+  }
+
+  # The ONE write this role can perform: rewrite Steam appdetails cache items.
+  # Exists for the run-once fulfillment `backfill_genres` bin (issue #57) and
+  # future cache rebuilds after a parse change — the bin's only write is
+  # put_steam_app → PutItem. The LeadingKeys condition confines writes to
+  # partition keys beginning STEAMAPP#, so games, links, claims, and sync state
+  # stay untouchable; item reads/deletes and every other mutation remain denied
+  # by omission.
+  statement {
+    sid     = "SteamCacheWrite"
+    effect  = "Allow"
+    actions = ["dynamodb:PutItem"]
+    resources = [
+      "arn:aws:dynamodb:${local.region}:${local.account}:table/${local.app_prefix}*",
+    ]
+    condition {
+      test     = "ForAllValues:StringLike"
+      variable = "dynamodb:LeadingKeys"
+      values   = ["STEAMAPP#*"]
+    }
   }
 
   # HARD BOUNDARY: the debug role can never read the humble session cookie or
