@@ -9,10 +9,11 @@
 > the main stack AND run `deploy-web.sh`: S3 site-bucket sync + CloudFront invalidation). AWS profiles
 > `kitten-debug` / `kitten-deploy` are configured in `~/.aws/config` on the box. **So kitten CAN deploy**
 > — assume `kitten-deploy` deliberately for a deploy, `kitten-debug` for everything else.
-> First real web deploy by kitten: **2026-07-08** (published #58 + #60 to `bendobundles.com` — CI-built
-> `web-dist` artifact → `aws s3 sync … --delete` → CloudFront invalidation, no `terraform apply` needed
-> for a web-only change). See `terraform-iam/README.md` + `terraform-iam/iam-deploy-role.tf` for the
-> authoritative, current picture.
+> **Kitten is the stack's deployer** — every production deploy since bring-up has been kitten's (Ben may
+> have run only the very first apply). E.g. lambda/infra applies from 2026-07-04, and the 2026-07-08 web
+> publish of #58 + #60 to `bendobundles.com` (CI `web-dist` → `s3 sync --delete` → CloudFront invalidation,
+> no `terraform apply` for a web-only change). See **`terraform/README.md` → "Deploying as kitten"** for the
+> step-by-step, plus `terraform-iam/README.md` + `iam-deploy-role.tf` for the role picture.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

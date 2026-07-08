@@ -1,7 +1,113 @@
 # bendobundles — Terraform deploy runbook
 
-> **This is Ben's complete deploy guide.** Read it top to bottom the first time; afterwards you'll
-> only need the [Deploy loop](#deploy-loop) section.
+> **Who deploys this: kitten (the agent) does — every production deploy so far has been kitten's.**
+> (Ben may have run the very first bring-up apply; everything since is kitten.) So the operational path is
+> **[Deploying as kitten](#deploying-as-kitten-the-agent)** — start there. Kitten doesn't run from this
+> repo's directory, so this grep-reachable runbook is the signpost. The Ben-local sections further down
+> (prerequisites, one-time bootstrap, local toolchain) are reference + the one-time account setup, not the
+> routine loop.
+
+---
+
+## Deploying as kitten (the agent)
+
+**Yes, kitten can deploy — web and terraform both.** The credentials live in `terraform-iam/`: a
+`kitten-mgr` IAM user (long-lived key on the box, `sts:AssumeRole`-only) that assumes **`kitten-debug`**
+(read-only, the default) or **`kitten-deploy`** (powerful — `terraform apply` + `deploy-web.sh`). Profiles
+`kitten-debug` / `kitten-deploy` are in `~/.aws/config`.
+
+> **You MUST pass `--profile kitten-deploy` (or `AWS_PROFILE=kitten-deploy`) for any deploy action.**
+> The box's bare instance identity (`…omyac-ombb`) is narrow and **403s** on S3/CloudFront — a plain
+> `aws s3 …` will fail confusingly. Use `kitten-deploy` deliberately for deploys, `kitten-debug` for
+> read-only inspection.
+
+### Web-only deploy (the common case — no `terraform apply`)
+
+A friend-facing web change (merged PR that only touches `web/`) needs just S3 sync + CloudFront
+invalidation. Kitten can do this **fully self-serve — no secrets required.** The box is Node 18 and the
+SPA build needs Node 22, so the clean path is **pull the CI-built `web-dist` artifact** (CI builds on
+Node 22 on every green push to `main`). (A Node 22 is also installed at `~/.local/node22/bin` if you ever
+must build locally — `export PATH="$HOME/.local/node22/bin:$PATH"`, and `rm -rf node_modules && npm ci`
+under it first — but the CI artifact avoids all of that.)
+
+```bash
+# 1. Grab the CI-built SPA from the latest green run on main (find it: gh run list -R yourcodekitten/bendobundles --branch main)
+rm -rf web/dist
+gh run download <GREEN_RUN_ID> -R yourcodekitten/bendobundles -n web-dist -D web/dist
+
+# 2. Get the authoritative targets from terraform state (read-only)
+cd terraform
+AWS_PROFILE=kitten-deploy terraform init -backend-config=backend.hcl -input=false
+AWS_PROFILE=kitten-deploy terraform output -raw s3_bucket_id                # brd-prod-ue1-bendobundles-site
+AWS_PROFILE=kitten-deploy terraform output -raw cloudfront_distribution_id  # E3M17M9HPGPY0K
+cd ..
+
+# 3. DRY-RUN the sync first — a clean SPA republish deletes ONLY the old vite-hashed js/css pair.
+#    Anything else showing up as (dryrun) delete → STOP and look.
+AWS_PROFILE=kitten-deploy aws s3 sync web/dist s3://<BUCKET> --delete --dryrun
+
+# 4. Real sync + invalidation
+AWS_PROFILE=kitten-deploy aws s3 sync web/dist s3://<BUCKET> --delete
+AWS_PROFILE=kitten-deploy aws cloudfront create-invalidation --distribution-id <DIST_ID> --paths "/*"
+
+# 5. VERIFY (never report from memory): the live site serves the new bundle
+curl -s https://bendobundles.com/ | grep -oE '/assets/index-[A-Za-z0-9_]+\.js'   # matches web/dist/index.html
+```
+
+`./deploy-web.sh` wraps steps 2–4 (run it with `AWS_PROFILE=kitten-deploy`, after `web/dist` is in place
+and `terraform init` has run). Steps 3 + 5 (dry-run, verify) are kitten's discipline on top of the script.
+
+### Full deploy (infra / lambdas changed — needs `terraform apply`)
+
+Same role and state; the `kitten-deploy` policy is built for exactly this. **Kitten has everything it
+needs — no part of this waits on Ben.**
+
+1. **Lambda zips** (only if a Rust crate changed) — pull from the green run and flatten to the names
+   Terraform references:
+   ```bash
+   gh run download <GREEN_RUN_ID> -R yourcodekitten/bendobundles -n lambda-zips -D terraform/artifacts
+   for b in public-api admin-api fulfillment; do
+     mv terraform/artifacts/$b/bootstrap.zip terraform/artifacts/$b.zip && rmdir terraform/artifacts/$b
+   done
+   ```
+2. **Recreate `production.tfvars`** — gitignored, so kitten writes it fresh each deploy (off-transcript;
+   `terraform/production.tfvars` or a scratchpad path). Every value is already on the box:
+   - `aws_account_id = "672812236571"` (constant) · `domain_zone_id = "Z05311872JYVFOPFTIVOS"`
+     (re-derivable: `AWS_PROFILE=kitten-deploy aws route53 list-hosted-zones`)
+   - `humble_username` / `discord_webhook_url` from **`~/.secrets/bendobundles-deploy.env`** (600, outside
+     git — the saved deploy secrets; see `code-kitten` `state/decisions.md` 2026-07-06 pointer)
+3. **`admin_password_hash` — pull the LIVE value and pass it back verbatim (a no-op). NEVER re-hash the
+   password.** The `admin_hash` SSM param (`aws-ssm.tf`) is `value = var.admin_password_hash` with **no
+   `ignore_changes`**, so terraform sets it to whatever you pass on every apply. Argon2 with a fresh salt
+   produces a *different* PHC string → an in-place UPDATE that **silently resets Ben's live admin login**.
+   Feed the current stored value so the change is a no-op:
+   ```bash
+   export TF_VAR_admin_password_hash="$(AWS_PROFILE=kitten-deploy aws ssm get-parameter \
+     --name /brd-prod-ue1-bendobundles-param/admin-hash --with-decryption \
+     --query Parameter.Value --output text)"
+   # (kitten-deploy can also recover it from state — `terraform state pull` + jq — which works even if the
+   #  SSM read grant is ever removed; state ≠ SSM. Either source is fine.)
+   ```
+   `~/.secrets/…ADMIN_PASSWORD` is the plaintext, kept for break-glass only — do **not** argon2 it for a
+   routine apply; re-hashing is the clobber.
+
+```bash
+export TF_VAR_discord_webhook_url='…'   # optional; from ~/.secrets, enables cookie-death pings
+cd terraform
+AWS_PROFILE=kitten-deploy terraform init -backend-config=backend.hcl -input=false
+AWS_PROFILE=kitten-deploy terraform plan -var-file=production.tfvars -out=tf.plan
+# READ every "will be created/updated/destroyed" line — the count is exact (e.g. 2 crates changed = 2
+# updates; a 3rd line, or ANY admin_hash change, is a STOP). Then:
+AWS_PROFILE=kitten-deploy terraform apply tf.plan
+./deploy-web.sh     # publish the SPA too (AWS_PROFILE=kitten-deploy) if web/ changed
+```
+
+**Escalate to Ben** only for genuinely ambiguous blast radius — an unexpected `destroy`, an `admin_hash`
+change you didn't intend, a breaking infra change, or unrecognised providers (a wrong-workspace /
+foreign-state slip — see [bootstrap step 3](#one-time-bootstrap)). Routine web + code deploys don't need it.
+
+Authoritative outputs (`s3_bucket_id`, `cloudfront_distribution_id`, `site_url`) always come from
+`terraform output`; the values inlined in this doc are 2026-07-08 conveniences, not the source of truth.
 
 ---
 
