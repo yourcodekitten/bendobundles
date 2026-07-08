@@ -278,12 +278,22 @@ trapped and returned (ClaimDialog / GameDetailModal pattern). The unwrap sequenc
 "claiming…" → "it's yours! ♡" in Burgundy Ink with the key revealed — is the most important
 interaction in the product.
 
-### The Landing (signature)
-Room-drenched single viewport: the pixel-art scene (`/art/landing.png` — a four-shade
-adventurer walking toward a treasure chest) in a Pixel bezel with the DMG's asymmetric corner
-(`14px 14px 44px 14px`), the BENDOBUNDLES logotype (Silkscreen, caps) beneath, and the one line
-where "key" wears both Burgundy Ink and the Pixelify face — the accent word in the accent color
-and the accent type. Entrance is a single quiet rise with a `prefers-reduced-motion` bypass.
+### The Landing (signature — the treasure diorama)
+Room-drenched single viewport, staged as a **diorama** (impeccable live w/ ben, 2026-07-08): the
+pixel-art scene (`/art/landing.png` — a four-shade adventurer walking toward a treasure chest)
+fills a Pixel-bezel frame (`.landing-stage`, `16px 16px 40px 16px` DMG corner, 4/5 aspect), and
+the BENDOBUNDLES logotype (Silkscreen, caps) plus the one line are **docked in a floating JRPG
+text box** (`.landing-box`) straddling the frame's bottom edge — Floor bg, the double-line inset
+border (`inset 0 0 0 3px floor, inset 0 0 0 5px pixel`, The Bezel Rule), `0.75rem` radius. The
+scene idle-drifts and the box idle-floats; the whole thing still enters on the single quiet
+`landing-rise`. Every motion here has a `prefers-reduced-motion` bypass.
+
+Two earned delights live on the line (both live-built, both reduced-motion-safe):
+- **the key charm** (`.landing-key-charm`): a tiny pixel key swings gently off the burgundy "key"
+  word — the accent word in both the accent color (Burgundy Ink) and the accent type (Pixelify).
+- **the treasure heart** (`.landing-heart`): a cross-element discovery — hovering `.landing-stage-art`
+  lifts the sincere ♡ and twinkles two pixel sparkles beside it. The One Heart Rule holds — the
+  sparkles are pixels, not hearts, and there is still exactly one ♡, earned in the sincere moment.
 
 ### The Link-Page Header (signature — the JRPG scene)
 The gift page opens on a game scene, not a web header (built live with ben, 2026-07-07):
