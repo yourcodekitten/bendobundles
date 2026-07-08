@@ -476,7 +476,9 @@ impl SteamClient {
             .screenshots
             .into_iter()
             .filter_map(|s| match (s.path_thumbnail, s.path_full) {
-                (Some(thumbnail), Some(full)) => Some(Screenshot { thumbnail, full }),
+                (Some(thumbnail), Some(full)) if !thumbnail.is_empty() && !full.is_empty() => {
+                    Some(Screenshot { thumbnail, full })
+                }
                 _ => None,
             })
             .take(SCREENSHOT_CAP)
@@ -491,8 +493,15 @@ impl SteamClient {
             release_date: data.release_date.and_then(|r| r.date),
             short_description: data.short_description,
             header_image: data.header_image,
-            video_hls_url: first_movie.as_ref().and_then(|m| m.hls_h264.clone()),
-            video_thumbnail: first_movie.and_then(|m| m.thumbnail),
+            // Steam types these loosely; "" would render a phantom trailer slide (#62 review),
+            // so empty strings collapse to None at the wire.
+            video_hls_url: first_movie
+                .as_ref()
+                .and_then(|m| m.hls_h264.clone())
+                .filter(|s| !s.is_empty()),
+            video_thumbnail: first_movie
+                .and_then(|m| m.thumbnail)
+                .filter(|s| !s.is_empty()),
             screenshots,
         })))
     }

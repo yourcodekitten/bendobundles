@@ -216,8 +216,8 @@ buttons are flat at every state; if you're adding a shadow anywhere but a claim/
 you're diluting the unwrap.
 
 **The Bezel Rule.** Chunky dark-olive (Pixel) borders mark the handheld's screen: the landing
-art frame and dialog rings wear it. Hairlines everywhere else are Line. A thick border on an
-ordinary card is costume.
+art frame, dialog rings, and the game-detail media frame (the carousel viewport, issue #61)
+wear it. Hairlines everywhere else are Line. A thick border on an ordinary card is costume.
 
 ## 5. Components
 

@@ -174,6 +174,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
     }
     const first = els[0];
     const last = els[els.length - 1];
+    if (first === undefined || last === undefined) return;
     const active = document.activeElement;
     if (e.shiftKey) {
       if (active === first || active === container) {
@@ -272,8 +273,11 @@ export function GameDetailModal(props: GameDetailModalProps) {
 
               return (
                 <div className="space-y-4 pb-2">
-                  {/* Media header — trailer + screenshots carousel (#61) */}
+                  {/* Media header — trailer + screenshots carousel (#61).
+                      Keyed by game so carousel/video state can never survive
+                      an in-place game swap if one is ever added. */}
                   <MediaHeader
+                    key={game.id}
                     title={game.title}
                     artworkUrl={game.artwork_url}
                     detail={detail}

@@ -1918,6 +1918,11 @@ async fn admin_game_detail_superset_fields_and_steam_blob() {
         "steam must not be null for mapped game with cache"
     );
     assert_eq!(j["steam"]["detail"]["name"], "Detail Test Game");
+    // screenshots key rides the wire (issue #61) — a serde skip attr would drop it silently
+    assert!(
+        j["steam"]["detail"]["screenshots"].is_array(),
+        "steam.detail.screenshots must be serialized as an array"
+    );
     assert_eq!(j["steam"]["overall"]["desc"], "Very Positive");
     assert_eq!(j["steam"]["recent"]["percent_positive"], 90);
 

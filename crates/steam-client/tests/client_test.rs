@@ -828,12 +828,16 @@ async fn app_details_missing_screenshots_key_is_empty() {
 #[tokio::test]
 async fn app_details_screenshot_missing_either_tier_is_dropped() {
     // Both URLs or nothing — asymmetric fallbacks would create two sources of truth.
+    // Empty strings count as missing (a "" URL would render a phantom slide), and an
+    // empty movie hls/thumbnail must collapse to None, not Some("").
     let body = r#"{"413150":{"success":true,"data":{
         "name":"Partial Shots",
+        "movies":[{"id":1,"thumbnail":"","hls_h264":""}],
         "screenshots":[
             {"id":0,"path_thumbnail":"https://img.example/a.600x338.jpg","path_full":"https://img.example/a.1920x1080.jpg"},
             {"id":1,"path_thumbnail":"https://img.example/b.600x338.jpg"},
-            {"id":2,"path_full":"https://img.example/c.1920x1080.jpg"}
+            {"id":2,"path_full":"https://img.example/c.1920x1080.jpg"},
+            {"id":3,"path_thumbnail":"","path_full":"https://img.example/d.1920x1080.jpg"}
         ]
     }}}"#;
     let server = wiremock::MockServer::start().await;
@@ -856,4 +860,9 @@ async fn app_details_screenshot_missing_either_tier_is_dropped() {
         }],
         "entries missing either tier must drop, not fail or half-fill"
     );
+    assert_eq!(
+        detail.video_hls_url, None,
+        "empty hls url must be None, not Some(\"\")"
+    );
+    assert_eq!(detail.video_thumbnail, None, "empty thumbnail must be None");
 }

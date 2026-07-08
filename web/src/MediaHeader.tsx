@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import type Hls from 'hls.js';
 import type { SteamAppDetail } from './api';
+import { prefersReducedMotion } from './motion';
 import { titleColorClass } from './titleColor';
 
 // ── Media header: trailer + screenshots carousel (issue #61) ──────────────────
@@ -15,18 +16,13 @@ type MediaHeaderProps = {
   detail: SteamAppDetail | null;
 };
 
-// Repo pattern for reduced motion (friend/CursorCompanion.tsx:71,
-// friend/LinkPage.tsx:37): JS matchMedia, guarded — behavior-testable,
-// unlike a media-query-only class.
-function prefersReducedMotion(): boolean {
-  if (typeof window === 'undefined' || !window.matchMedia) return false;
-  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-}
-
 export function MediaHeader({ title, artworkUrl, detail }: MediaHeaderProps) {
   const [mediaIndex, setMediaIndex] = useState(0);
   const [videoPlaying, setVideoPlaying] = useState(false);
   const [hlsFailed, setHlsFailed] = useState(false);
+  // Read once at mount (lazy initializer) — the preference can't usefully change
+  // between renders and neither approach reacts live (no change listener).
+  const [reducedMotion] = useState(prefersReducedMotion);
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
 
@@ -42,9 +38,11 @@ export function MediaHeader({ title, artworkUrl, detail }: MediaHeaderProps) {
 
   // When hlsFailed, the trailer slide must not render AT ALL (not render-empty):
   // slideCount and the slide DOM both drop by one, keeping counter/index math honest.
-  const hlsUrl = !hlsFailed ? (detail?.video_hls_url ?? null) : null;
+  // `||` not `??`: an empty-string url (loosely-typed wire) must not render a phantom slide.
+  const hlsUrl = !hlsFailed ? detail?.video_hls_url || null : null;
   const screenshots = detail?.screenshots ?? [];
-  const slideCount = (hlsUrl !== null ? 1 : 0) + screenshots.length;
+  const trailerSlides = hlsUrl !== null ? 1 : 0;
+  const slideCount = trailerSlides + screenshots.length;
   const artwork = detail?.header_image ?? artworkUrl;
 
   // ── Thin fallback: no media at all → today's header, no carousel chrome ─────
@@ -64,11 +62,13 @@ export function MediaHeader({ title, artworkUrl, detail }: MediaHeaderProps) {
   const index = Math.min(mediaIndex, slideCount - 1);
 
   const goTo = (next: number) => {
+    // Single slide = nothing to navigate; without this, an arrow key on a
+    // trailer-only header would "navigate" in place and pause the video.
+    if (slideCount < 2) return;
     const wrapped = (next + slideCount) % slideCount;
-    if (wrapped === index) return;
     // Leaving the trailer slide pauses playback; the ▶ overlay returns so
     // coming back is an explicit resume, never an auto-play.
-    if (hlsUrl !== null && index === 0) {
+    if (trailerSlides === 1 && index === 0) {
       videoRef.current?.pause();
       setVideoPlaying(false);
     }
@@ -128,7 +128,7 @@ export function MediaHeader({ title, artworkUrl, detail }: MediaHeaderProps) {
     >
       {/* Slide strip — transform per index; reduced motion = instant swap */}
       <div
-        className={`flex ${prefersReducedMotion() ? '' : 'transition-transform duration-300'}`}
+        className={`flex ${reducedMotion ? '' : 'transition-transform duration-300'}`}
         style={{ transform: `translateX(-${index * 100}%)` }}
       >
         {hlsUrl !== null && (
@@ -144,6 +144,12 @@ export function MediaHeader({ title, artworkUrl, detail }: MediaHeaderProps) {
               }
               className="aspect-video w-full object-cover"
               playsInline
+              onError={() => {
+                // Safari-native path has no hls.js error events; a 404/decode failure
+                // must still drop the trailer slide. hls.js raises recoverable element
+                // errors during normal MSE operation, so only act on the native path.
+                if (hlsRef.current === null) setHlsFailed(true);
+              }}
             />
             {!videoPlaying && (
               <button
@@ -158,20 +164,26 @@ export function MediaHeader({ title, artworkUrl, detail }: MediaHeaderProps) {
           </div>
         )}
         {screenshots.map((shot, i) => {
-          const slideIdx = (hlsUrl !== null ? 1 : 0) + i;
+          const slideIdx = trailerSlides + i;
           return (
+            // Key includes the position: Steam occasionally repeats an asset URL,
+            // and duplicate keys would mis-reconcile the inert/aria-hidden flags.
             <div
-              key={shot.full}
+              key={`${i}-${shot.full}`}
               className="w-full shrink-0"
               aria-hidden={index !== slideIdx || undefined}
               inert={index !== slideIdx || undefined}
             >
-              <img
-                src={shot.full}
-                loading="lazy"
-                alt={`${title} screenshot ${i + 1}`}
-                className="aspect-video w-full object-cover"
-              />
+              {/* Mount the image only near the active slide: translated-out slides
+                  sit within the browser's lazy-load distance band, so loading="lazy"
+                  alone still fetches the next few full-res files on open. */}
+              {Math.abs(slideIdx - index) <= 1 && (
+                <img
+                  src={shot.full}
+                  alt={`${title} screenshot ${i + 1}`}
+                  className="aspect-video w-full object-cover"
+                />
+              )}
             </div>
           );
         })}

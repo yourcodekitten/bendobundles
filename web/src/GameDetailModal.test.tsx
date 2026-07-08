@@ -526,6 +526,34 @@ describe('media carousel', () => {
     expect(screen.queryByLabelText('play trailer')).not.toBeInTheDocument();
   });
 
+  it('video element error without hls.js attached drops the trailer slide', async () => {
+    // Safari-native path: no hls.js error events exist, the <video> onError is the
+    // only failure signal. Guarded to hlsRef===null so hls.js's recoverable element
+    // errors don't false-trigger.
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    const video = document.querySelector('video') as HTMLVideoElement;
+    act(() => {
+      video.dispatchEvent(new Event('error'));
+    });
+    expect(await screen.findByText('1 / 2')).toBeInTheDocument();
+    expect(screen.queryByLabelText('play trailer')).not.toBeInTheDocument();
+  });
+
+  it('video element error during hls.js playback does NOT drop the trailer', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await userEvent.click(await screen.findByLabelText('play trailer'));
+    await waitFor(() => expect(hlsCbCapture.errorCb).not.toBeNull());
+    const video = document.querySelector('video') as HTMLVideoElement;
+    act(() => {
+      video.dispatchEvent(new Event('error'));
+    });
+    // hls.js owns error handling while attached — only its fatal callback drops the slide.
+    expect(screen.getByText('1 / 3')).toBeInTheDocument();
+  });
+
   it('off-screen slides are inert and aria-hidden', async () => {
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
