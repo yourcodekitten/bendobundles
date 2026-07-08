@@ -410,3 +410,147 @@ describe('GameDetailModal', () => {
     expect(document.querySelector('video')).toBeNull();
   });
 });
+
+// ── Media carousel (issue #61) ────────────────────────────────────────────────
+
+const screenshotsFixture = [
+  {
+    thumbnail: 'https://example.com/ss1.600x338.jpg',
+    full: 'https://example.com/ss1.1920x1080.jpg',
+  },
+  {
+    thumbnail: 'https://example.com/ss2.600x338.jpg',
+    full: 'https://example.com/ss2.1920x1080.jpg',
+  },
+];
+
+const steamDetailWithScreenshots = {
+  ...steamDetailFixture,
+  screenshots: screenshotsFixture,
+};
+
+describe('media carousel', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hlsCbCapture.errorCb = null;
+    clearGameDetailCache();
+  });
+
+  function mockDetail(detail: object | null) {
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: friendGame,
+      steam:
+        detail === null
+          ? null
+          : { detail: detail as never, overall: overallFixture, recent: recentFixture },
+    });
+  }
+
+  function renderFriendModal() {
+    return render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={friendGame}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+  }
+
+  it('trailer + screenshots: trailer is slide 1, arrows + counter present', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    expect(await screen.findByLabelText('play trailer')).toBeInTheDocument();
+    expect(screen.getByLabelText('previous')).toBeInTheDocument();
+    expect(screen.getByLabelText('next')).toBeInTheDocument();
+    expect(screen.getByText('1 / 3')).toBeInTheDocument();
+  });
+
+  it('next advances to a screenshot and wraps past the end', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    const next = await screen.findByLabelText('next');
+    await userEvent.click(next);
+    expect(screen.getByText('2 / 3')).toBeInTheDocument();
+    expect(screen.getByAltText('Stardew Valley screenshot 1')).toBeInTheDocument();
+    await userEvent.click(next);
+    expect(screen.getByText('3 / 3')).toBeInTheDocument();
+    await userEvent.click(next);
+    expect(screen.getByText('1 / 3')).toBeInTheDocument(); // wrap
+  });
+
+  it('one screenshot, no trailer: image alone, zero carousel chrome', async () => {
+    mockDetail({
+      ...steamDetailFixture,
+      video_hls_url: null,
+      screenshots: [screenshotsFixture[0]],
+    });
+    renderFriendModal();
+    expect(
+      await screen.findByAltText('Stardew Valley screenshot 1'),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText('previous')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('next')).not.toBeInTheDocument();
+    expect(screen.queryByText('1 / 1')).not.toBeInTheDocument();
+  });
+
+  it('no trailer, no screenshots: plain header image, no carousel chrome', async () => {
+    mockDetail({ ...steamDetailFixture, video_hls_url: null });
+    renderFriendModal();
+    expect(await screen.findByAltText('Stardew Valley')).toBeInTheDocument();
+    expect(screen.queryByLabelText('next')).not.toBeInTheDocument();
+  });
+
+  it('navigating away from the trailer pauses the video', async () => {
+    const pauseSpy = vi
+      .spyOn(HTMLMediaElement.prototype, 'pause')
+      .mockImplementation(() => {});
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await userEvent.click(await screen.findByLabelText('next'));
+    expect(pauseSpy).toHaveBeenCalled();
+    pauseSpy.mockRestore();
+  });
+
+  it('fatal HLS error mid-carousel drops the trailer slide and clamps the index', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await userEvent.click(await screen.findByLabelText('play trailer'));
+    await waitFor(() => expect(hlsCbCapture.errorCb).not.toBeNull());
+    act(() => hlsCbCapture.errorCb?.('hlsError', { fatal: true }));
+    // Trailer gone: 2 screenshots remain, counter consistent, no crash.
+    expect(await screen.findByText('1 / 2')).toBeInTheDocument();
+    expect(screen.queryByLabelText('play trailer')).not.toBeInTheDocument();
+  });
+
+  it('off-screen slides are inert and aria-hidden', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    const region = screen.getByRole('region', { name: 'media' });
+    const hidden = region.querySelectorAll('[aria-hidden="true"][inert]');
+    expect(hidden.length).toBe(2); // both screenshot slides while trailer is active
+  });
+
+  it('reduced motion: no transition class; motion allowed: transition present', async () => {
+    const mm = vi.spyOn(window, 'matchMedia');
+    mm.mockReturnValue({ matches: true } as MediaQueryList);
+    mockDetail(steamDetailWithScreenshots);
+    const { unmount } = renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    const strip = () =>
+      screen.getByRole('region', { name: 'media' }).firstElementChild as HTMLElement;
+    expect(strip().className).not.toContain('transition-transform');
+    unmount();
+    clearGameDetailCache();
+    mm.mockReturnValue({ matches: false } as MediaQueryList);
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    expect(strip().className).toContain('transition-transform');
+    mm.mockRestore();
+  });
+});

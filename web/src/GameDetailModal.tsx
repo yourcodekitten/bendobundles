@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import type Hls from 'hls.js';
 import type { GameView, AdminGame, SteamDetailBlob, SelfClaimResult } from './api';
+import { MediaHeader } from './MediaHeader';
 import { titleColorClass } from './titleColor';
 
 // ── Per-session module-level detail cache ─────────────────────────────────────
@@ -88,12 +88,8 @@ export function GameDetailModal(props: GameDetailModalProps) {
 
   const [loadState, setLoadState] = useState<LoadState>({ phase: 'loading' });
   const [retryKey, setRetryKey] = useState(0);
-  const [videoPlaying, setVideoPlaying] = useState(false);
-  const [hlsFailed, setHlsFailed] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const hlsRef = useRef<Hls | null>(null);
 
   // ── Focus on open (a11y) ──────────────────────────────────────────────────
 
@@ -137,17 +133,6 @@ export function GameDetailModal(props: GameDetailModalProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [game.id, mount, token, loadDetail, retryKey]);
 
-  // ── HLS cleanup on unmount ────────────────────────────────────────────────
-
-  useEffect(() => {
-    return () => {
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
-    };
-  }, []);
-
   // ── Escape key ────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -157,39 +142,6 @@ export function GameDetailModal(props: GameDetailModalProps) {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [onClose]);
-
-  // ── HLS play handler ──────────────────────────────────────────────────────
-
-  const handlePlay = async (hlsUrl: string) => {
-    if (!videoRef.current || videoPlaying) return;
-    const video = videoRef.current;
-
-    if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Native HLS — Safari
-      video.src = hlsUrl;
-    } else {
-      // hls.js path
-      const { default: HlsClass } = await import('hls.js');
-      const hls = new HlsClass();
-      hlsRef.current = hls;
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(video);
-      hls.on(HlsClass.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          setHlsFailed(true);
-          hls.destroy();
-          hlsRef.current = null;
-        }
-      });
-    }
-
-    setVideoPlaying(true);
-    try {
-      await video.play();
-    } catch {
-      // play() rejection (browser policy, no source in test env) — ignore
-    }
-  };
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -273,48 +225,15 @@ export function GameDetailModal(props: GameDetailModalProps) {
             {/* Full detail — steam non-null */}
             {loadState.phase === 'loaded' && loadState.steam !== null && (() => {
               const { detail, overall, recent } = loadState.steam;
-              const hlsUrl = detail?.video_hls_url ?? null;
-              const artwork = detail?.header_image ?? game.artwork_url;
 
               return (
                 <div className="space-y-4 pb-2">
-                  {/* Video or artwork header */}
-                  {!hlsFailed && hlsUrl !== null ? (
-                    <div className="relative">
-                      <video
-                        ref={videoRef}
-                        poster={
-                          detail?.video_thumbnail ??
-                          detail?.header_image ??
-                          game.artwork_url ??
-                          undefined
-                        }
-                        className="aspect-video w-full object-cover"
-                        playsInline
-                      />
-                      {!videoPlaying && (
-                        <button
-                          type="button"
-                          aria-label="play trailer"
-                          onClick={() => void handlePlay(hlsUrl)}
-                          className="absolute inset-0 flex items-center justify-center bg-black/40 hover:bg-black/50"
-                        >
-                          <span className="text-5xl text-white">▶</span>
-                        </button>
-                      )}
-                    </div>
-                  ) : artwork !== null ? (
-                    <img
-                      src={artwork}
-                      alt={game.title}
-                      className="aspect-video w-full object-cover"
-                    />
-                  ) : (
-                    <div
-                      className={`aspect-video w-full ${titleColorClass(game.title)}`}
-                      aria-hidden="true"
-                    />
-                  )}
+                  {/* Media header — trailer + screenshots carousel (#61) */}
+                  <MediaHeader
+                    title={game.title}
+                    artworkUrl={game.artwork_url}
+                    detail={detail}
+                  />
 
                   {/* Text detail — only when detail is non-null */}
                   {detail !== null && (
