@@ -2076,7 +2076,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     );
 }
 
-/// Outcome of one [`backfill_steam_genres`] run.
+/// Outcome of one [`backfill_steam_details`] run.
 #[derive(Debug, Default)]
 pub struct BackfillSummary {
     /// Live detail refetched and persisted.
@@ -2091,16 +2091,16 @@ pub struct BackfillSummary {
     pub aborted_429: bool,
 }
 
-/// Run-once STEAMAPP# rebuild (issue #57): refetch appdetails for EVERY catalog appid through
+/// Run-once STEAMAPP# rebuild (issues #57, #61): refetch appdetails for EVERY catalog appid through
 /// the current parse (id-allowlisted genres) and rewrite each item, preserving the reviews half
 /// (`overall`, `recent`, `reviews_fetched_at`). Unlike [`enrich_steam_apps`] this ignores the
 /// 30-day freshness window — refetching regardless is the point — but skips items whose
 /// `fetched_at` is within `skip_fresh_secs`, so an aborted run resumes where it left off.
 ///
 /// Takes `Store`/`SteamClient` directly rather than [`Deps`]: the caller is the feature-gated
-/// `backfill_genres` bin (human-run, never the lambda), which has no humble/webhook/session to
+/// `backfill_details` bin (human-run, never the lambda), which has no humble/webhook/session to
 /// carry. Paced like the enrichment pass; a 429 aborts with `aborted_429` set.
-pub async fn backfill_steam_genres(
+pub async fn backfill_steam_details(
     store: &dynamo::Store,
     steam: &steam_client::SteamClient,
     pace: std::time::Duration,
