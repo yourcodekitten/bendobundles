@@ -50,7 +50,7 @@ this plan is the how).
   parse ~line 419-463)
 - Modify: `crates/steam-client/tests/fixtures/appdetails-413150-trimmed.json`
 - Test: `crates/steam-client/tests/client_test.rs` (storefront section, after
-  `app_details_tolerates_mistyped_category_ids` ~line 640)
+  `app_details_tolerates_mistyped_category_ids` ~line 609)
 
 **Interfaces:**
 - Produces: `steam_client::Screenshot { pub thumbnail: String, pub full: String }` (derives
@@ -266,11 +266,15 @@ Adding a struct field breaks every literal initializer. Find them all:
 grep -rn "SteamAppDetail {" crates/ --include="*.rs"
 ```
 
-For each **test/helper** literal (e.g. `fresh_cache` in
-`crates/fulfillment/tests/handler_test.rs`, `steam_app_cache_full` in
-`crates/dynamo/tests/store_test.rs`, and any in public-api/admin-api tests), add
-`screenshots: vec![],`. Do NOT touch the one real construction site (steam-client's parse —
-already done in Step 4). Then:
+Add `screenshots: vec![],` to each **test/helper** literal. The complete set (verified):
+- `crates/dynamo/tests/store_test.rs:1760` (inside `steam_app_cache_full`)
+- `crates/fulfillment/tests/handler_test.rs:4272` (inside `fresh_cache`)
+- `crates/public-api/tests/api_test.rs:1256` (inside `test_steam_cache`)
+- `crates/admin-api/tests/api_test.rs:1850` (inline seed)
+
+Do NOT touch the one real construction site (steam-client's parse — already done in
+Step 4). The grep + the `--all-targets` check below are the backstop if a new literal has
+appeared since this plan was written:
 
 ```bash
 cargo check --workspace --all-targets 2>&1 | tail -3
@@ -326,9 +330,8 @@ fn steam_app_cache_pre_screenshots_blob_deserializes() {
 }
 ```
 
-If `serde_json` is not already a dev-dependency of the dynamo crate, add it to
-`crates/dynamo/Cargo.toml` under `[dev-dependencies]` as `serde_json = "1"` (check first —
-it almost certainly is, the store tests are JSON-heavy).
+`serde_json` is already in the dynamo crate's `[dependencies]` (Cargo.toml line 11) and is
+therefore available to integration tests — do NOT add a redundant dev-dependency.
 
 - [ ] **Step 2: Run it, verify it passes (the implementation landed in Task 1)**
 
@@ -370,9 +373,16 @@ git commit -S -m "dynamo: pin pre-#61 blob compat — missing screenshots key de
 - [ ] **Step 1: Extend the shared mock body + write the failing assertion**
 
 In `crates/fulfillment/tests/handler_test.rs`, add a `screenshots` entry to
-`appdetails_found_body` (~line 4188), inside `"data"` after `"movies"`:
+`appdetails_found_body` (~line 4188). The body is a `serde_json::json!` macro literal and
+`"movies"` is currently the LAST key in `"data"` (its `}]` closes at ~line 4207) — so the
+existing `}]` **gains a trailing comma**, then the new key follows:
 
 ```rust
+                "movies": [{
+                    "id": 1, "name": "Trailer",
+                    "thumbnail": "https://img.example/thumb.jpg",
+                    "hls_h264": "https://vid.example/master.m3u8"
+                }],
                 "screenshots": [{
                     "id": 0,
                     "path_thumbnail": "https://img.example/ss.600x338.jpg",
@@ -529,6 +539,9 @@ git commit -S -m "web: mirror Screenshot + optional SteamAppDetail.screenshots i
   detail: SteamAppDetail | null }): JSX element`. The modal is its only consumer. ALL
   video/HLS state (`videoPlaying`, `hlsFailed`, `videoRef`, `hlsRef`, `handlePlay`, the HLS
   unmount cleanup) moves INTO this component — the modal keeps none of it.
+  **Invariant: when `hlsFailed` is true the trailer `<div>` must not render AT ALL** (not
+  render-empty) — slideCount and the slide DOM both drop by one, which is what makes the
+  fatal-HLS test's `1 / 2` counter and the inert-count test both hold.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -714,8 +727,9 @@ type MediaHeaderProps = {
   detail: SteamAppDetail | null;
 };
 
-// Repo pattern for reduced motion (CursorCompanion.tsx / LinkPage.tsx): JS
-// matchMedia, guarded — behavior-testable, unlike a media-query-only class.
+// Repo pattern for reduced motion (friend/CursorCompanion.tsx:71,
+// friend/LinkPage.tsx:37): JS matchMedia, guarded — behavior-testable,
+// unlike a media-query-only class.
 function prefersReducedMotion(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return false;
   return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
