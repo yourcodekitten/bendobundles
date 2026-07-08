@@ -13,6 +13,7 @@ import { ClaimDialog } from './ClaimDialog';
 import { ClaimsHistory } from './ClaimsHistory';
 import { GameGrid } from './GameGrid';
 import { GameDetailModal } from '../GameDetailModal';
+import { CursorCompanion } from './CursorCompanion';
 
 type ViewState =
   | { kind: 'loading' }
@@ -203,8 +204,19 @@ export function LinkPage() {
           />
           <div className="absolute inset-x-0 top-0 flex items-center justify-between px-6 py-3">
             <h1 className="font-logo wordmark-outline text-xl uppercase tracking-[0.03em]">bendobundles</h1>
-            <span className="text-sm font-medium text-ink">
-              {data.claims_used}/{data.claims_allowed} claims used
+            <span
+              className="inline-flex items-center gap-2 font-pixel text-[0.8125rem] text-give-soft"
+              aria-label={`${data.claims_used} of ${data.claims_allowed} claims used`}
+            >
+              {data.claims_allowed - data.claims_used > 0 ? (
+                <>
+                  <span className="claim-beacon" aria-hidden="true" />
+                  {data.claims_allowed - data.claims_used} gift
+                  {data.claims_allowed - data.claims_used === 1 ? '' : 's'} waiting
+                </>
+              ) : (
+                <span className="text-dust">all claimed</span>
+              )}
             </span>
           </div>
           {/* ≤800px the box leaves the banner and drops into flow, still
@@ -315,6 +327,8 @@ export function LinkPage() {
           onRefresh={refresh}
         />
       )}
+
+      <CursorCompanion variant="critter" away={detailGame !== null || claimingGame !== null} />
     </div>
   );
 }

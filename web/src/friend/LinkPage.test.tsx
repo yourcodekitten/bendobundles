@@ -138,7 +138,8 @@ describe('LinkPage', () => {
     renderLinkPage();
     await waitFor(() => {
       expect(screen.getByText('Test Bundle')).toBeInTheDocument();
-      expect(screen.getByText(/1\/3 claims used/)).toBeInTheDocument();
+      // counter is now the "N gifts waiting" beacon; aria-label preserves the count
+      expect(screen.getByLabelText('1 of 3 claims used')).toBeInTheDocument();
     });
   });
 

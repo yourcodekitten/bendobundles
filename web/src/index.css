@@ -129,3 +129,204 @@
     animation: none;
   }
 }
+
+/* the claims beacon — a burgundy dot that ripples, drawing the eye to an
+   unclaimed gift floating on the link-page banner */
+.claim-beacon {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--color-give);
+  animation: claim-beacon-pulse 1.5s ease-in-out infinite;
+}
+@keyframes claim-beacon-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--color-give) 55%, transparent);
+  }
+  50% {
+    transform: scale(1.18);
+    box-shadow: 0 0 0 6px color-mix(in oklab, var(--color-give) 0%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .claim-beacon {
+    animation: none;
+  }
+}
+
+/* the landing diorama — the pixel scene staged in a bezel with the wordmark +
+   line docked in a floating JRPG text box straddling the frame's bottom edge
+   (impeccable live w/ ben, 2026-07-08, overdrive → structure). the scene
+   breathes; the box floats. the ceremony budget still lives in the claim
+   dialog — this is a quiet, living entrance, not a shout. */
+@keyframes landing-diorama-drift {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(0, -1.2%, 0) scale(1.01);
+  }
+}
+@keyframes landing-box-float {
+  0%,
+  100% {
+    transform: translateY(-4px);
+  }
+  50% {
+    transform: translateY(4px);
+  }
+}
+.landing-diorama {
+  position: relative;
+  width: min(92vw, 440px);
+  aspect-ratio: 4 / 5;
+  margin: 0 auto;
+}
+.landing-stage {
+  position: absolute;
+  inset: 0;
+  border: 8px solid var(--color-pixel);
+  border-radius: 16px 16px 40px 16px;
+  overflow: hidden;
+  background: var(--color-room);
+}
+.landing-stage-art {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  image-rendering: pixelated;
+  transform-origin: center 42%;
+  animation: landing-diorama-drift 9s ease-in-out infinite;
+}
+.landing-box {
+  position: absolute;
+  left: 24px;
+  right: 24px;
+  bottom: -18px;
+  background: var(--color-floor);
+  border-radius: 0.75rem;
+  padding: 16px 18px;
+  /* the JRPG text-box double-line inset (The Bezel Rule); inset only — a drop
+     shadow here would break The Ceremony Rule */
+  box-shadow:
+    inset 0 0 0 3px var(--color-floor),
+    inset 0 0 0 5px var(--color-pixel);
+  animation: landing-box-float 4.5s ease-in-out infinite;
+}
+.landing-box-word {
+  font-family: var(--font-logo);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 1.05rem;
+  line-height: 1.2;
+  color: var(--color-ink);
+}
+.landing-box-line {
+  margin: 0.5rem 0 0;
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--color-ink);
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing-stage-art,
+  .landing-box {
+    animation: none;
+  }
+}
+
+/* the key charm — a tiny pixel key swinging off the word "key", the one word
+   on the landing that matters (impeccable live w/ ben, 2026-07-08, delight).
+   inherits fill from the burgundy give-soft "key" span; a treasure key you can
+   almost hear jingle. */
+@keyframes landing-key-swing {
+  0%,
+  100% {
+    transform: rotate(-9deg);
+  }
+  50% {
+    transform: rotate(9deg);
+  }
+}
+.landing-key-charm {
+  display: inline-block;
+  width: 1.2em;
+  height: 0.6em;
+  margin-left: 0.12em;
+  vertical-align: -0.02em;
+  fill: currentColor;
+  transform-origin: top center;
+  animation: landing-key-swing 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing-key-charm {
+    animation: none;
+    transform: rotate(0);
+  }
+}
+
+/* the treasure heart — hovering the diorama art lifts the ♡ and twinkles two
+   pixel sparkles beside it (impeccable live w/ ben, 2026-07-08, delight). a
+   cross-element discovery: look at the treasure, the heart answers. the sincere
+   One Heart stays exactly one — the sparkles are pixels, not hearts. */
+.landing-heart {
+  display: inline-block;
+  position: relative;
+  transform-origin: center bottom;
+  transition: transform 0.35s cubic-bezier(0.25, 1, 0.5, 1);
+}
+.landing-heart::before,
+.landing-heart::after {
+  content: "";
+  position: absolute;
+  width: 0.3em;
+  height: 0.3em;
+  background: var(--color-give-soft);
+  transform: rotate(45deg) scale(0);
+  opacity: 0;
+  pointer-events: none;
+}
+.landing-heart::before {
+  left: -0.45em;
+  top: -0.12em;
+}
+.landing-heart::after {
+  right: -0.45em;
+  top: 0.18em;
+}
+@keyframes landing-heart-twinkle {
+  0%,
+  100% {
+    transform: rotate(45deg) scale(0);
+    opacity: 0;
+  }
+  50% {
+    transform: rotate(45deg) scale(1);
+    opacity: 1;
+  }
+}
+.landing-diorama:has(.landing-stage-art:hover) .landing-heart {
+  transform: translateY(-3px);
+}
+.landing-diorama:has(.landing-stage-art:hover) .landing-heart::before {
+  animation: landing-heart-twinkle 0.9s ease-in-out infinite;
+}
+.landing-diorama:has(.landing-stage-art:hover) .landing-heart::after {
+  animation: landing-heart-twinkle 0.9s ease-in-out 0.45s infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing-diorama:has(.landing-stage-art:hover) .landing-heart {
+    transform: none;
+  }
+  .landing-diorama:has(.landing-stage-art:hover) .landing-heart::before,
+  .landing-diorama:has(.landing-stage-art:hover) .landing-heart::after {
+    animation: none;
+    opacity: 0;
+  }
+}

@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { type GameView } from '../api';
 import { titleColorClass, titleHueVar } from '../titleColor';
 
@@ -11,7 +12,7 @@ interface GameGridProps {
   onDetail: (game: GameView) => void;
 }
 
-export function GameGrid({ games, owned, onDetail }: GameGridProps) {
+function GameGridImpl({ games, owned, onDetail }: GameGridProps) {
   // Group by title; preserve server order — first occurrence wins the card
   const seen = new Map<string, { game: GameView; count: number }>();
   for (const game of games) {
@@ -117,7 +118,7 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
             type="button"
             aria-label={`${game.title} — details`}
             onClick={() => onDetail(game)}
-            className="block w-full rounded-[6px_6px_20px_6px] overflow-hidden text-left cursor-pointer focus-visible:outline-[3px] focus-visible:outline-pixel focus-visible:outline-offset-2"
+            className="block w-full rounded-[6px_6px_20px_6px] overflow-hidden text-left cursor-pointer transition duration-200 ease-[cubic-bezier(0.25,1,0.5,1)] hover:brightness-[1.05] active:brightness-[0.98] motion-safe:hover:-translate-y-[3px] motion-safe:active:-translate-y-px focus-visible:outline-[3px] focus-visible:outline-pixel focus-visible:outline-offset-2"
             style={{ background: `color-mix(in oklch, ${shellHue}, var(--color-shelf) 80%)` }}
           >
             <div
@@ -138,3 +139,7 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
     </section>
   );
 }
+
+// memoized so the friend page's per-character typewriter re-render doesn't
+// reconcile the whole card grid ~70x/sec; props are stable during typing.
+export const GameGrid = memo(GameGridImpl);
