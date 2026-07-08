@@ -449,6 +449,12 @@ export async function adminClearSteamIdentity(): Promise<void> {
 
 // ── Steam detail types (mirrors Rust steam-client structs, snake_case serde) ──
 
+/** One store screenshot — mirrors Rust steam_client::Screenshot. */
+export type Screenshot = {
+  thumbnail: string;
+  full: string;
+};
+
 export type SteamAppDetail = {
   app_id: number;
   name: string;
@@ -460,6 +466,11 @@ export type SteamAppDetail = {
   header_image: string | null;
   video_hls_url: string | null;
   video_thumbnail: string | null;
+  /**
+   * Optional, not `Screenshot[] | null`: an OLD lambda racing this bundle during deploy
+   * omits the key entirely. Read as `detail.screenshots ?? []`.
+   */
+  screenshots?: Screenshot[];
 };
 
 export type ReviewSummary = {
