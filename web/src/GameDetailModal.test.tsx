@@ -410,3 +410,233 @@ describe('GameDetailModal', () => {
     expect(document.querySelector('video')).toBeNull();
   });
 });
+
+// ── Media carousel (issue #61) ────────────────────────────────────────────────
+
+const screenshotsFixture = [
+  {
+    thumbnail: 'https://example.com/ss1.600x338.jpg',
+    full: 'https://example.com/ss1.1920x1080.jpg',
+  },
+  {
+    thumbnail: 'https://example.com/ss2.600x338.jpg',
+    full: 'https://example.com/ss2.1920x1080.jpg',
+  },
+];
+
+const steamDetailWithScreenshots = {
+  ...steamDetailFixture,
+  screenshots: screenshotsFixture,
+};
+
+describe('media carousel', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hlsCbCapture.errorCb = null;
+    clearGameDetailCache();
+  });
+
+  function mockDetail(detail: object | null) {
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: friendGame,
+      steam:
+        detail === null
+          ? null
+          : { detail: detail as never, overall: overallFixture, recent: recentFixture },
+    });
+  }
+
+  function renderFriendModal() {
+    return render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={friendGame}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+  }
+
+  it('trailer + screenshots: trailer is slide 1, arrows + counter present', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    expect(await screen.findByLabelText('play trailer')).toBeInTheDocument();
+    expect(screen.getByLabelText('previous')).toBeInTheDocument();
+    expect(screen.getByLabelText('next')).toBeInTheDocument();
+    expect(screen.getByText('1 / 3')).toBeInTheDocument();
+  });
+
+  it('next advances to a screenshot and wraps past the end', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    const next = await screen.findByLabelText('next');
+    await userEvent.click(next);
+    expect(screen.getByText('2 / 3')).toBeInTheDocument();
+    expect(screen.getByAltText('Stardew Valley screenshot 1')).toBeInTheDocument();
+    await userEvent.click(next);
+    expect(screen.getByText('3 / 3')).toBeInTheDocument();
+    await userEvent.click(next);
+    expect(screen.getByText('1 / 3')).toBeInTheDocument(); // wrap
+  });
+
+  it('one screenshot, no trailer: image alone, zero carousel chrome', async () => {
+    mockDetail({
+      ...steamDetailFixture,
+      video_hls_url: null,
+      screenshots: [screenshotsFixture[0]],
+    });
+    renderFriendModal();
+    expect(
+      await screen.findByAltText('Stardew Valley screenshot 1'),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText('previous')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('next')).not.toBeInTheDocument();
+    expect(screen.queryByText('1 / 1')).not.toBeInTheDocument();
+  });
+
+  it('no trailer, no screenshots: plain header image, no carousel chrome', async () => {
+    mockDetail({ ...steamDetailFixture, video_hls_url: null });
+    renderFriendModal();
+    expect(await screen.findByAltText('Stardew Valley')).toBeInTheDocument();
+    expect(screen.queryByLabelText('next')).not.toBeInTheDocument();
+  });
+
+  it('navigating away from the trailer pauses the video', async () => {
+    const pauseSpy = vi
+      .spyOn(HTMLMediaElement.prototype, 'pause')
+      .mockImplementation(() => {});
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await userEvent.click(await screen.findByLabelText('next'));
+    expect(pauseSpy).toHaveBeenCalled();
+    pauseSpy.mockRestore();
+  });
+
+  it('fatal HLS error mid-carousel drops the trailer slide and clamps the index', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await userEvent.click(await screen.findByLabelText('play trailer'));
+    await waitFor(() => expect(hlsCbCapture.errorCb).not.toBeNull());
+    act(() => hlsCbCapture.errorCb?.('hlsError', { fatal: true }));
+    // Trailer gone: 2 screenshots remain, counter consistent, no crash.
+    expect(await screen.findByText('1 / 2')).toBeInTheDocument();
+    expect(screen.queryByLabelText('play trailer')).not.toBeInTheDocument();
+  });
+
+  it('video element error without hls.js attached drops the trailer slide', async () => {
+    // Safari-native path: no hls.js error events exist, the <video> onError is the
+    // only failure signal. Guarded to hlsRef===null so hls.js's recoverable element
+    // errors don't false-trigger.
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    const video = document.querySelector('video') as HTMLVideoElement;
+    act(() => {
+      video.dispatchEvent(new Event('error'));
+    });
+    expect(await screen.findByText('1 / 2')).toBeInTheDocument();
+    expect(screen.queryByLabelText('play trailer')).not.toBeInTheDocument();
+  });
+
+  it('video element error during hls.js playback does NOT drop the trailer', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await userEvent.click(await screen.findByLabelText('play trailer'));
+    await waitFor(() => expect(hlsCbCapture.errorCb).not.toBeNull());
+    const video = document.querySelector('video') as HTMLVideoElement;
+    act(() => {
+      video.dispatchEvent(new Event('error'));
+    });
+    // hls.js owns error handling while attached — only its fatal callback drops the slide.
+    expect(screen.getByText('1 / 3')).toBeInTheDocument();
+  });
+
+  it('off-screen slides are inert and aria-hidden', async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    const region = screen.getByRole('region', { name: 'media' });
+    const hidden = region.querySelectorAll('[aria-hidden="true"][inert]');
+    expect(hidden.length).toBe(2); // both screenshot slides while trailer is active
+  });
+
+  it('reduced motion: no transition class; motion allowed: transition present', async () => {
+    const mm = vi.spyOn(window, 'matchMedia');
+    mm.mockReturnValue({ matches: true } as MediaQueryList);
+    mockDetail(steamDetailWithScreenshots);
+    const { unmount } = renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    const strip = () =>
+      screen.getByRole('region', { name: 'media' }).firstElementChild as HTMLElement;
+    expect(strip().className).not.toContain('transition-transform');
+    unmount();
+    clearGameDetailCache();
+    mm.mockReturnValue({ matches: false } as MediaQueryList);
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    expect(strip().className).toContain('transition-transform');
+    mm.mockRestore();
+  });
+});
+
+// ── Focus trap (issue #61 acceptance) ─────────────────────────────────────────
+
+describe('focus trap', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hlsCbCapture.errorCb = null;
+    clearGameDetailCache();
+  });
+
+  function renderFriendModal() {
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: friendGame,
+      steam: { detail: steamDetailFixture, overall: null, recent: null },
+    });
+    return render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={friendGame}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+  }
+
+  it('Tab from the container enters the dialog; Tab on last focusable wraps to first', async () => {
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    const dialog = screen.getByRole('dialog');
+    expect(document.activeElement).toBe(dialog); // focus-on-open pin
+
+    // Tab from the container lands on the FIRST focusable inside the dialog.
+    await userEvent.tab();
+    const first = document.activeElement as HTMLElement;
+    expect(dialog.contains(first)).toBe(true);
+
+    // From the last focusable (claim button, friend footer), Tab must WRAP to first.
+    const claim = screen.getByRole('button', { name: 'claim' });
+    claim.focus();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(first);
+  });
+
+  it('Shift+Tab on the first focusable wraps to the last', async () => {
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    await userEvent.tab(); // container → first focusable
+    const first = document.activeElement as HTMLElement;
+    await userEvent.tab({ shift: true });
+    const last = document.activeElement as HTMLElement;
+    expect(last).not.toBe(first);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog.contains(last)).toBe(true);
+  });
+});

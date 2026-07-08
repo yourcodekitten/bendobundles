@@ -1264,6 +1264,7 @@ fn test_steam_cache(app_id: u32) -> SteamAppCache {
             header_image: None,
             video_hls_url: None,
             video_thumbnail: None,
+            screenshots: vec![],
         }),
         overall: Some(ReviewSummary {
             desc: "Mostly Positive".into(),
@@ -1338,6 +1339,11 @@ async fn game_detail_listable_200_with_steam_blob() {
     assert!(
         !j["steam"]["detail"].is_null(),
         "steam.detail must be present"
+    );
+    // screenshots key rides the wire (issue #61) — a serde skip attr would drop it silently
+    assert!(
+        j["steam"]["detail"]["screenshots"].is_array(),
+        "steam.detail.screenshots must be serialized as an array"
     );
     assert_eq!(j["steam"]["overall"]["desc"], "Mostly Positive");
     assert_eq!(j["steam"]["recent"]["percent_positive"], 83);

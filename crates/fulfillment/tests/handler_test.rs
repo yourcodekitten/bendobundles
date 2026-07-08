@@ -7,7 +7,7 @@
 use domain::{AppidSource, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{Store, SyncState};
 use fulfillment::{
-    Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, backfill_steam_genres,
+    Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, backfill_steam_details,
     enrich_steam_apps, gift_decision, handle, reveal_decision,
 };
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
@@ -4204,6 +4204,11 @@ fn appdetails_found_body(name: &str) -> serde_json::Value {
                     "id": 1, "name": "Trailer",
                     "thumbnail": "https://img.example/thumb.jpg",
                     "hls_h264": "https://vid.example/master.m3u8"
+                }],
+                "screenshots": [{
+                    "id": 0,
+                    "path_thumbnail": "https://img.example/ss.600x338.jpg",
+                    "path_full": "https://img.example/ss.1920x1080.jpg"
                 }]
             }
         }
@@ -4280,6 +4285,7 @@ fn fresh_cache(app_id: u32, now: i64) -> dynamo::SteamAppCache {
             header_image: None,
             video_hls_url: None,
             video_thumbnail: None,
+            screenshots: vec![],
         }),
         overall: Some(steam_client::ReviewSummary {
             desc: "Positive".into(),
@@ -4625,7 +4631,7 @@ async fn enrich_no_steam_client_is_noop() {
 }
 
 // =================================================================================================
-// backfill_steam_genres (issue #57): run-once STEAMAPP# rebuild through the current parse.
+// backfill_steam_details (issue #57): run-once STEAMAPP# rebuild through the current parse.
 // =================================================================================================
 
 // (a) A stale-but-within-30d dirty item is refetched (enrichment would have skipped it),
@@ -4659,7 +4665,7 @@ async fn backfill_rewrites_dirty_detail_and_preserves_reviews() {
         .await;
 
     let steam = steam_client_at(&steam_mock.uri());
-    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+    let summary = backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
 
@@ -4671,6 +4677,14 @@ async fn backfill_rewrites_dirty_detail_and_preserves_reviews() {
         detail.genres,
         vec!["Indie".to_string(), "Single-player".to_string()],
         "genres must be rebuilt through the new parse (allowlisted only)"
+    );
+    assert_eq!(
+        detail.screenshots,
+        vec![steam_client::Screenshot {
+            thumbnail: "https://img.example/ss.600x338.jpg".into(),
+            full: "https://img.example/ss.1920x1080.jpg".into(),
+        }],
+        "backfill must persist screenshots through the new parse (issue #61)"
     );
     assert!(cache.fetched_at >= now, "fetched_at must be restamped");
     // Reviews half preserved exactly as seeded.
@@ -4695,7 +4709,7 @@ async fn backfill_skips_items_within_skip_fresh_window() {
 
     let steam_mock = steam_mock_empty().await;
     let steam = steam_client_at(&steam_mock.uri());
-    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+    let summary = backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
 
@@ -4726,7 +4740,7 @@ async fn backfill_fetches_missing_cache_items() {
         .await;
 
     let steam = steam_client_at(&steam_mock.uri());
-    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+    let summary = backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
 
@@ -4763,7 +4777,7 @@ async fn backfill_delisted_writes_negative_stub() {
         .await;
 
     let steam = steam_client_at(&steam_mock.uri());
-    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+    let summary = backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
 
@@ -4793,7 +4807,7 @@ async fn backfill_429_aborts_with_flag() {
         .await;
 
     let steam = steam_client_at(&steam_mock.uri());
-    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+    let summary = backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
 

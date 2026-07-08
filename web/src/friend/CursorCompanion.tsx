@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef, useState, type JSX } from 'react';
+import { prefersReducedMotion } from '../motion';
 
 /* ── the cursor companion ──────────────────────────────────────────────────
    a small pixel friend that lazily trails the cursor around the gift page and
@@ -66,10 +67,7 @@ const CSS = `
 
 function canRun(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return false;
-  return (
-    window.matchMedia('(pointer: fine)').matches &&
-    !window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  );
+  return window.matchMedia('(pointer: fine)').matches && !prefersReducedMotion();
 }
 
 function CursorCompanionImpl({ variant, away }: { variant: CompanionVariant; away: boolean }) {

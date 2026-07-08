@@ -765,3 +765,104 @@ async fn recent_reviews_percent_rounds_not_floors() {
     );
     assert_eq!(recent.count, 3);
 }
+
+// ── screenshots (issue #61) ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn app_details_parses_screenshots_thumb_and_full_capped_at_10() {
+    // Fixture is a REAL captured appdetails response (16 screenshots) — the wire field
+    // names (path_thumbnail/path_full) are pinned by capture, not by hand.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(APPDETAILS_FIXTURE))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert_eq!(
+        detail.screenshots.len(),
+        10,
+        "16 in the fixture must cap at 10"
+    );
+    let first = &detail.screenshots[0];
+    assert!(
+        first
+            .thumbnail
+            .contains("ss_b887651a93b0525739049eb4194f633de2df75be.600x338"),
+        "first thumbnail must be the capture's path_thumbnail; got {}",
+        first.thumbnail
+    );
+    assert!(
+        first
+            .full
+            .contains("ss_b887651a93b0525739049eb4194f633de2df75be.1920x1080"),
+        "first full must be the capture's path_full; got {}",
+        first.full
+    );
+}
+
+#[tokio::test]
+async fn app_details_missing_screenshots_key_is_empty() {
+    // Pre-existing blobs / apps without screenshots: absent key must parse to [], never fail.
+    let body = r#"{"413150":{"success":true,"data":{"name":"No Shots"}}}"#;
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert_eq!(detail.screenshots, vec![]);
+}
+
+#[tokio::test]
+async fn app_details_screenshot_missing_either_tier_is_dropped() {
+    // Both URLs or nothing — asymmetric fallbacks would create two sources of truth.
+    // Empty strings count as missing (a "" URL would render a phantom slide), and an
+    // empty movie hls/thumbnail must collapse to None, not Some("").
+    let body = r#"{"413150":{"success":true,"data":{
+        "name":"Partial Shots",
+        "movies":[{"id":1,"thumbnail":"","hls_h264":""}],
+        "screenshots":[
+            {"id":0,"path_thumbnail":"https://img.example/a.600x338.jpg","path_full":"https://img.example/a.1920x1080.jpg"},
+            {"id":1,"path_thumbnail":"https://img.example/b.600x338.jpg"},
+            {"id":2,"path_full":"https://img.example/c.1920x1080.jpg"},
+            {"id":3,"path_thumbnail":"","path_full":"https://img.example/d.1920x1080.jpg"}
+        ]
+    }}}"#;
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert_eq!(
+        detail.screenshots,
+        vec![steam_client::Screenshot {
+            thumbnail: "https://img.example/a.600x338.jpg".into(),
+            full: "https://img.example/a.1920x1080.jpg".into(),
+        }],
+        "entries missing either tier must drop, not fail or half-fill"
+    );
+    assert_eq!(
+        detail.video_hls_url, None,
+        "empty hls url must be None, not Some(\"\")"
+    );
+    assert_eq!(detail.video_thumbnail, None, "empty thumbnail must be None");
+}

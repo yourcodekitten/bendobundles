@@ -1768,6 +1768,7 @@ fn steam_app_cache_full(app_id: u32) -> SteamAppCache {
             header_image: Some("https://cdn.steam/header.jpg".into()),
             video_hls_url: None,
             video_thumbnail: None,
+            screenshots: vec![],
         }),
         overall: Some(steam_client::ReviewSummary {
             desc: "Mostly Positive".into(),
@@ -1870,4 +1871,14 @@ async fn list_steam_app_ids_excludes_non_steamapp_items() {
         2,
         "idempotent overwrite must not duplicate entries"
     );
+}
+
+/// Pre-#61 blobs have no `screenshots` key in the detail JSON. `#[serde(default)]` must
+/// fill `[]` — if this ever fails, every cached app in prod stops deserializing.
+#[test]
+fn steam_app_cache_pre_screenshots_blob_deserializes() {
+    let body = r#"{"app_id":413150,"detail":{"app_id":413150,"name":"Stardew Valley","developers":["ConcernedApe"],"publishers":["ConcernedApe"],"genres":["Indie"],"release_date":"Feb 26, 2016","short_description":"farm.","header_image":null,"video_hls_url":null,"video_thumbnail":null},"overall":null,"recent":null,"fetched_at":100,"reviews_fetched_at":100}"#;
+    let cache: dynamo::SteamAppCache =
+        serde_json::from_str(body).expect("pre-screenshots blob must still deserialize");
+    assert_eq!(cache.detail.expect("detail present").screenshots, vec![]);
 }

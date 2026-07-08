@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import type Hls from 'hls.js';
 import type { GameView, AdminGame, SteamDetailBlob, SelfClaimResult } from './api';
+import { MediaHeader } from './MediaHeader';
 import { titleColorClass } from './titleColor';
 
 // ── Per-session module-level detail cache ─────────────────────────────────────
@@ -12,6 +12,22 @@ const gameDetailCache = new Map<string, SteamDetailBlob | null>();
 
 export function clearGameDetailCache(): void {
   gameDetailCache.clear();
+}
+
+// ── Focus trap (issue #61 acceptance) ─────────────────────────────────────────
+// Computed at keydown time: the focusable set is dynamic (carousel slides are
+// inert per-index, buttons appear/disappear), so a cached list would trap focus
+// into hidden slides.
+
+const FOCUSABLE_SELECTOR =
+  'button, [href], input, select, textarea, video, [tabindex]:not([tabindex="-1"])';
+
+function dialogFocusables(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (el) =>
+      el.closest('[inert], [aria-hidden="true"]') === null &&
+      !el.hasAttribute('disabled'),
+  );
 }
 
 // ── Status badge — mirrors Catalog's mapping ──────────────────────────────────
@@ -88,12 +104,8 @@ export function GameDetailModal(props: GameDetailModalProps) {
 
   const [loadState, setLoadState] = useState<LoadState>({ phase: 'loading' });
   const [retryKey, setRetryKey] = useState(0);
-  const [videoPlaying, setVideoPlaying] = useState(false);
-  const [hlsFailed, setHlsFailed] = useState(false);
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const hlsRef = useRef<Hls | null>(null);
 
   // ── Focus on open (a11y) ──────────────────────────────────────────────────
 
@@ -137,17 +149,6 @@ export function GameDetailModal(props: GameDetailModalProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [game.id, mount, token, loadDetail, retryKey]);
 
-  // ── HLS cleanup on unmount ────────────────────────────────────────────────
-
-  useEffect(() => {
-    return () => {
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
-      }
-    };
-  }, []);
-
   // ── Escape key ────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -158,36 +159,31 @@ export function GameDetailModal(props: GameDetailModalProps) {
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [onClose]);
 
-  // ── HLS play handler ──────────────────────────────────────────────────────
+  // ── Focus trap: Tab/Shift+Tab wrap inside the dialog ──────────────────────
+  // (Escape stays the document listener above; the carousel's Arrow handling
+  // lives on the carousel region — Tab is the only key this handler owns.)
 
-  const handlePlay = async (hlsUrl: string) => {
-    if (!videoRef.current || videoPlaying) return;
-    const video = videoRef.current;
-
-    if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Native HLS — Safari
-      video.src = hlsUrl;
-    } else {
-      // hls.js path
-      const { default: HlsClass } = await import('hls.js');
-      const hls = new HlsClass();
-      hlsRef.current = hls;
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(video);
-      hls.on(HlsClass.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          setHlsFailed(true);
-          hls.destroy();
-          hlsRef.current = null;
-        }
-      });
+  const handleTrapKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== 'Tab') return;
+    const container = containerRef.current;
+    if (container === null) return;
+    const els = dialogFocusables(container);
+    if (els.length === 0) {
+      e.preventDefault(); // nowhere to go — focus stays on the container
+      return;
     }
-
-    setVideoPlaying(true);
-    try {
-      await video.play();
-    } catch {
-      // play() rejection (browser policy, no source in test env) — ignore
+    const first = els[0];
+    const last = els[els.length - 1];
+    if (first === undefined || last === undefined) return;
+    const active = document.activeElement;
+    if (e.shiftKey) {
+      if (active === first || active === container) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else if (active === last || active === container) {
+      e.preventDefault();
+      first.focus();
     }
   };
 
@@ -209,6 +205,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
         onClick={(e) => {
           if (e.target === e.currentTarget) onClose();
         }}
+        onKeyDown={handleTrapKeyDown}
       >
         <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl bg-floor shadow-2xl ring-1 ring-pixel">
           {/* Header */}
@@ -273,48 +270,18 @@ export function GameDetailModal(props: GameDetailModalProps) {
             {/* Full detail — steam non-null */}
             {loadState.phase === 'loaded' && loadState.steam !== null && (() => {
               const { detail, overall, recent } = loadState.steam;
-              const hlsUrl = detail?.video_hls_url ?? null;
-              const artwork = detail?.header_image ?? game.artwork_url;
 
               return (
                 <div className="space-y-4 pb-2">
-                  {/* Video or artwork header */}
-                  {!hlsFailed && hlsUrl !== null ? (
-                    <div className="relative">
-                      <video
-                        ref={videoRef}
-                        poster={
-                          detail?.video_thumbnail ??
-                          detail?.header_image ??
-                          game.artwork_url ??
-                          undefined
-                        }
-                        className="aspect-video w-full object-cover"
-                        playsInline
-                      />
-                      {!videoPlaying && (
-                        <button
-                          type="button"
-                          aria-label="play trailer"
-                          onClick={() => void handlePlay(hlsUrl)}
-                          className="absolute inset-0 flex items-center justify-center bg-black/40 hover:bg-black/50"
-                        >
-                          <span className="text-5xl text-white">▶</span>
-                        </button>
-                      )}
-                    </div>
-                  ) : artwork !== null ? (
-                    <img
-                      src={artwork}
-                      alt={game.title}
-                      className="aspect-video w-full object-cover"
-                    />
-                  ) : (
-                    <div
-                      className={`aspect-video w-full ${titleColorClass(game.title)}`}
-                      aria-hidden="true"
-                    />
-                  )}
+                  {/* Media header — trailer + screenshots carousel (#61).
+                      Keyed by game so carousel/video state can never survive
+                      an in-place game swap if one is ever added. */}
+                  <MediaHeader
+                    key={game.id}
+                    title={game.title}
+                    artworkUrl={game.artwork_url}
+                    detail={detail}
+                  />
 
                   {/* Text detail — only when detail is non-null */}
                   {detail !== null && (

@@ -43,6 +43,17 @@ pub struct SteamAppDetail {
     /// First movie's hls_h264 URL (movies are HLS/DASH-only now, no mp4/webm)
     pub video_hls_url: Option<String>,
     pub video_thumbnail: Option<String>,
+    /// First 10 store screenshots (thumbnail + full tiers). Empty when the app has none
+    /// or the cached blob predates the field (issue #61).
+    #[serde(default)]
+    pub screenshots: Vec<Screenshot>,
+}
+
+/// One store screenshot: Steam's `path_thumbnail` (600x338) + `path_full` (1920x1080) tiers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Screenshot {
+    pub thumbnail: String,
+    pub full: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +199,16 @@ struct AppDetailDataWire {
     header_image: Option<String>,
     #[serde(default)]
     movies: Vec<MovieWire>,
+    #[serde(default)]
+    screenshots: Vec<ScreenshotWire>,
+}
+
+/// Both tiers or the entry is dropped — a screenshot with only one URL would force the
+/// UI to guess. Options (not defaults) so a missing key drops the entry, not the parse.
+#[derive(Deserialize)]
+struct ScreenshotWire {
+    path_thumbnail: Option<String>,
+    path_full: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -225,6 +246,10 @@ where
 /// (Online Co-op 38, LAN Co-op 48, …) are dropped — Steam includes the parent category
 /// alongside its variants, so coverage holds while the tag count stays flat (issue #57).
 const ALLOWED_CATEGORY_IDS: [u32; 5] = [2, 1, 9, 49, 20];
+
+/// Screenshots kept per app ("a handful", issue #61): bounds the cache blob; a cap change
+/// reaches existing blobs only via a backfill rerun or the 30-day refresh.
+const SCREENSHOT_CAP: usize = 10;
 
 #[derive(Deserialize)]
 struct ReleaseDateWire {
@@ -447,6 +472,17 @@ impl SteamClient {
                 genres.push(cat.description);
             }
         }
+        let screenshots: Vec<Screenshot> = data
+            .screenshots
+            .into_iter()
+            .filter_map(|s| match (s.path_thumbnail, s.path_full) {
+                (Some(thumbnail), Some(full)) if !thumbnail.is_empty() && !full.is_empty() => {
+                    Some(Screenshot { thumbnail, full })
+                }
+                _ => None,
+            })
+            .take(SCREENSHOT_CAP)
+            .collect();
         let first_movie = data.movies.into_iter().next();
         Ok(AppDetails::Found(Box::new(SteamAppDetail {
             app_id,
@@ -457,8 +493,16 @@ impl SteamClient {
             release_date: data.release_date.and_then(|r| r.date),
             short_description: data.short_description,
             header_image: data.header_image,
-            video_hls_url: first_movie.as_ref().and_then(|m| m.hls_h264.clone()),
-            video_thumbnail: first_movie.and_then(|m| m.thumbnail),
+            // Steam types these loosely; "" would render a phantom trailer slide (#62 review),
+            // so empty strings collapse to None at the wire.
+            video_hls_url: first_movie
+                .as_ref()
+                .and_then(|m| m.hls_h264.clone())
+                .filter(|s| !s.is_empty()),
+            video_thumbnail: first_movie
+                .and_then(|m| m.thumbnail)
+                .filter(|s| !s.is_empty()),
+            screenshots,
         })))
     }
 

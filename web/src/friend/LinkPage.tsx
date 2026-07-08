@@ -14,6 +14,7 @@ import { ClaimsHistory } from './ClaimsHistory';
 import { GameGrid } from './GameGrid';
 import { GameDetailModal } from '../GameDetailModal';
 import { CursorCompanion } from './CursorCompanion';
+import { prefersReducedMotion } from '../motion';
 
 type ViewState =
   | { kind: 'loading' }
@@ -34,7 +35,7 @@ export function LinkPage() {
   const [typeKey, setTypeKey] = useState(0);
   useEffect(() => {
     if (typeTotal === 0) return;
-    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    if (prefersReducedMotion()) {
       setTypeChars(typeTotal);
       return;
     }

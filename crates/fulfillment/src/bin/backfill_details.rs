@@ -1,9 +1,9 @@
-//! Run-once STEAMAPP# cache rebuild (issue #57): refetches appdetails for every catalog
+//! Run-once STEAMAPP# cache rebuild (issues #57, #61): refetches appdetails for every catalog
 //! appid through the current parse (id-allowlisted genres) and rewrites each item,
 //! preserving the reviews half. Run by a human with AWS credentials, never by CI or the
 //! lambda:
 //!
-//!   TABLE_NAME=<table> cargo run -p fulfillment --features backfill --bin backfill_genres
+//!   TABLE_NAME=<table> cargo run -p fulfillment --features backfill --bin backfill_details
 //!
 //! Optional env: SKIP_FRESH_SECS (default 43200 = 12h) — items whose appdetails were
 //! fetched more recently than this are skipped, which is what makes a rerun after a 429
@@ -39,7 +39,7 @@ async fn main() {
         SteamApiKey::new(String::new()),
     )
     .expect("SteamClient construction");
-    let summary = fulfillment::backfill_steam_genres(
+    let summary = fulfillment::backfill_steam_details(
         &store,
         &steam,
         fulfillment::STEAM_ENRICH_PACE,
