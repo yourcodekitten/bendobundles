@@ -1946,14 +1946,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         if !need_detail && !need_reviews {
             continue; // both halves fresh — nothing to do
         }
-        let cache = existing.unwrap_or(dynamo::SteamAppCache {
-            app_id,
-            detail: None,
-            overall: None,
-            recent: None,
-            fetched_at: 0,
-            reviews_fetched_at: 0,
-        });
+        let cache = existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id));
         worklist.push(Work {
             app_id,
             need_detail,
@@ -2084,7 +2077,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
 }
 
 /// Outcome of one [`backfill_steam_genres`] run.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct BackfillSummary {
     /// Live detail refetched and persisted.
     pub fetched: u32,
@@ -2139,15 +2132,7 @@ pub async fn backfill_steam_genres(
             );
             continue;
         }
-        let mut cache = existing.unwrap_or(dynamo::SteamAppCache {
-            app_id,
-            detail: None,
-            overall: None,
-            recent: None,
-            fetched_at: 0,
-            reviews_fetched_at: 0,
-        });
-        let mut delisted = false;
+        let mut cache = existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id));
         tokio::time::sleep(pace).await;
         match steam.get_app_details(app_id).await {
             Ok(steam_client::AppDetails::Found(d)) => {
@@ -2159,7 +2144,6 @@ pub async fn backfill_steam_genres(
                 cache.detail = None;
                 cache.fetched_at = now;
                 cache.reviews_fetched_at = now;
-                delisted = true;
             }
             Err(steam_client::SteamError::RateLimited) => {
                 summary.aborted_429 = true;
@@ -2183,10 +2167,11 @@ pub async fn backfill_steam_genres(
             summary.failed += 1;
             continue;
         }
-        if delisted {
-            summary.negative += 1;
-        } else {
+        // What was just written IS the outcome: Some detail = live refetch, None = stub.
+        if cache.detail.is_some() {
             summary.fetched += 1;
+        } else {
+            summary.negative += 1;
         }
         let done = summary.fetched + summary.negative + summary.skipped + summary.failed;
         tracing::info!(app_id, done, total, "backfill: item rewritten");

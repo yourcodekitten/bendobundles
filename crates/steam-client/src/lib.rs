@@ -195,14 +195,29 @@ struct DescriptionWire {
     description: String,
 }
 
-/// `categories[].id` is a JSON number (unlike `genres[].id`, a string) and is Steam's
-/// stable category identifier — the allowlist keys on it, not on the description text.
-/// A missing id deserializes to 0 (allowlisted-nothing) rather than failing the parse.
+/// `categories[].id` is nominally a JSON number (unlike `genres[].id`, a string) and is
+/// Steam's stable category identifier — the allowlist keys on it, not on the description
+/// text. Steam types ids loosely across sibling arrays, so a missing OR mistyped id
+/// deserializes to 0 (allowlisted-nothing) rather than failing the whole appdetails parse
+/// and permanently un-enriching the app.
 #[derive(Deserialize)]
 struct CategoryWire {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_category_id")]
     id: u32,
     description: String,
+}
+
+/// Number → u32 (0 on overflow/negative); numeric string → parsed; anything else → 0.
+/// 0 matches no allowlist entry, so junk ids drop the category instead of erroring.
+fn lenient_category_id<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        serde_json::Value::String(s) => s.parse().unwrap_or(0),
+        _ => 0,
+    })
 }
 
 /// Steam category ids that survive into `SteamAppDetail::genres`: the top-level player

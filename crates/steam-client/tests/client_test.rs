@@ -606,6 +606,40 @@ async fn app_details_filters_categories_to_player_mode_allowlist() {
 }
 
 #[tokio::test]
+async fn app_details_tolerates_mistyped_category_ids() {
+    // Steam types ids loosely across sibling arrays (genres[].id IS a string), so a
+    // category id arriving as a string, bool, or missing must never fail the whole
+    // appdetails parse — that would permanently un-enrich the app. String ids that
+    // parse numerically still count against the allowlist; junk ids just drop the entry.
+    let body = r#"{"413150":{"success":true,"data":{
+        "name":"Mixed Ids",
+        "genres":[{"id":"23","description":"Indie"}],
+        "categories":[
+            {"id":"2","description":"Single-player"},
+            {"id":true,"description":"Steam Achievements"},
+            {"description":"Family Sharing"}
+        ]
+    }}}"#;
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert_eq!(
+        detail.genres,
+        vec!["Indie".to_string(), "Single-player".to_string()],
+        "string id \"2\" must count as allowlisted; junk/missing ids must drop, not fail"
+    );
+}
+
+#[tokio::test]
 async fn app_details_delisted_is_success_false() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))

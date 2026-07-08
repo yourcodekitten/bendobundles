@@ -105,6 +105,22 @@ pub struct SteamAppCache {
     pub reviews_fetched_at: i64,
 }
 
+impl SteamAppCache {
+    /// A blank cache item for `app_id`: no halves fetched, both clocks at epoch — every
+    /// staleness window sees it as maximally stale. The one definition of "blank" shared
+    /// by the enrichment pass and the backfill bin, so they can never disagree on it.
+    pub fn empty(app_id: u32) -> Self {
+        Self {
+            app_id,
+            detail: None,
+            overall: None,
+            recent: None,
+            fetched_at: 0,
+            reviews_fetched_at: 0,
+        }
+    }
+}
+
 /// A sync-run marker older than this is dead: the fulfillment lambda's hard timeout is 900s, so
 /// a run that began more than 900s (+ a skew margin) ago cannot still be executing. A stale
 /// marker means a run crashed/timed out before reporting — it may be taken over.

@@ -4628,17 +4628,6 @@ async fn enrich_no_steam_client_is_noop() {
 // backfill_steam_genres (issue #57): run-once STEAMAPP# rebuild through the current parse.
 // =================================================================================================
 
-/// A wiremock-backed SteamClient for driving backfill directly (no Deps involved).
-fn backfill_steam_client(server: &wiremock::MockServer) -> steam_client::SteamClient {
-    steam_client::SteamClient::new(
-        &server.uri(),
-        &server.uri(),
-        &server.uri(),
-        steam_client::SteamApiKey::new("TESTKEY".into()),
-    )
-    .unwrap()
-}
-
 // (a) A stale-but-within-30d dirty item is refetched (enrichment would have skipped it),
 //     genres come back clean, and the reviews half is preserved byte-for-byte.
 #[tokio::test]
@@ -4669,7 +4658,7 @@ async fn backfill_rewrites_dirty_detail_and_preserves_reviews() {
         .mount(&steam_mock)
         .await;
 
-    let steam = backfill_steam_client(&steam_mock);
+    let steam = steam_client_at(&steam_mock.uri());
     let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
@@ -4705,7 +4694,7 @@ async fn backfill_skips_items_within_skip_fresh_window() {
     store.put_steam_app(&fresh_cache(570, now)).await.unwrap();
 
     let steam_mock = steam_mock_empty().await;
-    let steam = backfill_steam_client(&steam_mock);
+    let steam = steam_client_at(&steam_mock.uri());
     let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
@@ -4736,7 +4725,7 @@ async fn backfill_fetches_missing_cache_items() {
         .mount(&steam_mock)
         .await;
 
-    let steam = backfill_steam_client(&steam_mock);
+    let steam = steam_client_at(&steam_mock.uri());
     let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
@@ -4773,7 +4762,7 @@ async fn backfill_delisted_writes_negative_stub() {
         .mount(&steam_mock)
         .await;
 
-    let steam = backfill_steam_client(&steam_mock);
+    let steam = steam_client_at(&steam_mock.uri());
     let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
@@ -4803,7 +4792,7 @@ async fn backfill_429_aborts_with_flag() {
         .mount(&steam_mock)
         .await;
 
-    let steam = backfill_steam_client(&steam_mock);
+    let steam = steam_client_at(&steam_mock.uri());
     let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
         .await
         .unwrap();
