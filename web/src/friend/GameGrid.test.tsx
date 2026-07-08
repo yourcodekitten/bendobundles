@@ -105,4 +105,26 @@ describe('GameGrid', () => {
       'https://example.com/art.jpg',
     );
   });
+
+  it('renders up to 4 genre chips straight from the list payload — no fetch', () => {
+    const games = [
+      makeGame({
+        id: '1',
+        title: 'Celeste',
+        genres: ['Action', 'Indie', 'Platformer', 'Adventure', 'Casual'],
+      }),
+    ];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.getByText('Action')).toBeInTheDocument();
+    expect(screen.getByText('Adventure')).toBeInTheDocument();
+    // display cap is 4 — the 5th genre from the payload is not rendered
+    expect(screen.queryByText('Casual')).not.toBeInTheDocument();
+    // genre chips replace the key_type chip
+    expect(screen.queryByText('steam')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the key_type chip when the payload has no genres', () => {
+    render(<GameGrid games={[makeGame({ id: '1', title: 'Game' })]} onDetail={vi.fn()} />);
+    expect(screen.getByText('steam')).toBeInTheDocument();
+  });
 });
