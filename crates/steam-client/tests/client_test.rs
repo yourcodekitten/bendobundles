@@ -574,6 +574,38 @@ async fn app_details_found_parses_fields() {
 }
 
 #[tokio::test]
+async fn app_details_filters_categories_to_player_mode_allowlist() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(APPDETAILS_FIXTURE))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    // Real genres in API order, then ONLY the allowlisted top-level player-mode
+    // categories (ids 2, 1, 9) in API order. The fixture's 12 other categories —
+    // mode variants (Online Co-op, LAN Co-op, Shared/Split Screen…) and store
+    // features (Steam Achievements, Steam Cloud, Family Sharing…) — must be gone.
+    assert_eq!(
+        detail.genres,
+        vec![
+            "Indie".to_string(),
+            "RPG".to_string(),
+            "Simulation".to_string(),
+            "Single-player".to_string(),
+            "Multi-player".to_string(),
+            "Co-op".to_string(),
+        ],
+        "genres must be real genres + allowlisted player modes only"
+    );
+}
+
+#[tokio::test]
 async fn app_details_delisted_is_success_false() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
