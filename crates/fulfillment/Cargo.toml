@@ -27,3 +27,12 @@ aws-config = { version = "1", features = ["behavior-version-latest", "test-util"
 aws-sdk-dynamodb = "1"
 tokio.workspace = true
 wiremock = "0.6"
+
+[features]
+# Build-gate for the run-once backfill bin (see src/bin/backfill_genres.rs). Empty on
+# purpose: the bin's deps are all normal deps; the gate just keeps it out of default builds.
+backfill = []
+
+[[bin]]
+name = "backfill_genres"
+required-features = ["backfill"]
