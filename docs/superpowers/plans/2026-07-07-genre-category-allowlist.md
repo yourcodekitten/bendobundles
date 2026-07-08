@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Every commit is GPG-signed: `git commit -S`. Author must be `code kitten <yourcodekitten@gmail.com>` (verify `git config user.email` before the first commit).
-- CI gate is `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `cargo test --workspace` — both must pass at every commit.
+- CI gates are `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test --workspace` — ALL THREE must pass at every commit. After pasting any code block from this plan, run `cargo fmt` before committing — the blocks are not guaranteed rustfmt-normal.
 - Crate convention: matches on `SteamError` name **every** variant — no `_` arm. The compiler's exhaustiveness check is the guard that future variants get a decision.
 - TDD: write the failing test, RUN it and see the real failure, then implement. Never write implementation before the red run.
 - The fulfillment integration tests are dynamodb-gated: `store_or_skip` skips (prints `SKIP <test>: no dynamodb-local…`) unless a DynamoDB-compatible endpoint is listening on `localhost:8000` (or `DYNAMODB_LOCAL_URL` is set). To get honest reds/greens, start one first, e.g. `pip install --user 'moto[server]' && moto_server -p 8000 &` (or any dynamodb-local). If moto starts erroring `Corrupt("already exists")` across repeated suite runs, restart the moto process — it accumulates state; that error is not a real test failure.
@@ -132,7 +132,10 @@ const ALLOWED_CATEGORY_IDS: [u32; 5] = [2, 1, 9, 49, 20];
 Run: `cargo test -p steam-client`
 Expected: PASS, including the new test AND the pre-existing `app_details_found_parses_fields` (its `genres.contains("RPG")` assertion still holds).
 
-- [ ] **Step 5: Lint**
+- [ ] **Step 5: Format + lint**
+
+Run: `cargo fmt` then `cargo fmt --check`
+Expected: no diff remains (fmt is a CI gate).
 
 Run: `cargo clippy -p steam-client --all-targets --all-features -- -D warnings`
 Expected: clean.
@@ -165,11 +168,13 @@ trading cards...) and mode variants no longer render as genre tags (#57)."
 
 **Background for a cold implementer:** The stored `STEAMAPP#<app_id>` cache items were written with the OLD merged genre lists and only self-heal on a 30-day TTL at ≤75 apps per once-daily sync (~10 days for the ~700-app catalog). This task adds a run-once rebuild that refetches appdetails for EVERY catalog appid through the NEW parse and rewrites each item, preserving the reviews half (`overall`, `recent`, `reviews_fetched_at` — appdetails and reviews are independently-clocked halves of the same item). It deliberately IGNORES the 30-day freshness window (refetching regardless is the point) but skips items whose `fetched_at` is within `skip_fresh_secs` (default 12 h) so an aborted run resumes where it left off. Mirror `enrich_steam_apps` (the function directly above where you'll add this) for pacing, error arms, and Delisted semantics. The function takes `Store`/`SteamClient` directly — NOT `Deps` — because the bin can't (and shouldn't) construct the humble/webhook/session baggage `Deps` carries.
 
-The test file already has every helper you need: `store_or_skip` (dynamodb-gated store), `seed_steam_game` (writes a `Game` with a `steam_app_id`), `appdetails_found_body(name)` (wiremock JSON: genres `[Indie]`, categories `[Single-player id 2]`), `appdetails_delisted_body()`, `fresh_cache(app_id, now)` (a fully-populated cache item with both clocks at `now`), `days_ago(n)`, and `far_deadline`. Tests construct a `SteamClient` pointed at a wiremock server exactly like this: `steam_client::SteamClient::new(&server.uri(), &server.uri(), &server.uri(), steam_client::SteamApiKey::new("TESTKEY".into())).unwrap()`.
+The test file already has every helper you need: `store_or_skip` (dynamodb-gated store), `seed_steam_game` (writes a `Game` with a `steam_app_id`), `appdetails_found_body(name)` (wiremock JSON: genres `[Indie]`, categories `[Single-player id 2]`), `appdetails_delisted_body()`, `fresh_cache(app_id, now)` (a fully-populated cache item with both clocks at `now`), `days_ago(n)`, and `steam_mock_empty()` (a MockServer with nothing mounted, so any storefront call is a countable miss). Tests construct a `SteamClient` pointed at a wiremock server exactly like this: `steam_client::SteamClient::new(&server.uri(), &server.uri(), &server.uri(), steam_client::SteamApiKey::new("TESTKEY".into())).unwrap()`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add a new section at the end of `crates/fulfillment/tests/handler_test.rs` (after the existing enrichment tests). Add `backfill_steam_genres` (only — the tests never name `BackfillSummary`, and an unused import fails the `-D warnings` gate) to the existing `use fulfillment::{...}` import at the top of the file.
+Add a new section at the end of `crates/fulfillment/tests/handler_test.rs` (after the existing enrichment tests). Add `backfill_steam_genres` (only — the tests never name `BackfillSummary`, and an unused import fails the `-D warnings` gate) to the existing `use fulfillment::{...}` import at the top of the file, inserted in sorted position: directly BEFORE `enrich_steam_apps` (rustfmt sorts brace lists; appending at the end fails the fmt gate).
+
+After pasting the block below, run `cargo fmt` — some assert lines are longer than rustfmt-normal form and it will resplit them.
 
 ```rust
 // =================================================================================================
@@ -354,7 +359,7 @@ async fn backfill_429_aborts_with_flag() {
 - [ ] **Step 2: Run the tests — verify they fail to compile (red)**
 
 Run: `cargo test -p fulfillment --test handler_test backfill -- --nocapture`
-Expected: COMPILE ERROR — `backfill_steam_genres` and `BackfillSummary` are not defined. A compile-error red is the honest red here; note it and move on.
+Expected: COMPILE ERROR — unresolved import: `backfill_steam_genres` does not exist in `fulfillment` yet. A compile-error red is the honest red here; note it and move on.
 
 - [ ] **Step 3: Implement `backfill_steam_genres`**
 
@@ -410,6 +415,7 @@ pub async fn backfill_steam_genres(
         if let Some(c) = &existing {
             if now - c.fetched_at < skip_fresh_secs {
                 summary.skipped += 1;
+                tracing::debug!(app_id, "backfill: fetched recently — skipped (resume window)");
                 continue;
             }
         }
@@ -556,6 +562,9 @@ async fn main() {
 ```
 
 - [ ] **Step 6: Verify the bin builds and the workspace is green**
+
+Run: `cargo fmt` then `cargo fmt --check`
+Expected: no diff remains (fmt is a CI gate).
 
 Run: `cargo build -p fulfillment --features backfill --bin backfill_genres`
 Expected: builds clean.
