@@ -231,7 +231,7 @@ async fn choose_content_gift_sends_the_right_form() {
         // The double-submit CSRF pair (cookie value replayed as the header) must be sent — same
         // check the redeem write is held to; without this a broken csrf dance passes silently.
         .and(DoubleSubmitPairMatches)
-        .and(body_string_contains("gamekey=UZz2zYTdsC5HfCYp"))
+        .and(body_string_contains("gamekey=KITTENTESTKEY000"))
         .and(body_string_contains("parent_identifier=initial"))
         // `chosen_identifiers[]` url-encodes to `chosen_identifiers%5B%5D`.
         .and(body_string_contains(
@@ -247,7 +247,7 @@ async fn choose_content_gift_sends_the_right_form() {
 
     client(&server)
         .await
-        .choose_content("UZz2zYTdsC5HfCYp", &["octopathtravelerii"], true)
+        .choose_content("KITTENTESTKEY000", &["octopathtravelerii"], true)
         .await
         .unwrap();
 }
