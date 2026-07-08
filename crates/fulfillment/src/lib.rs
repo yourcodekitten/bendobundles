@@ -1946,14 +1946,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         if !need_detail && !need_reviews {
             continue; // both halves fresh — nothing to do
         }
-        let cache = existing.unwrap_or(dynamo::SteamAppCache {
-            app_id,
-            detail: None,
-            overall: None,
-            recent: None,
-            fetched_at: 0,
-            reviews_fetched_at: 0,
-        });
+        let cache = existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id));
         worklist.push(Work {
             app_id,
             need_detail,
@@ -2081,6 +2074,117 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         deferred,
         "steam enrichment: fetched={fetched} fresh={fresh} negative={negative} aborted_429={aborted_429}"
     );
+}
+
+/// Outcome of one [`backfill_steam_genres`] run.
+#[derive(Debug, Default)]
+pub struct BackfillSummary {
+    /// Live detail refetched and persisted.
+    pub fetched: u32,
+    /// Delisted stubs written.
+    pub negative: u32,
+    /// Skipped: `fetched_at` within the skip-fresh window (resume support).
+    pub skipped: u32,
+    /// Per-app failures (store read/write or storefront error) — logged, app skipped.
+    pub failed: u32,
+    /// True when a 429 aborted the run early. Rerun to resume; persisted progress survives.
+    pub aborted_429: bool,
+}
+
+/// Run-once STEAMAPP# rebuild (issue #57): refetch appdetails for EVERY catalog appid through
+/// the current parse (id-allowlisted genres) and rewrite each item, preserving the reviews half
+/// (`overall`, `recent`, `reviews_fetched_at`). Unlike [`enrich_steam_apps`] this ignores the
+/// 30-day freshness window — refetching regardless is the point — but skips items whose
+/// `fetched_at` is within `skip_fresh_secs`, so an aborted run resumes where it left off.
+///
+/// Takes `Store`/`SteamClient` directly rather than [`Deps`]: the caller is the feature-gated
+/// `backfill_genres` bin (human-run, never the lambda), which has no humble/webhook/session to
+/// carry. Paced like the enrichment pass; a 429 aborts with `aborted_429` set.
+pub async fn backfill_steam_genres(
+    store: &dynamo::Store,
+    steam: &steam_client::SteamClient,
+    pace: std::time::Duration,
+    skip_fresh_secs: i64,
+) -> Result<BackfillSummary, dynamo::StoreError> {
+    let games = store.list_all_games().await?;
+    // Distinct appids, ascending — deterministic order so an aborted run resumes predictably.
+    let appids: std::collections::BTreeSet<u32> =
+        games.iter().filter_map(|g| g.steam_app_id).collect();
+    let total = appids.len();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let mut summary = BackfillSummary::default();
+    for app_id in appids {
+        let existing = match store.get_steam_app(app_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(app_id, error = ?e, "backfill: get_steam_app failed — skipping app");
+                summary.failed += 1;
+                continue;
+            }
+        };
+        if let Some(c) = &existing
+            && now - c.fetched_at < skip_fresh_secs
+        {
+            summary.skipped += 1;
+            tracing::debug!(
+                app_id,
+                "backfill: fetched recently — skipped (resume window)"
+            );
+            continue;
+        }
+        let mut cache = existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id));
+        tokio::time::sleep(pace).await;
+        match steam.get_app_details(app_id).await {
+            Ok(steam_client::AppDetails::Found(d)) => {
+                cache.detail = Some(*d);
+                cache.fetched_at = now;
+            }
+            // Delisted: negative stub, BOTH clocks stamped — same semantics as enrichment.
+            Ok(steam_client::AppDetails::Delisted) => {
+                cache.detail = None;
+                cache.fetched_at = now;
+                cache.reviews_fetched_at = now;
+            }
+            Err(steam_client::SteamError::RateLimited) => {
+                summary.aborted_429 = true;
+                break;
+            }
+            Err(
+                e @ (steam_client::SteamError::Api(_)
+                | steam_client::SteamError::Network(_)
+                | steam_client::SteamError::Parse(_)
+                | steam_client::SteamError::KeyRejected
+                | steam_client::SteamError::NotFound
+                | steam_client::SteamError::OpenIdRejected(_)),
+            ) => {
+                tracing::warn!(app_id, error = ?e, "backfill: appdetails failed — skipping app");
+                summary.failed += 1;
+                continue;
+            }
+        }
+        if let Err(e) = store.put_steam_app(&cache).await {
+            tracing::warn!(app_id, error = ?e, "backfill: put_steam_app failed — this app not persisted");
+            summary.failed += 1;
+            continue;
+        }
+        // What was just written IS the outcome: Some detail = live refetch, None = stub.
+        if cache.detail.is_some() {
+            summary.fetched += 1;
+        } else {
+            summary.negative += 1;
+        }
+        let done = summary.fetched + summary.negative + summary.skipped + summary.failed;
+        tracing::info!(app_id, done, total, "backfill: item rewritten");
+    }
+    tracing::info!(
+        fetched = summary.fetched,
+        negative = summary.negative,
+        skipped = summary.skipped,
+        failed = summary.failed,
+        aborted_429 = summary.aborted_429,
+        "backfill: done"
+    );
+    Ok(summary)
 }
 
 /// Lazy title-pass: for every steam-type game with no `steam_app_id` (and not `Manual` source),

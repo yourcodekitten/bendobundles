@@ -33,7 +33,9 @@ pub struct SteamAppDetail {
     pub name: String,
     pub developers: Vec<String>,
     pub publishers: Vec<String>,
-    /// genres + categories descriptions, deduped order-preserving
+    /// genres + allowlisted player-mode categories (Single-player, Multi-player,
+    /// Co-op, PvP, MMO), deduped order-preserving. Store-feature categories
+    /// (achievements, cloud, controller…) are filtered out by id at parse time.
     pub genres: Vec<String>,
     pub release_date: Option<String>,
     pub short_description: String,
@@ -179,7 +181,7 @@ struct AppDetailDataWire {
     #[serde(default)]
     genres: Vec<DescriptionWire>,
     #[serde(default)]
-    categories: Vec<DescriptionWire>,
+    categories: Vec<CategoryWire>,
     release_date: Option<ReleaseDateWire>,
     #[serde(default)]
     short_description: String,
@@ -192,6 +194,37 @@ struct AppDetailDataWire {
 struct DescriptionWire {
     description: String,
 }
+
+/// `categories[].id` is nominally a JSON number (unlike `genres[].id`, a string) and is
+/// Steam's stable category identifier — the allowlist keys on it, not on the description
+/// text. Steam types ids loosely across sibling arrays, so a missing OR mistyped id
+/// deserializes to 0 (allowlisted-nothing) rather than failing the whole appdetails parse
+/// and permanently un-enriching the app.
+#[derive(Deserialize)]
+struct CategoryWire {
+    #[serde(default, deserialize_with = "lenient_category_id")]
+    id: u32,
+    description: String,
+}
+
+/// Number → u32 (0 on overflow/negative); numeric string → parsed; anything else → 0.
+/// 0 matches no allowlist entry, so junk ids drop the category instead of erroring.
+fn lenient_category_id<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()).unwrap_or(0),
+        serde_json::Value::String(s) => s.parse().unwrap_or(0),
+        _ => 0,
+    })
+}
+
+/// Steam category ids that survive into `SteamAppDetail::genres`: the top-level player
+/// modes only. 2 Single-player, 1 Multi-player, 9 Co-op, 49 PvP, 20 MMO. Mode *variants*
+/// (Online Co-op 38, LAN Co-op 48, …) are dropped — Steam includes the parent category
+/// alongside its variants, so coverage holds while the tag count stays flat (issue #57).
+const ALLOWED_CATEGORY_IDS: [u32; 5] = [2, 1, 9, 49, 20];
 
 #[derive(Deserialize)]
 struct ReleaseDateWire {
@@ -410,7 +443,7 @@ impl SteamClient {
             .ok_or_else(|| SteamError::Parse("success:true but no data field".into()))?;
         let mut genres: Vec<String> = data.genres.into_iter().map(|g| g.description).collect();
         for cat in data.categories {
-            if !genres.contains(&cat.description) {
+            if ALLOWED_CATEGORY_IDS.contains(&cat.id) && !genres.contains(&cat.description) {
                 genres.push(cat.description);
             }
         }

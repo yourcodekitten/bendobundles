@@ -7,8 +7,8 @@
 use domain::{AppidSource, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{Store, SyncState};
 use fulfillment::{
-    Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, enrich_steam_apps,
-    gift_decision, handle, reveal_decision,
+    Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, backfill_steam_genres,
+    enrich_steam_apps, gift_decision, handle, reveal_decision,
 };
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use std::sync::Arc;
@@ -4622,4 +4622,181 @@ async fn enrich_no_steam_client_is_noop() {
         d.store.get_steam_app(888).await.unwrap().is_none(),
         "with no Steam client the pass must write nothing"
     );
+}
+
+// =================================================================================================
+// backfill_steam_genres (issue #57): run-once STEAMAPP# rebuild through the current parse.
+// =================================================================================================
+
+// (a) A stale-but-within-30d dirty item is refetched (enrichment would have skipped it),
+//     genres come back clean, and the reviews half is preserved byte-for-byte.
+#[tokio::test]
+async fn backfill_rewrites_dirty_detail_and_preserves_reviews() {
+    let Some(store) = store_or_skip("t-bf-rewrite").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    seed_steam_game(&store, "gk-bf1", "mn-bf1", "Dirty Game", Some(413150), None).await;
+    // Seed: 1-day-old detail (fresh by the 30d TTL — enrichment would skip it) with the
+    // old merged tag soup; a distinctive reviews half that must survive untouched.
+    let mut dirty = fresh_cache(413150, now);
+    dirty.fetched_at = days_ago(1);
+    dirty.reviews_fetched_at = 777_777;
+    dirty.detail.as_mut().unwrap().genres = vec![
+        "Indie".into(),
+        "Single-player".into(),
+        "Steam Achievements".into(),
+        "Family Sharing".into(),
+    ];
+    store.put_steam_app(&dirty).await.unwrap();
+
+    let steam_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", "413150"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(appdetails_found_body("Dirty Game")))
+        .mount(&steam_mock)
+        .await;
+
+    let steam = steam_client_at(&steam_mock.uri());
+    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.fetched, 1, "one item rewritten");
+    assert_eq!(summary.skipped, 0);
+    let cache = store.get_steam_app(413150).await.unwrap().unwrap();
+    let detail = cache.detail.expect("detail must be present");
+    assert_eq!(
+        detail.genres,
+        vec!["Indie".to_string(), "Single-player".to_string()],
+        "genres must be rebuilt through the new parse (allowlisted only)"
+    );
+    assert!(cache.fetched_at >= now, "fetched_at must be restamped");
+    // Reviews half preserved exactly as seeded.
+    assert_eq!(cache.reviews_fetched_at, 777_777, "reviews clock untouched");
+    assert_eq!(cache.overall, dirty.overall, "overall reviews untouched");
+    assert_eq!(cache.recent, dirty.recent, "recent reviews untouched");
+    // Exactly ONE storefront call: appdetails. No reviews/histogram refetch.
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "backfill must touch appdetails only");
+}
+
+// (b) Items fetched within the skip-fresh window are skipped — zero storefront calls.
+//     This is the resume mechanism after an aborted run.
+#[tokio::test]
+async fn backfill_skips_items_within_skip_fresh_window() {
+    let Some(store) = store_or_skip("t-bf-skip").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    seed_steam_game(&store, "gk-bf2", "mn-bf2", "Fresh Game", Some(570), None).await;
+    store.put_steam_app(&fresh_cache(570, now)).await.unwrap();
+
+    let steam_mock = steam_mock_empty().await;
+    let steam = steam_client_at(&steam_mock.uri());
+    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.skipped, 1);
+    assert_eq!(summary.fetched, 0);
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(
+        reqs.len(),
+        0,
+        "fresh item must trigger zero storefront calls"
+    );
+}
+
+// (c) A game with an appid but NO cache item yet gets fetched and written.
+#[tokio::test]
+async fn backfill_fetches_missing_cache_items() {
+    let Some(store) = store_or_skip("t-bf-missing").await else {
+        return;
+    };
+    seed_steam_game(&store, "gk-bf3", "mn-bf3", "New Game", Some(730), None).await;
+
+    let steam_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", "730"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(appdetails_found_body("New Game")))
+        .mount(&steam_mock)
+        .await;
+
+    let steam = steam_client_at(&steam_mock.uri());
+    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.fetched, 1);
+    let cache = store.get_steam_app(730).await.unwrap().unwrap();
+    assert_eq!(
+        cache.detail.unwrap().genres,
+        vec!["Indie".to_string(), "Single-player".to_string()]
+    );
+    assert_eq!(
+        cache.reviews_fetched_at, 0,
+        "no reviews were fetched — clock stays 0"
+    );
+}
+
+// (d) Delisted → negative stub with BOTH clocks stamped (mirrors enrichment semantics).
+#[tokio::test]
+async fn backfill_delisted_writes_negative_stub() {
+    let Some(store) = store_or_skip("t-bf-delisted").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    seed_steam_game(&store, "gk-bf4", "mn-bf4", "Dead Game", Some(999), None).await;
+    let mut dirty = fresh_cache(999, now);
+    dirty.fetched_at = days_ago(1);
+    store.put_steam_app(&dirty).await.unwrap();
+
+    let steam_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", "999"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(appdetails_delisted_body()))
+        .mount(&steam_mock)
+        .await;
+
+    let steam = steam_client_at(&steam_mock.uri());
+    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.negative, 1);
+    assert_eq!(summary.fetched, 0);
+    let cache = store.get_steam_app(999).await.unwrap().unwrap();
+    assert!(cache.detail.is_none(), "delisted → negative stub");
+    assert!(
+        cache.fetched_at >= now && cache.reviews_fetched_at >= now,
+        "both clocks stamped"
+    );
+}
+
+// (e) A 429 aborts the run (persisted progress survives; rerun resumes via skip-fresh).
+#[tokio::test]
+async fn backfill_429_aborts_with_flag() {
+    let Some(store) = store_or_skip("t-bf-429").await else {
+        return;
+    };
+    seed_steam_game(&store, "gk-bf5", "mn-bf5", "Limited Game", Some(440), None).await;
+
+    let steam_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&steam_mock)
+        .await;
+
+    let steam = steam_client_at(&steam_mock.uri());
+    let summary = backfill_steam_genres(&store, &steam, std::time::Duration::ZERO, 43_200)
+        .await
+        .unwrap();
+
+    assert!(summary.aborted_429, "429 must abort the run");
+    assert_eq!(summary.fetched, 0);
 }
