@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import type { ClaimView } from '../api';
 
 const STATE_CHIP: Record<ClaimView['state'], { label: string; className: string }> = {
@@ -10,7 +11,7 @@ interface ClaimsHistoryProps {
   claims: ClaimView[];
 }
 
-export function ClaimsHistory({ claims }: ClaimsHistoryProps) {
+function ClaimsHistoryImpl({ claims }: ClaimsHistoryProps) {
   if (claims.length === 0) return null;
 
   return (
@@ -55,3 +56,5 @@ export function ClaimsHistory({ claims }: ClaimsHistoryProps) {
     </section>
   );
 }
+
+export const ClaimsHistory = memo(ClaimsHistoryImpl);

@@ -129,3 +129,30 @@
     animation: none;
   }
 }
+
+/* the claims beacon — a burgundy dot that ripples, drawing the eye to an
+   unclaimed gift floating on the link-page banner */
+.claim-beacon {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--color-give);
+  animation: claim-beacon-pulse 1.5s ease-in-out infinite;
+}
+@keyframes claim-beacon-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--color-give) 55%, transparent);
+  }
+  50% {
+    transform: scale(1.18);
+    box-shadow: 0 0 0 6px color-mix(in oklab, var(--color-give) 0%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .claim-beacon {
+    animation: none;
+  }
+}
