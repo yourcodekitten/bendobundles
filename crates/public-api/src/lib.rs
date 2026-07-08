@@ -80,6 +80,11 @@ struct GameView {
     key_type: String,
     artwork_url: Option<String>,
     steam_app_id: Option<u32>,
+    /// First ~5 steam genres from the enrichment cache (cache-only,
+    /// best-effort). Empty → omitted from the wire. The detail endpoint
+    /// always leaves this empty — the modal reads the full steam blob.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    genres: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -460,20 +465,47 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             if hide_games {
                 return vec![];
             }
-            match s.store.list_listable_games().await {
-                Ok(gs) => gs
-                    .into_iter()
-                    .map(|g| GameView {
-                        id: g.id,
-                        title: g.title,
-                        bundle: g.bundle,
-                        key_type: g.key_type,
-                        artwork_url: g.artwork_url,
-                        steam_app_id: g.steam_app_id,
-                    })
-                    .collect(),
-                Err(_) => vec![],
+            let gs = match s.store.list_listable_games().await {
+                Ok(gs) => gs,
+                Err(_) => return vec![],
+            };
+            // Genres ride the same steam cache the detail endpoint reads —
+            // cache-only, best-effort: any miss/stub/error degrades to no
+            // genres for that game. Memoized per appid because duplicate
+            // copies of one title are common in the catalog.
+            let mut memo: std::collections::HashMap<u32, Vec<String>> =
+                std::collections::HashMap::new();
+            let mut views = Vec::with_capacity(gs.len());
+            for g in gs {
+                let genres = match g.steam_app_id {
+                    None => Vec::new(),
+                    Some(app_id) => {
+                        if let Some(known) = memo.get(&app_id) {
+                            known.clone()
+                        } else {
+                            let fetched: Vec<String> = match s.store.get_steam_app(app_id).await {
+                                Ok(Some(cache)) => cache
+                                    .detail
+                                    .map(|d| d.genres.into_iter().take(5).collect())
+                                    .unwrap_or_default(),
+                                Ok(None) | Err(_) => Vec::new(),
+                            };
+                            memo.insert(app_id, fetched.clone());
+                            fetched
+                        }
+                    }
+                };
+                views.push(GameView {
+                    id: g.id,
+                    title: g.title,
+                    bundle: g.bundle,
+                    key_type: g.key_type,
+                    artwork_url: g.artwork_url,
+                    steam_app_id: g.steam_app_id,
+                    genres,
+                });
             }
+            views
         },
         async {
             let cs = match s.store.claims_for_link(&token).await {
@@ -739,6 +771,9 @@ async fn handle_game_detail(
         key_type: game.key_type,
         artwork_url: game.artwork_url,
         steam_app_id: game.steam_app_id,
+        // Deliberately empty (key omitted on the wire): the modal reads
+        // steam.detail.genres from the full blob below instead.
+        genres: vec![],
     };
 
     (
