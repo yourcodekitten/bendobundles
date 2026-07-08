@@ -1858,6 +1858,7 @@ async fn admin_game_detail_superset_fields_and_steam_blob() {
                 header_image: None,
                 video_hls_url: None,
                 video_thumbnail: None,
+                screenshots: vec![],
             }),
             overall: Some(ReviewSummary {
                 desc: "Very Positive".into(),

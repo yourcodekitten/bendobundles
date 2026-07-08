@@ -1768,6 +1768,7 @@ fn steam_app_cache_full(app_id: u32) -> SteamAppCache {
             header_image: Some("https://cdn.steam/header.jpg".into()),
             video_hls_url: None,
             video_thumbnail: None,
+            screenshots: vec![],
         }),
         overall: Some(steam_client::ReviewSummary {
             desc: "Mostly Positive".into(),

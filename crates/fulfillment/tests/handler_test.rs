@@ -4280,6 +4280,7 @@ fn fresh_cache(app_id: u32, now: i64) -> dynamo::SteamAppCache {
             header_image: None,
             video_hls_url: None,
             video_thumbnail: None,
+            screenshots: vec![],
         }),
         overall: Some(steam_client::ReviewSummary {
             desc: "Positive".into(),

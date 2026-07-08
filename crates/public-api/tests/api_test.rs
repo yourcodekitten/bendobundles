@@ -1264,6 +1264,7 @@ fn test_steam_cache(app_id: u32) -> SteamAppCache {
             header_image: None,
             video_hls_url: None,
             video_thumbnail: None,
+            screenshots: vec![],
         }),
         overall: Some(ReviewSummary {
             desc: "Mostly Positive".into(),
