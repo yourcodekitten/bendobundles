@@ -554,3 +554,61 @@ describe('media carousel', () => {
     mm.mockRestore();
   });
 });
+
+// ── Focus trap (issue #61 acceptance) ─────────────────────────────────────────
+
+describe('focus trap', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hlsCbCapture.errorCb = null;
+    clearGameDetailCache();
+  });
+
+  function renderFriendModal() {
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: friendGame,
+      steam: { detail: steamDetailFixture, overall: null, recent: null },
+    });
+    return render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={friendGame}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+  }
+
+  it('Tab from the container enters the dialog; Tab on last focusable wraps to first', async () => {
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    const dialog = screen.getByRole('dialog');
+    expect(document.activeElement).toBe(dialog); // focus-on-open pin
+
+    // Tab from the container lands on the FIRST focusable inside the dialog.
+    await userEvent.tab();
+    const first = document.activeElement as HTMLElement;
+    expect(dialog.contains(first)).toBe(true);
+
+    // From the last focusable (claim button, friend footer), Tab must WRAP to first.
+    const claim = screen.getByRole('button', { name: 'claim' });
+    claim.focus();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(first);
+  });
+
+  it('Shift+Tab on the first focusable wraps to the last', async () => {
+    renderFriendModal();
+    await screen.findByLabelText('play trailer');
+    await userEvent.tab(); // container → first focusable
+    const first = document.activeElement as HTMLElement;
+    await userEvent.tab({ shift: true });
+    const last = document.activeElement as HTMLElement;
+    expect(last).not.toBe(first);
+    const dialog = screen.getByRole('dialog');
+    expect(dialog.contains(last)).toBe(true);
+  });
+});
