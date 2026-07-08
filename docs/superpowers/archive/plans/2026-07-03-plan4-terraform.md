@@ -1,5 +1,19 @@
 # Plan 4: Terraform / Deploy Implementation Plan
 
+> ⚠️ **SUPERSEDED (deploy model changed 2026-07-04) — read before trusting the "Deployment" bits.**
+> This plan's "**CI builds artifacts; ben runs `terraform apply` locally; nothing gives CI/kitten AWS
+> credentials**" (Global Constraints / spec §12 / Ben-decision 2) was the v1 model. It **no longer
+> holds.** Kitten was given real deploy tooling on 2026-07-04: the **`terraform-iam/`** stack creates a
+> `kitten-mgr` IAM user (long-lived key handed to kitten, `sts:AssumeRole`-only) that assumes
+> **`kitten-debug`** (read-only, default) or **`kitten-deploy`** (powerful — enough to `terraform apply`
+> the main stack AND run `deploy-web.sh`: S3 site-bucket sync + CloudFront invalidation). AWS profiles
+> `kitten-debug` / `kitten-deploy` are configured in `~/.aws/config` on the box. **So kitten CAN deploy**
+> — assume `kitten-deploy` deliberately for a deploy, `kitten-debug` for everything else.
+> First real web deploy by kitten: **2026-07-08** (published #58 + #60 to `bendobundles.com` — CI-built
+> `web-dist` artifact → `aws s3 sync … --delete` → CloudFront invalidation, no `terraform apply` needed
+> for a web-only change). See `terraform-iam/README.md` + `terraform-iam/iam-deploy-role.tf` for the
+> authoritative, current picture.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A `terraform/` stack that deploys bendobundles (3 lambdas, API Gateway, DynamoDB, SSM, EventBridge, S3+CloudFront SPA) from `bendoerr-terraform-modules/*` legos, plus the CI artifact builds and the one module enhancement the legos are missing.
@@ -16,7 +30,7 @@
 
 ## Global Constraints
 
-- Deployment v1 (spec §12): **CI builds artifacts; ben runs `terraform apply` locally.** Nothing in this plan gives CI AWS credentials.
+- Deployment v1 (spec §12): **CI builds artifacts; ben runs `terraform apply` locally.** Nothing in this plan gives CI AWS credentials. — ⚠️ **SUPERSEDED 2026-07-04 (see banner at top):** kitten now has `kitten-deploy` / `kitten-debug` roles (`terraform-iam/`) and can deploy. CI still has no creds; that part stands.
 - Trust boundary (spec §3): public-api has **zero** SSM access; only fulfillment + admin-api touch the humble-cookie param (fulfillment: Get; admin-api: Get+Put — its paste/rollback flow reads the old value by design, shipped in plan 2); admin-hash param readable by admin-api only.
 - Runtime contract (extracted from `crates/*/src/main.rs`, exact): public-api needs `TABLE_NAME`, `FULFILLMENT_FN`; admin-api needs `TABLE_NAME`, `FULFILLMENT_FN`, `ADMIN_HASH_PARAM`, `HUMBLE_COOKIE_PARAM`; fulfillment needs `TABLE_NAME`, `HUMBLE_COOKIE_PARAM`, optional `DISCORD_WEBHOOK_PARAM`. All panic-if-unset except the webhook. `HUMBLE_COOKIE_PARAM` must be the SAME param name for admin-api and fulfillment.
 - Dynamo schema must mirror `dynamo::Store::create_table_for_tests` exactly: PAY_PER_REQUEST; `pk`/`sk` (S) primary; GSI `listable` = `gsi1pk`/`gsi1sk` (S, ALL); GSI `pending-claims` = `gsi2pk`/`gsi2sk` (S, ALL); **TTL on attribute `ttl`** (sessions; schema.rs says "terraform will enable it in plan 4" — this is that).
