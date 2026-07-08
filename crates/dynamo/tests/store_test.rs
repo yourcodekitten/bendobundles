@@ -740,6 +740,39 @@ async fn batch_get_games_found_and_missing() {
     assert!(empty.is_empty());
 }
 
+/// batch_get_steam_apps: found appids come back keyed by app_id (including
+/// negative-cache stubs); missing appids are simply absent (no error); empty
+/// input short-circuits to an empty map with no I/O.
+#[tokio::test]
+async fn batch_get_steam_apps_found_and_missing() {
+    let Some(store) = store_or_skip("batch-get-steam-apps").await else {
+        return;
+    };
+    let full = steam_app_cache_full(570);
+    let stub = steam_app_cache_stub(571);
+    store.put_steam_app(&full).await.unwrap();
+    store.put_steam_app(&stub).await.unwrap();
+
+    let map = store
+        .batch_get_steam_apps(&[570, 571, 99999])
+        .await
+        .unwrap();
+
+    assert_eq!(map.len(), 2, "two found, one missing");
+    assert_eq!(
+        map.get(&570).unwrap().detail.as_ref().unwrap().genres,
+        vec!["Action".to_string(), "Indie".to_string()]
+    );
+    assert!(
+        map.get(&571).unwrap().detail.is_none(),
+        "negative-cache stub round-trips through the batch read"
+    );
+    assert!(!map.contains_key(&99999));
+
+    let empty = store.batch_get_steam_apps(&[]).await.unwrap();
+    assert!(empty.is_empty());
+}
+
 /// `list_listable_games` must exhaust every page. Force a 1-item Query page via the test seam so
 /// three listable games span three pages: a single-page read would truncate to the first item.
 #[tokio::test]

@@ -22,3 +22,10 @@ export function titleColorClass(title: string): string {
   }
   return PALETTE[Math.abs(hash) % PALETTE.length] ?? 'bg-shelf';
 }
+
+/** The hash hue as a CSS var() expression, for color-mix()/inline styles.
+    The bg-* class ↔ --color-* custom-property naming convention lives HERE,
+    once — call sites must not re-derive it. */
+export function titleHueVar(title: string): string {
+  return `var(${titleColorClass(title).replace('bg-', '--color-')})`;
+}

@@ -1,5 +1,5 @@
 import { type GameView } from '../api';
-import { titleColorClass } from '../titleColor';
+import { titleColorClass, titleHueVar } from '../titleColor';
 
 interface GameGridProps {
   games: GameView[];
@@ -31,7 +31,7 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
           owned !== undefined &&
           owned.has(game.steam_app_id);
         // the game's shell hue for the 'clear' variant — same shared hash
-        const shellHue = `var(${titleColorClass(game.title).replace('bg-', '--color-')})`;
+        const shellHue = titleHueVar(game.title);
 
         const art =
           game.artwork_url !== null ? (
@@ -58,10 +58,7 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
 
         // genres ride the list payload now (issue #55) — no per-card fetch.
         // max 4 chips on the card; absent/empty falls back to the key_type chip.
-        const genres =
-          game.genres !== undefined && game.genres.length > 0
-            ? game.genres.slice(0, 4)
-            : null;
+        const genres = game.genres?.length ? game.genres.slice(0, 4) : null;
 
         const titleBlock = (
           <>
@@ -82,7 +79,7 @@ export function GameGrid({ games, owned, onDetail }: GameGridProps) {
               </span>
             ) : (
               genres.map((genre) => {
-                const hue = `var(${titleColorClass(genre).replace('bg-', '--color-')})`;
+                const hue = titleHueVar(genre);
                 return (
                   <span
                     key={genre}

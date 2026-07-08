@@ -1721,6 +1721,55 @@ impl Store {
         self.get_meta(&steam_app_pk(app_id)).await
     }
 
+    /// Batch-fetch Steam app cache entries by app_id — one `BatchGetItem` per 100
+    /// ids (the DynamoDB batch cap), re-requesting unprocessed keys until drained.
+    /// Missing appids are simply absent from the returned map; callers decide how
+    /// to degrade. Avoids the N-serial-GetItem shape on hot read paths (the link
+    /// view reads genres for the whole listable catalog per request).
+    pub async fn batch_get_steam_apps(
+        &self,
+        app_ids: &[u32],
+    ) -> Result<HashMap<u32, SteamAppCache>, StoreError> {
+        use aws_sdk_dynamodb::types::KeysAndAttributes;
+        let mut caches = HashMap::with_capacity(app_ids.len());
+        for chunk in app_ids.chunks(100) {
+            let mut keys: Vec<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = chunk
+                .iter()
+                .map(|app_id| {
+                    let (pk, sk) = schema::key_pair(steam_app_pk(*app_id), "META");
+                    HashMap::from([("pk".to_string(), pk), ("sk".to_string(), sk)])
+                })
+                .collect();
+            while !keys.is_empty() {
+                let ka = KeysAndAttributes::builder()
+                    .set_keys(Some(keys))
+                    .build()
+                    .map_err(|e| StoreError::Aws(format!("{e:?}")))?;
+                let resp = self
+                    .client
+                    .batch_get_item()
+                    .request_items(&self.table, ka)
+                    .send()
+                    .await?;
+                for item in resp
+                    .responses()
+                    .and_then(|tables| tables.get(&self.table))
+                    .map(|items| items.as_slice())
+                    .unwrap_or_default()
+                {
+                    let c: SteamAppCache = parse_body(item)?;
+                    caches.insert(c.app_id, c);
+                }
+                keys = resp
+                    .unprocessed_keys()
+                    .and_then(|tables| tables.get(&self.table))
+                    .map(|ka| ka.keys().to_vec())
+                    .unwrap_or_default();
+            }
+        }
+        Ok(caches)
+    }
+
     /// Return all cached Steam app_ids. Paged Scan filtered on `begins_with(pk, "STEAMAPP#")` —
     /// the same rationale as `list_all_games` (at ~700 items a Scan is fine). Does NOT include
     /// non-STEAMAPP items (games, links, etc.).

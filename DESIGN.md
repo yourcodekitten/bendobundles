@@ -235,11 +235,12 @@ Tactile and cozy: quiet, pressable, unhurried — with all saved energy spent on
 ### Chips
 - **Style:** Shelf bg, Ink Soft text, 0.25rem radius, 2px × 8px padding, 0.75rem text. On the
   Shelf-bodied game card the neutral chip steps to Floor bg instead (shelf-on-shelf vanishes).
-- **Genre chips (game card):** the first 4 cached steam genres replace the key_type chip. Each
-  genre's color rides the shared title-hash palette (The Title-Hash Rule — hashed through
-  `titleColorClass`, never a local copy): bg is the hash hue mixed 30/70 toward Floor, text is
-  the same hue deepened toward ink. Same genre, same color, every card, forever. No cached
-  genres → the plain key_type chip (delight never gates).
+- **Genre chips (game card):** the first 4 steam genres from the link-list payload replace the
+  key_type chip (the server batch-reads the enrichment cache into `games[].genres` — the grid
+  never fetches per card). Each genre's color rides the shared title-hash palette (The
+  Title-Hash Rule — hashed through `titleColorClass`, never a local copy): bg is the hash hue
+  mixed 30/70 toward Floor, text is the same hue deepened toward ink. Same genre, same color,
+  every card, forever. No genres in the payload → the plain key_type chip (delight never gates).
 - **State:** status chips swap to the deep-bg/pale-text status pairs; the "gifted" badge wears
   Button Burgundy (it records a completed act of giving).
 
