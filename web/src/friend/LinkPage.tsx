@@ -1,6 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useParams } from 'react-router-dom';
-import { fetchLink, fetchGameDetail, steamOwnedForLink, NotFound, type GameView, type LinkView } from '../api';
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams } from "react-router-dom";
+import {
+  fetchLink,
+  fetchGameDetail,
+  steamOwnedForLink,
+  NotFound,
+  type GameView,
+  type LinkView,
+} from "../api";
 import {
   consumeReturnFragment,
   loadIdentity,
@@ -8,28 +15,42 @@ import {
   clearIdentity,
   beginConnect,
   type SteamIdentity,
-} from '../steamIdentity';
-import { ClaimDialog } from './ClaimDialog';
-import { ClaimsHistory } from './ClaimsHistory';
-import { GameGrid } from './GameGrid';
-import { GameDetailModal } from '../GameDetailModal';
-import { CursorCompanion } from './CursorCompanion';
-import { prefersReducedMotion } from '../motion';
+} from "../steamIdentity";
+import { ClaimDialog } from "./ClaimDialog";
+import { ClaimsHistory } from "./ClaimsHistory";
+import { GameGrid } from "./GameGrid";
+import { GameDetailModal } from "../GameDetailModal";
+import { CursorCompanion } from "./CursorCompanion";
+import { prefersReducedMotion, motionOK } from "../motion";
+import { BootScreen } from "./BootScreen";
 
 type ViewState =
-  | { kind: 'loading' }
-  | { kind: 'not-found' }
-  | { kind: 'error' }
-  | { kind: 'loaded'; data: LinkView };
+  | { kind: "loading" }
+  | { kind: "not-found" }
+  | { kind: "error" }
+  | { kind: "loaded"; data: LinkView };
 
+// The gift page powers on like the handheld (ben's pick, 2026-07-09): the
+// boot screen plays over the initial load — it doubles as the loading screen
+// while the link data fetches behind it. Skipped under reduced motion.
 export function LinkPage() {
+  const [booting, setBooting] = useState(motionOK);
+  return (
+    <>
+      {booting && <BootScreen onDone={() => setBooting(false)} />}
+      <LinkPageBody bootDone={!booting} />
+    </>
+  );
+}
+
+function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   const { token } = useParams<{ token: string }>();
-  const [view, setView] = useState<ViewState>({ kind: 'loading' });
+  const [view, setView] = useState<ViewState>({ kind: "loading" });
   const [claimingGame, setClaimingGame] = useState<GameView | null>(null);
   // ── dialog-box typewriter (the page's one entrance; see DESIGN.md motion) ──
   const DIALOG_BODY =
     "games from ben's humble stash, picked for you \u2661 open one for details, claim it, and the key is yours.";
-  const typedLabel = view.kind === 'loaded' ? view.data.label : '';
+  const typedLabel = view.kind === "loaded" ? view.data.label : "";
   const typeTotal = typedLabel.length + DIALOG_BODY.length;
   const [typeChars, setTypeChars] = useState(0);
   const [typeKey, setTypeKey] = useState(0);
@@ -39,25 +60,39 @@ export function LinkPage() {
       setTypeChars(typeTotal);
       return;
     }
+    // the entrance waits for the boot screen to clear (the data loads BEHIND
+    // the boot, so without this gate the typing is already done when the
+    // boot cuts away — ben caught it, 2026-07-09)
+    if (!bootDone) return;
     setTypeChars(0);
-    const iv = setInterval(() => {
-      setTypeChars((c) => {
-        if (c >= typeTotal) {
-          clearInterval(iv);
-          return c;
-        }
-        return c + 1;
-      });
-    }, 14);
-    return () => clearInterval(iv);
-  }, [typeKey, typeTotal]);
+    // ...then a 1s beat before the first character — the box sits with its
+    // blinking cursor for a moment, like the game is thinking
+    let iv: ReturnType<typeof setInterval> | undefined;
+    const delay = setTimeout(() => {
+      iv = setInterval(() => {
+        setTypeChars((c) => {
+          if (c >= typeTotal) {
+            if (iv !== undefined) clearInterval(iv);
+            return c;
+          }
+          return c + 1;
+        });
+      }, 14);
+    }, 1000);
+    return () => {
+      clearTimeout(delay);
+      if (iv !== undefined) clearInterval(iv);
+    };
+  }, [typeKey, typeTotal, bootDone]);
   const typeDone = typeChars >= typeTotal;
   const [detailGame, setDetailGame] = useState<GameView | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const prevTokenRef = useRef<string | undefined>(undefined);
 
   // ── steam identity state ────────────────────────────────────────────────────
-  const [steamIdentity, setSteamIdentity] = useState<SteamIdentity | null>(null);
+  const [steamIdentity, setSteamIdentity] = useState<SteamIdentity | null>(
+    null,
+  );
   const [steamPrivate, setSteamPrivate] = useState(false);
   const [steamError, setSteamError] = useState<string | null>(null);
 
@@ -76,7 +111,7 @@ export function LinkPage() {
       return;
     }
 
-    if ('error' in fragment) {
+    if ("error" in fragment) {
       if (!cancelled) setSteamError(fragment.error);
       return;
     }
@@ -88,13 +123,18 @@ export function LinkPage() {
       try {
         const result = await steamOwnedForLink(token!, steamid);
         if (cancelled) return;
-        const owned = result === 'private' ? [] : result;
-        const id: SteamIdentity = { steamid, persona, owned, fetched_at: Date.now() };
+        const owned = result === "private" ? [] : result;
+        const id: SteamIdentity = {
+          steamid,
+          persona,
+          owned,
+          fetched_at: Date.now(),
+        };
         saveIdentity(id);
         setSteamIdentity(id);
-        if (result === 'private') setSteamPrivate(true);
+        if (result === "private") setSteamPrivate(true);
       } catch {
-        if (!cancelled) setSteamError('steam_unreachable');
+        if (!cancelled) setSteamError("steam_unreachable");
       }
     }
 
@@ -110,25 +150,25 @@ export function LinkPage() {
 
     async function load() {
       if (!token) {
-        setView({ kind: 'not-found' });
+        setView({ kind: "not-found" });
         return;
       }
       // Hard reset to the spinner only on token change (initial load / navigation).
       // refreshTick bumps refetch behind the current view — no blank flash mid-claim.
       if (prevTokenRef.current !== token) {
         prevTokenRef.current = token;
-        setView({ kind: 'loading' });
+        setView({ kind: "loading" });
       }
       try {
         const data = await fetchLink(token);
-        if (!cancelled) setView({ kind: 'loaded', data });
+        if (!cancelled) setView({ kind: "loaded", data });
       } catch (error) {
         if (cancelled) return;
         if (error instanceof NotFound) {
-          setView({ kind: 'not-found' });
+          setView({ kind: "not-found" });
         } else {
           // Transient failure — keep stale loaded data if we have it
-          setView((v) => (v.kind === 'loaded' ? v : { kind: 'error' }));
+          setView((v) => (v.kind === "loaded" ? v : { kind: "error" }));
         }
       }
     }
@@ -145,7 +185,34 @@ export function LinkPage() {
     [steamIdentity],
   );
 
-  if (view.kind === 'loading') {
+  // ── The shelf shuffle (ben, 2026-07-09) ─────────────────────────────────────
+  // Games render in a random order so each visit rummages the trove afresh —
+  // but the order is locked per visit (ranks assigned once, then reused), so
+  // a claim-refresh never rearranges the shelf someone is standing in front
+  // of. New ids appearing mid-visit sort after the shuffled ones.
+  const shuffleRanksRef = useRef<Map<string, number> | null>(null);
+  const shelfGames = useMemo(() => {
+    if (view.kind !== "loaded") return [];
+    const games = view.data.games;
+    if (shuffleRanksRef.current === null) {
+      const ids = games.map((g) => g.id);
+      for (let i = ids.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = ids[i]!;
+        ids[i] = ids[j]!;
+        ids[j] = tmp;
+      }
+      shuffleRanksRef.current = new Map(ids.map((id, pos) => [id, pos]));
+    }
+    const ranks = shuffleRanksRef.current;
+    return [...games].sort(
+      (a, b) =>
+        (ranks.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+        (ranks.get(b.id) ?? Number.MAX_SAFE_INTEGER),
+    );
+  }, [view]);
+
+  if (view.kind === "loading") {
     return (
       <div className="flex min-h-screen items-center justify-center bg-room text-ink">
         <p className="text-dust">loading...</p>
@@ -153,12 +220,14 @@ export function LinkPage() {
     );
   }
 
-  if (view.kind === 'error') {
+  if (view.kind === "error") {
     return (
       <div className="flex min-h-screen items-center justify-center bg-room text-ink">
         <main className="text-center">
           <h1 className="text-2xl font-bold">couldn&apos;t load this page</h1>
-          <p className="mt-2 text-dust">something hiccuped on our end — the link is fine</p>
+          <p className="mt-2 text-dust">
+            something hiccuped on our end — the link is fine
+          </p>
           <button
             type="button"
             onClick={refresh}
@@ -171,7 +240,7 @@ export function LinkPage() {
     );
   }
 
-  if (view.kind === 'not-found') {
+  if (view.kind === "not-found") {
     return (
       <div className="flex min-h-screen items-center justify-center bg-room text-ink">
         <main className="text-center">
@@ -184,8 +253,8 @@ export function LinkPage() {
 
   const { data } = view;
   // Explicit server state — never inferred from side signals like games.length
-  const exhausted = data.state === 'exhausted';
-  const dead = data.state === 'revoked' || data.state === 'expired';
+  const exhausted = data.state === "exhausted";
+  const dead = data.state === "revoked" || data.state === "expired";
 
   return (
     <div className="min-h-screen bg-room text-ink">
@@ -195,16 +264,18 @@ export function LinkPage() {
             aria-hidden="true"
             className="h-60 w-full"
             style={{
-              backgroundImage: 'url(/art/banner.png)',
-              backgroundRepeat: 'repeat-x',
+              backgroundImage: "url(/art/banner.png)",
+              backgroundRepeat: "repeat-x",
               /* pin the banner's center (the chest) 200px from the right edge;
                  the scene tiles horizontally for wide viewports */
-              backgroundPosition: 'calc(100% + 824px) 62%',
-              backgroundColor: 'rgb(197,198,125)',
+              backgroundPosition: "calc(100% + 824px) 62%",
+              backgroundColor: "rgb(197,198,125)",
             }}
           />
           <div className="absolute inset-x-0 top-0 flex items-center justify-between px-6 py-3">
-            <h1 className="font-logo wordmark-outline text-xl uppercase tracking-[0.03em]">bendobundles</h1>
+            <h1 className="font-logo wordmark-outline text-xl uppercase tracking-[0.03em]">
+              bendobundles
+            </h1>
             <span
               className="inline-flex items-center gap-2 font-pixel text-[0.8125rem] text-give-soft"
               aria-label={`${data.claims_used} of ${data.claims_allowed} claims used`}
@@ -213,7 +284,8 @@ export function LinkPage() {
                 <>
                   <span className="claim-beacon" aria-hidden="true" />
                   {data.claims_allowed - data.claims_used} gift
-                  {data.claims_allowed - data.claims_used === 1 ? '' : 's'} waiting
+                  {data.claims_allowed - data.claims_used === 1 ? "" : "s"}{" "}
+                  waiting
                 </>
               ) : (
                 <span className="text-dust">all claimed</span>
@@ -234,48 +306,77 @@ export function LinkPage() {
             </button>
             <h2 className="min-h-7 text-xl leading-tight text-give-soft">
               {typedLabel.slice(0, typeChars)}
-              {typeChars < typedLabel.length && <span aria-hidden="true" className="tw-cursor">&#9646;</span>}
+              {typeChars < typedLabel.length && (
+                <span aria-hidden="true" className="tw-cursor">
+                  &#9646;
+                </span>
+              )}
             </h2>
             <p className="mt-1.5 min-h-10 max-w-[60ch] text-sm text-ink-soft">
               {DIALOG_BODY.slice(0, Math.max(0, typeChars - typedLabel.length))}
               {typeChars >= typedLabel.length && !typeDone && (
-                <span aria-hidden="true" className="tw-cursor">&#9646;</span>
+                <span aria-hidden="true" className="tw-cursor">
+                  &#9646;
+                </span>
               )}
             </p>
             {steamIdentity !== null ? (
-              <div className={`mt-2 flex items-center gap-2 transition-opacity duration-300 ${typeDone ? 'opacity-100' : 'pointer-events-none opacity-0'}`}>
-                <span className="rounded bg-shelf px-2 py-1 text-xs text-ink-soft">{steamIdentity.persona}</span>
-                <button type="button" onClick={() => { clearIdentity(); setSteamIdentity(null); setSteamPrivate(false); setSteamError(null); }} className="text-xs text-dust-faint hover:text-ink-soft">disconnect</button>
+              <div
+                className={`mt-2 flex items-center gap-2 transition-opacity duration-300 ${typeDone ? "opacity-100" : "pointer-events-none opacity-0"}`}
+              >
+                <span className="rounded bg-shelf px-2 py-1 text-xs text-ink-soft">
+                  {steamIdentity.persona}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearIdentity();
+                    setSteamIdentity(null);
+                    setSteamPrivate(false);
+                    setSteamError(null);
+                  }}
+                  className="text-xs text-dust-faint hover:text-ink-soft"
+                >
+                  disconnect
+                </button>
               </div>
             ) : (
               <button
                 type="button"
                 onClick={() => beginConnect(`/l/${token}`)}
-                className={`font-pixel group mt-2 -mx-1 flex items-center gap-1.5 rounded px-1 py-0.5 text-sm text-ink hover:bg-shelf transition-opacity duration-300 ${typeDone ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
+                className={`font-pixel group mt-2 -mx-1 flex items-center gap-1.5 rounded px-1 py-0.5 text-sm text-ink hover:bg-shelf transition-opacity duration-300 ${typeDone ? "opacity-100" : "pointer-events-none opacity-0"}`}
               >
-                <span aria-hidden="true" className="menu-cursor text-give">&#9656;</span>
+                <span aria-hidden="true" className="menu-cursor text-give">
+                  &#9656;
+                </span>
                 connect to steam
-                <span className="font-sans text-xs text-dust-faint">— flags the games you already own</span>
+                <span className="font-sans text-xs text-dust-faint">
+                  — flags the games you already own
+                </span>
               </button>
             )}
           </div>
         </div>
       </header>
 
+      {/* your gifts — moved up under the banner (ben, 2026-07-09): the friend's
+          claimed games sit right below the scene, not buried at the page bottom */}
+      <ClaimsHistory claims={data.claims} />
+
       {/* Steam privacy notice — spec §4 wording verbatim */}
       {steamPrivate && (
         <p className="mx-6 mt-4 text-sm text-dust">
-          couldn&apos;t read your library — check Steam&apos;s <em>game details</em> privacy
-          setting
+          couldn&apos;t read your library — check Steam&apos;s{" "}
+          <em>game details</em> privacy setting
         </p>
       )}
 
       {/* Steam connect error */}
       {steamError !== null && (
         <p className="mx-6 mt-4 text-sm text-dust">
-          {steamError === 'verify_failed'
+          {steamError === "verify_failed"
             ? "we couldn't verify your Steam account — try again"
-            : 'Steam is currently unavailable — try again later'}
+            : "Steam is currently unavailable — try again later"}
         </p>
       )}
 
@@ -300,17 +401,19 @@ export function LinkPage() {
       {/* Grid: shown for exhausted or active (claiming lives in the detail modal,
           which respects link state); hidden for revoked/expired */}
       {!dead && (
-        <GameGrid games={data.games} owned={ownedSet} onDetail={setDetailGame} />
+        <GameGrid
+          games={shelfGames}
+          owned={ownedSet}
+          onDetail={setDetailGame}
+        />
       )}
-
-      <ClaimsHistory claims={data.claims} />
 
       {detailGame !== null && token !== undefined && (
         <GameDetailModal
           mount="friend"
           token={token}
           game={detailGame}
-          active={data.state === 'active'}
+          active={data.state === "active"}
           loadDetail={(gameId) => fetchGameDetail(token, gameId)}
           onClaim={(g) => {
             setDetailGame(null);
@@ -329,7 +432,10 @@ export function LinkPage() {
         />
       )}
 
-      <CursorCompanion variant="critter" away={detailGame !== null || claimingGame !== null} />
+      <CursorCompanion
+        variant="critter"
+        away={detailGame !== null || claimingGame !== null}
+      />
     </div>
   );
 }

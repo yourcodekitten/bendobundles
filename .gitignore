@@ -8,3 +8,6 @@ terraform/*.tfvars
 terraform-iam/.terraform/
 terraform-iam/backend.hcl
 terraform-iam/*.tfplan
+
+# impeccable live-mode ephemeral state (design tooling; never source)
+.impeccable/

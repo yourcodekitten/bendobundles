@@ -1,57 +1,72 @@
 // Hoisted so the vi.mock factory can capture the callback reference
 const hlsCbCapture = vi.hoisted(() => {
-  const ref: { errorCb: ((event: string, data: { fatal: boolean }) => void) | null } = {
+  const ref: {
+    errorCb: ((event: string, data: { fatal: boolean }) => void) | null;
+  } = {
     errorCb: null,
   };
   return ref;
 });
 
-vi.mock('hls.js', () => {
+vi.mock("hls.js", () => {
   class MockHls {
-    static Events = { ERROR: 'hlsError' };
+    static Events = { ERROR: "hlsError" };
     loadSource = vi.fn();
     attachMedia = vi.fn();
-    on = vi.fn().mockImplementation(
-      (event: string, cb: (event: string, data: { fatal: boolean }) => void) => {
-        if (event === 'hlsError') hlsCbCapture.errorCb = cb;
-      },
-    );
+    on = vi
+      .fn()
+      .mockImplementation(
+        (
+          event: string,
+          cb: (event: string, data: { fatal: boolean }) => void,
+        ) => {
+          if (event === "hlsError") hlsCbCapture.errorCb = cb;
+        },
+      );
     destroy = vi.fn();
   }
   return { default: MockHls };
 });
 
-vi.mock('./api');
+vi.mock("./api");
 
-import { render, screen, waitFor, act } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
-import { vi, describe, it, expect, beforeEach } from 'vitest';
-import { GameDetailModal, clearGameDetailCache } from './GameDetailModal';
-import type { GameView, AdminGame } from './api';
-import { fetchGameDetail, adminGameDetail, Unauthorized } from './api';
-import { withAuth } from './admin/withAuth';
+import {
+  render,
+  screen,
+  waitFor,
+  act,
+  fireEvent,
+  within,
+} from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { vi, describe, it, expect, beforeEach } from "vitest";
+import { GameDetailModal } from "./GameDetailModal";
+import { clearGameDetailCache } from "./gameDetailCache";
+import type { GameView, AdminGame } from "./api";
+import { fetchGameDetail, adminGameDetail, Unauthorized } from "./api";
+import { withAuth } from "./admin/withAuth";
 
 // ── Fixtures based on Stardew Valley captures (413150) ────────────────────────
 
 const steamDetailFixture = {
   app_id: 413150,
-  name: 'Stardew Valley',
-  developers: ['ConcernedApe'],
-  publishers: ['ConcernedApe'],
-  genres: ['Indie', 'RPG', 'Simulation'],
-  release_date: 'Feb 26, 2016',
+  name: "Stardew Valley",
+  developers: ["ConcernedApe"],
+  publishers: ["ConcernedApe"],
+  genres: ["Indie", "RPG", "Simulation"],
+  release_date: "Feb 26, 2016",
   short_description:
     "You've inherited your grandfather's old farm plot in Stardew Valley. Armed with hand-me-down tools and a few coins, you set out to begin your new life.",
   header_image:
-    'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/413150/header.jpg',
+    "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/413150/header.jpg",
   video_hls_url:
-    'https://video.akamai.steamstatic.com/store_trailers/413150/336433/hls_264_master.m3u8',
+    "https://video.akamai.steamstatic.com/store_trailers/413150/336433/hls_264_master.m3u8",
   video_thumbnail:
-    'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/256815967/movie.293x165.jpg',
+    "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/256815967/movie.293x165.jpg",
 };
 
 const overallFixture = {
-  desc: 'Overwhelmingly Positive',
+  desc: "Overwhelmingly Positive",
   total_positive: 455578,
   total_negative: 5303,
   total_reviews: 460881,
@@ -63,24 +78,24 @@ const recentFixture = {
 };
 
 const friendGame: GameView = {
-  id: 'gx:stardew',
-  title: 'Stardew Valley',
-  bundle: 'Indie Gems Bundle',
-  key_type: 'steam',
-  artwork_url: 'https://example.com/stardew.jpg',
+  id: "gx:stardew",
+  title: "Stardew Valley",
+  bundle: "Indie Gems Bundle",
+  key_type: "steam",
+  artwork_url: "https://example.com/stardew.jpg",
   steam_app_id: 413150,
 };
 
 const adminGame: AdminGame = {
-  id: 'gx:stardew',
-  title: 'Stardew Valley',
-  bundle: 'Indie Gems Bundle',
-  key_type: 'steam',
+  id: "gx:stardew",
+  title: "Stardew Valley",
+  bundle: "Indie Gems Bundle",
+  key_type: "steam",
   giftable: true,
   hidden: false,
-  status: 'available',
+  status: "available",
   claim_id: null,
-  artwork_url: 'https://example.com/stardew.jpg',
+  artwork_url: "https://example.com/stardew.jpg",
   requires_choice: false,
   steam_app_id: 413150,
   owned_by_ben: false,
@@ -89,24 +104,28 @@ const adminGame: AdminGame = {
 // ── Shared render helpers ─────────────────────────────────────────────────────
 
 function friendLoadDetail(gameId: string) {
-  return fetchGameDetail('tok123', gameId);
+  return fetchGameDetail("tok123", gameId);
 }
 
 function adminLoadDetail(gameId: string) {
   return adminGameDetail(gameId);
 }
 
-describe('GameDetailModal', () => {
+describe("GameDetailModal", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     hlsCbCapture.errorCb = null;
     clearGameDetailCache();
   });
 
-  it('renders full detail variant from a mocked response', async () => {
+  it("renders full detail variant from a mocked response", async () => {
     vi.mocked(fetchGameDetail).mockResolvedValue({
       game: friendGame,
-      steam: { detail: steamDetailFixture, overall: overallFixture, recent: recentFixture },
+      steam: {
+        detail: steamDetailFixture,
+        overall: overallFixture,
+        recent: recentFixture,
+      },
     });
 
     render(
@@ -121,24 +140,28 @@ describe('GameDetailModal', () => {
       />,
     );
 
-    await waitFor(() => expect(screen.getByText('Stardew Valley')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText("Stardew Valley")).toBeInTheDocument(),
+    );
     // dev / pub line
     expect(screen.getByText(/ConcernedApe/)).toBeInTheDocument();
     // release date
     expect(screen.getByText(/Feb 26, 2016/)).toBeInTheDocument();
     // genre chip
-    expect(screen.getByText('Indie')).toBeInTheDocument();
+    expect(screen.getByText("Indie")).toBeInTheDocument();
     // short description (partial match)
     expect(screen.getByText(/grandfather's old farm/)).toBeInTheDocument();
     // overall review badge
     expect(screen.getByText(/Overwhelmingly Positive/)).toBeInTheDocument();
     // recent review badge
-    expect(screen.getByText(/97%.*positive/i)).toBeInTheDocument();
+    expect(screen.getByText(/97% of [\d,.]+ recent/i)).toBeInTheDocument();
     // play button visible (video_hls_url present)
-    expect(screen.getByRole('button', { name: /play trailer/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /play trailer/i }),
+    ).toBeInTheDocument();
   });
 
-  it('shows thin fallback when steam is null', async () => {
+  it("shows thin fallback when steam is null", async () => {
     vi.mocked(fetchGameDetail).mockResolvedValue({
       game: friendGame,
       steam: null,
@@ -157,17 +180,23 @@ describe('GameDetailModal', () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByText(/no steam page for this one/i)).toBeInTheDocument(),
+      expect(
+        screen.getByText(/no steam page for this one/i),
+      ).toBeInTheDocument(),
     );
     // Shows bundle and key_type
-    expect(screen.getByText('Indie Gems Bundle')).toBeInTheDocument();
-    expect(screen.getByText('steam')).toBeInTheDocument();
+    expect(screen.getByText("Indie Gems Bundle")).toBeInTheDocument();
+    expect(screen.getByText("steam")).toBeInTheDocument();
     // No video, no review badges
-    expect(screen.queryByRole('button', { name: /play trailer/i })).not.toBeInTheDocument();
-    expect(screen.queryByText(/Overwhelmingly Positive/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /play trailer/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Overwhelmingly Positive/),
+    ).not.toBeInTheDocument();
   });
 
-  it('claim button in modal footer calls onClaim with the game', async () => {
+  it("claim button starts the chest game; onClaim fires after the burst", async () => {
     const user = userEvent.setup();
     const onClaim = vi.fn();
 
@@ -189,13 +218,24 @@ describe('GameDetailModal', () => {
     );
 
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: /^claim$/i })).toBeInTheDocument(),
+      expect(
+        screen.getByRole("button", { name: /^claim$/i }),
+      ).toBeInTheDocument(),
     );
-    await user.click(screen.getByRole('button', { name: /^claim$/i }));
-    expect(onClaim).toHaveBeenCalledWith(friendGame);
+    // First press starts the chest game — no claim yet, the footer button
+    // becomes the masher.
+    await user.click(screen.getByRole("button", { name: /^claim$/i }));
+    expect(onClaim).not.toHaveBeenCalled();
+    const masher = screen.getByRole("button", { name: /mash to claim/i });
+    // Seed 30 + 18/mash → 4 mashes crest 100 and trigger the burst; onClaim
+    // fires once the burst beat (CLAIM_BURST_MS) finishes.
+    for (let i = 0; i < 4; i++) await user.click(masher);
+    await waitFor(() => expect(onClaim).toHaveBeenCalledWith(friendGame), {
+      timeout: 2000,
+    });
   });
 
-  it('admin mount shows status badge', async () => {
+  it("admin mount shows status badge", async () => {
     vi.mocked(adminGameDetail).mockResolvedValue({
       game: adminGame,
       steam: null,
@@ -215,7 +255,9 @@ describe('GameDetailModal', () => {
       />,
     );
 
-    await waitFor(() => expect(screen.getByText('available')).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText("available")).toBeInTheDocument(),
+    );
   });
 
   // ── F2: honest HLS-fallback test ─────────────────────────────────────────────
@@ -227,12 +269,16 @@ describe('GameDetailModal', () => {
   // Neuter-check: with hlsFailed handling removed from the component (temporarily
   // setting hlsFailed never triggers), the artwork img does NOT appear and the
   // video element remains. Verified RED before restoring.
-  it('falls back to artwork when hls.js fires a fatal error', async () => {
+  it("falls back to artwork when hls.js fires a fatal error", async () => {
     const user = userEvent.setup();
 
     vi.mocked(fetchGameDetail).mockResolvedValue({
       game: friendGame,
-      steam: { detail: steamDetailFixture, overall: overallFixture, recent: recentFixture },
+      steam: {
+        detail: steamDetailFixture,
+        overall: overallFixture,
+        recent: recentFixture,
+      },
     });
 
     render(
@@ -249,29 +295,35 @@ describe('GameDetailModal', () => {
 
     // Wait for play button to appear
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: /play trailer/i })).toBeInTheDocument(),
+      expect(
+        screen.getByRole("button", { name: /play trailer/i }),
+      ).toBeInTheDocument(),
     );
 
     // Click play — hls.on registers the error callback
-    await user.click(screen.getByRole('button', { name: /play trailer/i }));
+    await user.click(screen.getByRole("button", { name: /play trailer/i }));
 
     // Simulate fatal HLS error
     act(() => {
-      hlsCbCapture.errorCb?.('hlsError', { fatal: true });
+      hlsCbCapture.errorCb?.("hlsError", { fatal: true });
     });
 
     // After fatal error: artwork img is shown (positive assertion), video element is gone
     await waitFor(() =>
-      expect(screen.getByRole('img', { name: /stardew valley/i })).toBeInTheDocument(),
+      expect(
+        screen.getByRole("img", { name: /stardew valley/i }),
+      ).toBeInTheDocument(),
     );
-    expect(screen.queryByRole('button', { name: /play trailer/i })).not.toBeInTheDocument();
-    expect(document.querySelector('video')).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /play trailer/i }),
+    ).not.toBeInTheDocument();
+    expect(document.querySelector("video")).toBeNull();
   });
 
   // ── F1: admin loadDetail 401 navigates to login ───────────────────────────────
   // withAuth returns a forever-pending promise on Unauthorized (navigation in flight).
   // The modal must stay in the "loading" phase — never show an error state.
-  it('admin loadDetail Unauthorized navigates to login, modal stays in loading phase', async () => {
+  it("admin loadDetail Unauthorized navigates to login, modal stays in loading phase", async () => {
     const navigate = vi.fn();
     vi.mocked(adminGameDetail).mockRejectedValue(new Unauthorized());
 
@@ -285,20 +337,24 @@ describe('GameDetailModal', () => {
         onSelfClaim={vi.fn()}
         adminSteamId={null}
         selfClaimResult={null}
-        loadDetail={(gameId) => withAuth(() => adminGameDetail(gameId), navigate)}
+        loadDetail={(gameId) =>
+          withAuth(() => adminGameDetail(gameId), navigate)
+        }
       />,
     );
 
     // withAuth redirects and the promise never resolves — navigate fires
     await waitFor(() =>
-      expect(navigate).toHaveBeenCalledWith('/admin/login', { replace: true }),
+      expect(navigate).toHaveBeenCalledWith("/admin/login", { replace: true }),
     );
     // Modal must NOT show error state — it stays in loading (navigation is underway)
-    expect(screen.queryByText(/couldn't load details/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/couldn't load details/i),
+    ).not.toBeInTheDocument();
   });
 
   // ── F3: focus management ──────────────────────────────────────────────────────
-  it('dialog container receives focus on open', async () => {
+  it("dialog container receives focus on open", async () => {
     vi.mocked(fetchGameDetail).mockResolvedValue({
       game: friendGame,
       steam: null,
@@ -318,7 +374,7 @@ describe('GameDetailModal', () => {
 
     // The dialog container (role=dialog) should receive focus on mount
     await waitFor(() => {
-      const dialog = screen.getByRole('dialog');
+      const dialog = screen.getByRole("dialog");
       expect(document.activeElement).toBe(dialog);
     });
   });
@@ -326,7 +382,7 @@ describe('GameDetailModal', () => {
   // ── F4: module-level cache survives close/reopen ──────────────────────────────
   // The useRef cache was destroyed on unmount; a module-level Map is not.
   // After close → reopen, the fetch must be called exactly once.
-  it('does not refetch on reopen (per-session cache)', async () => {
+  it("does not refetch on reopen (per-session cache)", async () => {
     vi.mocked(fetchGameDetail).mockResolvedValue({
       game: friendGame,
       steam: null,
@@ -346,7 +402,9 @@ describe('GameDetailModal', () => {
 
     // Wait for initial load
     await waitFor(() =>
-      expect(screen.getByText(/no steam page for this one/i)).toBeInTheDocument(),
+      expect(
+        screen.getByText(/no steam page for this one/i),
+      ).toBeInTheDocument(),
     );
     expect(fetchGameDetail).toHaveBeenCalledTimes(1);
 
@@ -366,7 +424,9 @@ describe('GameDetailModal', () => {
 
     // Cache should serve the result — fetch still called only once total
     await waitFor(() =>
-      expect(screen.getByText(/no steam page for this one/i)).toBeInTheDocument(),
+      expect(
+        screen.getByText(/no steam page for this one/i),
+      ).toBeInTheDocument(),
     );
     expect(fetchGameDetail).toHaveBeenCalledTimes(1);
   });
@@ -374,7 +434,7 @@ describe('GameDetailModal', () => {
   // ── F5: delisted stub — steam non-null but detail: null ───────────────────────
   // Steam has review data but no app detail (game removed from store).
   // Badges must render, no video/play button, no crash, artwork shown.
-  it('renders delisted stub: detail null, reviews present, no video, artwork shown', async () => {
+  it("renders delisted stub: detail null, reviews present, no video, artwork shown", async () => {
     vi.mocked(fetchGameDetail).mockResolvedValue({
       game: friendGame,
       steam: {
@@ -400,14 +460,18 @@ describe('GameDetailModal', () => {
     await waitFor(() =>
       expect(screen.getByText(/Overwhelmingly Positive/)).toBeInTheDocument(),
     );
-    expect(screen.getByText(/97%.*positive/i)).toBeInTheDocument();
+    expect(screen.getByText(/97% of [\d,.]+ recent/i)).toBeInTheDocument();
 
     // Artwork is shown (falls back to game.artwork_url since detail.header_image is null)
-    expect(screen.getByRole('img', { name: /stardew valley/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("img", { name: /stardew valley/i }),
+    ).toBeInTheDocument();
 
     // No video element, no play button
-    expect(screen.queryByRole('button', { name: /play trailer/i })).not.toBeInTheDocument();
-    expect(document.querySelector('video')).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /play trailer/i }),
+    ).not.toBeInTheDocument();
+    expect(document.querySelector("video")).toBeNull();
   });
 });
 
@@ -415,12 +479,12 @@ describe('GameDetailModal', () => {
 
 const screenshotsFixture = [
   {
-    thumbnail: 'https://example.com/ss1.600x338.jpg',
-    full: 'https://example.com/ss1.1920x1080.jpg',
+    thumbnail: "https://example.com/ss1.600x338.jpg",
+    full: "https://example.com/ss1.1920x1080.jpg",
   },
   {
-    thumbnail: 'https://example.com/ss2.600x338.jpg',
-    full: 'https://example.com/ss2.1920x1080.jpg',
+    thumbnail: "https://example.com/ss2.600x338.jpg",
+    full: "https://example.com/ss2.1920x1080.jpg",
   },
 ];
 
@@ -429,7 +493,7 @@ const steamDetailWithScreenshots = {
   screenshots: screenshotsFixture,
 };
 
-describe('media carousel', () => {
+describe("media carousel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     hlsCbCapture.errorCb = null;
@@ -442,7 +506,11 @@ describe('media carousel', () => {
       steam:
         detail === null
           ? null
-          : { detail: detail as never, overall: overallFixture, recent: recentFixture },
+          : {
+              detail: detail as never,
+              overall: overallFixture,
+              recent: recentFixture,
+            },
     });
   }
 
@@ -460,29 +528,54 @@ describe('media carousel', () => {
     );
   }
 
-  it('trailer + screenshots: trailer is slide 1, arrows + counter present', async () => {
+  it("trailer + screenshots: trailer on stage, thumbnails replace arrows", async () => {
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
-    expect(await screen.findByLabelText('play trailer')).toBeInTheDocument();
-    expect(screen.getByLabelText('previous')).toBeInTheDocument();
-    expect(screen.getByLabelText('next')).toBeInTheDocument();
-    expect(screen.getByText('1 / 3')).toBeInTheDocument();
+    expect(await screen.findByLabelText("play trailer")).toBeInTheDocument();
+    // contact sheet: no sequential chrome, one thumb per item instead
+    expect(screen.queryByLabelText("previous")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("next")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "trailer" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Stardew Valley screenshot 1" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Stardew Valley screenshot 2" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("item 1 of 3")).toBeInTheDocument();
   });
 
-  it('next advances to a screenshot and wraps past the end', async () => {
+  it("clicking a thumbnail jumps straight to that screenshot", async () => {
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
-    const next = await screen.findByLabelText('next');
-    await userEvent.click(next);
-    expect(screen.getByText('2 / 3')).toBeInTheDocument();
-    expect(screen.getByAltText('Stardew Valley screenshot 1')).toBeInTheDocument();
-    await userEvent.click(next);
-    expect(screen.getByText('3 / 3')).toBeInTheDocument();
-    await userEvent.click(next);
-    expect(screen.getByText('1 / 3')).toBeInTheDocument(); // wrap
+    await screen.findByLabelText("play trailer");
+    const thumb = screen.getByRole("button", {
+      name: "Stardew Valley screenshot 2",
+    });
+    await userEvent.click(thumb);
+    expect(
+      screen.getByAltText("Stardew Valley screenshot 2"),
+    ).toBeInTheDocument();
+    expect(thumb).toHaveAttribute("aria-current", "true");
+    expect(screen.getByText("item 3 of 3")).toBeInTheDocument();
   });
 
-  it('one screenshot, no trailer: image alone, zero carousel chrome', async () => {
+  it("arrow keys still step and wrap", async () => {
+    mockDetail(steamDetailWithScreenshots);
+    renderFriendModal();
+    await screen.findByLabelText("play trailer");
+    const region = screen.getByRole("region", { name: "media" });
+    fireEvent.keyDown(region, { key: "ArrowLeft" }); // wraps to the last screenshot
+    expect(
+      screen.getByAltText("Stardew Valley screenshot 2"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("item 3 of 3")).toBeInTheDocument();
+    fireEvent.keyDown(region, { key: "ArrowRight" }); // wraps back to the trailer
+    expect(screen.getByLabelText("play trailer")).toBeInTheDocument();
+    expect(screen.getByText("item 1 of 3")).toBeInTheDocument();
+  });
+
+  it("one screenshot, no trailer: image alone, zero chrome", async () => {
     mockDetail({
       ...steamDetailFixture,
       video_hls_url: null,
@@ -490,102 +583,107 @@ describe('media carousel', () => {
     });
     renderFriendModal();
     expect(
-      await screen.findByAltText('Stardew Valley screenshot 1'),
+      await screen.findByAltText("Stardew Valley screenshot 1"),
     ).toBeInTheDocument();
-    expect(screen.queryByLabelText('previous')).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('next')).not.toBeInTheDocument();
-    expect(screen.queryByText('1 / 1')).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Stardew Valley screenshot 1" }),
+    ).not.toBeInTheDocument(); // no thumbnail grid for a single item
+    expect(screen.queryByText(/item 1 of/)).not.toBeInTheDocument();
   });
 
-  it('no trailer, no screenshots: plain header image, no carousel chrome', async () => {
+  it("no trailer, no screenshots: plain header image, no chrome", async () => {
     mockDetail({ ...steamDetailFixture, video_hls_url: null });
     renderFriendModal();
-    expect(await screen.findByAltText('Stardew Valley')).toBeInTheDocument();
-    expect(screen.queryByLabelText('next')).not.toBeInTheDocument();
+    expect(await screen.findByAltText("Stardew Valley")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /screenshot/ }),
+    ).not.toBeInTheDocument();
   });
 
-  it('navigating away from the trailer pauses the video', async () => {
+  it("navigating away from the trailer pauses the video", async () => {
     const pauseSpy = vi
-      .spyOn(HTMLMediaElement.prototype, 'pause')
+      .spyOn(HTMLMediaElement.prototype, "pause")
       .mockImplementation(() => {});
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
-    await userEvent.click(await screen.findByLabelText('next'));
+    await screen.findByLabelText("play trailer");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Stardew Valley screenshot 1" }),
+    );
     expect(pauseSpy).toHaveBeenCalled();
     pauseSpy.mockRestore();
   });
 
-  it('fatal HLS error mid-carousel drops the trailer slide and clamps the index', async () => {
+  it("fatal HLS error drops the trailer and clamps the index", async () => {
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
-    await userEvent.click(await screen.findByLabelText('play trailer'));
+    await userEvent.click(await screen.findByLabelText("play trailer"));
     await waitFor(() => expect(hlsCbCapture.errorCb).not.toBeNull());
-    act(() => hlsCbCapture.errorCb?.('hlsError', { fatal: true }));
-    // Trailer gone: 2 screenshots remain, counter consistent, no crash.
-    expect(await screen.findByText('1 / 2')).toBeInTheDocument();
-    expect(screen.queryByLabelText('play trailer')).not.toBeInTheDocument();
+    act(() => hlsCbCapture.errorCb?.("hlsError", { fatal: true }));
+    // Trailer gone: 2 screenshots remain, thumbs and counter consistent, no crash.
+    expect(await screen.findByText("item 1 of 2")).toBeInTheDocument();
+    expect(screen.queryByLabelText("play trailer")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "trailer" }),
+    ).not.toBeInTheDocument();
   });
 
-  it('video element error without hls.js attached drops the trailer slide', async () => {
+  it("video element error without hls.js attached drops the trailer", async () => {
     // Safari-native path: no hls.js error events exist, the <video> onError is the
     // only failure signal. Guarded to hlsRef===null so hls.js's recoverable element
     // errors don't false-trigger.
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
-    await screen.findByLabelText('play trailer');
-    const video = document.querySelector('video') as HTMLVideoElement;
+    await screen.findByLabelText("play trailer");
+    const video = document.querySelector("video") as HTMLVideoElement;
     act(() => {
-      video.dispatchEvent(new Event('error'));
+      video.dispatchEvent(new Event("error"));
     });
-    expect(await screen.findByText('1 / 2')).toBeInTheDocument();
-    expect(screen.queryByLabelText('play trailer')).not.toBeInTheDocument();
+    expect(await screen.findByText("item 1 of 2")).toBeInTheDocument();
+    expect(screen.queryByLabelText("play trailer")).not.toBeInTheDocument();
   });
 
-  it('video element error during hls.js playback does NOT drop the trailer', async () => {
+  it("video element error during hls.js playback does NOT drop the trailer", async () => {
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
-    await userEvent.click(await screen.findByLabelText('play trailer'));
+    await userEvent.click(await screen.findByLabelText("play trailer"));
     await waitFor(() => expect(hlsCbCapture.errorCb).not.toBeNull());
-    const video = document.querySelector('video') as HTMLVideoElement;
+    const video = document.querySelector("video") as HTMLVideoElement;
     act(() => {
-      video.dispatchEvent(new Event('error'));
+      video.dispatchEvent(new Event("error"));
     });
-    // hls.js owns error handling while attached — only its fatal callback drops the slide.
-    expect(screen.getByText('1 / 3')).toBeInTheDocument();
+    // hls.js owns error handling while attached — only its fatal callback drops the trailer.
+    expect(screen.getByText("item 1 of 3")).toBeInTheDocument();
   });
 
-  it('off-screen slides are inert and aria-hidden', async () => {
+  it("hidden stage neighbors stay out of the accessibility tree", async () => {
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
-    await screen.findByLabelText('play trailer');
-    const region = screen.getByRole('region', { name: 'media' });
-    const hidden = region.querySelectorAll('[aria-hidden="true"][inert]');
-    expect(hidden.length).toBe(2); // both screenshot slides while trailer is active
+    await screen.findByLabelText("play trailer");
+    const region = screen.getByRole("region", { name: "media" });
+    // Trailer active: the pre-mounted neighbor screenshot is display:none, and
+    // thumbnail imgs are decorative (alt="") — no accessible img exists yet.
+    expect(within(region).queryAllByRole("img").length).toBe(0);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Stardew Valley screenshot 1" }),
+    );
+    // Active screenshot is the only accessible image on the stage.
+    expect(within(region).getAllByRole("img").length).toBe(1);
   });
 
-  it('reduced motion: no transition class; motion allowed: transition present', async () => {
-    const mm = vi.spyOn(window, 'matchMedia');
-    mm.mockReturnValue({ matches: true } as MediaQueryList);
-    mockDetail(steamDetailWithScreenshots);
-    const { unmount } = renderFriendModal();
-    await screen.findByLabelText('play trailer');
-    const strip = () =>
-      screen.getByRole('region', { name: 'media' }).firstElementChild as HTMLElement;
-    expect(strip().className).not.toContain('transition-transform');
-    unmount();
-    clearGameDetailCache();
-    mm.mockReturnValue({ matches: false } as MediaQueryList);
+  it("motion is CSS-gated: thumbs carry a motion-reduce fallback", async () => {
+    // Reduced motion lives in CSS now (motion-reduce: utility + the media-fade
+    // @media block in index.css) — assert the utility is actually on the tile.
     mockDetail(steamDetailWithScreenshots);
     renderFriendModal();
-    await screen.findByLabelText('play trailer');
-    expect(strip().className).toContain('transition-transform');
-    mm.mockRestore();
+    const thumb = await screen.findByRole("button", { name: "trailer" });
+    expect(thumb.className).toContain("motion-reduce:transition-none");
   });
 });
 
 // ── Focus trap (issue #61 acceptance) ─────────────────────────────────────────
 
-describe('focus trap', () => {
+describe("focus trap", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     hlsCbCapture.errorCb = null;
@@ -610,10 +708,10 @@ describe('focus trap', () => {
     );
   }
 
-  it('Tab from the container enters the dialog; Tab on last focusable wraps to first', async () => {
+  it("Tab from the container enters the dialog; Tab on last focusable wraps to first", async () => {
     renderFriendModal();
-    await screen.findByLabelText('play trailer');
-    const dialog = screen.getByRole('dialog');
+    await screen.findByLabelText("play trailer");
+    const dialog = screen.getByRole("dialog");
     expect(document.activeElement).toBe(dialog); // focus-on-open pin
 
     // Tab from the container lands on the FIRST focusable inside the dialog.
@@ -622,21 +720,21 @@ describe('focus trap', () => {
     expect(dialog.contains(first)).toBe(true);
 
     // From the last focusable (claim button, friend footer), Tab must WRAP to first.
-    const claim = screen.getByRole('button', { name: 'claim' });
+    const claim = screen.getByRole("button", { name: "claim" });
     claim.focus();
     await userEvent.tab();
     expect(document.activeElement).toBe(first);
   });
 
-  it('Shift+Tab on the first focusable wraps to the last', async () => {
+  it("Shift+Tab on the first focusable wraps to the last", async () => {
     renderFriendModal();
-    await screen.findByLabelText('play trailer');
+    await screen.findByLabelText("play trailer");
     await userEvent.tab(); // container → first focusable
     const first = document.activeElement as HTMLElement;
     await userEvent.tab({ shift: true });
     const last = document.activeElement as HTMLElement;
     expect(last).not.toBe(first);
-    const dialog = screen.getByRole('dialog');
+    const dialog = screen.getByRole("dialog");
     expect(dialog.contains(last)).toBe(true);
   });
 });

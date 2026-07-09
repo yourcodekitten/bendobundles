@@ -7,27 +7,27 @@
    A/B buttons, reserved for giving and claiming (The Button Burgundy Rule). */
 @theme {
   /* room — surfaces, light to dark */
-  --color-room: oklch(87% 0.085 112);           /* page background — the screen */
-  --color-floor: oklch(91% 0.07 110);           /* cards, dialogs, panels */
-  --color-shelf: oklch(80% 0.09 112);           /* chips, raised rows */
-  --color-control: oklch(73% 0.09 113);         /* neutral buttons */
-  --color-control-bright: oklch(69% 0.09 114);  /* neutral button hover */
+  --color-room: oklch(87% 0.085 112); /* page background — the screen */
+  --color-floor: oklch(91% 0.07 110); /* cards, dialogs, panels */
+  --color-shelf: oklch(80% 0.09 112); /* chips, raised rows */
+  --color-control: oklch(73% 0.09 113); /* neutral buttons */
+  --color-control-bright: oklch(69% 0.09 114); /* neutral button hover */
 
   /* ink — text, dark to light */
-  --color-ink: oklch(30% 0.06 120);             /* primary text */
-  --color-ink-soft: oklch(36% 0.06 118);        /* secondary text */
-  --color-dust: oklch(43% 0.06 116);            /* muted text */
-  --color-dust-faint: oklch(48% 0.06 114);      /* faintest legible text */
+  --color-ink: oklch(30% 0.06 120); /* primary text */
+  --color-ink-soft: oklch(36% 0.06 118); /* secondary text */
+  --color-dust: oklch(43% 0.06 116); /* muted text */
+  --color-dust-faint: oklch(48% 0.06 114); /* faintest legible text */
 
   /* structure */
-  --color-line: oklch(66% 0.075 112);           /* hairline borders */
-  --color-pixel: oklch(35% 0.06 120);           /* bezel: dialog rings, focus, frames */
+  --color-line: oklch(66% 0.075 112); /* hairline borders */
+  --color-pixel: oklch(35% 0.06 120); /* bezel: dialog rings, focus, frames */
 
   /* give — the DMG A/B button burgundy; claiming and gifting ONLY */
   --color-give: oklch(46% 0.155 355);
-  --color-give-bright: oklch(52% 0.16 355);     /* hover */
-  --color-give-soft: oklch(42% 0.14 350);       /* accent text on light surfaces */
-  --color-give-ink: oklch(97% 0.012 350);       /* text on give backgrounds */
+  --color-give-bright: oklch(52% 0.16 355); /* hover */
+  --color-give-soft: oklch(42% 0.14 350); /* accent text on light surfaces */
+  --color-give-ink: oklch(97% 0.012 350); /* text on give backgrounds */
 
   /* title-hash palette — muted earth (see titleColor.ts + DESIGN.md, The
      Title-Hash Rule): art-fallback blocks in quiet attic materials */
@@ -86,15 +86,53 @@
   }
 }
 
+/* game-detail stage — a soft settle when a screenshot lands from a contact-sheet
+   jump (#61); sequential steps stay instant (neighbors are pre-mounted) */
+@keyframes media-fade {
+  from {
+    opacity: 0.35;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.media-fade {
+  animation: media-fade 0.25s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .media-fade {
+    animation: none;
+  }
+}
+
+/* trailer fullscreen — the WRAPPER goes fullscreen (video + HUD strip
+   together, so the minimal controls stay reachable); the video letterboxes
+   on black instead of cropping */
+.media-video-wrap:fullscreen {
+  display: grid;
+  align-items: center;
+  background: black;
+}
+.media-video-wrap:fullscreen video {
+  aspect-ratio: auto;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
 /* the logotype outline — light Silkscreen with a hard 8-direction pixel edge,
    for wordmarks floating over the banner scene */
 .wordmark-outline {
   color: var(--color-floor);
   text-shadow:
-    2px 0 0 var(--color-pixel), -2px 0 0 var(--color-pixel),
-    0 2px 0 var(--color-pixel), 0 -2px 0 var(--color-pixel),
-    2px 2px 0 var(--color-pixel), -2px 2px 0 var(--color-pixel),
-    2px -2px 0 var(--color-pixel), -2px -2px 0 var(--color-pixel);
+    2px 0 0 var(--color-pixel),
+    -2px 0 0 var(--color-pixel),
+    0 2px 0 var(--color-pixel),
+    0 -2px 0 var(--color-pixel),
+    2px 2px 0 var(--color-pixel),
+    -2px 2px 0 var(--color-pixel),
+    2px -2px 0 var(--color-pixel),
+    -2px -2px 0 var(--color-pixel);
 }
 
 /* the dialog-box typing cursor — a blinking block, JRPG style */
@@ -127,6 +165,554 @@
 @media (prefers-reduced-motion: reduce) {
   .menu-cursor {
     animation: none;
+  }
+}
+
+/* the ceremony bezel — the claim dialog's panel wears the JRPG double-line
+   frame (The Bezel Rule), joined by the Ceremony shadow (dialogs only) */
+.dialog-bezel {
+  border: 3px solid var(--color-pixel);
+  box-shadow:
+    inset 0 0 0 3px var(--color-floor),
+    inset 0 0 0 5px var(--color-pixel),
+    0 25px 50px -12px rgb(0 0 0 / 0.25);
+}
+
+/* ── the claim celebration — four confirm-click concepts, OVERDRIVEN ──────────
+   (ben, 2026-07-09: "MOAR! it needs to be EPIC!") each concept breaks one
+   convention: fanfare shakes the dialog itself; key detonates the padlock;
+   confetti escapes the dialog onto the whole viewport; boot fakes an entire
+   power-on sequence for one button click. Mounted only when motion is
+   affirmatively allowed (JS gate in ClaimDialog) — reduced-motion never sees
+   these nodes. Transform/opacity only; steps() or exponential ease-out. */
+.celebrate {
+  position: relative;
+  min-height: 148px;
+  display: grid;
+  place-items: center;
+}
+
+/* concept: fanfare — the victory screen. double flash, banner slam, the panel
+   itself screen-shakes, corner starbursts, spark rain, a results line. */
+.cel-fanfare {
+  animation: cel-shake 0.5s steps(2, jump-none) 0.1s both;
+}
+@keyframes cel-shake {
+  0% {
+    transform: translate(0, 0) rotate(0deg);
+  }
+  25% {
+    transform: translate(-4px, 2px) rotate(-0.6deg);
+  }
+  50% {
+    transform: translate(4px, -2px) rotate(0.6deg);
+  }
+  75% {
+    transform: translate(-2px, -2px) rotate(-0.3deg);
+  }
+  100% {
+    transform: translate(0, 0) rotate(0deg);
+  }
+}
+.cel-flash {
+  position: absolute;
+  inset: -24px;
+  z-index: 1;
+  background: var(--color-give-ink);
+  pointer-events: none;
+  animation: cel-flash 0.55s steps(2, jump-none) both;
+}
+@keyframes cel-flash {
+  0% {
+    opacity: 0.9;
+  }
+  40% {
+    opacity: 0;
+  }
+  60% {
+    opacity: 0.7;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.cel-banner {
+  margin: 0;
+  z-index: 2;
+  font-family: var(--font-pixel);
+  font-weight: 600;
+  font-size: 1.9rem;
+  letter-spacing: 0.02em;
+  color: var(--color-give-soft);
+  animation: cel-banner-slam 0.42s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes cel-banner-slam {
+  from {
+    transform: scale(3);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+.cel-afterline {
+  position: absolute;
+  bottom: 10px;
+  margin: 0;
+  z-index: 2;
+  font-family: var(--font-pixel);
+  font-size: 0.9rem;
+  color: var(--color-ink-soft);
+  animation: cel-afterline-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) 0.9s both;
+}
+@keyframes cel-afterline-rise {
+  from {
+    transform: translateY(14px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+.cel-star {
+  position: absolute;
+  z-index: 2;
+  font-family: var(--font-pixel);
+  font-size: 1.3rem;
+  color: var(--color-give);
+  animation: cel-star-pop 0.6s steps(3) both;
+}
+@keyframes cel-star-pop {
+  0% {
+    transform: scale(0);
+    opacity: 0;
+  }
+  40% {
+    transform: scale(1.6);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 0;
+  }
+}
+.cel-sparkrain {
+  position: absolute;
+  top: -8px;
+  width: 5px;
+  height: 5px;
+  border-radius: 1px;
+  background: var(--color-give-bright);
+  opacity: 0;
+  animation: cel-sparkfall 0.9s steps(7) both;
+}
+@keyframes cel-sparkfall {
+  0% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(190px);
+  }
+}
+
+/* concept: key — the unlocking. the key rides in on a spark trail, seats,
+   turns with a clunk (the panel jolts), the shackle pops open and the
+   padlock bursts into pixel fragments behind a double ring flash. */
+.cel-keyturn {
+  animation: cel-clunk 0.3s steps(2, jump-none) 1s both;
+}
+@keyframes cel-clunk {
+  0% {
+    transform: translate(0, 0);
+  }
+  50% {
+    transform: translate(3px, -3px);
+  }
+  100% {
+    transform: translate(0, 0);
+  }
+}
+.cel-lock {
+  position: relative;
+  display: block;
+  width: 64px;
+  height: 50px;
+  border-radius: 7px;
+  background: var(--color-pixel);
+  box-shadow: inset 0 -7px 0 oklch(28% 0.05 120);
+  animation: cel-lock-burst-body 0.4s cubic-bezier(0.22, 1, 0.36, 1) 1.15s both;
+}
+@keyframes cel-lock-burst-body {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.18);
+  }
+  100% {
+    transform: scale(1.06);
+  }
+}
+.cel-shackle {
+  position: absolute;
+  top: -25px;
+  left: 50%;
+  width: 38px;
+  height: 29px;
+  border: 9px solid var(--color-pixel);
+  border-bottom: none;
+  border-radius: 19px 19px 0 0;
+  transform: translateX(-50%);
+  animation: cel-shackle-pop 0.5s cubic-bezier(0.22, 1, 0.36, 1) 1.1s both;
+}
+@keyframes cel-shackle-pop {
+  from {
+    transform: translateX(-50%) translateY(0) rotate(0deg);
+  }
+  to {
+    transform: translateX(-50%) translateY(-14px) rotate(-14deg);
+  }
+}
+.cel-lock-hole {
+  position: absolute;
+  left: 50%;
+  top: 16px;
+  transform: translateX(-50%);
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--color-floor);
+  box-shadow: 0 9px 0 -3px var(--color-floor);
+}
+.cel-frag {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
+  background: var(--color-pixel);
+  opacity: 0;
+  animation: cel-frag-fly 0.65s cubic-bezier(0.15, 0.6, 0.3, 1) 1.15s both;
+}
+@keyframes cel-frag-fly {
+  0% {
+    transform: translate(-50%, -50%) rotate(0deg);
+    opacity: 1;
+  }
+  100% {
+    transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy)))
+      rotate(var(--rot));
+    opacity: 0;
+  }
+}
+.cel-key {
+  position: absolute;
+  left: calc(50% - 104px);
+  top: calc(50% - 5px);
+  display: block;
+  width: 52px;
+  height: 10px;
+  border-radius: 2px;
+  background: var(--color-give);
+  transform-origin: 85% 50%;
+  animation: cel-key-journey 1.15s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.cel-key-bow {
+  position: absolute;
+  left: -18px;
+  top: -7px;
+  width: 23px;
+  height: 23px;
+  border: 7px solid var(--color-give);
+  border-radius: 50%;
+}
+.cel-key-teeth {
+  position: absolute;
+  right: 2px;
+  top: 10px;
+  width: 6px;
+  height: 8px;
+  background: var(--color-give);
+  box-shadow: -10px 0 0 var(--color-give);
+}
+.cel-key-spark {
+  position: absolute;
+  top: 2px;
+  width: 5px;
+  height: 5px;
+  border-radius: 1px;
+  background: var(--color-give-bright);
+  animation: cel-key-trail 0.5s steps(4) both;
+}
+@keyframes cel-key-trail {
+  0% {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-26px);
+  }
+}
+@keyframes cel-key-journey {
+  0% {
+    transform: translateX(-52px) rotate(0deg);
+    opacity: 0;
+  }
+  38% {
+    transform: translateX(0) rotate(0deg);
+    opacity: 1;
+  }
+  62% {
+    transform: translateX(0) rotate(0deg);
+  }
+  87% {
+    transform: translateX(0) rotate(90deg);
+  }
+  100% {
+    transform: translateX(0) rotate(90deg);
+  }
+}
+.cel-ring-flash {
+  position: absolute;
+  inset: -12px;
+  border: 3px solid var(--color-give);
+  border-radius: 8px;
+  opacity: 0;
+  pointer-events: none;
+  animation: cel-ring 0.5s steps(4, jump-none) 1.15s both;
+}
+@keyframes cel-ring {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+  75% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.cel-white-blink {
+  position: absolute;
+  inset: -24px;
+  z-index: 1;
+  background: var(--color-give-ink);
+  pointer-events: none;
+  opacity: 0;
+  animation: cel-flash 0.35s steps(2, jump-none) 1.1s both;
+}
+
+/* concept: confetti — the supernova, uncontained. the burst escapes the
+   dialog onto a full-viewport layer (backdrop 40 / panel 50 / sky 60);
+   the one ♡ rises through it with two orbiting pixel sparks. */
+.cel-confetti {
+  animation: cel-pop 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes cel-pop {
+  0% {
+    transform: scale(1);
+  }
+  35% {
+    transform: scale(1.1);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+.cel-sky {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+}
+.cel-piece {
+  position: absolute;
+  left: 50%;
+  top: 55%;
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
+  animation: cel-burst 1.5s cubic-bezier(0.15, 0.6, 0.3, 1) both;
+}
+.cel-piece--streamer {
+  width: 4px;
+  height: 14px;
+}
+@keyframes cel-burst {
+  0% {
+    transform: translate(-50%, -50%) rotate(0deg);
+    opacity: 1;
+  }
+  55% {
+    transform: translate(calc(-50% + var(--dx)), calc(-50% + var(--dy)))
+      rotate(var(--rot));
+    opacity: 1;
+  }
+  100% {
+    transform: translate(
+        calc(-50% + var(--dx) * 1.15),
+        calc(-50% + var(--dy) + 46vh)
+      )
+      rotate(calc(var(--rot) * 2));
+    opacity: 0;
+  }
+}
+.cel-heart {
+  position: relative;
+  z-index: 1;
+  font-size: 2.6rem;
+  line-height: 1;
+  color: var(--color-give-soft);
+  animation: cel-heart-rise 1.15s cubic-bezier(0.22, 1, 0.36, 1) 0.12s both;
+}
+@keyframes cel-heart-rise {
+  from {
+    transform: translateY(30px) scale(0.5);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+}
+.cel-orbit {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  background: var(--color-give-bright);
+  animation: cel-orbit 1s steps(8) 0.3s infinite;
+}
+.cel-orbit--2 {
+  animation-delay: 0.8s;
+}
+@keyframes cel-orbit {
+  0% {
+    transform: translate(-32px, -8px);
+    opacity: 1;
+  }
+  25% {
+    transform: translate(0, -34px);
+    opacity: 1;
+  }
+  50% {
+    transform: translate(28px, -8px);
+    opacity: 1;
+  }
+  75% {
+    transform: translate(0, 20px);
+    opacity: 0.6;
+  }
+  100% {
+    transform: translate(-32px, -8px);
+    opacity: 1;
+  }
+}
+
+/* concept: boot — the full power-on. olive takeover, chunky logo crawl,
+   burgundy ding, ©1984 small print, a 12-block loading meter, hard cut to
+   the key. Fixed overlay above the dialog (backdrop 40 / panel 50 / 60). */
+.cel-boot {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  background: var(--color-room);
+  animation: cel-boot-out 0.2s steps(2, jump-none) 2.55s both;
+}
+@keyframes cel-boot-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+.cel-boot-stack {
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+}
+.cel-boot-logo {
+  margin: 0;
+  font-family: var(--font-logo);
+  text-transform: uppercase;
+  font-size: 1.7rem;
+  letter-spacing: 0.04em;
+  color: var(--color-ink);
+  animation:
+    cel-boot-scroll 0.95s steps(14) both,
+    cel-boot-ding 0.3s steps(2, jump-none) 1.05s both;
+}
+@keyframes cel-boot-scroll {
+  from {
+    transform: translateY(-42vh);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+@keyframes cel-boot-ding {
+  from {
+    color: var(--color-give-soft);
+  }
+  to {
+    color: var(--color-ink);
+  }
+}
+.cel-boot-sub {
+  margin: 0;
+  font-family: var(--font-pixel);
+  font-size: 0.8125rem;
+  color: var(--color-dust);
+  animation: cel-boot-sub-in 0.3s steps(2, jump-none) 1.35s both;
+}
+@keyframes cel-boot-sub-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.cel-boot-meter {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 4px;
+  background: var(--color-floor);
+  box-shadow: inset 0 0 0 2px var(--color-pixel);
+  animation: cel-boot-sub-in 0.2s steps(2, jump-none) 1.5s both;
+}
+.cel-boot-seg {
+  width: 12px;
+  height: 14px;
+  border-radius: 1px;
+  background: var(--color-pixel);
+  opacity: 0;
+  animation: cel-boot-seg-in 0.12s steps(1) both;
+}
+.cel-boot-seg:last-child {
+  background: var(--color-give);
+}
+@keyframes cel-boot-seg-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }
 
@@ -328,5 +914,444 @@
   .landing-diorama:has(.landing-stage-art:hover) .landing-heart::after {
     animation: none;
     opacity: 0;
+  }
+}
+
+/* ── The handheld: game-detail modal (impeccable overdrive, ben's pick 2026-07-09) ──
+   The detail modal IS the 1989 DMG. A faded-grey plastic case, a dark bezel, the
+   content scrolling inside the LCD screen, and the claim button as the round
+   burgundy A. Params baked from the live accept: deep shell molding, LCD grid 0.15,
+   speaker grille on. Colours stay inside the palette — the grey is the room's own
+   hue desaturated, not a new hue family (The one-green discipline). */
+.handheld-shell {
+  position: relative;
+  /* faded-DMG grey: the room's hue (108) desaturated hard (chroma 0.09 → 0.018) so
+     it reads grey without adding a new hue family — an attic-faded gameboy. */
+  background: oklch(76% 0.018 108);
+  border-radius: 14px 14px 52px 14px;
+  /* deep molding (ben's live pick): sculpted plastic, not flat */
+  box-shadow:
+    0 0 0 1px var(--color-pixel),
+    0 25px 50px -12px rgb(0 0 0 / 0.25),
+    inset 0 3px 2px oklch(100% 0 0 / 0.4),
+    inset 0 -6px 12px oklch(30% 0.06 120 / 0.3),
+    inset 2px 0 3px oklch(100% 0 0 / 0.12),
+    inset -2px 0 6px oklch(30% 0.06 120 / 0.12);
+}
+.handheld-bezel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin: 18px 18px 0;
+  padding: 6px 10px 12px;
+  background: var(--color-pixel);
+  border-radius: 10px 10px 26px 10px;
+}
+.handheld-bezel-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px 8px;
+  font-family: "Pixelify Sans Variable", ui-sans-serif, sans-serif;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: oklch(91% 0.07 110 / 0.55);
+}
+.handheld-led {
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: oklch(70% 0.18 145);
+  box-shadow: 0 0 6px oklch(70% 0.18 145 / 0.8);
+}
+.handheld-bezel-label {
+  flex: 1;
+  text-align: center;
+}
+.handheld-close {
+  color: oklch(91% 0.07 110 / 0.7);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+.handheld-close:hover {
+  color: oklch(91% 0.07 110);
+}
+.handheld-screenwrap {
+  position: relative;
+  display: flex;
+  min-height: 200px;
+  min-width: 0;
+}
+.handheld-screen {
+  width: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--color-room);
+  border-radius: 4px;
+}
+.handheld-grid {
+  position: absolute;
+  inset: 0;
+  border-radius: 4px;
+  pointer-events: none;
+  opacity: 0.15; /* LCD grid — baked from the live accept */
+  background-image:
+    repeating-linear-gradient(
+      0deg,
+      oklch(30% 0.06 120 / 0.16) 0 1px,
+      transparent 1px 3px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      oklch(30% 0.06 120 / 0.16) 0 1px,
+      transparent 1px 3px
+    );
+}
+.handheld-controls {
+  padding: 14px 22px 22px;
+  padding-right: 104px; /* clears the speaker grille (baked on) */
+}
+.handheld-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "Pixelify Sans Variable", ui-sans-serif, sans-serif;
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+.handheld-a {
+  position: relative;
+  width: 58px;
+  height: 58px;
+  flex: none;
+  border-radius: 9999px;
+  background: var(--color-give);
+  color: var(--color-give-ink);
+  font-family: "Pixelify Sans Variable", ui-sans-serif, sans-serif;
+  font-size: 12px;
+  transform: rotate(-18deg);
+  cursor: pointer;
+  margin-bottom: 6px;
+  box-shadow:
+    inset 0 -4px 8px oklch(20% 0.1 355 / 0.45),
+    inset 0 2px 3px oklch(97% 0.012 350 / 0.35),
+    0 0 0 1px oklch(30% 0.08 355 / 0.5);
+}
+.handheld-a:hover:not(:disabled) {
+  background: var(--color-give-bright);
+}
+.handheld-a:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.handheld-a::after {
+  content: "a";
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 50%;
+  transform: translateX(-50%) rotate(18deg);
+  font-size: 10px;
+  color: var(--color-ink-soft);
+}
+.handheld-speaker {
+  display: block; /* speaker grille — baked on */
+  position: absolute;
+  right: 20px;
+  bottom: 14px;
+  width: 64px;
+  height: 38px;
+  transform: rotate(-22deg);
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    90deg,
+    oklch(30% 0.06 120 / 0.35) 0 4px,
+    transparent 4px 13px
+  );
+}
+
+/* ── The claim chest — a Game Boy game (overdrive, ben 2026-07-09) ─────────────
+   Hitting claim starts a mini-game that TAKES OVER the LCD: an opaque Floor
+   screen (ben's fix — no see-through), the olive-LCD palette, pixel font, a
+   segmented block meter, and a chunky pixel treasure chest that shakes as you
+   mash and bursts open at full charge. Three skins via [data-skin]. The mash
+   mechanic + timers live in GameDetailModal; this is the skin. */
+.handheld-screen.is-dimmed {
+  opacity: 0.12;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+}
+.claim-game {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+  /* opaque LCD, same surface as the modal (ben's fix) */
+  background: var(--color-floor);
+  animation: claim-game-in 0.28s ease-out both;
+}
+@keyframes claim-game-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.cg-frame {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 15px;
+  align-self: stretch;
+  padding: 18px;
+  overflow: hidden;
+  text-align: center;
+  font-family: var(--font-pixel);
+}
+/* arcade scanlines over the play field (the arcade skin, ben's pick 2026-07-09) */
+.cg-frame::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    oklch(30% 0.06 120 / 0.07) 0 2px,
+    transparent 2px 4px
+  );
+}
+.cg-title {
+  margin: 0;
+  font-family: var(--font-pixel);
+  font-size: 0.9rem;
+  letter-spacing: 0.02em;
+  color: var(--color-ink-soft);
+}
+.cg-chest {
+  position: relative;
+  width: 132px;
+  height: 100px;
+  cursor: pointer;
+  animation: cg-idle 1.6s ease-in-out infinite;
+}
+@keyframes cg-idle {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+.cc-glow {
+  position: absolute;
+  inset: -12% 8%;
+  z-index: 0;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    color-mix(in oklch, var(--color-give), transparent 35%),
+    transparent 70%
+  );
+  opacity: calc(var(--cc-charge, 0) * 0.85);
+  filter: blur(7px);
+  transition: opacity 0.1s linear;
+}
+.cc-body {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 0;
+  height: 56px;
+  z-index: 1;
+  background: var(--color-pixel);
+  border-radius: 4px 4px 6px 6px;
+  box-shadow:
+    inset 0 -6px 0 oklch(28% 0.05 120),
+    inset 0 3px 0 oklch(42% 0.06 118);
+}
+.cc-lid {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  top: 20px;
+  height: 30px;
+  z-index: 1;
+  background: oklch(40% 0.06 118);
+  border-radius: 9px 9px 2px 2px;
+  transform-origin: bottom center;
+  box-shadow: inset 0 4px 0 oklch(48% 0.06 116);
+  transition: transform 0.25s cubic-bezier(0.2, 0.9, 0.25, 1);
+}
+.cc-band {
+  position: absolute;
+  left: 47%;
+  top: 22px;
+  width: 6%;
+  height: 76px;
+  z-index: 1;
+  background: oklch(62% 0.03 100);
+  border-radius: 2px;
+}
+.cc-lock {
+  position: absolute;
+  left: 50%;
+  top: 44px;
+  width: 20px;
+  height: 18px;
+  z-index: 2;
+  transform: translateX(-50%);
+  background: var(--color-give);
+  border-radius: 3px;
+  box-shadow: inset 0 -3px 0 oklch(38% 0.14 355);
+}
+.cc-lock::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 5px;
+  width: 4px;
+  height: 4px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: var(--color-give-ink);
+  box-shadow: 0 4px 0 -1px var(--color-give-ink);
+}
+.cc-spark {
+  position: absolute;
+  top: 38px;
+  left: 50%;
+  z-index: 2;
+  width: 6px;
+  height: 6px;
+  border-radius: 1px;
+  background: var(--color-give-bright);
+  opacity: 0;
+}
+.cg-chest.is-burst {
+  animation: cg-burst 0.7s cubic-bezier(0.2, 0.9, 0.25, 1) both;
+}
+.cg-chest.is-burst .cc-lid {
+  transform: rotate(-116deg) translateY(-2px);
+}
+.cg-chest.is-burst .cc-glow {
+  opacity: 1;
+  inset: -32% -12%;
+}
+.cg-chest.is-burst .cc-spark {
+  animation: cc-spark-fly 0.7s ease-out both;
+}
+.cc-spark-1 {
+  --sx: -46px;
+  --sy: -42px;
+}
+.cc-spark-2 {
+  --sx: 44px;
+  --sy: -38px;
+}
+.cc-spark-3 {
+  --sx: -30px;
+  --sy: -54px;
+}
+.cc-spark-4 {
+  --sx: 32px;
+  --sy: -52px;
+}
+@keyframes cc-spark-fly {
+  0% {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(calc(-50% + var(--sx)), var(--sy)) scale(0.4);
+  }
+}
+@keyframes cg-burst {
+  0% {
+    transform: scale(1);
+  }
+  30% {
+    transform: scale(1.16);
+  }
+  100% {
+    transform: scale(1.04);
+  }
+}
+/* segmented block meter — the gameboy progress read, arcade-tall */
+.cg-meter {
+  display: flex;
+  gap: 3px;
+  width: min(80%, 264px);
+  height: 24px;
+  padding: 3px;
+  border-radius: 4px;
+  background: var(--color-shelf);
+  box-shadow: inset 0 0 0 2px var(--color-pixel);
+}
+.cg-seg {
+  flex: 1;
+  border-radius: 1px;
+  background: color-mix(in oklch, var(--color-pixel), transparent 84%);
+  transition: background 0.08s linear;
+}
+.cg-seg.is-on {
+  background: var(--color-give);
+}
+.cg-prompt {
+  margin: 0;
+  font-family: var(--font-pixel);
+  font-size: 1.3rem;
+  letter-spacing: 0.03em;
+  color: var(--color-give-soft);
+}
+.cg-a {
+  color: var(--color-give-soft);
+}
+.cg-win {
+  margin: 0;
+  font-family: var(--font-pixel);
+  font-size: 1.25rem;
+  color: var(--color-give-soft);
+}
+.cg-cancel {
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  color: var(--color-dust);
+  cursor: pointer;
+}
+.cg-cancel:hover {
+  color: var(--color-ink-soft);
+}
+.handheld-a.is-mashing:active {
+  transform: rotate(-18deg) scale(0.9);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .claim-game,
+  .cg-chest,
+  .cg-chest.is-burst,
+  .cg-chest.is-burst .cc-spark {
+    animation: none;
+  }
+  .cg-chest.is-burst .cc-lid {
+    transform: rotate(-116deg);
+    transition: none;
+  }
+  .cg-seg,
+  .cc-glow,
+  .handheld-screen.is-dimmed {
+    transition: none;
   }
 }
