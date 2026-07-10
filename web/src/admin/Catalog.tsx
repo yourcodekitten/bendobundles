@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   adminCatalog,
   adminGameDetail,
@@ -14,6 +14,31 @@ import {
 import { withAuth } from './withAuth';
 import { titleColorClass } from '../titleColor';
 import { GameDetailModal } from '../GameDetailModal';
+import {
+  applyToolkit,
+  collectTagOptions,
+  type GroupKey,
+  type RatingFloor,
+  type SortKey,
+  type ToolkitState,
+} from './catalogToolkit';
+import { ToolkitBar } from './ToolkitBar';
+
+// URL param values are attacker-writable (it's a URL) — anything outside the
+// known key sets falls back to the idle value rather than reaching a cast.
+const RATING_KEYS: readonly RatingFloor[] = [
+  'any',
+  'mixed',
+  'mostly-positive',
+  'very-positive',
+  'overwhelmingly-positive',
+];
+const SORT_KEYS: readonly SortKey[] = ['title', 'rating', 'date-new', 'date-old'];
+const GROUP_KEYS: readonly GroupKey[] = ['none', 'publisher', 'studio', 'bundle'];
+
+function keyOf<T extends string>(raw: string | null, known: readonly T[], idle: T): T {
+  return raw !== null && (known as readonly string[]).includes(raw) ? (raw as T) : idle;
+}
 
 // Status badge — exact color mapping from plan (snake_case serde values)
 //   available=green, pending=amber, gifted=violet, ben_redeemed=slate, expired=red
@@ -45,7 +70,28 @@ const NO_GAMES: AdminGame[] = [];
 export function Catalog() {
   const navigate = useNavigate();
   const [state, setState] = useState<PageState>({ phase: 'loading' });
-  const [search, setSearch] = useState('');
+  // Toolkit state (search included) lives in the URL so refresh/back/forward
+  // preserve the dig. Params are omitted at their idle values.
+  const [params, setParams] = useSearchParams();
+  const toolkit: ToolkitState = useMemo(
+    () => ({
+      q: params.get('q') ?? '',
+      tags: params.get('tags')?.split(',').filter(Boolean) ?? [],
+      rating: keyOf(params.get('rating'), RATING_KEYS, 'any'),
+      sort: keyOf(params.get('sort'), SORT_KEYS, 'title'),
+      group: keyOf(params.get('group'), GROUP_KEYS, 'none'),
+    }),
+    [params],
+  );
+  const setToolkit = (next: ToolkitState) => {
+    const p = new URLSearchParams();
+    if (next.q) p.set('q', next.q);
+    if (next.tags.length > 0) p.set('tags', next.tags.join(','));
+    if (next.rating !== 'any') p.set('rating', next.rating);
+    if (next.sort !== 'title') p.set('sort', next.sort);
+    if (next.group !== 'none') p.set('group', next.group);
+    setParams(p, { replace: true });
+  };
   // Per-row inline error for toggle refusals (mid-claim 409 from server)
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
 
@@ -143,20 +189,12 @@ export function Catalog() {
 
   // Memos live above the early returns (hooks must run unconditionally).
   // summary derives only from the full unfiltered list — it must not
-  // recompute per search keystroke; filtered recomputes only on games/query.
+  // recompute per search keystroke; the pipeline recomputes only on
+  // games/toolkit changes.
   const games = state.phase === 'loaded' ? state.games : NO_GAMES;
-  const q = search.toLowerCase();
 
-  const filtered = useMemo(
-    () =>
-      q === ''
-        ? games
-        : games.filter(
-            (g) =>
-              g.title.toLowerCase().includes(q) || g.bundle.toLowerCase().includes(q),
-          ),
-    [games, q],
-  );
+  const tagOptions = useMemo(() => collectTagOptions(games), [games]);
+  const visible = useMemo(() => applyToolkit(games, toolkit), [games, toolkit]);
 
   const summary = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -194,15 +232,104 @@ export function Catalog() {
           type="search"
           aria-label="search games"
           placeholder="search title or bundle…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
+          value={toolkit.q}
+          onChange={(e) => setToolkit({ ...toolkit, q: e.target.value })}
           className="rounded border border-line bg-floor px-3 py-1.5 text-sm text-ink placeholder-dust focus:border-pixel focus:outline-none"
         />
         <p className="text-sm text-dust-faint">{summary}</p>
       </div>
 
-      <div className="space-y-1">
-        {filtered.map((game) => {
+      <ToolkitBar
+        state={toolkit}
+        tagOptions={tagOptions}
+        shown={visible.shown}
+        total={games.length}
+        excludedNoData={visible.excludedNoData}
+        onChange={setToolkit}
+      />
+
+      <div className="space-y-4">
+        {visible.groups.map((group) => {
+          const rows = group.games.map((game) => renderRow(game));
+          if (group.label === null) {
+            return (
+              <div key="__all" className="space-y-1">
+                {rows}
+              </div>
+            );
+          }
+          return (
+            <details key={group.label} open>
+              <summary className="cursor-pointer text-sm font-medium text-ink-soft">
+                {group.label} ({group.games.length})
+              </summary>
+              <div className="mt-2 space-y-1">{rows}</div>
+            </details>
+          );
+        })}
+      </div>
+
+      {/* Game detail modal — opens on row click */}
+      {detailGame !== null && (
+        <GameDetailModal
+          mount="admin"
+          game={detailGame}
+          loadDetail={(gameId) => withAuth(() => adminGameDetail(gameId), navigate)}
+          onClose={() => setDetailGame(null)}
+          armedId={armedId}
+          claiming={claiming}
+          onSelfClaim={(g) => void handleSelfClaim(g)}
+          adminSteamId={adminSteamId}
+          selfClaimResult={result}
+        />
+      )}
+
+      {/* Self-claims section */}
+      {selfClaims.length > 0 && (
+        <div className="mt-8">
+          <h2 className="mb-3 text-sm font-medium text-ink-soft">your self-claims</h2>
+          <div className="space-y-2">
+            {selfClaims.map((sc) => (
+              <div
+                key={sc.game_id}
+                className="flex flex-wrap items-center gap-3 rounded bg-floor px-4 py-3 text-sm"
+              >
+                <span className="font-mono text-xs text-dust">{sc.game_id}</span>
+                <span
+                  className={`rounded px-2 py-0.5 text-xs font-medium ${
+                    sc.state === 'fulfilled'
+                      ? 'bg-green-700 text-green-100'
+                      : sc.state === 'compensated'
+                        ? 'bg-slate-600 text-slate-100'
+                        : 'bg-amber-700 text-amber-100'
+                  }`}
+                >
+                  {sc.state}
+                </span>
+                {sc.revealed_key !== null && (
+                  <>
+                    <span className="select-all font-mono text-xs">{sc.revealed_key}</span>
+                    <button
+                      type="button"
+                      onClick={() => void navigator.clipboard.writeText(sc.revealed_key!)}
+                      className="rounded bg-control px-2 py-1 text-xs"
+                    >
+                      copy
+                    </button>
+                  </>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  // Row renderer — the pre-toolkit map body, unchanged except the steam
+  // readout under the bundle line. Hoisted so grouped and ungrouped views
+  // render identical rows.
+  function renderRow(game: AdminGame) {
           const rowErr = rowErrors[game.id];
           const isArmed = armedId === game.id;
           const isClaiming = claiming === game.id;
@@ -229,10 +356,26 @@ export function Catalog() {
                   />
                 )}
 
-                {/* Title + bundle */}
+                {/* Title + bundle + compact steam readout (rating · % · year) */}
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-medium">{game.title}</p>
                   <p className="truncate text-xs text-dust">{game.bundle}</p>
+                  {game.steam !== null &&
+                    (game.steam.review_desc !== null ||
+                      game.steam.review_percent !== null ||
+                      game.steam.release_date_iso !== null) && (
+                      <p className="truncate text-xs text-dust-faint">
+                        {[
+                          game.steam.review_desc,
+                          game.steam.review_percent !== null
+                            ? `${game.steam.review_percent}%`
+                            : null,
+                          game.steam.release_date_iso?.slice(0, 4),
+                        ]
+                          .filter(Boolean)
+                          .join(' · ')}
+                      </p>
+                    )}
                 </div>
 
                 {/* key_type */}
@@ -365,63 +508,5 @@ export function Catalog() {
               )}
             </div>
           );
-        })}
-      </div>
-
-      {/* Game detail modal — opens on row click */}
-      {detailGame !== null && (
-        <GameDetailModal
-          mount="admin"
-          game={detailGame}
-          loadDetail={(gameId) => withAuth(() => adminGameDetail(gameId), navigate)}
-          onClose={() => setDetailGame(null)}
-          armedId={armedId}
-          claiming={claiming}
-          onSelfClaim={(g) => void handleSelfClaim(g)}
-          adminSteamId={adminSteamId}
-          selfClaimResult={result}
-        />
-      )}
-
-      {/* Self-claims section */}
-      {selfClaims.length > 0 && (
-        <div className="mt-8">
-          <h2 className="mb-3 text-sm font-medium text-ink-soft">your self-claims</h2>
-          <div className="space-y-2">
-            {selfClaims.map((sc) => (
-              <div
-                key={sc.game_id}
-                className="flex flex-wrap items-center gap-3 rounded bg-floor px-4 py-3 text-sm"
-              >
-                <span className="font-mono text-xs text-dust">{sc.game_id}</span>
-                <span
-                  className={`rounded px-2 py-0.5 text-xs font-medium ${
-                    sc.state === 'fulfilled'
-                      ? 'bg-green-700 text-green-100'
-                      : sc.state === 'compensated'
-                        ? 'bg-slate-600 text-slate-100'
-                        : 'bg-amber-700 text-amber-100'
-                  }`}
-                >
-                  {sc.state}
-                </span>
-                {sc.revealed_key !== null && (
-                  <>
-                    <span className="select-all font-mono text-xs">{sc.revealed_key}</span>
-                    <button
-                      type="button"
-                      onClick={() => void navigator.clipboard.writeText(sc.revealed_key!)}
-                      className="rounded bg-control px-2 py-1 text-xs"
-                    >
-                      copy
-                    </button>
-                  </>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
+  }
 }
