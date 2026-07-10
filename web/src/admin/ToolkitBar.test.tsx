@@ -79,7 +79,7 @@ describe('ToolkitBar', () => {
       { shown: 143, excludedNoData: 212 },
     );
     expect(screen.getByText(/showing 143 of 1081/)).toBeInTheDocument();
-    expect(screen.getByText(/212 without steam data hidden/)).toBeInTheDocument();
+    expect(screen.getByText(/212 missing tag or rating data hidden/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'clear filters' }));
     expect(onChange).toHaveBeenCalledWith({
       ...IDLE_TOOLKIT,

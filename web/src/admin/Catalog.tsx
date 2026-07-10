@@ -196,6 +196,17 @@ export function Catalog() {
   const tagOptions = useMemo(() => collectTagOptions(games), [games]);
   const visible = useMemo(() => applyToolkit(games, toolkit), [games, toolkit]);
 
+  // Grouping duplicates a multi-publisher/studio game into every group it
+  // belongs to (honest duplication) — but per-game stateful panels (revealed
+  // self-claim key, claim results, toggle errors) must render ONCE, at the
+  // game's first appearance, not once per copy.
+  const firstGroupFor = useMemo(() => {
+    const m = new Map<string, string | null>();
+    for (const group of visible.groups)
+      for (const game of group.games) if (!m.has(game.id)) m.set(game.id, group.label);
+    return m;
+  }, [visible]);
+
   const summary = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const g of games) {
@@ -250,7 +261,7 @@ export function Catalog() {
 
       <div className="space-y-4">
         {visible.groups.map((group) => {
-          const rows = group.games.map((game) => renderRow(game));
+          const rows = group.games.map((game) => renderRow(game, group.label));
           if (group.label === null) {
             return (
               <div key="__all" className="space-y-1">
@@ -328,12 +339,15 @@ export function Catalog() {
 
   // Row renderer — the pre-toolkit map body, unchanged except the steam
   // readout under the bundle line. Hoisted so grouped and ungrouped views
-  // render identical rows.
-  function renderRow(game: AdminGame) {
-          const rowErr = rowErrors[game.id];
+  // render identical rows. `groupLabel` identifies which appearance this is;
+  // stateful panels render only when it is the game's first appearance.
+  function renderRow(game: AdminGame, groupLabel: string | null) {
+          const isPrimaryAppearance = firstGroupFor.get(game.id) === groupLabel;
+          const rowErr = isPrimaryAppearance ? rowErrors[game.id] : undefined;
           const isArmed = armedId === game.id;
           const isClaiming = claiming === game.id;
-          const rowResult = result?.gameId === game.id ? result.r : null;
+          const rowResult =
+            isPrimaryAppearance && result?.gameId === game.id ? result.r : null;
           // TS narrowing caveat: alias r before branching
           const r = rowResult;
           return (

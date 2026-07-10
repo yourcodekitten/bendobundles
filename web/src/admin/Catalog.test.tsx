@@ -615,7 +615,7 @@ describe('Catalog toolkit wiring', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Action (1)' }));
     await waitFor(() => expect(screen.queryByText('Indie Gem')).not.toBeInTheDocument());
     expect(screen.queryByText('Zork Prime')).not.toBeInTheDocument();
-    expect(screen.getByText(/1 without steam data hidden/)).toBeInTheDocument();
+    expect(screen.getByText(/1 missing tag or rating data hidden/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'clear filters' }));
     await waitFor(() => expect(screen.getByText('Indie Gem')).toBeInTheDocument());
@@ -633,6 +633,47 @@ describe('Catalog toolkit wiring', () => {
       .filter((el) => el.tagName === 'SUMMARY')
       .map((el) => el.textContent?.trim().replace(/\s+/g, ' '));
     expect(headers).toEqual(['Pub House (2)', 'unmapped (1)']);
+  });
+
+  it('stateful panels render once under grouping: revealed key appears only at first appearance of a multi-publisher game', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([
+      {
+        ...gameFixture,
+        id: 'tk:multi',
+        title: 'Multi Pub Game',
+        status: 'available',
+        key_type: 'steam',
+        steam: {
+          genres: ['Action'],
+          developers: ['DevA'],
+          publishers: ['Big Pub', 'Small Pub'],
+          release_date: null,
+          release_date_iso: null,
+          review_desc: null,
+          review_percent: null,
+          review_count: null,
+          recent_percent: null,
+        },
+      },
+    ]);
+    vi.mocked(adminSelfClaim).mockResolvedValue({
+      kind: 'revealed',
+      key: 'DUPE-CHECK-1',
+      keyType: 'steam',
+    });
+    renderCatalogAt('/admin/catalog?group=publisher');
+    await waitFor(() => screen.getAllByText('Multi Pub Game'));
+
+    // the game row itself IS honestly duplicated across both publisher groups
+    expect(screen.getAllByText('Multi Pub Game')).toHaveLength(2);
+
+    const claims = screen.getAllByRole('button', { name: /claim for me/i });
+    fireEvent.click(claims[0]!);
+    fireEvent.click(screen.getAllByRole('button', { name: /confirm\?/i })[0]!);
+
+    // ...but the revealed key panel renders exactly once (first appearance)
+    await waitFor(() => screen.getByText('DUPE-CHECK-1'));
+    expect(screen.getAllByText('DUPE-CHECK-1')).toHaveLength(1);
   });
 
   it('rows show a compact rating/date readout when steam data exists', async () => {

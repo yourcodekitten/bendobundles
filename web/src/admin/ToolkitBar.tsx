@@ -139,7 +139,10 @@ export function ToolkitBar({
           <>
             <span>
               showing {shown} of {total}
-              {excludedNoData > 0 ? ` · ${excludedNoData} without steam data hidden` : ''}
+              {/* counts games dropped for LACKING the filtered field (unmapped,
+                  no genres, or unrated/low-count review desc) — not "no steam
+                  data": a mapped-but-unrated game lands here too. */}
+              {excludedNoData > 0 ? ` · ${excludedNoData} missing tag or rating data hidden` : ''}
             </span>
             <button
               type="button"
