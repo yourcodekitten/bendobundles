@@ -1938,3 +1938,83 @@ async fn admin_game_detail_superset_fields_and_steam_blob() {
         "machine_name must not leak"
     );
 }
+
+/// Catalog rows carry a compact steam summary when the app cache has one;
+/// unmapped games carry steam: null. review_percent rounds half-up.
+#[tokio::test]
+async fn catalog_joins_steam_summary() {
+    let Some(store) = store_or_skip("catalog-steam").await else {
+        return;
+    };
+    let mut mapped = test_game(1);
+    mapped.steam_app_id = Some(570);
+    let mapped_id = mapped.id.clone();
+    store.put_game(&mapped).await.unwrap();
+    let unmapped = test_game(2);
+    let unmapped_id = unmapped.id.clone();
+    store.put_game(&unmapped).await.unwrap();
+
+    store
+        .put_steam_app(&SteamAppCache {
+            app_id: 570,
+            detail: Some(SteamAppDetail {
+                app_id: 570,
+                name: "Mapped Game".into(),
+                developers: vec!["Dev Studio".into()],
+                publishers: vec!["Pub House".into()],
+                genres: vec!["Action".into(), "Co-op".into()],
+                release_date: Some("12 Nov 2019".into()),
+                short_description: String::new(),
+                header_image: None,
+                video_hls_url: None,
+                video_thumbnail: None,
+                screenshots: vec![],
+            }),
+            overall: Some(ReviewSummary {
+                desc: "Very Positive".into(),
+                total_positive: 2,
+                total_negative: 1,
+                total_reviews: 3,
+            }),
+            recent: Some(RecentReviews {
+                percent_positive: 80,
+                count: 40,
+            }),
+            fetched_at: 1,
+            reviews_fetched_at: 1,
+        })
+        .await
+        .unwrap();
+
+    let password = "steampw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let req = Request::get("/admin/api/catalog")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = body_json(resp).await;
+    let rows = rows.as_array().unwrap();
+
+    let m = rows.iter().find(|r| r["id"] == mapped_id).unwrap();
+    let s = &m["steam"];
+    assert_eq!(s["genres"], serde_json::json!(["Action", "Co-op"]));
+    assert_eq!(s["developers"], serde_json::json!(["Dev Studio"]));
+    assert_eq!(s["publishers"], serde_json::json!(["Pub House"]));
+    assert_eq!(s["release_date"], "12 Nov 2019");
+    assert_eq!(s["release_date_iso"], "2019-11-12");
+    assert_eq!(s["review_desc"], "Very Positive");
+    assert_eq!(s["review_percent"], 67, "2/3 must round to 67");
+    assert_eq!(s["review_count"], 3);
+    assert_eq!(s["recent_percent"], 80);
+
+    let u = rows.iter().find(|r| r["id"] == unmapped_id).unwrap();
+    assert!(u["steam"].is_null(), "unmapped game must carry steam: null");
+}
