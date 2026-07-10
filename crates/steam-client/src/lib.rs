@@ -674,12 +674,10 @@ impl SteamClient {
 pub fn parse_release_date(raw: &str) -> Option<time::Date> {
     use time::macros::format_description;
     let raw = raw.trim();
-    let eu = format_description!(
-        "[day padding:none] [month repr:short case_sensitive:false] [year]"
-    );
-    let us = format_description!(
-        "[month repr:short case_sensitive:false] [day padding:none], [year]"
-    );
+    let eu =
+        format_description!("[day padding:none] [month repr:short case_sensitive:false] [year]");
+    let us =
+        format_description!("[month repr:short case_sensitive:false] [day padding:none], [year]");
     time::Date::parse(raw, eu)
         .or_else(|_| time::Date::parse(raw, us))
         // bare month-year: reuse the EU shape by pinning day 1
