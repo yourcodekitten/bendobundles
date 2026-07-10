@@ -866,3 +866,26 @@ async fn app_details_screenshot_missing_either_tier_is_dropped() {
     );
     assert_eq!(detail.video_thumbnail, None, "empty thumbnail must be None");
 }
+
+/// parse_release_date: Steam's display formats → ISO date. Full dates parse
+/// exact, bare month-year parses to the first of the month, everything else
+/// (TBA / Coming soon / empty / garbage) is None.
+#[test]
+fn parse_release_date_observed_formats() {
+    use steam_client::parse_release_date;
+    let d = |s: &str| parse_release_date(s).map(|d| d.to_string());
+    // full date, EU order (the dominant Steam format)
+    assert_eq!(d("12 Nov 2019"), Some("2019-11-12".into()));
+    assert_eq!(d("1 Jan 2024"), Some("2024-01-01".into()));
+    // full date, US order with comma
+    assert_eq!(d("Nov 12, 2019"), Some("2019-11-12".into()));
+    // month-year → first of month
+    assert_eq!(d("Nov 2019"), Some("2019-11-01".into()));
+    // surrounding whitespace tolerated
+    assert_eq!(d("  12 Nov 2019 "), Some("2019-11-12".into()));
+    // unparseable → None
+    assert_eq!(d("Coming soon"), None);
+    assert_eq!(d("TBA"), None);
+    assert_eq!(d(""), None);
+    assert_eq!(d("Q3 2026"), None);
+}

@@ -667,6 +667,26 @@ impl SteamClient {
 
 // ── OpenID redirect helper ────────────────────────────────────────────────────
 
+/// Parse Steam's `release_date` display string into a date.
+/// Steam ships display strings, not timestamps; the observed closed set:
+/// "12 Nov 2019" (dominant), "Nov 12, 2019", bare "Nov 2019" (→ first of
+/// month), and non-dates ("Coming soon", "TBA", "Q3 2026", "") → None.
+pub fn parse_release_date(raw: &str) -> Option<time::Date> {
+    use time::macros::format_description;
+    let raw = raw.trim();
+    let eu = format_description!(
+        "[day padding:none] [month repr:short case_sensitive:false] [year]"
+    );
+    let us = format_description!(
+        "[month repr:short case_sensitive:false] [day padding:none], [year]"
+    );
+    time::Date::parse(raw, eu)
+        .or_else(|_| time::Date::parse(raw, us))
+        // bare month-year: reuse the EU shape by pinning day 1
+        .or_else(|_| time::Date::parse(&format!("1 {raw}"), eu))
+        .ok()
+}
+
 /// Build the "Sign in through Steam" redirect URL. Pure; both surfaces use it via the return
 /// endpoint. `realm` is the RP domain; `return_to` is the exact callback URL Steam will POST to.
 ///
