@@ -99,6 +99,7 @@ const adminGame: AdminGame = {
   requires_choice: false,
   steam_app_id: 413150,
   owned_by_ben: false,
+  steam: null,
 };
 
 // ── Shared render helpers ─────────────────────────────────────────────────────

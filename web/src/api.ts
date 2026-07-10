@@ -34,6 +34,21 @@ export type ClaimResult =
   | { kind: 'refused'; message: string }
   | { kind: 'error'; message: string };
 
+/** Compact steam projection on catalog rows — the toolkit's filter/sort/group
+ * data. Mirrors admin-api's SteamSummaryView exactly. */
+export type SteamSummary = {
+  genres: string[];
+  developers: string[];
+  publishers: string[];
+  release_date: string | null;
+  /** "YYYY-MM-DD", parsed server-side; null when Steam's string isn't a date. */
+  release_date_iso: string | null;
+  review_desc: string | null;
+  review_percent: number | null;
+  review_count: number | null;
+  recent_percent: number | null;
+};
+
 export type AdminGame = {
   id: string;
   title: string;
@@ -47,6 +62,7 @@ export type AdminGame = {
   requires_choice: boolean;
   steam_app_id: number | null;
   owned_by_ben: boolean;
+  steam: SteamSummary | null;
 };
 
 export type SelfClaimResult =

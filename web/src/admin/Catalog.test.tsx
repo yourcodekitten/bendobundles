@@ -34,6 +34,7 @@ const gameFixture: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  steam: null,
 };
 
 const gameAvailable: AdminGame = {
@@ -49,6 +50,7 @@ const gameAvailable: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  steam: null,
 };
 
 const gamePending: AdminGame = {
@@ -64,6 +66,7 @@ const gamePending: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  steam: null,
 };
 
 const gameGifted: AdminGame = {
@@ -79,6 +82,7 @@ const gameGifted: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  steam: null,
 };
 
 describe('Catalog', () => {
