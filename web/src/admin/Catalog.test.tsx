@@ -34,6 +34,7 @@ const gameFixture: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  steam: null,
 };
 
 const gameAvailable: AdminGame = {
@@ -49,6 +50,7 @@ const gameAvailable: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  steam: null,
 };
 
 const gamePending: AdminGame = {
@@ -64,6 +66,7 @@ const gamePending: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  steam: null,
 };
 
 const gameGifted: AdminGame = {
@@ -79,6 +82,7 @@ const gameGifted: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  steam: null,
 };
 
 describe('Catalog', () => {
@@ -520,5 +524,165 @@ describe('Catalog', () => {
       // Should fall back to plain confirm.
       expect(screen.getByRole('button', { name: /confirm\?/i })).toBeInTheDocument();
     });
+  });
+});
+
+// ── Toolkit wiring (URL state, grouped view, row readout) ─────────────────────
+
+function renderCatalogAt(entry: string) {
+  return render(
+    <MemoryRouter initialEntries={[entry]}>
+      <Routes>
+        <Route path="/admin/catalog" element={<Catalog />} />
+        <Route path="/admin/login" element={<div>login page</div>} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+const steamNull = null;
+const troveGames: AdminGame[] = [
+  {
+    ...gameFixture,
+    id: 'tk:action',
+    title: 'Action Hit',
+    bundle: 'June 2026',
+    steam: {
+      genres: ['Action'],
+      developers: ['DevA'],
+      publishers: ['Pub House'],
+      release_date: '12 Nov 2019',
+      release_date_iso: '2019-11-12',
+      review_desc: 'Very Positive',
+      review_percent: 94,
+      review_count: 1200,
+      recent_percent: 91,
+    },
+  },
+  {
+    ...gameFixture,
+    id: 'tk:indie',
+    title: 'Indie Gem',
+    bundle: 'June 2026',
+    steam: {
+      genres: ['Indie'],
+      developers: ['DevB'],
+      publishers: ['Pub House'],
+      release_date: 'Mar 2021',
+      release_date_iso: '2021-03-01',
+      review_desc: 'Mixed',
+      review_percent: 55,
+      review_count: 300,
+      recent_percent: 50,
+    },
+  },
+  {
+    ...gameFixture,
+    id: 'tk:zork',
+    title: 'Zork Prime',
+    bundle: 'March 2025',
+    steam: steamNull,
+  },
+];
+
+describe('Catalog toolkit wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(adminSelfClaims).mockResolvedValue([]);
+    vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+    vi.mocked(adminCatalog).mockResolvedValue(troveGames);
+  });
+
+  it('restores toolkit state from URL params and filters accordingly', async () => {
+    renderCatalogAt(
+      '/admin/catalog?tags=Action&rating=very-positive&sort=date-new&group=publisher&q=action',
+    );
+    await waitFor(() => screen.getByText('Action Hit'));
+
+    expect((screen.getByLabelText('search games') as HTMLInputElement).value).toBe('action');
+    expect((screen.getByLabelText('rating') as HTMLSelectElement).value).toBe('very-positive');
+    expect((screen.getByLabelText('sort') as HTMLSelectElement).value).toBe('date-new');
+    expect((screen.getByLabelText('group') as HTMLSelectElement).value).toBe('publisher');
+    expect(screen.queryByText('Indie Gem')).not.toBeInTheDocument();
+    expect(screen.queryByText('Zork Prime')).not.toBeInTheDocument();
+  });
+
+  it('toggling a tag chip filters without reload; clear filters restores the trove', async () => {
+    renderCatalogAt('/admin/catalog');
+    await waitFor(() => screen.getByText('Action Hit'));
+
+    fireEvent.click(screen.getByText('tags'));
+    fireEvent.click(screen.getByRole('button', { name: 'Action (1)' }));
+    await waitFor(() => expect(screen.queryByText('Indie Gem')).not.toBeInTheDocument());
+    expect(screen.queryByText('Zork Prime')).not.toBeInTheDocument();
+    expect(screen.getByText(/1 missing tag or rating data hidden/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'clear filters' }));
+    await waitFor(() => expect(screen.getByText('Indie Gem')).toBeInTheDocument());
+    expect(screen.getByText('Zork Prime')).toBeInTheDocument();
+  });
+
+  it('group=publisher renders collapsible sections with counts, unmapped last', async () => {
+    renderCatalogAt('/admin/catalog?group=publisher');
+    await waitFor(() => screen.getByText('Action Hit'));
+
+    // Group headers are <summary> elements — tag chips also end in "(n)",
+    // so scope the query by tag name before asserting order.
+    const headers = screen
+      .getAllByText(/\(\d+\)$/)
+      .filter((el) => el.tagName === 'SUMMARY')
+      .map((el) => el.textContent?.trim().replace(/\s+/g, ' '));
+    expect(headers).toEqual(['Pub House (2)', 'unmapped (1)']);
+  });
+
+  it('stateful panels render once under grouping: revealed key appears only at first appearance of a multi-publisher game', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([
+      {
+        ...gameFixture,
+        id: 'tk:multi',
+        title: 'Multi Pub Game',
+        status: 'available',
+        key_type: 'steam',
+        steam: {
+          genres: ['Action'],
+          developers: ['DevA'],
+          publishers: ['Big Pub', 'Small Pub'],
+          release_date: null,
+          release_date_iso: null,
+          review_desc: null,
+          review_percent: null,
+          review_count: null,
+          recent_percent: null,
+        },
+      },
+    ]);
+    vi.mocked(adminSelfClaim).mockResolvedValue({
+      kind: 'revealed',
+      key: 'DUPE-CHECK-1',
+      keyType: 'steam',
+    });
+    renderCatalogAt('/admin/catalog?group=publisher');
+    await waitFor(() => screen.getAllByText('Multi Pub Game'));
+
+    // the game row itself IS honestly duplicated across both publisher groups
+    expect(screen.getAllByText('Multi Pub Game')).toHaveLength(2);
+
+    const claims = screen.getAllByRole('button', { name: /claim for me/i });
+    fireEvent.click(claims[0]!);
+    fireEvent.click(screen.getAllByRole('button', { name: /confirm\?/i })[0]!);
+
+    // ...but the revealed key panel renders exactly once (first appearance)
+    await waitFor(() => screen.getByText('DUPE-CHECK-1'));
+    expect(screen.getAllByText('DUPE-CHECK-1')).toHaveLength(1);
+  });
+
+  it('rows show a compact rating/date readout when steam data exists', async () => {
+    renderCatalogAt('/admin/catalog');
+    await waitFor(() => screen.getByText('Action Hit'));
+
+    expect(screen.getByText('Very Positive · 94% · 2019')).toBeInTheDocument();
+    expect(screen.getByText('Mixed · 55% · 2021')).toBeInTheDocument();
+    // steam-null row: no readout — its row renders only title + bundle
+    expect(screen.queryByText(/null/)).not.toBeInTheDocument();
   });
 });

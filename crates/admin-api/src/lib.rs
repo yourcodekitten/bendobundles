@@ -263,14 +263,79 @@ struct CatalogGameView {
     requires_choice: bool,
     steam_app_id: Option<u32>,
     owned_by_ben: bool,
+    steam: Option<SteamSummaryView>,
+}
+
+/// Compact steam projection for catalog rows — the toolkit's filter/sort/group
+/// data. Deliberately excludes screenshots/video/description (the fat stays on
+/// the detail endpoint). `None` fields are individually absent-but-honest.
+#[derive(serde::Serialize)]
+struct SteamSummaryView {
+    genres: Vec<String>,
+    developers: Vec<String>,
+    publishers: Vec<String>,
+    release_date: Option<String>,
+    /// "YYYY-MM-DD" parsed server-side (time::Date Display is ISO-8601).
+    release_date_iso: Option<String>,
+    review_desc: Option<String>,
+    /// round(100 * positive / total); None when 0 reviews.
+    review_percent: Option<u8>,
+    review_count: Option<u64>,
+    recent_percent: Option<u8>,
+}
+
+/// Project a cache entry to the summary. Returns None for entries with
+/// nothing to show (negative-cache stub with no reviews either) so the row
+/// serializes `steam: null` rather than an all-null husk.
+fn steam_summary(cache: &dynamo::SteamAppCache) -> Option<SteamSummaryView> {
+    if cache.detail.is_none() && cache.overall.is_none() && cache.recent.is_none() {
+        return None;
+    }
+    let d = cache.detail.as_ref();
+    let release_date = d.and_then(|d| d.release_date.clone());
+    let release_date_iso = release_date
+        .as_deref()
+        .and_then(steam_client::parse_release_date)
+        .map(|d| d.to_string());
+    let o = cache.overall.as_ref();
+    let review_percent = o
+        .filter(|o| o.total_reviews > 0)
+        .map(|o| ((o.total_positive * 100 + o.total_reviews / 2) / o.total_reviews) as u8);
+    Some(SteamSummaryView {
+        genres: d.map(|d| d.genres.clone()).unwrap_or_default(),
+        developers: d.map(|d| d.developers.clone()).unwrap_or_default(),
+        publishers: d.map(|d| d.publishers.clone()).unwrap_or_default(),
+        release_date,
+        release_date_iso,
+        review_desc: o.map(|o| o.desc.clone()),
+        review_percent,
+        review_count: o.map(|o| o.total_reviews),
+        recent_percent: cache.recent.as_ref().map(|r| r.percent_positive),
+    })
 }
 
 async fn handle_catalog(State(s): State<AppState>) -> Response {
     match s.store.list_all_games().await {
         Ok(games) => {
+            // One BatchGetItem over the distinct appids (same idiom as the
+            // link view in public-api). Best-effort: a failed batch degrades
+            // every row to steam: null — the toolkit shows "unmapped" buckets,
+            // never an error.
+            let mut app_ids: Vec<u32> = games.iter().filter_map(|g| g.steam_app_id).collect();
+            app_ids.sort_unstable();
+            app_ids.dedup();
+            let caches = s
+                .store
+                .batch_get_steam_apps(&app_ids)
+                .await
+                .unwrap_or_default();
             let views: Vec<CatalogGameView> = games
                 .into_iter()
                 .map(|g| CatalogGameView {
+                    steam: g
+                        .steam_app_id
+                        .and_then(|id| caches.get(&id))
+                        .and_then(steam_summary),
                     id: g.id,
                     title: g.title,
                     bundle: g.bundle,
@@ -375,21 +440,24 @@ async fn handle_game_detail(State(s): State<AppState>, Path(id): Path<String>) -
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    // Steam cache — cache-only; degrade gracefully on any read error.
-    let steam = match game.steam_app_id {
+    // Steam cache — cache-only; degrade gracefully on any read error. Read
+    // once, then serve both shapes: the full blob (this endpoint's `steam`)
+    // and the compact summary the catalog rows carry (`game.steam`).
+    let cache = match game.steam_app_id {
+        None => None,
+        Some(app_id) => s.store.get_steam_app(app_id).await.ok().flatten(),
+    };
+    let steam = match &cache {
+        Some(cache) => serde_json::json!({
+            "detail": cache.detail,
+            "overall": cache.overall,
+            "recent": cache.recent,
+        }),
         None => serde_json::Value::Null,
-        Some(app_id) => match s.store.get_steam_app(app_id).await {
-            Ok(Some(cache)) => serde_json::json!({
-                "detail": cache.detail,
-                "overall": cache.overall,
-                "recent": cache.recent,
-            }),
-            Ok(None) => serde_json::Value::Null,
-            Err(_) => serde_json::Value::Null,
-        },
     };
 
     let game_view = CatalogGameView {
+        steam: cache.as_ref().and_then(steam_summary),
         id: game.id,
         title: game.title,
         bundle: game.bundle,
