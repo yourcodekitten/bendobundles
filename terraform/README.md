@@ -74,6 +74,12 @@ needs — no part of this waits on Ben.**
    `terraform/production.tfvars` or a scratchpad path). Every value is already on the box:
    - `aws_account_id = "672812236571"` (constant) · `domain_zone_id = "Z05311872JYVFOPFTIVOS"`
      (re-derivable: `AWS_PROFILE=kitten-deploy aws route53 list-hosted-zones`)
+   - `lambda_permissions_boundary_arn = "arn:aws:iam::672812236571:policy/brd-prod-ue1-bendobundles-iam-kitten-app-boundary"`
+     — **MANDATORY in production, every apply.** The variable defaults to `null` and the deploy role
+     is denied `iam:GetPolicy` on the boundary, so terraform can't discover it: omit it and the plan
+     shows `permissions_boundary -> null` **updates on all three lambda roles** — a silent boundary
+     strip. Any plan containing that line means the tfvars is missing this value: discard the plan,
+     add the var, re-plan. (Nearly shipped 2026-07-10.)
    - `humble_username` / `discord_webhook_url` from **`~/.secrets/bendobundles-deploy.env`** (600, outside
      git — the saved deploy secrets; see `code-kitten` `state/decisions.md` 2026-07-06 pointer)
 3. **`admin_password_hash` — pull the LIVE value and pass it back verbatim (a no-op). NEVER re-hash the
@@ -97,7 +103,7 @@ cd terraform
 AWS_PROFILE=kitten-deploy terraform init -backend-config=backend.hcl -input=false
 AWS_PROFILE=kitten-deploy terraform plan -var-file=production.tfvars -out=tf.plan
 # READ every "will be created/updated/destroyed" line — the count is exact (e.g. 2 crates changed = 2
-# updates; a 3rd line, or ANY admin_hash change, is a STOP). Then:
+# updates; a 3rd line, ANY admin_hash change, or ANY `permissions_boundary` change is a STOP). Then:
 AWS_PROFILE=kitten-deploy terraform apply tf.plan
 ./deploy-web.sh     # publish the SPA too (AWS_PROFILE=kitten-deploy) if web/ changed
 ```
@@ -263,6 +269,11 @@ Required variables — everything else has a default:
 ```hcl
 aws_account_id = "123456789012"    # your AWS account ID
 domain_zone_id = "Z1ABCDEF123456"  # Route53 hosted zone ID for bendobundles.com
+
+# Required in THIS production setup (defaults to null = unbounded roles). Omitting it
+# plans a `permissions_boundary -> null` strip on all three lambda execution roles —
+# see the full-deploy recipe above.
+lambda_permissions_boundary_arn = "arn:aws:iam::123456789012:policy/your-app-boundary"
 ```
 
 Keep `admin_password_hash` and `discord_webhook_url` out of the tfvars file. Pass them via
