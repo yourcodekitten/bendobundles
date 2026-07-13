@@ -49,6 +49,7 @@ export function Links() {
   const [formLabel, setFormLabel] = useState('');
   const [claimsAllowed, setClaimsAllowed] = useState(1);
   const [expiresDays, setExpiresDays] = useState('');
+  const [giftNote, setGiftNote] = useState('');
   const [creating, setCreating] = useState(false);
   // Stored after successful create — separate from page state so reload doesn't clear it
   const [createdInfo, setCreatedInfo] = useState<{ fullUrl: string; label: string } | null>(null);
@@ -85,13 +86,17 @@ export function Links() {
     setCreating(true);
     setCreateError(null);
     const expires = expiresDays !== '' ? parseInt(expiresDays, 10) : undefined;
-    withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires), navigate)
+    // Blank/whitespace note → omit the field; the server also normalizes, this
+    // just keeps the wire clean.
+    const note = giftNote.trim() !== '' ? giftNote.trim() : undefined;
+    withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires, note), navigate)
       .then((result) => {
         setCreatedInfo({ fullUrl: inviteUrl(result.token), label: trimmedLabel });
         setCreateError(null);
         setFormLabel('');
         setClaimsAllowed(1);
         setExpiresDays('');
+        setGiftNote('');
         // Reload to prepend the new link into the list
         load();
       })
@@ -241,6 +246,21 @@ export function Links() {
             />
           </label>
         </div>
+        <label className="flex flex-col gap-1 text-xs text-dust">
+          note to your friend (optional — greets them on their page)
+          <textarea
+            aria-label="note to your friend"
+            value={giftNote}
+            onChange={(e) => setGiftNote(e.target.value)}
+            maxLength={500}
+            rows={2}
+            placeholder="picked these with you in mind…"
+            className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
+          />
+          {giftNote.length > 400 && (
+            <span className="text-right text-dust">{giftNote.length}/500</span>
+          )}
+        </label>
         <button
           type="submit"
           disabled={creating}

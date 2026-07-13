@@ -120,6 +120,10 @@ struct ClaimView {
 #[derive(Serialize)]
 struct LinkView {
     label: String,
+    /// Ben's personal note to the friend; rendered in the page-load dialog.
+    /// Omitted from the JSON entirely when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gift_note: Option<String>,
     claims_allowed: u32,
     claims_used: u32,
     /// Explicit link state: "active" | "revoked" | "expired" | "exhausted".
@@ -536,6 +540,7 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
         StatusCode::OK,
         Json(LinkView {
             label: link.label,
+            gift_note: link.gift_note,
             claims_allowed: link.claims_allowed,
             claims_used: link.claims_used,
             state,

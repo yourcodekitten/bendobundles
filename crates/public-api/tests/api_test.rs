@@ -76,6 +76,7 @@ fn test_link(token: &str) -> Link {
     Link {
         token: token.into(),
         label: "Test Friend".into(),
+        gift_note: None,
         claims_allowed: 1,
         claims_used: 0,
         revoked: false,
@@ -211,6 +212,46 @@ async fn revoked_link_active_false_games_empty() {
     assert_eq!(j["state"], "revoked");
     assert_eq!(j["games"], serde_json::json!([]));
     assert!(j["claims"].as_array().is_some());
+}
+
+/// gift_note passes through to the friend view when set, and is OMITTED from the
+/// JSON (not null) when unset — the client gates the note dialog on field presence.
+#[tokio::test]
+async fn link_view_carries_gift_note_and_omits_when_unset() {
+    let Some(store) = store_or_skip("gift-note-link").await else {
+        return;
+    };
+    let mut noted = test_link("note-tok");
+    noted.gift_note = Some("picked these with you in mind ♡".into());
+    store.create_link(&noted).await.unwrap();
+    store.create_link(&test_link("plain-tok")).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    let req = Request::get("/api/l/note-tok").body(Body::empty()).unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["gift_note"], "picked these with you in mind ♡");
+
+    let req = Request::get("/api/l/plain-tok")
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert!(
+        j.get("gift_note").is_none(),
+        "unset gift_note must be omitted, got: {j}"
+    );
 }
 
 /// Exhausted link → 200, state:"exhausted", games STILL visible

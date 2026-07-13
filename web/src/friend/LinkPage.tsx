@@ -51,7 +51,10 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   const DIALOG_BODY =
     "games from ben's humble stash, picked for you \u2661 open one for details, claim it, and the key is yours.";
   const typedLabel = view.kind === "loaded" ? view.data.label : "";
-  const typeTotal = typedLabel.length + DIALOG_BODY.length;
+  // ben's personal note types as a third beat after the standard body —
+  // absent on most links, so everything is length-0-safe
+  const giftNote = view.kind === "loaded" ? (view.data.gift_note ?? "") : "";
+  const typeTotal = typedLabel.length + DIALOG_BODY.length + giftNote.length;
   const [typeChars, setTypeChars] = useState(0);
   const [typeKey, setTypeKey] = useState(0);
   useEffect(() => {
@@ -314,12 +317,41 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
             </h2>
             <p className="mt-1.5 min-h-10 max-w-[60ch] text-sm text-ink-soft">
               {DIALOG_BODY.slice(0, Math.max(0, typeChars - typedLabel.length))}
-              {typeChars >= typedLabel.length && !typeDone && (
-                <span aria-hidden="true" className="tw-cursor">
-                  &#9646;
-                </span>
-              )}
+              {typeChars >= typedLabel.length &&
+                typeChars < typedLabel.length + DIALOG_BODY.length && (
+                  <span aria-hidden="true" className="tw-cursor">
+                    &#9646;
+                  </span>
+                )}
             </p>
+            {/* ben's note — the personal beat. The container renders whenever a
+                note exists (empty while the earlier beats type) so the box
+                never grows mid-monologue. */}
+            {giftNote !== "" &&
+              (() => {
+                const noteChars = Math.max(
+                  0,
+                  typeChars - typedLabel.length - DIALOG_BODY.length,
+                );
+                return (
+                  <p className="mt-1.5 min-h-5 max-w-[60ch] text-sm italic text-give-soft">
+                    {noteChars > 0 && <>&ldquo;{giftNote.slice(0, noteChars)}</>}
+                    {noteChars > 0 && !typeDone && (
+                      <span aria-hidden="true" className="tw-cursor">
+                        &#9646;
+                      </span>
+                    )}
+                    {typeDone && (
+                      <>
+                        &rdquo;{" "}
+                        <span className="font-pixel not-italic text-xs text-dust">
+                          &mdash; ben
+                        </span>
+                      </>
+                    )}
+                  </p>
+                );
+              })()}
             {steamIdentity !== null ? (
               <div
                 className={`mt-2 flex items-center gap-2 transition-opacity duration-300 ${typeDone ? "opacity-100" : "pointer-events-none opacity-0"}`}

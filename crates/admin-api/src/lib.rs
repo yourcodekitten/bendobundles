@@ -491,12 +491,14 @@ async fn handle_game_detail(State(s): State<AppState>, Path(id): Path<String>) -
 const EXPIRES_DAYS_MAX: u32 = 3650; // ~10 years — nobody needs a longer-lived gift link
 const CLAIMS_ALLOWED_MAX: u32 = 100;
 const LABEL_MAX_CHARS: usize = 200;
+const GIFT_NOTE_MAX_CHARS: usize = 500; // fits the friend page's dialog box without scrolling
 
 #[derive(Deserialize)]
 struct CreateLinkBody {
     label: String,
     claims_allowed: u32,
     expires_days: Option<u32>,
+    gift_note: Option<String>,
 }
 
 impl CreateLinkBody {
@@ -521,7 +523,26 @@ impl CreateLinkBody {
                 "label must be at most {LABEL_MAX_CHARS} characters"
             ));
         }
+        if self
+            .gift_note
+            .as_deref()
+            .is_some_and(|n| n.trim().chars().count() > GIFT_NOTE_MAX_CHARS)
+        {
+            return Err(format!(
+                "gift_note must be at most {GIFT_NOTE_MAX_CHARS} characters"
+            ));
+        }
         Ok(())
+    }
+
+    /// Trimmed note, with empty/whitespace-only collapsed to `None` so the
+    /// friend page can gate rendering on plain field presence.
+    fn normalized_gift_note(&self) -> Option<String> {
+        self.gift_note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(String::from)
     }
 }
 
@@ -551,6 +572,7 @@ async fn handle_create_link(
 
     let link = domain::Link {
         token: token.clone(),
+        gift_note: body.normalized_gift_note(),
         label: body.label,
         claims_allowed: body.claims_allowed,
         claims_used: 0,

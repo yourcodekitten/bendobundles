@@ -200,6 +200,7 @@ fn test_link(token: &str) -> Link {
     Link {
         token: token.into(),
         label: "Admin Test Link".into(),
+        gift_note: None,
         claims_allowed: 3,
         claims_used: 0,
         revoked: false,
@@ -495,6 +496,104 @@ async fn create_link_overlong_label_returns_422() {
     assert!(
         j["error"].as_str().unwrap().contains("label"),
         "error must name the bad field, got: {j}"
+    );
+}
+
+/// POST /admin/api/links with an over-long gift_note → 422. The bound is checked on the
+/// TRIMMED text, so 500 chars of payload wrapped in whitespace still passes.
+#[tokio::test]
+async fn create_link_overlong_gift_note_returns_422() {
+    let Some(store) = store_or_skip("link-422-note").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Chatty", "claims_allowed": 1, "gift_note": "x".repeat(501)}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"].as_str().unwrap().contains("gift_note"),
+        "error must name the bad field, got: {j}"
+    );
+
+    // Exactly 500 (padded with whitespace that trimming discards) is legal.
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Chatty", "claims_allowed": 1,
+            "gift_note": format!("  {}  ", "x".repeat(500))}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// gift_note round-trips trimmed; empty/whitespace-only collapses to ABSENT (not ""), so
+/// clients can gate rendering on field presence.
+#[tokio::test]
+async fn create_link_gift_note_roundtrips_trimmed_and_blank_collapses_to_absent() {
+    let Some(store) = store_or_skip("link-note-roundtrip").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Dave", "claims_allowed": 1,
+            "gift_note": "  enjoy the trove, dave!  "}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let noted_token = body_json(resp).await["token"].as_str().unwrap().to_string();
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Quiet", "claims_allowed": 1, "gift_note": "   "}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let blank_token = body_json(resp).await["token"].as_str().unwrap().to_string();
+
+    let list_req = Request::get("/admin/api/links")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
+        .oneshot(list_req)
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let links = body_json(list_resp).await;
+    let arr = links.as_array().unwrap();
+
+    let noted = arr.iter().find(|l| l["token"] == noted_token).unwrap();
+    assert_eq!(noted["gift_note"], "enjoy the trove, dave!");
+
+    let blank = arr.iter().find(|l| l["token"] == blank_token).unwrap();
+    assert!(
+        blank.get("gift_note").is_none(),
+        "whitespace-only note must be stored as None and omitted from JSON, got: {blank}"
     );
 }
 

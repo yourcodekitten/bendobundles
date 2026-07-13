@@ -64,6 +64,29 @@ describe("LinkPage", () => {
     vi.mocked(beginConnect).mockImplementation(() => {});
   });
 
+  it("renders ben's gift note with attribution when present", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({
+      ...baseLink,
+      gift_note: "picked these with you in mind",
+    });
+    renderLinkPage();
+    await waitFor(() => {
+      expect(
+        screen.getByText(/picked these with you in mind/),
+      ).toBeInTheDocument();
+    });
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
+
+  it("renders no note paragraph or attribution when gift_note is absent", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink });
+    renderLinkPage();
+    await waitFor(() => {
+      expect(screen.getByText("Test Bundle")).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
+  });
+
   it("shows loading state initially", () => {
     // never resolves
     vi.mocked(fetchLink).mockImplementation(() => new Promise(() => {}));

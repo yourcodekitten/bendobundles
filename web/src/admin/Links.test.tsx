@@ -148,7 +148,7 @@ describe('Links', () => {
       // Wait for both: api called AND full URL in DOM (after reload settles)
       const expectedUrl = `${window.location.origin}/l/tok-new`;
       await waitFor(() => {
-        expect(adminCreateLink).toHaveBeenCalledWith('Charlie', 1, undefined);
+        expect(adminCreateLink).toHaveBeenCalledWith('Charlie', 1, undefined, undefined);
         expect(screen.getByText(expectedUrl)).toBeInTheDocument();
       });
 
@@ -156,6 +156,34 @@ describe('Links', () => {
       expect(
         screen.getByRole('button', { name: 'copy invite for Charlie' }),
       ).toBeInTheDocument();
+    });
+
+    it('passes a trimmed gift note through and clears the field on success', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockResolvedValue({
+        token: 'tok-noted',
+        url_path: '/l/tok-noted',
+      });
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      const noteBox = screen.getByRole('textbox', { name: 'note to your friend' });
+      await user.type(noteBox, '  enjoy the trove!  ');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+      await waitFor(() => {
+        expect(adminCreateLink).toHaveBeenCalledWith(
+          'Charlie',
+          1,
+          undefined,
+          'enjoy the trove!',
+        );
+      });
+      // Field resets with the rest of the form
+      expect(noteBox).toHaveValue('');
     });
 
     it('create copy button writes the full URL to navigator.clipboard', async () => {

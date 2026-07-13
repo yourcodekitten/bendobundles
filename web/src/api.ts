@@ -21,6 +21,8 @@ export type LinkState = 'active' | 'revoked' | 'expired' | 'exhausted';
 
 export type LinkView = {
   label: string;
+  /** Ben's personal note to the friend; absent when he didn't leave one. */
+  gift_note?: string;
   claims_allowed: number;
   claims_used: number;
   state: LinkState;
@@ -268,6 +270,7 @@ export async function adminCreateLink(
   label: string,
   claims: number,
   expiresDays?: number,
+  giftNote?: string,
 ): Promise<{ token: string; url_path: string }> {
   const response = await fetch('/admin/api/links', {
     method: 'POST',
@@ -276,6 +279,7 @@ export async function adminCreateLink(
       label,
       claims_allowed: claims,
       expires_days: expiresDays,
+      gift_note: giftNote,
     }),
   });
 

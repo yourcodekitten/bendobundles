@@ -95,6 +95,12 @@ pub struct Game {
 pub struct Link {
     pub token: String,
     pub label: String,
+    /// Ben's personal note to the friend, shown on their link page. Cosmetic
+    /// (never consulted by claim enforcement), so it lives only in the item
+    /// body — no top-level attribute, no enforcer override. `#[serde(default)]`:
+    /// records written before this field existed deserialize to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gift_note: Option<String>,
     pub claims_allowed: u32,
     pub claims_used: u32,
     pub revoked: bool,
@@ -311,6 +317,7 @@ mod tests {
         Link {
             token: "tok".into(),
             label: "dave".into(),
+            gift_note: None,
             claims_allowed: 2,
             claims_used: 0,
             revoked: false,
