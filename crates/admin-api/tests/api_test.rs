@@ -2296,7 +2296,10 @@ async fn catalog_carries_tags_descriptors_and_hidden_source() {
         f["steam"]["content_descriptor_ids"],
         serde_json::json!([1, 3, 5, 4])
     );
-    assert_eq!(f["hidden_source"], "sync", "sync provenance serializes snake_case");
+    assert_eq!(
+        f["hidden_source"], "sync",
+        "sync provenance serializes snake_case"
+    );
 
     let p = rows.iter().find(|r| r["id"] == plain_id).unwrap();
     assert!(

@@ -312,7 +312,9 @@ fn steam_summary(cache: &dynamo::SteamAppCache) -> Option<SteamSummaryView> {
     Some(SteamSummaryView {
         genres: d.map(|d| d.genres.clone()).unwrap_or_default(),
         tags: d.map(|d| d.tags.clone()).unwrap_or_default(),
-        content_descriptor_ids: d.map(|d| d.content_descriptor_ids.clone()).unwrap_or_default(),
+        content_descriptor_ids: d
+            .map(|d| d.content_descriptor_ids.clone())
+            .unwrap_or_default(),
         developers: d.map(|d| d.developers.clone()).unwrap_or_default(),
         publishers: d.map(|d| d.publishers.clone()).unwrap_or_default(),
         release_date,

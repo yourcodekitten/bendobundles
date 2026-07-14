@@ -972,7 +972,9 @@ async fn tag_list_parses_id_name_map() {
 async fn store_items_parses_tags_in_popularity_order() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/IStoreBrowseService/GetItems/v1/"))
+        .and(wiremock::matchers::path(
+            "/IStoreBrowseService/GetItems/v1/",
+        ))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
             r#"{"response":{"store_items":[
                 {"appid":1294420,"tagids":[19,701,1774],"content_descriptorids":[5]},
@@ -997,7 +999,9 @@ async fn store_items_parses_tags_in_popularity_order() {
 async fn store_items_chunks_batches_of_fifty() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/IStoreBrowseService/GetItems/v1/"))
+        .and(wiremock::matchers::path(
+            "/IStoreBrowseService/GetItems/v1/",
+        ))
         .respond_with(
             wiremock::ResponseTemplate::new(200)
                 .set_body_string(r#"{"response":{"store_items":[]}}"#),
@@ -1015,7 +1019,9 @@ async fn store_items_chunks_batches_of_fifty() {
 async fn store_items_rate_limited_maps_to_error() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/IStoreBrowseService/GetItems/v1/"))
+        .and(wiremock::matchers::path(
+            "/IStoreBrowseService/GetItems/v1/",
+        ))
         .respond_with(wiremock::ResponseTemplate::new(429))
         .mount(&server)
         .await;

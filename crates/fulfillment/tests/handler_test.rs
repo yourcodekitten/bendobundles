@@ -5037,14 +5037,21 @@ async fn enrich_one_way_never_unhides_when_descriptors_clear() {
 
     let steam_mock = MockServer::start().await;
     mount_steam_detail(&steam_mock, 555, appdetails_plain_body("Once Adult")).await;
-    mount_tag_endpoints(&steam_mock, serde_json::json!([{"appid": 555, "tagids": [19]}])).await;
+    mount_tag_endpoints(
+        &steam_mock,
+        serde_json::json!([{"appid": 555, "tagids": [19]}]),
+    )
+    .await;
     let mut d = deps(store, "http://unused", None);
     d.steam = Some(steam_client_at(&steam_mock.uri()));
 
     enrich_steam_apps(&d, far_deadline()).await;
 
     let g = d.store.get_game(&gid).await.unwrap().unwrap();
-    assert!(g.hidden, "descriptors clearing must never unhide (#71 one-way)");
+    assert!(
+        g.hidden,
+        "descriptors clearing must never unhide (#71 one-way)"
+    );
     assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
 }
 
@@ -5087,7 +5094,10 @@ async fn enrich_preserves_old_tags_when_getitems_fails() {
         vec!["Old Tag".to_string()],
         "a failed tag batch must never wipe existing tags"
     );
-    assert_eq!(detail.name, "Fresh Name", "the appdetails refresh itself must land");
+    assert_eq!(
+        detail.name, "Fresh Name",
+        "the appdetails refresh itself must land"
+    );
 }
 
 #[tokio::test]
@@ -5111,7 +5121,11 @@ async fn enrich_stores_empty_tags_when_app_absent_from_nonempty_batch() {
     mount_steam_detail(&steam_mock, 111, appdetails_plain_body("Present Game")).await;
     mount_steam_detail(&steam_mock, 222, appdetails_plain_body("Gated Game")).await;
     // Successful NON-EMPTY batch containing only appid 111 — 222 is the gated/absent case.
-    mount_tag_endpoints(&steam_mock, serde_json::json!([{"appid": 111, "tagids": [19]}])).await;
+    mount_tag_endpoints(
+        &steam_mock,
+        serde_json::json!([{"appid": 111, "tagids": [19]}]),
+    )
+    .await;
     let mut d = deps(store, "http://unused", None);
     d.steam = Some(steam_client_at(&steam_mock.uri()));
 
@@ -5177,10 +5191,17 @@ async fn enrich_sweeps_adult_games_with_fresh_cache_no_fetch() {
     enrich_steam_apps(&d, far_deadline()).await;
 
     let g = d.store.get_game(&gid).await.unwrap().unwrap();
-    assert!(g.hidden, "decide-loop sweep must catch fresh-cache adult games");
+    assert!(
+        g.hidden,
+        "decide-loop sweep must catch fresh-cache adult games"
+    );
     assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
     let reqs = steam_mock.received_requests().await.unwrap();
-    assert_eq!(reqs.len(), 0, "fresh cache must still mean zero storefront calls");
+    assert_eq!(
+        reqs.len(),
+        0,
+        "fresh cache must still mean zero storefront calls"
+    );
 }
 
 #[tokio::test]
@@ -5210,10 +5231,9 @@ async fn backfill_populates_tags_and_auto_hides() {
     .await;
     let steam = steam_client_at(&steam_mock.uri());
 
-    let summary =
-        backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
-            .await
-            .unwrap();
+    let summary = backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
+        .await
+        .unwrap();
 
     assert_eq!(summary.fetched, 1);
     assert_eq!(summary.auto_hidden, 1);
@@ -5247,13 +5267,18 @@ async fn backfill_skip_fresh_items_still_swept_for_adult() {
     let steam_mock = steam_mock_empty().await;
     let steam = steam_client_at(&steam_mock.uri());
 
-    let summary =
-        backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
-            .await
-            .unwrap();
+    let summary = backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
+        .await
+        .unwrap();
 
-    assert_eq!(summary.skipped, 1, "the fresh item must have been skip-fresh'd");
-    assert_eq!(summary.auto_hidden, 1, "…but its adult descriptors must still sweep");
+    assert_eq!(
+        summary.skipped, 1,
+        "the fresh item must have been skip-fresh'd"
+    );
+    assert_eq!(
+        summary.auto_hidden, 1,
+        "…but its adult descriptors must still sweep"
+    );
     let g = store.get_game(&gid).await.unwrap().unwrap();
     assert!(g.hidden);
     assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));

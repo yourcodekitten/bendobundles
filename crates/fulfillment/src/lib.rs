@@ -1870,10 +1870,7 @@ pub const STEAM_TAG_STORE_CAP: usize = 10;
 /// the app from the browse surface → store empty and let genre fallback take over (#71).
 fn tags_for_app(
     app_id: u32,
-    tag_data: Option<&(
-        std::collections::HashMap<u32, steam_client::StoreItemTags>,
-        std::collections::HashMap<u32, String>,
-    )>,
+    tag_data: Option<&TagBatch>,
     prev_detail: Option<&steam_client::SteamAppDetail>,
 ) -> Vec<String> {
     match tag_data {
@@ -1890,6 +1887,12 @@ fn tags_for_app(
     }
 }
 
+/// GetItems results + the tagid→name map, fetched together (both-or-nothing).
+type TagBatch = (
+    std::collections::HashMap<u32, steam_client::StoreItemTags>,
+    std::collections::HashMap<u32, String>,
+);
+
 /// One batched GetItems+GetTagList fetch with the shape-drift plausibility guard.
 /// `None` = failed or implausible → callers preserve existing tags. Both-or-nothing:
 /// resolving tag names with a partial map would silently store a truncated tag list (#71).
@@ -1897,10 +1900,7 @@ async fn fetch_tag_batch(
     steam: &steam_client::SteamClient,
     ids: &[u32],
     ctx: &str,
-) -> Option<(
-    std::collections::HashMap<u32, steam_client::StoreItemTags>,
-    std::collections::HashMap<u32, String>,
-)> {
+) -> Option<TagBatch> {
     match (steam.get_store_items(ids).await, steam.get_tag_list().await) {
         // Plausibility guard (shape-drift): a non-empty request answered with ZERO items
         // is indistinguishable from a Valve field rename parsing as a "successful empty
@@ -2284,12 +2284,7 @@ pub async fn backfill_steam_details(
     // fetched LAZILY on the first item that actually needs a refetch — an all-skipped
     // (fully fresh / resumed) run keeps the "zero storefront calls" contract.
     let all_ids: Vec<u32> = appids.iter().copied().collect();
-    let mut tag_data: Option<
-        Option<(
-            std::collections::HashMap<u32, steam_client::StoreItemTags>,
-            std::collections::HashMap<u32, String>,
-        )>,
-    > = None;
+    let mut tag_data: Option<Option<TagBatch>> = None;
 
     // appid → game ids + the adult sweep set, mirroring enrichment.
     let mut games_by_appid: std::collections::HashMap<u32, Vec<String>> =
