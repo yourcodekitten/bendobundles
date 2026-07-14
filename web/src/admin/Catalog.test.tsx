@@ -34,6 +34,7 @@ const gameFixture: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -50,6 +51,7 @@ const gameAvailable: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -66,6 +68,7 @@ const gamePending: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -82,6 +85,7 @@ const gameGifted: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -486,6 +490,7 @@ describe('Catalog', () => {
           id: 'gx:ownedchoice',
           status: 'available',
           owned_by_ben: true,
+          hidden_source: null,
           requires_choice: true,
           steam_app_id: 730,
         },
@@ -510,6 +515,7 @@ describe('Catalog', () => {
           id: 'gx:ownednull',
           status: 'available',
           owned_by_ben: true,
+          hidden_source: null,
           steam_app_id: 730,
         },
       ]);
@@ -549,6 +555,8 @@ const troveGames: AdminGame[] = [
     bundle: 'June 2026',
     steam: {
       genres: ['Action'],
+      tags: [],
+      content_descriptor_ids: [],
       developers: ['DevA'],
       publishers: ['Pub House'],
       release_date: '12 Nov 2019',
@@ -566,6 +574,8 @@ const troveGames: AdminGame[] = [
     bundle: 'June 2026',
     steam: {
       genres: ['Indie'],
+      tags: [],
+      content_descriptor_ids: [],
       developers: ['DevB'],
       publishers: ['Pub House'],
       release_date: 'Mar 2021',
@@ -645,6 +655,8 @@ describe('Catalog toolkit wiring', () => {
         key_type: 'steam',
         steam: {
           genres: ['Action'],
+          tags: [],
+          content_descriptor_ids: [],
           developers: ['DevA'],
           publishers: ['Big Pub', 'Small Pub'],
           release_date: null,

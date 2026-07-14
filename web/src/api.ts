@@ -8,6 +8,8 @@ export type GameView = {
   steam_app_id: number | null;
   /** First ~5 steam genres from the server's enrichment cache; absent when unknown. */
   genres?: string[];
+  /** Top community tags (popularity order, ≤10); absent when unknown/empty — fall back to genres (#71). */
+  tags?: string[];
 };
 
 export type ClaimView = {
@@ -40,6 +42,10 @@ export type ClaimResult =
  * data. Mirrors admin-api's SteamSummaryView exactly. */
 export type SteamSummary = {
   genres: string[];
+  /** Top community tags (popularity order, ≤10) — the toolkit's chips + tag filter (#71). */
+  tags: string[];
+  /** Raw content descriptor ids — badge/mature-filter policy lives in tags.ts (#71). */
+  content_descriptor_ids: number[];
   developers: string[];
   publishers: string[];
   release_date: string | null;
@@ -64,6 +70,8 @@ export type AdminGame = {
   requires_choice: boolean;
   steam_app_id: number | null;
   owned_by_ben: boolean;
+  /** Who last set hidden — 'sync' rows are auto-hides (#71). */
+  hidden_source: 'admin' | 'sync' | null;
   steam: SteamSummary | null;
 };
 
@@ -521,6 +529,11 @@ export type SteamAppDetail = {
    * omits the key entirely. Read as `detail.screenshots ?? []`.
    */
   screenshots?: Screenshot[];
+  /** Optional like screenshots: an OLD lambda racing this bundle during deploy omits
+   * these keys. Read as `detail.tags ?? []` etc. (#71). */
+  tags?: string[];
+  content_descriptor_ids?: number[];
+  content_notes?: string | null;
 };
 
 export type ReviewSummary = {

@@ -51,6 +51,8 @@ import { withAuth } from "./admin/withAuth";
 const steamDetailFixture = {
   app_id: 413150,
   name: "Stardew Valley",
+  tags: [],
+  content_descriptor_ids: [],
   developers: ["ConcernedApe"],
   publishers: ["ConcernedApe"],
   genres: ["Indie", "RPG", "Simulation"],
@@ -99,6 +101,7 @@ const adminGame: AdminGame = {
   requires_choice: false,
   steam_app_id: 413150,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 

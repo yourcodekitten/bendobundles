@@ -22,11 +22,14 @@ const base: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
 const steamBase: SteamSummary = {
   genres: [],
+  tags: [],
+  content_descriptor_ids: [],
   developers: [],
   publishers: [],
   release_date: null,
