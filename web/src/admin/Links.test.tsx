@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -254,6 +254,28 @@ describe('Links', () => {
       expect(
         screen.queryByRole('textbox', { name: 'note for Alice' }),
       ).not.toBeInTheDocument();
+    });
+
+    it('clamps and counts the note in code points, not UTF-16 units', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([{ ...link1, gift_note: 'hi' }]);
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+
+      // 501 astral emoji = 501 code points (1002 UTF-16 units): the server
+      // bound is 500 code points, so the clamp keeps exactly 500 emoji —
+      // the old maxLength={500} would have cut at 250.
+      const emoji = '\u{1F381}';
+      fireEvent.change(box, { target: { value: emoji.repeat(501) } });
+      const clamped = (box as HTMLTextAreaElement).value;
+      expect(Array.from(clamped).length).toBe(500);
+      // and the counter reports code points, not the UTF-16 length (1000)
+      expect(screen.getByText('500/500')).toBeInTheDocument();
     });
   });
 

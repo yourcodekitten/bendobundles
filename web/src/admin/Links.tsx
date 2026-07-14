@@ -12,6 +12,7 @@ import {
   type AdminClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
+import { clampCodePoints, codePointCount } from '../text';
 import { inviteUrl } from '../inviteUrl';
 
 // Page-level state machine
@@ -49,6 +50,10 @@ function omitKey<T>(map: Record<string, T>, key: string): Record<string, T> {
 
 // Show the note character counter only near the bound — both note textareas
 // (create form + row editor) share this threshold so they can't drift.
+// Counted in CODE POINTS (the server's chars() unit) — maxLength/.length are
+// UTF-16 units and would cap an emoji-heavy note at half the real limit while
+// the counter lied about it (OMBB, #69 review). Input is clamped to the bound
+// via clampCodePoints instead of maxLength.
 const NOTE_COUNTER_AT = GIFT_NOTE_MAX - 100;
 
 function formatDate(iso: string): string {
@@ -305,15 +310,16 @@ export function Links() {
           <textarea
             aria-label="note to your friend"
             value={giftNote}
-            onChange={(e) => setGiftNote(e.target.value)}
-            maxLength={GIFT_NOTE_MAX}
+            onChange={(e) =>
+              setGiftNote(clampCodePoints(e.target.value, GIFT_NOTE_MAX))
+            }
             rows={2}
             placeholder="picked these with you in mind…"
             className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
           />
-          {giftNote.length > NOTE_COUNTER_AT && (
+          {codePointCount(giftNote) > NOTE_COUNTER_AT && (
             <span className="text-right text-dust">
-              {giftNote.length}/{GIFT_NOTE_MAX}
+              {codePointCount(giftNote)}/{GIFT_NOTE_MAX}
             </span>
           )}
         </label>
@@ -478,17 +484,19 @@ export function Links() {
                     onChange={(e) =>
                       setNoteDrafts((prev) => ({
                         ...prev,
-                        [link.token]: e.target.value,
+                        [link.token]: clampCodePoints(
+                          e.target.value,
+                          GIFT_NOTE_MAX,
+                        ),
                       }))
                     }
-                    maxLength={GIFT_NOTE_MAX}
                     rows={2}
                     placeholder="leave blank to remove the note"
                     className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink disabled:opacity-50"
                   />
-                  {noteDraft.length > NOTE_COUNTER_AT && (
+                  {codePointCount(noteDraft) > NOTE_COUNTER_AT && (
                     <span className="text-right text-xs text-dust">
-                      {noteDraft.length}/{GIFT_NOTE_MAX}
+                      {codePointCount(noteDraft)}/{GIFT_NOTE_MAX}
                     </span>
                   )}
                   <div className="flex items-center gap-2">

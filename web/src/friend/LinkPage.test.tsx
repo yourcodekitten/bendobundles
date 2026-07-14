@@ -559,6 +559,27 @@ describe("typewriter (animations on)", () => {
     }
     expect(screen.getByText(/— ben/)).toBeInTheDocument();
   });
+
+  it("types ZWJ emoji families atomically (grapheme clusters, not code points)", async () => {
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧, 5 code points
+    vi.mocked(fetchLink).mockResolvedValue({
+      ...baseLink,
+      gift_note: `for the ${family} and you`,
+    });
+    renderLinkPage();
+    await tick(2900);
+    await tick(1000);
+    // walk the animation; the family must only ever appear WHOLE — a lone
+    // member (or partial ZWJ join) means the slicer cut inside the cluster
+    for (let i = 0; i < 160; i++) {
+      await tick(14);
+      const text = document.body.textContent ?? "";
+      if (text.includes("\u{1F468}")) {
+        expect(text).toContain(family);
+      }
+    }
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
 });
 
 });

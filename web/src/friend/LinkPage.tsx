@@ -22,6 +22,7 @@ import { GameGrid } from "./GameGrid";
 import { GameDetailModal } from "../GameDetailModal";
 import { CursorCompanion } from "./CursorCompanion";
 import { prefersReducedMotion, motionOK } from "../motion";
+import { graphemes } from "../text";
 import { BootScreen } from "./BootScreen";
 
 type ViewState =
@@ -64,20 +65,21 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   // ben's personal note types as a third beat after the standard body —
   // absent on most links, so everything is length-0-safe
   const giftNote = view.kind === "loaded" ? (view.data.gift_note ?? "") : "";
-  // Beats are measured and sliced in CODE POINTS — String.prototype.slice cuts
-  // UTF-16 units, so it splits an emoji's surrogate pair mid-character (a lone
-  // surrogate renders as U+FFFD for a tick), and the gift note is exactly
-  // where emoji show up. Code points also match the server's chars() bound.
-  // Memoized: this component re-renders ~70×/s while typing, and re-deriving
-  // the arrays per tick is pure allocation churn in the hottest path.
-  const labelCps = useMemo(() => Array.from(typedLabel), [typedLabel]);
-  const bodyCps = useMemo(() => Array.from(DIALOG_BODY), [DIALOG_BODY]);
-  const noteCps = useMemo(() => Array.from(giftNote), [giftNote]);
+  // Beats are measured and sliced in GRAPHEME CLUSTERS — .slice on the string
+  // cuts UTF-16 units (splits surrogate pairs into U+FFFD), and code points
+  // still split ZWJ sequences (a family emoji assembles member by member).
+  // Graphemes are the unit the eye sees; the gift note is exactly where emoji
+  // show up. (The server's 500 bound stays code points — that's an input
+  // limit, enforced where input happens.) Memoized: this component re-renders
+  // ~70×/s while typing, and re-deriving per tick is pure allocation churn.
+  const labelGr = useMemo(() => graphemes(typedLabel), [typedLabel]);
+  const bodyGr = useMemo(() => graphemes(DIALOG_BODY), [DIALOG_BODY]);
+  const noteGr = useMemo(() => graphemes(giftNote), [giftNote]);
   // cumulative beat offsets — every slice and cursor handoff below reads from
   // these, so the boundaries live in exactly one place
-  const bodyStart = labelCps.length;
-  const noteStart = bodyStart + bodyCps.length;
-  const typeTotal = noteStart + noteCps.length;
+  const bodyStart = labelGr.length;
+  const noteStart = bodyStart + bodyGr.length;
+  const typeTotal = noteStart + noteGr.length;
   const [typeChars, setTypeChars] = useState(0);
   const [typeKey, setTypeKey] = useState(0);
   // the typeKey whose entrance has fully played, stamped ONLY at the explicit
@@ -395,11 +397,11 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
               &#8635;
             </button>
             <h2 className="min-h-7 text-xl leading-tight text-give-soft">
-              {labelCps.slice(0, typeChars).join("")}
+              {labelGr.slice(0, typeChars).join("")}
               {typeChars < bodyStart && <TwCursor />}
             </h2>
             <p className="mt-1.5 min-h-10 max-w-[60ch] text-sm text-ink-soft">
-              {bodyCps.slice(0, Math.max(0, typeChars - bodyStart)).join("")}
+              {bodyGr.slice(0, Math.max(0, typeChars - bodyStart)).join("")}
               {typeChars >= bodyStart && typeChars < noteStart && <TwCursor />}
             </p>
             {/* ben's note — the personal beat. The container renders whenever a
@@ -410,7 +412,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
             {giftNote !== "" && (
               <p className="mt-1.5 min-h-5 max-w-[60ch] text-sm italic text-give-soft">
                 {typeChars > noteStart && (
-                  <>&ldquo;{noteCps.slice(0, typeChars - noteStart).join("")}</>
+                  <>&ldquo;{noteGr.slice(0, typeChars - noteStart).join("")}</>
                 )}
                 {typeChars >= noteStart && !typeDone && <TwCursor />}
                 {typeDone && (

@@ -249,7 +249,8 @@ fn link_from_item(
     };
     // gift_note is post-creation-editable via `set_link_gift_note`'s scoped write, so the
     // top-level attribute is authoritative and absence means no-note — unconditional
-    // override, same rule as expires_at.
+    // override, same rule as expires_at. (body never carries the note at all — see
+    // `schema::link_body` — so this override is also the ONLY source, not just the winner.)
     link.gift_note = item
         .get("gift_note")
         .and_then(|v| v.as_s().ok())
@@ -433,10 +434,7 @@ impl Store {
             .key("pk", pk)
             .key("sk", sk)
             .update_expression(expr)
-            .expression_attribute_values(
-                ":b",
-                schema::s(serde_json::to_string(l).expect("link serializes")),
-            )
+            .expression_attribute_values(":b", schema::s(schema::link_body(l)))
             .expression_attribute_values(
                 ":ca",
                 aws_sdk_dynamodb::types::AttributeValue::N(l.claims_allowed.to_string()),
@@ -684,7 +682,7 @@ impl Store {
                 "revoked = :f AND claims_used < claims_allowed \
                  AND (attribute_not_exists(expires_at) OR expires_at > :now)",
             )
-            .expression_attribute_values(":b", av_s(&serde_json::to_string(&bumped).expect("link")))
+            .expression_attribute_values(":b", av_s(&schema::link_body(&bumped)))
             .expression_attribute_values(
                 ":one",
                 aws_sdk_dynamodb::types::AttributeValue::N("1".into()),

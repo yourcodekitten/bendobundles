@@ -226,6 +226,104 @@ async fn gift_note_survives_claim_body_rewrite() {
     );
 }
 
+/// The note lives ONLY in the top-level attribute — the `body` blob must never
+/// carry it (schema::link_body strips it at every writer). Otherwise a body
+/// written while a note was set retains the text verbatim at rest after a
+/// "clear", indefinitely on links that see no further body write — a delete
+/// that doesn't delete (OMBB, #69 review). Asserted RAW, against the stored
+/// item, across all three body writers: create, update_link_meta, claim_game.
+#[tokio::test]
+async fn gift_note_never_persisted_in_body_blob() {
+    let Some(store) = store_or_skip("gift-note-purge").await else {
+        return;
+    };
+    let client = raw_client("gift-note-purge").await;
+    let table = "t-gift-note-purge";
+    const SECRET: &str = "between us only ♡";
+
+    let raw_body = |token: &'static str| {
+        let client = client.clone();
+        async move {
+            let out = client
+                .get_item()
+                .table_name(table)
+                .key("pk", AttributeValue::S(format!("LINK#{token}")))
+                .key("sk", AttributeValue::S("META".into()))
+                .send()
+                .await
+                .unwrap();
+            let item = out.item.unwrap();
+            item.get("body").unwrap().as_s().unwrap().to_string()
+        }
+    };
+
+    // create (writer 1): note readable via the attr, absent from body
+    store.put_game(&game(1, true)).await.unwrap();
+    let mut noted = link("tok-purge");
+    noted.gift_note = Some(SECRET.into());
+    store.create_link(&noted).await.unwrap();
+    assert_eq!(
+        store
+            .get_link("tok-purge")
+            .await
+            .unwrap()
+            .unwrap()
+            .gift_note
+            .as_deref(),
+        Some(SECRET)
+    );
+    assert!(
+        !raw_body("tok-purge").await.contains("between us"),
+        "create must not serialize the note into body"
+    );
+
+    // claim_game (writer 2) rewrites body — still noteless
+    store
+        .claim_game(
+            "tok-purge",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-02 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !raw_body("tok-purge").await.contains("between us"),
+        "claim's body rewrite must not serialize the note"
+    );
+
+    // update_link_meta (writer 3, the revoke shape) — still noteless
+    let mut l = store.get_link("tok-purge").await.unwrap().unwrap();
+    l.revoked = true;
+    store.update_link_meta(&l).await.unwrap();
+    assert!(
+        !raw_body("tok-purge").await.contains("between us"),
+        "update_link_meta must not serialize the note"
+    );
+
+    // and after a clear, NOTHING anywhere holds the text
+    assert!(store.set_link_gift_note("tok-purge", None).await.unwrap());
+    let out = client
+        .get_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S("LINK#tok-purge".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = out.item.unwrap();
+    assert!(!item.contains_key("gift_note"), "attr removed on clear");
+    assert!(
+        !item
+            .get("body")
+            .unwrap()
+            .as_s()
+            .unwrap()
+            .contains("between us"),
+        "cleared note must leave no copy at rest"
+    );
+}
+
 #[tokio::test]
 async fn claim_happy_path_then_race_loses() {
     let Some(store) = store_or_skip("claim-race").await else {

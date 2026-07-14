@@ -99,10 +99,11 @@ pub struct Link {
     /// (never consulted by claim enforcement), but editable after creation —
     /// so like the enforcer fields it is authoritative in a top-level dynamo
     /// attribute (written ONLY by `set_link_gift_note`'s scoped update) and
-    /// overridden on read; the body copy is a convenience that may go stale
-    /// under concurrent body writers (claim's `SET body`, revoke).
-    /// `#[serde(default)]`: records written before this field existed
-    /// deserialize to `None`.
+    /// overridden on read. The stored `body` blob NEVER carries it (writers
+    /// serialize via `schema::link_body`, which strips it): the note lives in
+    /// exactly one place, so clearing it leaves no copy at rest (OMBB, #69
+    /// review). `#[serde(default)]`: records written before this field
+    /// existed deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gift_note: Option<String>,
     pub claims_allowed: u32,
