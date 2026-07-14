@@ -1965,6 +1965,9 @@ fn steam_app_cache_full(app_id: u32) -> SteamAppCache {
             video_hls_url: None,
             video_thumbnail: None,
             screenshots: vec![],
+            tags: vec![],
+            content_descriptor_ids: vec![],
+            content_notes: None,
         }),
         overall: Some(steam_client::ReviewSummary {
             desc: "Mostly Positive".into(),

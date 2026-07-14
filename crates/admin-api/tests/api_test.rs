@@ -2059,6 +2059,9 @@ async fn admin_game_detail_superset_fields_and_steam_blob() {
                 video_hls_url: None,
                 video_thumbnail: None,
                 screenshots: vec![],
+                tags: vec![],
+                content_descriptor_ids: vec![],
+                content_notes: None,
             }),
             overall: Some(ReviewSummary {
                 desc: "Very Positive".into(),
@@ -2169,6 +2172,9 @@ async fn catalog_joins_steam_summary() {
                 video_hls_url: None,
                 video_thumbnail: None,
                 screenshots: vec![],
+                tags: vec![],
+                content_descriptor_ids: vec![],
+                content_notes: None,
             }),
             overall: Some(ReviewSummary {
                 desc: "Very Positive".into(),

@@ -47,6 +47,20 @@ pub struct SteamAppDetail {
     /// or the cached blob predates the field (issue #61).
     #[serde(default)]
     pub screenshots: Vec<Screenshot>,
+    /// Top user-defined store tags by popularity (names, capped at 10 by the enrichment
+    /// pass — GetItems order preserved). Always empty from [`get_app_details`]; the
+    /// enrichment pass owns this field. Empty when the app is gated/delisted from the
+    /// browse surface or the blob predates the field; cards fall back to `genres` (#71).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Raw Steam content descriptor ids (1 nudity/sexual · 2 violence/gore · 3 adult-only
+    /// sexual · 4 gratuitous sexual · 5 general mature). Semantics live in the consumers:
+    /// `domain::ADULT_HIDE_DESCRIPTOR_IDS` drives auto-hide, the web's badge set drives 🔞.
+    #[serde(default)]
+    pub content_descriptor_ids: Vec<u32>,
+    /// Steam's free-text descriptor note, verbatim (grammar and all). Admin detail only.
+    #[serde(default)]
+    pub content_notes: Option<String>,
 }
 
 /// One store screenshot: Steam's `path_thumbnail` (600x338) + `path_full` (1920x1080) tiers.
@@ -201,6 +215,17 @@ struct AppDetailDataWire {
     movies: Vec<MovieWire>,
     #[serde(default)]
     screenshots: Vec<ScreenshotWire>,
+    #[serde(default)]
+    content_descriptors: Option<ContentDescriptorsWire>,
+}
+
+/// appdetails' `content_descriptors: {ids, notes}` — dev-selected checkboxes. `required_age`
+/// stays ignored (self-reported; Puss! says 0 — issue #71).
+#[derive(Deserialize)]
+struct ContentDescriptorsWire {
+    #[serde(default)]
+    ids: Vec<u32>,
+    notes: Option<String>,
 }
 
 /// Both tiers or the entry is dropped — a screenshot with only one URL would force the
@@ -483,6 +508,14 @@ impl SteamClient {
             })
             .take(SCREENSHOT_CAP)
             .collect();
+        let (content_descriptor_ids, content_notes) = match data.content_descriptors {
+            Some(cd) => (
+                cd.ids,
+                // "" would render a phantom note line — collapse at the wire like the movie URLs.
+                cd.notes.filter(|s| !s.trim().is_empty()),
+            ),
+            None => (Vec::new(), None),
+        };
         let first_movie = data.movies.into_iter().next();
         Ok(AppDetails::Found(Box::new(SteamAppDetail {
             app_id,
@@ -503,6 +536,9 @@ impl SteamClient {
                 .and_then(|m| m.thumbnail)
                 .filter(|s| !s.is_empty()),
             screenshots,
+            tags: Vec::new(),
+            content_descriptor_ids,
+            content_notes,
         })))
     }
 

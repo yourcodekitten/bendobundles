@@ -640,6 +640,64 @@ async fn app_details_tolerates_mistyped_category_ids() {
 }
 
 #[tokio::test]
+async fn app_details_parses_content_descriptors() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(APPDETAILS_FIXTURE))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert_eq!(detail.content_descriptor_ids, vec![1, 5]);
+    assert_eq!(detail.content_notes, Some("Some nudity.".to_string()));
+    // get_app_details never fills tags — enrichment owns them (GetItems).
+    assert!(detail.tags.is_empty());
+}
+
+#[tokio::test]
+async fn app_details_tolerates_missing_content_descriptors() {
+    // Fixture WITHOUT the key — most apps. Serde default must yield empties, not a parse error.
+    let body = APPDETAILS_FIXTURE.replace(
+        r#""content_descriptors": { "ids": [1, 5], "notes": "Some nudity." },"#,
+        "",
+    );
+    assert_ne!(
+        body, APPDETAILS_FIXTURE,
+        "needle must have matched — fixture line drifted?"
+    );
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert!(detail.content_descriptor_ids.is_empty());
+    assert_eq!(detail.content_notes, None);
+}
+
+#[test]
+fn steam_app_detail_blob_backcompat() {
+    // A cache blob written before this build (no tags/descriptor fields) must deserialize.
+    let old = r#"{"app_id":1,"name":"x","developers":[],"publishers":[],"genres":["RPG"],
+        "release_date":null,"short_description":"","header_image":null,
+        "video_hls_url":null,"video_thumbnail":null}"#;
+    let d: steam_client::SteamAppDetail = serde_json::from_str(old).unwrap();
+    assert!(d.tags.is_empty());
+    assert!(d.content_descriptor_ids.is_empty());
+    assert_eq!(d.content_notes, None);
+}
+
+#[tokio::test]
 async fn app_details_delisted_is_success_false() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
