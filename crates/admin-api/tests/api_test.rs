@@ -597,6 +597,77 @@ async fn create_link_gift_note_roundtrips_trimmed_and_blank_collapses_to_absent(
     );
 }
 
+/// POST /admin/api/links/:token/note — set, clear (blank), 422 over-length, 404 unknown.
+/// Uses the revoke-style read-modify-write; the note must never disturb enforcer fields.
+#[tokio::test]
+async fn set_link_note_after_create_edits_clears_and_validates() {
+    let Some(store) = store_or_skip("link-note-edit").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    store
+        .create_link(&test_link("note-edit-tok"))
+        .await
+        .unwrap();
+
+    let post_note = |body: serde_json::Value, token: &'static str| {
+        let store = Arc::clone(&store);
+        let invoker = Arc::clone(&invoker);
+        let admin_hash = admin_hash.clone();
+        let session = session.clone();
+        async move {
+            let req = Request::post(format!("/admin/api/links/{token}/note"))
+                .header("content-type", "application/json")
+                .header("cookie", format!("session={session}"))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            router(store, invoker, admin_hash, None)
+                .oneshot(req)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Set a note after the fact (trimmed on the way in).
+    let resp = post_note(
+        serde_json::json!({"gift_note": "  wrote this later ♡  "}),
+        "note-edit-tok",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored = store.get_link("note-edit-tok").await.unwrap().unwrap();
+    assert_eq!(stored.gift_note.as_deref(), Some("wrote this later ♡"));
+    // Enforcer fields untouched by the note write.
+    assert_eq!(stored.claims_allowed, 3);
+    assert!(!stored.revoked);
+
+    // Blank clears it.
+    let resp = post_note(serde_json::json!({"gift_note": "   "}), "note-edit-tok").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cleared = store.get_link("note-edit-tok").await.unwrap().unwrap();
+    assert_eq!(cleared.gift_note, None);
+
+    // Over-length → 422 naming the field; note stays cleared.
+    let resp = post_note(
+        serde_json::json!({"gift_note": "x".repeat(501)}),
+        "note-edit-tok",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(j["error"].as_str().unwrap().contains("gift_note"));
+    let still = store.get_link("note-edit-tok").await.unwrap().unwrap();
+    assert_eq!(still.gift_note, None);
+
+    // Unknown token → 404.
+    let resp = post_note(serde_json::json!({"gift_note": "hello?"}), "no-such-tok").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 /// Regression guard: a valid create with expires_days at the max bound (3650) still succeeds —
 /// validation must reject the absurd, never the legitimate.
 #[tokio::test]

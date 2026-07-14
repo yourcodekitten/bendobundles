@@ -5,6 +5,7 @@ import {
   adminCreateLink,
   adminRevoke,
   adminLinkClaims,
+  adminSetLinkNote,
   CreateLinkValidationError,
   type AdminLink,
   type AdminClaimView,
@@ -67,6 +68,14 @@ export function Links() {
   // Audit expansions: token → AuditData (noUncheckedIndexedAccess → AuditData | undefined)
   const [auditMap, setAuditMap] = useState<Record<string, AuditData>>({});
 
+  // Note editing: token → draft text (key presence = editor open). Saving a
+  // blank draft clears the note server-side.
+  const [noteDrafts, setNoteDrafts] = useState<Record<string, string>>({});
+  const [noteSaving, setNoteSaving] = useState<Set<string>>(new Set());
+  // Per-token note-save failure — a silent catch would leave ben unsure what
+  // the friend's page now says (mirrors the revoke-error pattern)
+  const [noteErrors, setNoteErrors] = useState<Record<string, string>>({});
+
   const load = useCallback(() => {
     setState({ phase: 'loading' });
     // withAuth re-throws non-Unauthorized errors → .catch sets error state
@@ -118,6 +127,35 @@ export function Links() {
       })
       .finally(() => {
         setCreating(false);
+      });
+  };
+
+  const handleSaveNote = (link: AdminLink) => {
+    const draft = noteDrafts[link.token];
+    if (draft === undefined) return;
+    setNoteSaving((prev) => new Set(prev).add(link.token));
+    setNoteErrors(({ [link.token]: _, ...rest }) => rest);
+    withAuth(() => adminSetLinkNote(link.token, draft.trim()), navigate)
+      .then(() => {
+        setNoteDrafts(({ [link.token]: _, ...rest }) => rest);
+        // Reload so the row reflects what the friend's page now says
+        load();
+      })
+      .catch((err: unknown) => {
+        setNoteErrors((prev) => ({
+          ...prev,
+          [link.token]:
+            err instanceof CreateLinkValidationError
+              ? err.message
+              : "couldn't save the note — the friend's page is unchanged.",
+        }));
+      })
+      .finally(() => {
+        setNoteSaving((prev) => {
+          const next = new Set(prev);
+          next.delete(link.token);
+          return next;
+        });
       });
   };
 
@@ -307,6 +345,9 @@ export function Links() {
           const auditState = auditMap[link.token];
           const armed = revokeArmed.has(link.token);
           const revokeErr = revokeErrors[link.token];
+          const noteDraft = noteDrafts[link.token];
+          const noteErr = noteErrors[link.token];
+          const savingNote = noteSaving.has(link.token);
 
           return (
             <div key={link.token} className="rounded bg-floor p-4">
@@ -366,6 +407,25 @@ export function Links() {
 
                   <button
                     type="button"
+                    onClick={() =>
+                      setNoteDrafts((prev) =>
+                        prev[link.token] !== undefined
+                          ? (({ [link.token]: _, ...rest }) => rest)(prev)
+                          : { ...prev, [link.token]: link.gift_note ?? '' },
+                      )
+                    }
+                    aria-label={
+                      link.gift_note !== undefined
+                        ? `edit note for ${link.label}`
+                        : `add note for ${link.label}`
+                    }
+                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright"
+                  >
+                    {link.gift_note !== undefined ? 'edit note' : 'add note'}
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => handleAuditToggle(link.token)}
                     aria-label={
                       auditState !== undefined
@@ -378,6 +438,62 @@ export function Links() {
                   </button>
                 </div>
               </div>
+
+              {/* Current note — what the friend's dialog says today */}
+              {link.gift_note !== undefined && noteDraft === undefined && (
+                <p className="mt-2 text-xs italic text-dust">
+                  &ldquo;{link.gift_note}&rdquo;
+                </p>
+              )}
+
+              {/* Note editor — save persists; a blank save clears the note */}
+              {noteDraft !== undefined && (
+                <div className="mt-2 flex flex-col gap-2">
+                  <textarea
+                    aria-label={`note for ${link.label}`}
+                    value={noteDraft}
+                    onChange={(e) =>
+                      setNoteDrafts((prev) => ({
+                        ...prev,
+                        [link.token]: e.target.value,
+                      }))
+                    }
+                    maxLength={500}
+                    rows={2}
+                    placeholder="leave blank to remove the note"
+                    className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
+                  />
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={savingNote}
+                      onClick={() => handleSaveNote(link)}
+                      aria-label={`save note for ${link.label}`}
+                      className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
+                    >
+                      {savingNote ? 'saving…' : 'save note'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={savingNote}
+                      onClick={() =>
+                        setNoteDrafts(({ [link.token]: _, ...rest }) => rest)
+                      }
+                      aria-label={`cancel note for ${link.label}`}
+                      className="rounded px-3 py-1.5 text-xs text-dust hover:text-ink"
+                    >
+                      cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Note-save failure — loud, per row */}
+              {noteErr !== undefined && (
+                <p role="alert" className="mt-2 text-xs text-red-700">
+                  {noteErr}
+                </p>
+              )}
 
               {/* Revoke failure — must be loud; the link may still be claimable */}
               {revokeErr !== undefined && (

@@ -16,6 +16,7 @@ vi.mock('../api', async (importOriginal) => {
     adminCreateLink: vi.fn(),
     adminRevoke: vi.fn(),
     adminLinkClaims: vi.fn(),
+    adminSetLinkNote: vi.fn(),
   };
 });
 import {
@@ -23,6 +24,7 @@ import {
   adminCreateLink,
   adminRevoke,
   adminLinkClaims,
+  adminSetLinkNote,
   CreateLinkValidationError,
 } from '../api';
 
@@ -126,6 +128,82 @@ describe('Links', () => {
         expect(screen.getByText(/couldn't load links/i)).toBeInTheDocument(),
       );
       expect(screen.queryByText('login page')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('note editing', () => {
+    it('shows the current note and saves an edited one', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([
+        { ...link1, gift_note: 'old words' },
+      ]);
+      vi.mocked(adminSetLinkNote).mockResolvedValue(undefined);
+
+      renderLinks();
+      await waitFor(() => screen.getByText(/old words/));
+
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+      expect(box).toHaveValue('old words');
+
+      await user.clear(box);
+      await user.type(box, '  new words  ');
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+
+      await waitFor(() => {
+        expect(adminSetLinkNote).toHaveBeenCalledWith('tok-abc123', 'new words');
+      });
+    });
+
+    it('offers "add note" on a note-less link and a blank save clears', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([
+        { ...link1, gift_note: 'kill me' },
+      ]);
+      vi.mocked(adminSetLinkNote).mockResolvedValue(undefined);
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      // link2 has no note → the affordance reads "add note"
+      vi.mocked(adminLinks).mockResolvedValue([link2]);
+
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+      await user.clear(box);
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+
+      await waitFor(() => {
+        expect(adminSetLinkNote).toHaveBeenCalledWith('tok-abc123', '');
+      });
+      // After the post-save reload (now returning link2), Bob shows "add note"
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'add note for Bob' }),
+      );
+    });
+
+    it('surfaces a save failure loudly and keeps the editor open', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([{ ...link1, gift_note: 'hi' }]);
+      vi.mocked(adminSetLinkNote).mockRejectedValue(
+        new Error("couldn't save the note — it may not have changed"),
+      );
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent(/couldn't save the note/);
+      });
+      // Editor stays open with the draft intact
+      expect(
+        screen.getByRole('textbox', { name: 'note for Alice' }),
+      ).toBeInTheDocument();
     });
   });
 

@@ -91,6 +91,8 @@ export type AdminClaimView = {
 export type AdminLink = {
   token: string;
   label: string;
+  /** Ben's note to the friend; absent when unset (list serializes domain::Link). */
+  gift_note?: string;
   claims_allowed: number;
   claims_used: number;
   revoked: boolean;
@@ -332,6 +334,32 @@ export async function adminRevoke(token: string): Promise<void> {
   // never resolve as if the link were dead.
   if (!response.ok) {
     throw new Error('revoke failed — the link may still be live');
+  }
+}
+
+/** Set, replace, or clear (blank note) a link's gift note after creation. */
+export async function adminSetLinkNote(token: string, note: string): Promise<void> {
+  const response = await fetch(`/admin/api/links/${token}/note`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ gift_note: note }),
+  });
+  await checkUnauthorized(response);
+
+  if (!response.ok) {
+    if (response.status === 422) {
+      let message = 'invalid note';
+      try {
+        const errBody = (await response.json()) as { error?: unknown };
+        if (typeof errBody.error === 'string') {
+          message = errBody.error;
+        }
+      } catch {
+        // non-JSON body — keep the generic message
+      }
+      throw new CreateLinkValidationError(message);
+    }
+    throw new Error("couldn't save the note — it may not have changed");
   }
 }
 

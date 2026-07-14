@@ -101,6 +101,7 @@ pub fn router(
             post(handle_create_link).get(handle_list_links),
         )
         .route("/admin/api/links/:token/revoke", post(handle_revoke_link))
+        .route("/admin/api/links/:token/note", post(handle_set_link_note))
         .route("/admin/api/links/:token/claims", get(handle_link_claims))
         .route("/admin/api/claims/self", get(handle_self_claims))
         .route("/admin/api/sync", post(handle_sync))
@@ -613,6 +614,57 @@ async fn handle_revoke_link(State(s): State<AppState>, Path(token): Path<String>
     };
 
     link.revoked = true;
+
+    match s.store.update_link_meta(&link).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── POST /admin/api/links/:token/note ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetLinkNoteBody {
+    /// The new note. Blank/whitespace-only (or null) CLEARS the note — one
+    /// endpoint covers set, edit, and remove.
+    gift_note: Option<String>,
+}
+
+/// Set/replace/clear a link's gift note after creation. Same read-modify-write
+/// shape as revoke: `update_link_meta` writes the body without touching the
+/// top-level `claims_used` counter, and reads re-override enforcer fields, so
+/// editing this cosmetic field can never clobber claim enforcement.
+async fn handle_set_link_note(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+    Json(body): Json<SetLinkNoteBody>,
+) -> Response {
+    let note = body
+        .gift_note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(String::from);
+    if note
+        .as_deref()
+        .is_some_and(|n| n.chars().count() > GIFT_NOTE_MAX_CHARS)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("gift_note must be at most {GIFT_NOTE_MAX_CHARS} characters")
+            })),
+        )
+            .into_response();
+    }
+
+    let mut link = match s.store.get_link(&token).await {
+        Ok(Some(l)) => l,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    link.gift_note = note;
 
     match s.store.update_link_meta(&link).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
