@@ -38,6 +38,14 @@ function stateBadgeClass(state: string): string {
   }
 }
 
+/** Immutably drop one key from a record — the destructuring-rest omit idiom
+ * trips this repo's no-unused-vars (no ignoreRestSiblings). */
+function omitKey<T>(map: Record<string, T>, key: string): Record<string, T> {
+  const next = { ...map };
+  delete next[key];
+  return next;
+}
+
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
@@ -134,10 +142,10 @@ export function Links() {
     const draft = noteDrafts[link.token];
     if (draft === undefined) return;
     setNoteSaving((prev) => new Set(prev).add(link.token));
-    setNoteErrors(({ [link.token]: _, ...rest }) => rest);
+    setNoteErrors((prev) => omitKey(prev, link.token));
     withAuth(() => adminSetLinkNote(link.token, draft.trim()), navigate)
       .then(() => {
-        setNoteDrafts(({ [link.token]: _, ...rest }) => rest);
+        setNoteDrafts((prev) => omitKey(prev, link.token));
         // Reload so the row reflects what the friend's page now says
         load();
       })
@@ -410,7 +418,7 @@ export function Links() {
                     onClick={() =>
                       setNoteDrafts((prev) =>
                         prev[link.token] !== undefined
-                          ? (({ [link.token]: _, ...rest }) => rest)(prev)
+                          ? omitKey(prev, link.token)
                           : { ...prev, [link.token]: link.gift_note ?? '' },
                       )
                     }
@@ -476,9 +484,7 @@ export function Links() {
                     <button
                       type="button"
                       disabled={savingNote}
-                      onClick={() =>
-                        setNoteDrafts(({ [link.token]: _, ...rest }) => rest)
-                      }
+                      onClick={() => setNoteDrafts((prev) => omitKey(prev, link.token))}
                       aria-label={`cancel note for ${link.label}`}
                       className="rounded px-3 py-1.5 text-xs text-dust hover:text-ink"
                     >
