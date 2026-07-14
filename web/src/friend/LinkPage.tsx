@@ -43,6 +43,15 @@ export function LinkPage() {
   );
 }
 
+/** The dialog box's blinking block cursor — one definition for all beats. */
+function TwCursor() {
+  return (
+    <span aria-hidden="true" className="tw-cursor">
+      &#9646;
+    </span>
+  );
+}
+
 function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   const { token } = useParams<{ token: string }>();
   const [view, setView] = useState<ViewState>({ kind: "loading" });
@@ -54,9 +63,27 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   // ben's personal note types as a third beat after the standard body —
   // absent on most links, so everything is length-0-safe
   const giftNote = view.kind === "loaded" ? (view.data.gift_note ?? "") : "";
-  const typeTotal = typedLabel.length + DIALOG_BODY.length + giftNote.length;
+  // Beats are measured and sliced in CODE POINTS — String.prototype.slice cuts
+  // UTF-16 units, so it splits an emoji's surrogate pair mid-character (a lone
+  // surrogate renders as U+FFFD for a tick), and the gift note is exactly
+  // where emoji show up. Code points also match the server's chars() bound.
+  const labelCps = Array.from(typedLabel);
+  const bodyCps = Array.from(DIALOG_BODY);
+  const noteCps = Array.from(giftNote);
+  // cumulative beat offsets — every slice and cursor handoff below reads from
+  // these, so the boundaries live in exactly one place
+  const bodyStart = labelCps.length;
+  const noteStart = bodyStart + bodyCps.length;
+  const typeTotal = noteStart + noteCps.length;
   const [typeChars, setTypeChars] = useState(0);
   const [typeKey, setTypeKey] = useState(0);
+  // the typeKey whose entrance has fully played. The note is editable
+  // post-creation, so a background refetch can change typeTotal — re-running
+  // this effect mid-session. Once the entrance has played, snap to the new
+  // text instead of replaying: a retype would re-disable the typeDone-gated
+  // controls under the friend for several seconds. The replay button bumps
+  // typeKey, which re-arms the full animation.
+  const playedKeyRef = useRef<number | null>(null);
   useEffect(() => {
     if (typeTotal === 0) return;
     if (prefersReducedMotion()) {
@@ -67,6 +94,10 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
     // the boot, so without this gate the typing is already done when the
     // boot cuts away — ben caught it, 2026-07-09)
     if (!bootDone) return;
+    if (playedKeyRef.current === typeKey) {
+      setTypeChars(typeTotal);
+      return;
+    }
     setTypeChars(0);
     // ...then a 1s beat before the first character — the box sits with its
     // blinking cursor for a moment, like the game is thinking
@@ -88,6 +119,11 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
     };
   }, [typeKey, typeTotal, bootDone]);
   const typeDone = typeChars >= typeTotal;
+  useEffect(() => {
+    if (typeDone && typeTotal > 0) {
+      playedKeyRef.current = typeKey;
+    }
+  }, [typeDone, typeKey, typeTotal]);
   const [detailGame, setDetailGame] = useState<GameView | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const prevTokenRef = useRef<string | undefined>(undefined);
@@ -297,7 +333,15 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
           </div>
           {/* ≤800px the box leaves the banner and drops into flow, still
               straddling the banner's bottom edge like a JRPG text box */}
-          <div className="absolute bottom-4 left-6 w-[34rem] max-w-[calc(100%-3rem)] rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)] max-[800px]:relative max-[800px]:bottom-auto max-[800px]:left-auto max-[800px]:w-auto max-[800px]:max-w-none max-[800px]:-mt-8 max-[800px]:mx-7">
+          {/* onClick: tap-to-complete, the JRPG-dialog convention this box is
+              homaging — a long note otherwise keeps the typeDone-gated steam
+              controls inert for seconds with nothing to do but watch */}
+          <div
+            onClick={() => {
+              if (!typeDone) setTypeChars(typeTotal);
+            }}
+            className="absolute bottom-4 left-6 w-[34rem] max-w-[calc(100%-3rem)] rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)] max-[800px]:relative max-[800px]:bottom-auto max-[800px]:left-auto max-[800px]:w-auto max-[800px]:max-w-none max-[800px]:-mt-8 max-[800px]:mx-7"
+          >
             <button
               type="button"
               onClick={() => setTypeKey((k) => k + 1)}
@@ -308,50 +352,34 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
               &#8635;
             </button>
             <h2 className="min-h-7 text-xl leading-tight text-give-soft">
-              {typedLabel.slice(0, typeChars)}
-              {typeChars < typedLabel.length && (
-                <span aria-hidden="true" className="tw-cursor">
-                  &#9646;
-                </span>
-              )}
+              {labelCps.slice(0, typeChars).join("")}
+              {typeChars < bodyStart && <TwCursor />}
             </h2>
             <p className="mt-1.5 min-h-10 max-w-[60ch] text-sm text-ink-soft">
-              {DIALOG_BODY.slice(0, Math.max(0, typeChars - typedLabel.length))}
-              {typeChars >= typedLabel.length &&
-                typeChars < typedLabel.length + DIALOG_BODY.length && (
-                  <span aria-hidden="true" className="tw-cursor">
-                    &#9646;
-                  </span>
-                )}
+              {bodyCps.slice(0, Math.max(0, typeChars - bodyStart)).join("")}
+              {typeChars >= bodyStart && typeChars < noteStart && <TwCursor />}
             </p>
             {/* ben's note — the personal beat. The container renders whenever a
                 note exists (empty while the earlier beats type) so the box
-                never grows mid-monologue. */}
-            {giftNote !== "" &&
-              (() => {
-                const noteChars = Math.max(
-                  0,
-                  typeChars - typedLabel.length - DIALOG_BODY.length,
-                );
-                return (
-                  <p className="mt-1.5 min-h-5 max-w-[60ch] text-sm italic text-give-soft">
-                    {noteChars > 0 && <>&ldquo;{giftNote.slice(0, noteChars)}</>}
-                    {noteChars > 0 && !typeDone && (
-                      <span aria-hidden="true" className="tw-cursor">
-                        &#9646;
-                      </span>
-                    )}
-                    {typeDone && (
-                      <>
-                        &rdquo;{" "}
-                        <span className="font-pixel not-italic text-xs text-dust">
-                          &mdash; ben
-                        </span>
-                      </>
-                    )}
-                  </p>
-                );
-              })()}
+                never grows mid-monologue. The cursor moves in at the boundary
+                (>= noteStart, like the body's handoff) so it never blips out
+                for a tick between beats. */}
+            {giftNote !== "" && (
+              <p className="mt-1.5 min-h-5 max-w-[60ch] text-sm italic text-give-soft">
+                {typeChars > noteStart && (
+                  <>&ldquo;{noteCps.slice(0, typeChars - noteStart).join("")}</>
+                )}
+                {typeChars >= noteStart && !typeDone && <TwCursor />}
+                {typeDone && (
+                  <>
+                    &rdquo;{" "}
+                    <span className="font-pixel not-italic text-xs text-dust">
+                      &mdash; ben
+                    </span>
+                  </>
+                )}
+              </p>
+            )}
             {steamIdentity !== null ? (
               <div
                 className={`mt-2 flex items-center gap-2 transition-opacity duration-300 ${typeDone ? "opacity-100" : "pointer-events-none opacity-0"}`}

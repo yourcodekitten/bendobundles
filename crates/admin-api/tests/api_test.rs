@@ -598,7 +598,9 @@ async fn create_link_gift_note_roundtrips_trimmed_and_blank_collapses_to_absent(
 }
 
 /// POST /admin/api/links/:token/note — set, clear (blank), 422 over-length, 404 unknown.
-/// Uses the revoke-style read-modify-write; the note must never disturb enforcer fields.
+/// Backed by `set_link_gift_note`'s single-attribute write; the note must never
+/// disturb enforcer fields (and structurally can't — the handler holds no link
+/// snapshot to write back stale).
 #[tokio::test]
 async fn set_link_note_after_create_edits_clears_and_validates() {
     let Some(store) = store_or_skip("link-note-edit").await else {
@@ -666,6 +668,34 @@ async fn set_link_note_after_create_edits_clears_and_validates() {
     // Unknown token → 404.
     let resp = post_note(serde_json::json!({"gift_note": "hello?"}), "no-such-tok").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A note edit on a REVOKED link must not resurrect it. (The old
+    // read-modify-write shape could write a stale revoked=false back; the
+    // scoped write makes that unrepresentable — this pins the contract.)
+    let revoke = Request::post("/admin/api/links/note-edit-tok/revoke")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(revoke)
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = post_note(
+        serde_json::json!({"gift_note": "still here?"}),
+        "note-edit-tok",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after = store.get_link("note-edit-tok").await.unwrap().unwrap();
+    assert!(after.revoked, "note edit must never un-revoke a link");
+    assert_eq!(after.gift_note.as_deref(), Some("still here?"));
 }
 
 /// Regression guard: a valid create with expires_days at the max bound (3650) still succeeds —

@@ -7,6 +7,7 @@ import {
   adminLinkClaims,
   adminSetLinkNote,
   CreateLinkValidationError,
+  GIFT_NOTE_MAX,
   type AdminLink,
   type AdminClaimView,
 } from '../api';
@@ -141,11 +142,22 @@ export function Links() {
   const handleSaveNote = (link: AdminLink) => {
     const draft = noteDrafts[link.token];
     if (draft === undefined) return;
+    // No-op save (unchanged text, e.g. open-then-save): just close the editor —
+    // no request, no server write, no list refetch.
+    if (draft.trim() === (link.gift_note ?? '')) {
+      setNoteDrafts((prev) => omitKey(prev, link.token));
+      return;
+    }
     setNoteSaving((prev) => new Set(prev).add(link.token));
     setNoteErrors((prev) => omitKey(prev, link.token));
     withAuth(() => adminSetLinkNote(link.token, draft.trim()), navigate)
       .then(() => {
-        setNoteDrafts((prev) => omitKey(prev, link.token));
+        // Only close the editor if the draft is still what we saved — the
+        // textarea stays editable during a slow save, and an unconditional
+        // delete here would silently discard anything typed since.
+        setNoteDrafts((prev) =>
+          prev[link.token] === draft ? omitKey(prev, link.token) : prev,
+        );
         // Reload so the row reflects what the friend's page now says
         load();
       })
@@ -298,13 +310,15 @@ export function Links() {
             aria-label="note to your friend"
             value={giftNote}
             onChange={(e) => setGiftNote(e.target.value)}
-            maxLength={500}
+            maxLength={GIFT_NOTE_MAX}
             rows={2}
             placeholder="picked these with you in mind…"
             className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
           />
-          {giftNote.length > 400 && (
-            <span className="text-right text-dust">{giftNote.length}/500</span>
+          {giftNote.length > GIFT_NOTE_MAX - 100 && (
+            <span className="text-right text-dust">
+              {giftNote.length}/{GIFT_NOTE_MAX}
+            </span>
           )}
         </label>
         <button
@@ -415,19 +429,23 @@ export function Links() {
 
                   <button
                     type="button"
-                    onClick={() =>
+                    disabled={savingNote}
+                    onClick={() => {
+                      // Closing the editor abandons the edit — drop its stale
+                      // failure message along with the draft.
+                      setNoteErrors((prev) => omitKey(prev, link.token));
                       setNoteDrafts((prev) =>
                         prev[link.token] !== undefined
                           ? omitKey(prev, link.token)
                           : { ...prev, [link.token]: link.gift_note ?? '' },
-                      )
-                    }
+                      );
+                    }}
                     aria-label={
                       link.gift_note !== undefined
                         ? `edit note for ${link.label}`
                         : `add note for ${link.label}`
                     }
-                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright"
+                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
                   >
                     {link.gift_note !== undefined ? 'edit note' : 'add note'}
                   </button>
@@ -460,17 +478,23 @@ export function Links() {
                   <textarea
                     aria-label={`note for ${link.label}`}
                     value={noteDraft}
+                    disabled={savingNote}
                     onChange={(e) =>
                       setNoteDrafts((prev) => ({
                         ...prev,
                         [link.token]: e.target.value,
                       }))
                     }
-                    maxLength={500}
+                    maxLength={GIFT_NOTE_MAX}
                     rows={2}
                     placeholder="leave blank to remove the note"
-                    className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
+                    className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink disabled:opacity-50"
                   />
+                  {noteDraft.length > GIFT_NOTE_MAX - 100 && (
+                    <span className="text-right text-xs text-dust">
+                      {noteDraft.length}/{GIFT_NOTE_MAX}
+                    </span>
+                  )}
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
@@ -484,7 +508,13 @@ export function Links() {
                     <button
                       type="button"
                       disabled={savingNote}
-                      onClick={() => setNoteDrafts((prev) => omitKey(prev, link.token))}
+                      onClick={() => {
+                        // Cancel abandons the edit — a lingering failure alert
+                        // for a save nobody is retrying would just read as
+                        // "something is still wrong".
+                        setNoteErrors((prev) => omitKey(prev, link.token));
+                        setNoteDrafts((prev) => omitKey(prev, link.token));
+                      }}
                       aria-label={`cancel note for ${link.label}`}
                       className="rounded px-3 py-1.5 text-xs text-dust hover:text-ink"
                     >

@@ -254,6 +254,49 @@ async fn link_view_carries_gift_note_and_omits_when_unset() {
     );
 }
 
+/// A dead (revoked/expired) link must not serve the gift note: the note is
+/// strictly more personal than the catalog, and the catalog is already hidden
+/// for exactly these states. Revoking a leaked URL has to take the personal
+/// message with it.
+#[tokio::test]
+async fn dead_link_omits_gift_note() {
+    let Some(store) = store_or_skip("dead-note-link").await else {
+        return;
+    };
+    let mut revoked = test_link("revoked-note-tok");
+    revoked.gift_note = Some("just for you ♡".into());
+    revoked.revoked = true;
+    store.create_link(&revoked).await.unwrap();
+    let mut expired = test_link("expired-note-tok");
+    expired.gift_note = Some("just for you ♡".into());
+    expired.expires_at = Some(datetime!(2020-01-01 00:00 UTC));
+    store.create_link(&expired).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    for (token, state) in [
+        ("revoked-note-tok", "revoked"),
+        ("expired-note-tok", "expired"),
+    ] {
+        let req = Request::get(format!("/api/l/{token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = plain_router(Arc::clone(&store), mock.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["state"], state);
+        assert!(
+            j.get("gift_note").is_none(),
+            "{state} link must not serve the gift note, got: {j}"
+        );
+    }
+}
+
 /// Exhausted link → 200, state:"exhausted", games STILL visible
 /// (friend can browse; claim buttons disabled client-side). The explicit state
 /// field is what lets the client tell exhausted from revoked without guessing

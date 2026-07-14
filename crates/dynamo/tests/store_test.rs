@@ -130,6 +130,73 @@ async fn link_and_claim_roundtrip() {
     assert_eq!(store.claims_for_link("tok1").await.unwrap(), vec![claim]);
 }
 
+/// `set_link_gift_note` is a single-attribute write and the top-level attr is
+/// authoritative on read. Two properties pinned here:
+///
+/// 1. **A stale body writer cannot clobber the note** (the lost-update the old
+///    body-only design had): set a note, then land `update_link_meta` with a
+///    Link snapshot taken BEFORE the note existed (exactly what a racing revoke
+///    carries) — the note must survive, and the revoke must stick.
+/// 2. **A note write cannot disturb enforcement**: the fn takes only
+///    (token, note), so there is no snapshot to carry stale `revoked` /
+///    `claims_allowed` / `expires_at` back in — un-revoking by note edit is
+///    unrepresentable. Asserted behaviorally: note ops on a revoked link leave
+///    it revoked.
+#[tokio::test]
+async fn gift_note_scoped_write_survives_stale_body_writers() {
+    let Some(store) = store_or_skip("gift-note-scoped").await else {
+        return;
+    };
+    store.create_link(&link("tok-note")).await.unwrap();
+    let pre_note_snapshot = store.get_link("tok-note").await.unwrap().unwrap();
+
+    // set the note via the scoped write
+    assert!(
+        store
+            .set_link_gift_note("tok-note", Some("wrote this later ♡"))
+            .await
+            .unwrap()
+    );
+
+    // a concurrent revoke commits from its pre-note snapshot (body has NO note)
+    let mut stale_revoke = pre_note_snapshot;
+    stale_revoke.revoked = true;
+    store.update_link_meta(&stale_revoke).await.unwrap();
+
+    let after = store.get_link("tok-note").await.unwrap().unwrap();
+    assert!(after.revoked, "the revoke must stick");
+    assert_eq!(
+        after.gift_note.as_deref(),
+        Some("wrote this later ♡"),
+        "a stale body write must not clobber the note (top-level attr is authoritative)"
+    );
+
+    // editing/clearing the note on the revoked link must leave it revoked
+    assert!(
+        store
+            .set_link_gift_note("tok-note", Some("edited ♡"))
+            .await
+            .unwrap()
+    );
+    let edited = store.get_link("tok-note").await.unwrap().unwrap();
+    assert!(edited.revoked, "a note edit must never un-revoke");
+    assert_eq!(edited.gift_note.as_deref(), Some("edited ♡"));
+
+    assert!(store.set_link_gift_note("tok-note", None).await.unwrap());
+    let cleared = store.get_link("tok-note").await.unwrap().unwrap();
+    assert!(cleared.revoked);
+    assert_eq!(cleared.gift_note, None, "REMOVE path clears the note");
+
+    // unknown token → Ok(false), and nothing is created
+    assert!(
+        !store
+            .set_link_gift_note("no-such-tok", Some("x"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get_link("no-such-tok").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn claim_happy_path_then_race_loses() {
     let Some(store) = store_or_skip("claim-race").await else {

@@ -227,6 +227,13 @@ fn link_from_item(
             )
         }
     };
+    // gift_note is post-creation-editable via `set_link_gift_note`'s scoped write, so the
+    // top-level attribute is authoritative and absence means no-note — unconditional
+    // override, same rule as expires_at.
+    link.gift_note = item
+        .get("gift_note")
+        .and_then(|v| v.as_s().ok())
+        .map(String::from);
     Ok(link)
 }
 
@@ -423,6 +430,49 @@ impl Store {
         }
         req.send().await?;
         Ok(())
+    }
+
+    /// Set/replace/clear a link's gift note via a single-attribute SET/REMOVE. Deliberately
+    /// NOT a read-modify-write through `update_link_meta`: that shape carries the caller's
+    /// possibly-stale `revoked`/`claims_allowed`/`expires_at` back into the write, so a note
+    /// save racing a revoke would silently un-revoke the link. Touching ONLY `gift_note`
+    /// (which reads override from the top-level attribute) makes the edit unable to disturb
+    /// enforcement by construction — and it's one round-trip instead of two.
+    /// Returns Ok(false) when no such link exists (the condition fails), Ok(true) on success.
+    pub async fn set_link_gift_note(
+        &self,
+        token: &str,
+        note: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(token), "META");
+        let req = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .condition_expression("attribute_exists(pk)");
+        let req = match note {
+            Some(n) => req
+                .update_expression("SET gift_note = :n")
+                .expression_attribute_values(":n", schema::s(n)),
+            None => req.update_expression("REMOVE gift_note"),
+        };
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(sdk_err) => {
+                if matches!(
+                    sdk_err.as_service_error(),
+                    Some(
+                        aws_sdk_dynamodb::operation::update_item::UpdateItemError::ConditionalCheckFailedException(_)
+                    )
+                ) {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
     }
 
     pub async fn get_link(&self, token: &str) -> Result<Option<Link>, StoreError> {

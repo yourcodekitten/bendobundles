@@ -195,6 +195,9 @@ describe('Links', () => {
         screen.getByRole('button', { name: 'edit note for Alice' }),
       );
       await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+      await user.clear(box);
+      await user.type(box, 'hello');
       await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
 
       await waitFor(() => {
@@ -204,6 +207,53 @@ describe('Links', () => {
       expect(
         screen.getByRole('textbox', { name: 'note for Alice' }),
       ).toBeInTheDocument();
+    });
+
+    it('an unchanged save is a no-op: closes the editor without a request', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([{ ...link1, gift_note: 'hi' }]);
+      vi.mocked(adminSetLinkNote).mockResolvedValue(undefined);
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('textbox', { name: 'note for Alice' }),
+        ).not.toBeInTheDocument(),
+      );
+      expect(adminSetLinkNote).not.toHaveBeenCalled();
+      // No refetch either — the list was loaded exactly once
+      expect(adminLinks).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancel clears a stale save-failure alert with the draft', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([{ ...link1, gift_note: 'hi' }]);
+      vi.mocked(adminSetLinkNote).mockRejectedValue(new Error('boom'));
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+      await user.clear(box);
+      await user.type(box, 'hello');
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+      await waitFor(() => screen.getByRole('alert'));
+
+      await user.click(screen.getByRole('button', { name: 'cancel note for Alice' }));
+      // Abandoning the edit takes the failure message with it — a lingering
+      // alert would read as "something is still wrong"
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('textbox', { name: 'note for Alice' }),
+      ).not.toBeInTheDocument();
     });
   });
 

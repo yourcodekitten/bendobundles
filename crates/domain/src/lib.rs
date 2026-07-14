@@ -96,9 +96,13 @@ pub struct Link {
     pub token: String,
     pub label: String,
     /// Ben's personal note to the friend, shown on their link page. Cosmetic
-    /// (never consulted by claim enforcement), so it lives only in the item
-    /// body — no top-level attribute, no enforcer override. `#[serde(default)]`:
-    /// records written before this field existed deserialize to `None`.
+    /// (never consulted by claim enforcement), but editable after creation —
+    /// so like the enforcer fields it is authoritative in a top-level dynamo
+    /// attribute (written ONLY by `set_link_gift_note`'s scoped update) and
+    /// overridden on read; the body copy is a convenience that may go stale
+    /// under concurrent body writers (claim's `SET body`, revoke).
+    /// `#[serde(default)]`: records written before this field existed
+    /// deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gift_note: Option<String>,
     pub claims_allowed: u32,

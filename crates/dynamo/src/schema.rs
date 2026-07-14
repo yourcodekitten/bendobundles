@@ -111,6 +111,14 @@ pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
     if let Some(exp) = l.expires_at {
         item.insert("expires_at".into(), epoch_s(exp));
     }
+    // Top-level `gift_note` is authoritative, like the enforcer attrs: the note is
+    // editable post-creation via `set_link_gift_note`'s single-attribute SET/REMOVE,
+    // so it must not live only in body where claim_game's `SET body` (serialized from
+    // a pre-transaction read) would silently revert an edit landing in the window.
+    // Omitted when None; `link_from_item` treats absence as no-note.
+    if let Some(n) = &l.gift_note {
+        item.insert("gift_note".into(), s(n));
+    }
     item
 }
 

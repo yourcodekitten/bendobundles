@@ -494,6 +494,27 @@ const CLAIMS_ALLOWED_MAX: u32 = 100;
 const LABEL_MAX_CHARS: usize = 200;
 const GIFT_NOTE_MAX_CHARS: usize = 500; // fits the friend page's dialog box without scrolling
 
+/// Single owner of the gift-note input rules — create and edit-after-the-fact both
+/// call these, so the two paths can never drift apart.
+///
+/// Bound is measured on the TRIMMED text (trailing whitespace shouldn't eat budget).
+fn validate_gift_note(raw: Option<&str>) -> Result<(), String> {
+    if raw.is_some_and(|n| n.trim().chars().count() > GIFT_NOTE_MAX_CHARS) {
+        return Err(format!(
+            "gift_note must be at most {GIFT_NOTE_MAX_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Trimmed note, with empty/whitespace-only collapsed to `None` so the friend page
+/// can gate rendering on plain field presence (and blank means "clear" on edit).
+fn normalize_gift_note(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(String::from)
+}
+
 #[derive(Deserialize)]
 struct CreateLinkBody {
     label: String,
@@ -524,26 +545,13 @@ impl CreateLinkBody {
                 "label must be at most {LABEL_MAX_CHARS} characters"
             ));
         }
-        if self
-            .gift_note
-            .as_deref()
-            .is_some_and(|n| n.trim().chars().count() > GIFT_NOTE_MAX_CHARS)
-        {
-            return Err(format!(
-                "gift_note must be at most {GIFT_NOTE_MAX_CHARS} characters"
-            ));
-        }
+        validate_gift_note(self.gift_note.as_deref())?;
         Ok(())
     }
 
-    /// Trimmed note, with empty/whitespace-only collapsed to `None` so the
-    /// friend page can gate rendering on plain field presence.
+    /// See `normalize_gift_note` — the shared rule.
     fn normalized_gift_note(&self) -> Option<String> {
-        self.gift_note
-            .as_deref()
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(String::from)
+        normalize_gift_note(self.gift_note.as_deref())
     }
 }
 
@@ -630,44 +638,28 @@ struct SetLinkNoteBody {
     gift_note: Option<String>,
 }
 
-/// Set/replace/clear a link's gift note after creation. Same read-modify-write
-/// shape as revoke: `update_link_meta` writes the body without touching the
-/// top-level `claims_used` counter, and reads re-override enforcer fields, so
-/// editing this cosmetic field can never clobber claim enforcement.
+/// Set/replace/clear a link's gift note after creation. NOT the revoke-shaped
+/// read-modify-write: `set_link_gift_note` is a single-attribute SET/REMOVE, so
+/// this handler holds no snapshot of the enforcer fields and a save racing a
+/// revoke/expiry change cannot write anything stale back (the old shape could
+/// silently un-revoke a link). One round-trip; the condition doubles as the 404.
 async fn handle_set_link_note(
     State(s): State<AppState>,
     Path(token): Path<String>,
     Json(body): Json<SetLinkNoteBody>,
 ) -> Response {
-    let note = body
-        .gift_note
-        .as_deref()
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .map(String::from);
-    if note
-        .as_deref()
-        .is_some_and(|n| n.chars().count() > GIFT_NOTE_MAX_CHARS)
-    {
+    if let Err(msg) = validate_gift_note(body.gift_note.as_deref()) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({
-                "error": format!("gift_note must be at most {GIFT_NOTE_MAX_CHARS} characters")
-            })),
+            Json(serde_json::json!({"error": msg})),
         )
             .into_response();
     }
+    let note = normalize_gift_note(body.gift_note.as_deref());
 
-    let mut link = match s.store.get_link(&token).await {
-        Ok(Some(l)) => l,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    link.gift_note = note;
-
-    match s.store.update_link_meta(&link).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+    match s.store.set_link_gift_note(&token, note.as_deref()).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
