@@ -495,24 +495,30 @@ const LABEL_MAX_CHARS: usize = 200;
 const GIFT_NOTE_MAX_CHARS: usize = 500; // fits the friend page's dialog box without scrolling
 
 /// Single owner of the gift-note input rules — create and edit-after-the-fact both
-/// call these, so the two paths can never drift apart.
+/// call this, so the two paths can never drift apart, and validation can't be
+/// skipped by a call site that only wanted normalization.
 ///
-/// Bound is measured on the TRIMMED text (trailing whitespace shouldn't eat budget).
-fn validate_gift_note(raw: Option<&str>) -> Result<(), String> {
-    if raw.is_some_and(|n| n.trim().chars().count() > GIFT_NOTE_MAX_CHARS) {
+/// Trims, bounds-checks the TRIMMED text (trailing whitespace shouldn't eat
+/// budget), and collapses empty/whitespace-only to `None` so the friend page can
+/// gate rendering on plain field presence (and blank means "clear" on edit).
+fn parse_gift_note(raw: Option<&str>) -> Result<Option<String>, String> {
+    let trimmed = raw.map(str::trim).filter(|n| !n.is_empty());
+    if trimmed.is_some_and(|n| n.chars().count() > GIFT_NOTE_MAX_CHARS) {
         return Err(format!(
             "gift_note must be at most {GIFT_NOTE_MAX_CHARS} characters"
         ));
     }
-    Ok(())
+    Ok(trimmed.map(String::from))
 }
 
-/// Trimmed note, with empty/whitespace-only collapsed to `None` so the friend page
-/// can gate rendering on plain field presence (and blank means "clear" on edit).
-fn normalize_gift_note(raw: Option<&str>) -> Option<String> {
-    raw.map(str::trim)
-        .filter(|n| !n.is_empty())
-        .map(String::from)
+/// The crate's one 422 shape — `{"error": msg}` — which the web client's
+/// `throwIfValidation422` parses; both validated endpoints build it here.
+fn unprocessable(msg: String) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "error": msg })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -545,13 +551,8 @@ impl CreateLinkBody {
                 "label must be at most {LABEL_MAX_CHARS} characters"
             ));
         }
-        validate_gift_note(self.gift_note.as_deref())?;
+        parse_gift_note(self.gift_note.as_deref())?;
         Ok(())
-    }
-
-    /// See `normalize_gift_note` — the shared rule.
-    fn normalized_gift_note(&self) -> Option<String> {
-        normalize_gift_note(self.gift_note.as_deref())
     }
 }
 
@@ -560,11 +561,7 @@ async fn handle_create_link(
     Json(body): Json<CreateLinkBody>,
 ) -> Response {
     if let Err(msg) = body.validate() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": msg})),
-        )
-            .into_response();
+        return unprocessable(msg);
     }
 
     // Token = two uuid-v4 simple-format (no hyphens) concatenated: 32 + 32 = 64 hex chars.
@@ -581,7 +578,8 @@ async fn handle_create_link(
 
     let link = domain::Link {
         token: token.clone(),
-        gift_note: body.normalized_gift_note(),
+        gift_note: parse_gift_note(body.gift_note.as_deref())
+            .expect("gift_note bound checked by validate() above"),
         label: body.label,
         claims_allowed: body.claims_allowed,
         claims_used: 0,
@@ -648,14 +646,13 @@ async fn handle_set_link_note(
     Path(token): Path<String>,
     Json(body): Json<SetLinkNoteBody>,
 ) -> Response {
-    if let Err(msg) = validate_gift_note(body.gift_note.as_deref()) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": msg})),
-        )
-            .into_response();
-    }
-    let note = normalize_gift_note(body.gift_note.as_deref());
+    // Validation precedes existence (matching create): an over-length note on an
+    // unknown token 422s rather than 404s — the single-RTT design never reads
+    // first, so field errors are diagnosed before the write's condition runs.
+    let note = match parse_gift_note(body.gift_note.as_deref()) {
+        Ok(n) => n,
+        Err(msg) => return unprocessable(msg),
+    };
 
     match s.store.set_link_gift_note(&token, note.as_deref()).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),

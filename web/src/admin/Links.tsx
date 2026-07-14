@@ -47,6 +47,10 @@ function omitKey<T>(map: Record<string, T>, key: string): Record<string, T> {
   return next;
 }
 
+// Show the note character counter only near the bound — both note textareas
+// (create form + row editor) share this threshold so they can't drift.
+const NOTE_COUNTER_AT = GIFT_NOTE_MAX - 100;
+
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
@@ -193,11 +197,7 @@ export function Links() {
           next.delete(link.token);
           return next;
         });
-        setRevokeErrors((prev) => {
-          const next = { ...prev };
-          delete next[link.token];
-          return next;
-        });
+        setRevokeErrors((prev) => omitKey(prev, link.token));
         load();
       })
       .catch(() => {
@@ -215,11 +215,7 @@ export function Links() {
     const current = auditMap[token];
     if (current !== undefined) {
       // Already open — collapse
-      setAuditMap((prev) => {
-        const next = { ...prev };
-        delete next[token];
-        return next;
-      });
+      setAuditMap((prev) => omitKey(prev, token));
       return;
     }
     // Open: start loading
@@ -315,7 +311,7 @@ export function Links() {
             placeholder="picked these with you in mind…"
             className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
           />
-          {giftNote.length > GIFT_NOTE_MAX - 100 && (
+          {giftNote.length > NOTE_COUNTER_AT && (
             <span className="text-right text-dust">
               {giftNote.length}/{GIFT_NOTE_MAX}
             </span>
@@ -490,7 +486,7 @@ export function Links() {
                     placeholder="leave blank to remove the note"
                     className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink disabled:opacity-50"
                   />
-                  {noteDraft.length > GIFT_NOTE_MAX - 100 && (
+                  {noteDraft.length > NOTE_COUNTER_AT && (
                     <span className="text-right text-xs text-dust">
                       {noteDraft.length}/{GIFT_NOTE_MAX}
                     </span>

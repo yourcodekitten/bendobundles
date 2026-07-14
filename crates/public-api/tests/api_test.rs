@@ -309,6 +309,7 @@ async fn exhausted_link_state_exhausted_games_visible() {
     store.put_game(&test_game(1)).await.unwrap();
     let mut lnk = test_link("exh-tok");
     lnk.claims_used = lnk.claims_allowed;
+    lnk.gift_note = Some("you got them all ♡".into());
     store.create_link(&lnk).await.unwrap();
 
     let mock = MockInvoker::new(FulfillResponse::GiftUrl {

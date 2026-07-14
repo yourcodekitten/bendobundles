@@ -190,6 +190,22 @@ fn is_ccf_put<R>(
     )
 }
 
+/// `is_ccf_put`'s sibling for conditional UpdateItem calls — same policy, same
+/// single home (see the doc above).
+fn is_ccf_update<R>(
+    e: &aws_sdk_dynamodb::error::SdkError<
+        aws_sdk_dynamodb::operation::update_item::UpdateItemError,
+        R,
+    >,
+) -> bool {
+    matches!(
+        e.as_service_error(),
+        Some(
+            aws_sdk_dynamodb::operation::update_item::UpdateItemError::ConditionalCheckFailedException(_)
+        )
+    )
+}
+
 /// Deserialize a LINK META item, overriding EVERY enforcer field from the authoritative
 /// top-level attributes. The `body` blob is a convenience copy; the fields `claim_game`'s
 /// condition expression actually enforces — `claims_used`, `claims_allowed`, `revoked`,
@@ -197,7 +213,11 @@ fn is_ccf_put<R>(
 /// concurrent writers (claim's atomic ADD, compensate's decrement, `update_link_meta`'s
 /// scoped SET/REMOVE) keep current. Reading any of them from `body` is a latent lost-update:
 /// harmless while body and attrs move in lockstep, live the day any writer moves an attr
-/// without rewriting body. So: body for identity/cosmetics, top-level attrs for enforcement.
+/// without rewriting body. So: body for immutable identity, top-level attrs for enforcement
+/// AND for anything editable post-creation (`gift_note` — see its scoped writer). A future
+/// editable field (label?) must follow the gift_note recipe, NOT ride in body alone: a
+/// body-only editable field gets silently reverted by claim's `SET body` from a
+/// pre-transaction read.
 ///
 /// `expires_at` absence is authoritative too — `link_item` omits it and `update_link_meta`
 /// REMOVEs it for never-expires — so the override is unconditional, not only-when-present.
@@ -460,18 +480,8 @@ impl Store {
         };
         match req.send().await {
             Ok(_) => Ok(true),
-            Err(sdk_err) => {
-                if matches!(
-                    sdk_err.as_service_error(),
-                    Some(
-                        aws_sdk_dynamodb::operation::update_item::UpdateItemError::ConditionalCheckFailedException(_)
-                    )
-                ) {
-                    Ok(false)
-                } else {
-                    Err(StoreError::Aws(format!("{sdk_err:?}")))
-                }
-            }
+            Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
+            Err(sdk_err) => Err(StoreError::Aws(format!("{sdk_err:?}"))),
         }
     }
 

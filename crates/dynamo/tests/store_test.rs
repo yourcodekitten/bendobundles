@@ -197,6 +197,35 @@ async fn gift_note_scoped_write_survives_stale_body_writers() {
     assert_eq!(store.get_link("no-such-tok").await.unwrap(), None);
 }
 
+/// The note must survive `claim_game`'s `SET body` — the OTHER stale body writer
+/// named in `domain::Link`'s doc. Guards against a refactor that turns the
+/// claim's link write into a full-item replace (which would drop the top-level
+/// `gift_note` attr) or otherwise rewrites attrs it doesn't own.
+#[tokio::test]
+async fn gift_note_survives_claim_body_rewrite() {
+    let Some(store) = store_or_skip("gift-note-claim").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let mut noted = link("tok-noted");
+    noted.gift_note = Some("picked for you ♡".into());
+    store.create_link(&noted).await.unwrap();
+
+    let now = datetime!(2026-07-02 12:00 UTC);
+    store
+        .claim_game("tok-noted", &game_id("gk1", "mn"), "c1", now)
+        .await
+        .unwrap();
+
+    let after = store.get_link("tok-noted").await.unwrap().unwrap();
+    assert_eq!(after.claims_used, 1);
+    assert_eq!(
+        after.gift_note.as_deref(),
+        Some("picked for you ♡"),
+        "claim's body rewrite must not disturb the note"
+    );
+}
+
 #[tokio::test]
 async fn claim_happy_path_then_race_loses() {
     let Some(store) = store_or_skip("claim-race").await else {

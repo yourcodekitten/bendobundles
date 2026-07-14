@@ -56,6 +56,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   const { token } = useParams<{ token: string }>();
   const [view, setView] = useState<ViewState>({ kind: "loading" });
   const [claimingGame, setClaimingGame] = useState<GameView | null>(null);
+  const viewLoaded = view.kind === "loaded";
   // ── dialog-box typewriter (the page's one entrance; see DESIGN.md motion) ──
   const DIALOG_BODY =
     "games from ben's humble stash, picked for you \u2661 open one for details, claim it, and the key is yours.";
@@ -67,9 +68,11 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   // UTF-16 units, so it splits an emoji's surrogate pair mid-character (a lone
   // surrogate renders as U+FFFD for a tick), and the gift note is exactly
   // where emoji show up. Code points also match the server's chars() bound.
-  const labelCps = Array.from(typedLabel);
-  const bodyCps = Array.from(DIALOG_BODY);
-  const noteCps = Array.from(giftNote);
+  // Memoized: this component re-renders ~70×/s while typing, and re-deriving
+  // the arrays per tick is pure allocation churn in the hottest path.
+  const labelCps = useMemo(() => Array.from(typedLabel), [typedLabel]);
+  const bodyCps = useMemo(() => Array.from(DIALOG_BODY), [DIALOG_BODY]);
+  const noteCps = useMemo(() => Array.from(giftNote), [giftNote]);
   // cumulative beat offsets — every slice and cursor handoff below reads from
   // these, so the boundaries live in exactly one place
   const bodyStart = labelCps.length;
@@ -77,16 +80,25 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   const typeTotal = noteStart + noteCps.length;
   const [typeChars, setTypeChars] = useState(0);
   const [typeKey, setTypeKey] = useState(0);
-  // the typeKey whose entrance has fully played. The note is editable
-  // post-creation, so a background refetch can change typeTotal — re-running
-  // this effect mid-session. Once the entrance has played, snap to the new
-  // text instead of replaying: a retype would re-disable the typeDone-gated
-  // controls under the friend for several seconds. The replay button bumps
-  // typeKey, which re-arms the full animation.
+  // the typeKey whose entrance has fully played, stamped ONLY at the explicit
+  // completion sites (interval clamp, skip, reduced-motion/already-played
+  // snap) — never derived from a render: a replay click's commit still sees
+  // the old completed typeChars, and a derived stamp would mark the new key
+  // played before it types a character. The note is editable post-creation,
+  // so a background refetch can change typeTotal mid-session: once the
+  // entrance has played, snap to the new text instead of replaying (a retype
+  // would re-disable the typeDone-gated controls under the friend for
+  // seconds). The replay button bumps typeKey, which re-arms the animation.
   const playedKeyRef = useRef<number | null>(null);
   useEffect(() => {
-    if (typeTotal === 0) return;
-    if (prefersReducedMotion()) {
+    // The entrance belongs to the loaded page. Without this gate the effect
+    // types DIALOG_BODY invisibly behind the loading/error views (typeTotal
+    // is never 0 — the body is a constant) and stamps itself played, so a
+    // slow first fetch or an error→retry would render the box pre-typed and
+    // the entrance would never animate.
+    if (!viewLoaded) return;
+    if (prefersReducedMotion() || playedKeyRef.current === typeKey) {
+      playedKeyRef.current = typeKey;
       setTypeChars(typeTotal);
       return;
     }
@@ -94,10 +106,6 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
     // the boot, so without this gate the typing is already done when the
     // boot cuts away — ben caught it, 2026-07-09)
     if (!bootDone) return;
-    if (playedKeyRef.current === typeKey) {
-      setTypeChars(typeTotal);
-      return;
-    }
     setTypeChars(0);
     // ...then a 1s beat before the first character — the box sits with its
     // blinking cursor for a moment, like the game is thinking
@@ -109,7 +117,10 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
             if (iv !== undefined) clearInterval(iv);
             return c;
           }
-          return c + 1;
+          const next = c + 1;
+          // completion observed at the source (idempotent ref write)
+          if (next >= typeTotal) playedKeyRef.current = typeKey;
+          return next;
         });
       }, 14);
     }, 1000);
@@ -117,13 +128,34 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       clearTimeout(delay);
       if (iv !== undefined) clearInterval(iv);
     };
-  }, [typeKey, typeTotal, bootDone]);
+  }, [typeKey, typeTotal, bootDone, viewLoaded]);
   const typeDone = typeChars >= typeTotal;
+  // skip-to-end — click/tap on the dialog box, or Enter/Space anywhere (the
+  // JRPG "press A" this page is homaging; keyboard users get the same out).
+  // Skipping counts as played: a later refetch must snap, not retype.
+  const skipTyping = useCallback(() => {
+    playedKeyRef.current = typeKey;
+    setTypeChars(typeTotal);
+  }, [typeKey, typeTotal]);
   useEffect(() => {
-    if (typeDone && typeTotal > 0) {
-      playedKeyRef.current = typeKey;
-    }
-  }, [typeDone, typeKey, typeTotal]);
+    if (!viewLoaded || typeDone) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      const t = e.target;
+      if (
+        t instanceof HTMLInputElement ||
+        t instanceof HTMLTextAreaElement ||
+        t instanceof HTMLButtonElement ||
+        (t instanceof HTMLElement && t.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      skipTyping();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [viewLoaded, typeDone, skipTyping]);
   const [detailGame, setDetailGame] = useState<GameView | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const prevTokenRef = useRef<string | undefined>(undefined);
@@ -194,9 +226,14 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       }
       // Hard reset to the spinner only on token change (initial load / navigation).
       // refreshTick bumps refetch behind the current view — no blank flash mid-claim.
+      // (This branch ONLY — a reset on every refreshTick refetch would replay the
+      // entrance after each claim, the exact churn playedKeyRef exists to prevent.)
       if (prevTokenRef.current !== token) {
         prevTokenRef.current = token;
         setView({ kind: "loading" });
+        // a different link is a different page: its entrance hasn't played
+        playedKeyRef.current = null;
+        setTypeChars(0);
       }
       try {
         const data = await fetchLink(token);
@@ -338,13 +375,19 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
               controls inert for seconds with nothing to do but watch */}
           <div
             onClick={() => {
-              if (!typeDone) setTypeChars(typeTotal);
+              if (!typeDone) skipTyping();
             }}
             className="absolute bottom-4 left-6 w-[34rem] max-w-[calc(100%-3rem)] rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)] max-[800px]:relative max-[800px]:bottom-auto max-[800px]:left-auto max-[800px]:w-auto max-[800px]:max-w-none max-[800px]:-mt-8 max-[800px]:mx-7"
           >
             <button
               type="button"
-              onClick={() => setTypeKey((k) => k + 1)}
+              onClick={(e) => {
+                // don't bubble into the box's tap-to-skip — one click must
+                // not mean both "skip" and "replay" (the skip half would
+                // paint a full-text frame before the restart)
+                e.stopPropagation();
+                setTypeKey((k) => k + 1);
+              }}
               aria-label="replay the text"
               title="replay"
               className="font-pixel absolute top-2.5 right-3 text-sm text-dust-faint hover:text-ink"
