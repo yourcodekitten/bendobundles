@@ -69,6 +69,7 @@ fn test_game(n: u32) -> Game {
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     }
 }
 
@@ -1350,6 +1351,9 @@ fn test_steam_cache(app_id: u32) -> SteamAppCache {
             video_hls_url: None,
             video_thumbnail: None,
             screenshots: vec![],
+            tags: vec![],
+            content_descriptor_ids: vec![],
+            content_notes: None,
         }),
         overall: Some(ReviewSummary {
             desc: "Mostly Positive".into(),
@@ -1807,4 +1811,66 @@ async fn link_list_carries_genres_from_steam_cache() {
         "detail game object must stay wire-identical (no genres key)"
     );
     assert_eq!(dj["steam"]["detail"]["genres"][0], "Action");
+}
+
+/// GET /api/l/:token — games carry community `tags` from the steam cache (#71);
+/// empty-tag caches omit the key (genre fallback stays client-side).
+#[tokio::test]
+async fn link_list_carries_tags_from_steam_cache() {
+    let uid = uuid::Uuid::new_v4().simple().to_string();
+    let Some(store) = store_or_skip(&format!("tag{}", &uid[..10])).await else {
+        return;
+    };
+
+    // game A: warm cache with tags
+    let mut a = test_game(70);
+    a.steam_app_id = Some(99201);
+    let aid = a.id.clone();
+    store.put_game(&a).await.unwrap();
+    let mut cache = test_steam_cache(99201);
+    cache.detail.as_mut().unwrap().tags = vec!["Roguelike".into(), "Sci-fi".into()];
+    store.put_steam_app(&cache).await.unwrap();
+
+    // game B: warm cache, EMPTY tags (gated/pre-backfill) → tags key absent
+    let mut b = test_game(71);
+    b.steam_app_id = Some(99202);
+    let bid = b.id.clone();
+    store.put_game(&b).await.unwrap();
+    store.put_steam_app(&test_steam_cache(99202)).await.unwrap();
+
+    let tok = format!("tag{}", &uid[..28]);
+    store.create_link(&test_link(&tok)).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let req = Request::get(format!("/api/l/{tok}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+
+    let games = j["games"].as_array().expect("games must be an array");
+    let ga = games
+        .iter()
+        .find(|g| g["id"] == aid.as_str())
+        .expect("game A must be in the list");
+    let gb = games
+        .iter()
+        .find(|g| g["id"] == bid.as_str())
+        .expect("game B must be in the list");
+
+    assert_eq!(
+        ga["tags"],
+        serde_json::json!(["Roguelike", "Sci-fi"]),
+        "cache-warm game carries community tags in popularity order"
+    );
+    assert!(
+        gb.get("tags").is_none(),
+        "empty-tag cache must omit the tags key entirely (genre fallback is client-side)"
+    );
 }

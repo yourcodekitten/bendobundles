@@ -106,7 +106,7 @@ describe('GameGrid', () => {
     );
   });
 
-  it('renders up to 4 genre chips straight from the list payload — no fetch', () => {
+  it('renders genre chips by width budget when the payload has no tags (#71 fallback)', () => {
     const games = [
       makeGame({
         id: '1',
@@ -117,10 +117,38 @@ describe('GameGrid', () => {
     render(<GameGrid games={games} onDetail={vi.fn()} />);
     expect(screen.getByText('Action')).toBeInTheDocument();
     expect(screen.getByText('Adventure')).toBeInTheDocument();
-    // display cap is 4 — the 5th genre from the payload is not rendered
-    expect(screen.queryByText('Casual')).not.toBeInTheDocument();
+    // width-budget fit (#71): these five short names all fit inside the 36-char budget
+    expect(screen.getByText('Casual')).toBeInTheDocument();
     // genre chips replace the key_type chip
     expect(screen.queryByText('steam')).not.toBeInTheDocument();
+  });
+
+  it('chips community tags over genres, in payload order (#71)', () => {
+    const games = [
+      makeGame({
+        id: '1',
+        title: 'Dome Keeper',
+        tags: ['Roguelike', 'Sci-fi'],
+        genres: ['Action'],
+      }),
+    ];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.getByText('Roguelike')).toBeInTheDocument();
+    expect(screen.getByText('Sci-fi')).toBeInTheDocument();
+    expect(screen.queryByText('Action')).not.toBeInTheDocument();
+  });
+
+  it('width-budget caps the chip row at 6 even for short tags (#71)', () => {
+    const games = [
+      makeGame({
+        id: '1',
+        title: 'Taggy',
+        tags: ['T1', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7', 'T8'],
+      }),
+    ];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.getByText('T6')).toBeInTheDocument();
+    expect(screen.queryByText('T7')).not.toBeInTheDocument();
   });
 
   it('falls back to the key_type chip when the payload has no genres', () => {

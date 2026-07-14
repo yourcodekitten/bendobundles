@@ -1,4 +1,5 @@
 import type { AdminGame } from '../api';
+import { displayTags, isMature } from '../tags';
 
 export type RatingFloor =
   | 'any'
@@ -7,6 +8,7 @@ export type RatingFloor =
   | 'very-positive'
   | 'overwhelmingly-positive';
 export type SortKey = 'title' | 'rating' | 'date-new' | 'date-old';
+export type MatureFilter = 'all' | 'hide' | 'only';
 export type GroupKey = 'none' | 'publisher' | 'studio' | 'bundle';
 
 export type ToolkitState = {
@@ -15,7 +17,21 @@ export type ToolkitState = {
   rating: RatingFloor;
   sort: SortKey;
   group: GroupKey;
+  /** 🔞 policy over content_descriptor_ids (#71): show all / hide flagged / only flagged. */
+  mature: MatureFilter;
 };
+
+/** The keys that FILTER rows (sort/group are view prefs — 'clear filters' keeps them).
+ * ToolkitBar derives its active-filter readout from this list, so filter N+1 registers
+ * in exactly one file (review round 2 — the forgotten-mature bug class). */
+export const FILTER_KEYS = ['q', 'tags', 'rating', 'mature'] as const;
+
+/** True when any FILTER key differs from its idle value. */
+export function filtersActive(state: ToolkitState): boolean {
+  return FILTER_KEYS.some((k) =>
+    k === 'tags' ? state.tags.length > 0 : state[k] !== IDLE_TOOLKIT[k],
+  );
+}
 
 export const IDLE_TOOLKIT: ToolkitState = {
   q: '',
@@ -23,6 +39,7 @@ export const IDLE_TOOLKIT: ToolkitState = {
   rating: 'any',
   sort: 'title',
   group: 'none',
+  mature: 'all',
 };
 
 // Steam's review ladder, worst→best. Rank = index. An unknown desc (Steam's
@@ -49,7 +66,8 @@ const FLOOR_RANK: Record<Exclude<RatingFloor, 'any'>, number> = {
 export function collectTagOptions(games: AdminGame[]): { tag: string; count: number }[] {
   const counts = new Map<string, number>();
   for (const g of games)
-    for (const t of g.steam?.genres ?? []) counts.set(t, (counts.get(t) ?? 0) + 1);
+    // Same chips you see = same chips you filter: community tags, genre fallback (#71).
+    for (const t of displayTags(g.steam ?? {})) counts.set(t, (counts.get(t) ?? 0) + 1);
   return [...counts]
     .map(([tag, count]) => ({ tag, count }))
     .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
@@ -76,12 +94,12 @@ export function applyToolkit(
   const filtered = games.filter((g) => {
     if (!matchesSearch(g, q)) return false;
     if (state.tags.length > 0) {
-      const genres = g.steam?.genres;
-      if (!genres || genres.length === 0) {
+      const tags = displayTags(g.steam ?? {});
+      if (tags.length === 0) {
         excludedNoData++;
         return false;
       }
-      if (!state.tags.every((t) => genres.includes(t))) return false;
+      if (!state.tags.every((t) => tags.includes(t))) return false;
     }
     if (state.rating !== 'any') {
       const desc = g.steam?.review_desc;
@@ -91,6 +109,15 @@ export function applyToolkit(
         return false;
       }
       if (rank < FLOOR_RANK[state.rating]) return false;
+    }
+    const flagged = isMature(g.steam?.content_descriptor_ids);
+    if (state.mature === 'hide' && flagged) return false;
+    if (state.mature === 'only' && !flagged) {
+      // rows with NO descriptor data (unmapped, or a deploy-window/old-lambda payload
+      // omitting the field) aren't provably non-mature — count them as no-data so the
+      // trove never silently shrinks (review round 2).
+      if (g.steam === null || g.steam.content_descriptor_ids === undefined) excludedNoData++;
+      return false;
     }
     return true;
   });

@@ -85,6 +85,11 @@ struct GameView {
     /// always leaves this empty — the modal reads the full steam blob.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     genres: Vec<String>,
+    /// Top community tags (popularity order, ≤10) from the enrichment cache — the card
+    /// chips (#71). Genres stay as the fallback for tag-less apps AND for deploy-window
+    /// back-compat (an older cached SPA bundle still reads `genres`). Empty → omitted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
 }
 
 impl GameView {
@@ -93,7 +98,7 @@ impl GameView {
     /// can't drift field-by-field. `genres` is the list endpoint's enrichment;
     /// the detail endpoint passes an empty vec (key omitted on the wire — the
     /// modal reads the full steam blob instead).
-    fn from_game(g: domain::Game, genres: Vec<String>) -> Self {
+    fn from_game(g: domain::Game, genres: Vec<String>, tags: Vec<String>) -> Self {
         Self {
             id: g.id,
             title: g.title,
@@ -102,6 +107,7 @@ impl GameView {
             artwork_url: g.artwork_url,
             steam_app_id: g.steam_app_id,
             genres,
+            tags,
         }
     }
 }
@@ -508,13 +514,16 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
                 .unwrap_or_default();
             gs.into_iter()
                 .map(|g| {
-                    let genres = g
+                    let detail = g
                         .steam_app_id
                         .and_then(|id| caches.get(&id))
-                        .and_then(|c| c.detail.as_ref())
+                        .and_then(|c| c.detail.as_ref());
+                    let genres = detail
                         .map(|d| d.genres.iter().take(5).cloned().collect())
                         .unwrap_or_default();
-                    GameView::from_game(g, genres)
+                    // Stored tags are already capped at 10 — no take() here.
+                    let tags = detail.map(|d| d.tags.clone()).unwrap_or_default();
+                    GameView::from_game(g, genres, tags)
                 })
                 .collect()
         },
@@ -779,9 +788,9 @@ async fn handle_game_detail(
         },
     };
 
-    // Genres deliberately empty (key omitted on the wire): the modal reads
-    // steam.detail.genres from the full blob below instead.
-    let game_view = GameView::from_game(game, vec![]);
+    // Genres and tags deliberately empty (keys omitted on the wire): the modal reads
+    // the full steam blob below instead.
+    let game_view = GameView::from_game(game, vec![], vec![]);
 
     (
         StatusCode::OK,

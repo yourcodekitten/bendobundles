@@ -2,6 +2,7 @@
  "413150": {
   "success": true,
   "data": {
+   "content_descriptors": { "ids": [1, 5], "notes": "Some nudity." },
    "steam_appid": 413150,
    "name": "Stardew Valley",
    "developers": [

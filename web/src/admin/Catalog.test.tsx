@@ -34,6 +34,7 @@ const gameFixture: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -50,6 +51,7 @@ const gameAvailable: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -66,6 +68,7 @@ const gamePending: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -82,6 +85,7 @@ const gameGifted: AdminGame = {
   requires_choice: false,
   steam_app_id: null,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -486,6 +490,7 @@ describe('Catalog', () => {
           id: 'gx:ownedchoice',
           status: 'available',
           owned_by_ben: true,
+          hidden_source: null,
           requires_choice: true,
           steam_app_id: 730,
         },
@@ -510,6 +515,7 @@ describe('Catalog', () => {
           id: 'gx:ownednull',
           status: 'available',
           owned_by_ben: true,
+          hidden_source: null,
           steam_app_id: 730,
         },
       ]);
@@ -523,6 +529,78 @@ describe('Catalog', () => {
       ).not.toBeInTheDocument();
       // Should fall back to plain confirm.
       expect(screen.getByRole('button', { name: /confirm\?/i })).toBeInTheDocument();
+    });
+  });
+
+  describe('mature badge + auto-hidden label (#71)', () => {
+    const steamWith = (ids: number[]) => ({
+      genres: ['Casual'],
+      tags: ['Sexual Content'],
+      content_descriptor_ids: ids,
+      developers: [],
+      publishers: [],
+      release_date: null,
+      release_date_iso: null,
+      review_desc: null,
+      review_percent: null,
+      review_count: null,
+      recent_percent: null,
+    });
+
+    it('shows the mature badge for sexual-content descriptors', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:mature', steam: steamWith([1, 5]) },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      expect(screen.getByRole('img', { name: /mature content/i })).toBeInTheDocument();
+    });
+
+    it('no badge for general-mature-only or violence-only descriptors', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:rollerdrome', steam: steamWith([5]) },
+        { ...gameFixture, id: 'gx:violent', title: 'Violent Game', steam: steamWith([2]) },
+        { ...gameFixture, id: 'gx:nosteam', title: 'No Steam Game' },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Violent Game')).toBeInTheDocument());
+      expect(screen.queryByRole('img', { name: /mature content/i })).not.toBeInTheDocument();
+    });
+
+    it('labels sync auto-hides next to the hidden toggle', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:autohid', hidden: true, hidden_source: 'sync' },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      expect(screen.getByText('auto-hidden: adult content')).toBeInTheDocument();
+    });
+
+    it('re-hiding locally stamps admin provenance — no stale auto-hidden label (#71 review r1)', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:rehide', hidden: false, hidden_source: 'sync' },
+      ]);
+      vi.mocked(adminSetHidden).mockResolvedValue({ ok: true });
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      // Ben re-hides the (previously sync-hidden, then unhidden) row.
+      fireEvent.click(screen.getByRole('switch', { name: /hide base game/i }));
+      await waitFor(() =>
+        expect(screen.getByRole('switch', { name: /hide base game/i })).toBeChecked(),
+      );
+      // The server stamps Admin on every toggle — the local row must too, so the
+      // stale 'sync' provenance never re-labels the row as auto-hidden.
+      expect(screen.queryByText('auto-hidden: adult content')).not.toBeInTheDocument();
+    });
+
+    it('no label for admin hides or unhidden sync rows', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:adminhid', hidden: true, hidden_source: 'admin' },
+        { ...gameFixture, id: 'gx:unhid', title: 'Unhidden Game', hidden: false, hidden_source: 'sync' },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Unhidden Game')).toBeInTheDocument());
+      expect(screen.queryByText('auto-hidden: adult content')).not.toBeInTheDocument();
     });
   });
 });
@@ -549,6 +627,8 @@ const troveGames: AdminGame[] = [
     bundle: 'June 2026',
     steam: {
       genres: ['Action'],
+      tags: [],
+      content_descriptor_ids: [],
       developers: ['DevA'],
       publishers: ['Pub House'],
       release_date: '12 Nov 2019',
@@ -566,6 +646,8 @@ const troveGames: AdminGame[] = [
     bundle: 'June 2026',
     steam: {
       genres: ['Indie'],
+      tags: [],
+      content_descriptor_ids: [],
       developers: ['DevB'],
       publishers: ['Pub House'],
       release_date: 'Mar 2021',
@@ -607,6 +689,12 @@ describe('Catalog toolkit wiring', () => {
     expect(screen.queryByText('Zork Prime')).not.toBeInTheDocument();
   });
 
+  it('restores the mature filter from URL params (#71)', async () => {
+    renderCatalogAt('/admin/catalog?mature=hide');
+    await waitFor(() => screen.getByText('Action Hit'));
+    expect((screen.getByLabelText('mature') as HTMLSelectElement).value).toBe('hide');
+  });
+
   it('toggling a tag chip filters without reload; clear filters restores the trove', async () => {
     renderCatalogAt('/admin/catalog');
     await waitFor(() => screen.getByText('Action Hit'));
@@ -645,6 +733,8 @@ describe('Catalog toolkit wiring', () => {
         key_type: 'steam',
         steam: {
           genres: ['Action'],
+          tags: [],
+          content_descriptor_ids: [],
           developers: ['DevA'],
           publishers: ['Big Pub', 'Small Pub'],
           release_date: null,

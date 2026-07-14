@@ -1,5 +1,6 @@
 import { memo } from 'react';
 import { type GameView } from '../api';
+import { displayTags, fitTags } from '../tags';
 import { titleColorClass, titleHueVar } from '../titleColor';
 
 interface GameGridProps {
@@ -57,9 +58,11 @@ function GameGridImpl({ games, owned, onDetail }: GameGridProps) {
             </div>
           );
 
-        // genres ride the list payload now (issue #55) — no per-card fetch.
-        // max 4 chips on the card; absent/empty falls back to the key_type chip.
-        const genres = game.genres?.length ? game.genres.slice(0, 4) : null;
+        // community tags replace genres on the chips (#71); genres remain the fallback
+        // for gated/delisted/pre-backfill apps. width-budget fit mirrors steam's store
+        // box (short tags ⇒ more chips). absent/empty falls back to the key_type chip.
+        const chipTags = fitTags(displayTags(game));
+        const genres = chipTags.length ? chipTags : null;
 
         const titleBlock = (
           <>

@@ -48,9 +48,22 @@ async fn main() {
     .await
     .expect("backfill: list_all_games failed");
     println!(
-        "backfill: fetched={} negative={} skipped={} failed={} aborted_429={}",
-        summary.fetched, summary.negative, summary.skipped, summary.failed, summary.aborted_429
+        "backfill: fetched={} negative={} skipped={} failed={} aborted_429={} auto_hidden={} tag_batch_failed={}",
+        summary.fetched,
+        summary.negative,
+        summary.skipped,
+        summary.failed,
+        summary.aborted_429,
+        summary.auto_hidden,
+        summary.tag_batch_failed
     );
+    if summary.tag_batch_failed {
+        eprintln!(
+            "tag batch FAILED — refetched items kept old tags but were stamped fresh; \
+             rerun with SKIP_FRESH_SECS=0 once the endpoint recovers"
+        );
+        std::process::exit(3);
+    }
     if summary.aborted_429 {
         eprintln!("rate-limited — rerun to resume (items already rewritten are skipped)");
         std::process::exit(2);

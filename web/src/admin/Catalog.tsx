@@ -12,9 +12,11 @@ import {
   type SelfClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
+import { isMature } from '../tags';
 import { titleColorClass } from '../titleColor';
 import { GameDetailModal } from '../GameDetailModal';
 import {
+  type MatureFilter,
   applyToolkit,
   collectTagOptions,
   type GroupKey,
@@ -35,6 +37,7 @@ const RATING_KEYS: readonly RatingFloor[] = [
 ];
 const SORT_KEYS: readonly SortKey[] = ['title', 'rating', 'date-new', 'date-old'];
 const GROUP_KEYS: readonly GroupKey[] = ['none', 'publisher', 'studio', 'bundle'];
+const MATURE_KEYS: readonly MatureFilter[] = ['all', 'hide', 'only'];
 
 function keyOf<T extends string>(raw: string | null, known: readonly T[], idle: T): T {
   return raw !== null && (known as readonly string[]).includes(raw) ? (raw as T) : idle;
@@ -80,6 +83,7 @@ export function Catalog() {
       rating: keyOf(params.get('rating'), RATING_KEYS, 'any'),
       sort: keyOf(params.get('sort'), SORT_KEYS, 'title'),
       group: keyOf(params.get('group'), GROUP_KEYS, 'none'),
+      mature: keyOf(params.get('mature'), MATURE_KEYS, 'all'),
     }),
     [params],
   );
@@ -90,6 +94,7 @@ export function Catalog() {
     if (next.rating !== 'any') p.set('rating', next.rating);
     if (next.sort !== 'title') p.set('sort', next.sort);
     if (next.group !== 'none') p.set('group', next.group);
+    if (next.mature !== 'all') p.set('mature', next.mature);
     setParams(p, { replace: true });
   };
   // Per-row inline error for toggle refusals (mid-claim 409 from server)
@@ -152,25 +157,45 @@ export function Catalog() {
 
     // Functional updates throughout: concurrent toggles must never revert
     // through a stale whole-list snapshot (that would clobber other rows).
-    const setRowHidden = (hidden: boolean) => {
+    // hidden_source rides along: the server stamps Admin on EVERY toggle (#71),
+    // so the local row must too — otherwise a re-hidden row keeps its stale
+    // 'sync' provenance and falsely re-labels as auto-hidden until a refetch.
+    const setRowHidden = (hidden: boolean, hidden_source: AdminGame['hidden_source']) => {
       setState((s) =>
         s.phase === 'loaded'
           ? {
               phase: 'loaded',
-              games: s.games.map((g) => (g.id === game.id ? { ...g, hidden } : g)),
+              games: s.games.map((g) => (g.id === game.id ? { ...g, hidden, hidden_source } : g)),
+            }
+          : s,
+      );
+    };
+    // Compare-and-swap revert: only undo THIS request's optimistic write. A later
+    // toggle's optimistic state must not be clobbered back to this closure's stale
+    // snapshot (review round 2 — the resurrected 'auto-hidden' label).
+    const revertRow = () => {
+      setState((s) =>
+        s.phase === 'loaded'
+          ? {
+              phase: 'loaded',
+              games: s.games.map((g) =>
+                g.id === game.id && g.hidden === newHidden && g.hidden_source === 'admin'
+                  ? { ...g, hidden: game.hidden, hidden_source: game.hidden_source }
+                  : g,
+              ),
             }
           : s,
       );
     };
 
-    // Optimistic flip
-    setRowHidden(newHidden);
+    // Optimistic flip — with the Admin stamp the server is about to write
+    setRowHidden(newHidden, 'admin');
 
     withAuth(() => adminSetHidden(game.id, newHidden), navigate)
       .then((result) => {
         if (!result.ok) {
           // Server refused (e.g. mid-claim 409) — revert this row + show message
-          setRowHidden(game.hidden);
+          revertRow();
           setRowErrors((prev) => ({ ...prev, [game.id]: result.message }));
         } else {
           // Clear any previous row error on success
@@ -183,7 +208,7 @@ export function Catalog() {
       })
       .catch(() => {
         // Unexpected error — revert this row silently (withAuth already redirected on 401)
-        setRowHidden(game.hidden);
+        revertRow();
       });
   };
 
@@ -411,6 +436,19 @@ export function Catalog() {
                   </span>
                 )}
 
+                {/* 🔞 — sexual-content descriptor family {1,3,4}; violence-only (2) and
+                    general-mature-only (5) deliberately don't badge (#71) */}
+                {game.steam !== null && isMature(game.steam.content_descriptor_ids) && (
+                  <span
+                    role="img"
+                    aria-label="mature content"
+                    title="steam content descriptors: sexual content"
+                    className="rounded bg-red-950 px-2 py-0.5 text-xs text-red-200"
+                  >
+                    🔞
+                  </span>
+                )}
+
                 {/* owned_by_ben badge — hidden when adminSteamIdentity is null (frozen-stamps caveat) */}
                 {game.owned_by_ben && adminSteamId !== null && (
                   <span className="rounded bg-blue-900 px-2 py-0.5 text-xs text-blue-200">
@@ -459,6 +497,16 @@ export function Catalog() {
                   />
                   <span className="text-xs text-dust">hidden</span>
                 </label>
+
+                {/* not-silent auto-hide (#71): sync-hidden rows say so */}
+                {game.hidden && game.hidden_source === 'sync' && (
+                  <span
+                    className="text-xs text-dust"
+                    title="hidden automatically by sync — adult content descriptors; toggling makes your choice permanent"
+                  >
+                    auto-hidden: adult content
+                  </span>
+                )}
 
                 {/* Inline toggle error — shown when server refuses (e.g. mid-claim) */}
                 {rowErr !== undefined && (

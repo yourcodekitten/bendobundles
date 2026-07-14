@@ -57,6 +57,23 @@ pub enum HiddenWrite {
     Contested,
 }
 
+/// Outcome of the sync auto-hide write. Non-`Written` variants are all "leave it alone":
+/// the sweep re-evaluates next run, and Admin provenance is permanent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoHideWrite {
+    /// Game is now hidden with `hidden_source = Sync`.
+    Written,
+    /// No game with that ID exists.
+    NotFound,
+    /// Already hidden (by anyone) — no write, provenance untouched.
+    AlreadyHidden,
+    /// `hidden_source == Admin` — Ben decided; the sweep never overrides him.
+    AdminOwned,
+    /// Optimistic-lock CCF (claim flipped status mid-window, or an admin write landed
+    /// between our read and put). Skip; next sync retries.
+    Contested,
+}
+
 /// Outcome of a guarded owned-by-ben write. The ONLY safe way to toggle `owned_by_ben` on a game.
 /// Closes the admin-toggle vs claim race that an unguarded `put_game` would lose.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1298,13 +1315,12 @@ impl Store {
         }
 
         game.hidden = hidden;
+        // Every admin toggle — hide OR unhide — stamps Admin: from this moment the
+        // auto-hide sweep defers to Ben on this record forever (#71).
+        game.hidden_source = Some(domain::HiddenSource::Admin);
 
         // Optimistic lock: status must match what we read. Mirrors upsert_game_from_sync.
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
+        let status_str = game.status.as_wire();
 
         let res = self
             .client
@@ -1322,6 +1338,55 @@ impl Store {
             Err(sdk_err) => {
                 if is_ccf_put(&sdk_err) {
                     Ok(HiddenWrite::Contested)
+                } else {
+                    Err(StoreError::Aws(format!("{sdk_err:?}")))
+                }
+            }
+        }
+    }
+
+    /// Sync auto-hide: the ONLY writer allowed to set `hidden` without admin intent.
+    /// One-way (never unhides). Same status optimistic-lock as `set_game_hidden`, plus a
+    /// condition on the top-level `hidden_source` mirror so an admin toggle landing inside
+    /// the read→write window wins (#71 "never fights Ben"; `appid_source` Manual-guard
+    /// pattern).
+    pub async fn auto_hide_game(&self, game_id: &str) -> Result<AutoHideWrite, StoreError> {
+        let Some(mut game) = self.get_game(game_id).await? else {
+            return Ok(AutoHideWrite::NotFound);
+        };
+        if game.hidden {
+            return Ok(AutoHideWrite::AlreadyHidden);
+        }
+        if game.hidden_source == Some(domain::HiddenSource::Admin) {
+            return Ok(AutoHideWrite::AdminOwned);
+        }
+        if game.status == GameStatus::Pending {
+            return Ok(AutoHideWrite::Contested);
+        }
+
+        game.hidden = true;
+        game.hidden_source = Some(domain::HiddenSource::Sync);
+
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_names("#hsrc", "hidden_source")
+            .expression_attribute_values(":expected", schema::s(game.status.as_wire()))
+            .expression_attribute_values(":admin", schema::s(domain::HiddenSource::Admin.as_wire()))
+            .condition_expression(
+                "#st = :expected AND (attribute_not_exists(#hsrc) OR #hsrc <> :admin)",
+            )
+            .send()
+            .await;
+
+        match res {
+            Ok(_) => Ok(AutoHideWrite::Written),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(AutoHideWrite::Contested)
                 } else {
                     Err(StoreError::Aws(format!("{sdk_err:?}")))
                 }
@@ -1364,11 +1429,7 @@ impl Store {
         // inside our read→write window: if appid_source is now Manual in DynamoDB,
         // we must NOT clobber it. attribute_not_exists allows the write on items that
         // predate the appid_source attribute (Title/Humble/None all still map).
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
+        let status_str = game.status.as_wire();
 
         let res = self
             .client
@@ -1378,7 +1439,10 @@ impl Store {
             .expression_attribute_names("#st", "status")
             .expression_attribute_names("#asrc", "appid_source")
             .expression_attribute_values(":expected", schema::s(status_str))
-            .expression_attribute_values(":manual", schema::s("manual".to_string()))
+            .expression_attribute_values(
+                ":manual",
+                schema::s(domain::AppidSource::Manual.as_wire()),
+            )
             .condition_expression(
                 "#st = :expected AND (attribute_not_exists(#asrc) OR #asrc <> :manual)",
             )
@@ -1418,6 +1482,9 @@ impl Store {
         // TOCTOU where a compensate+reclaim lands inside sync's read→write window. Without it, the
         // put would stamp the stale claim_id and strand the live claim (whose fulfill gate checks
         // claim_id for ownership).
+        // hidden_source must also be unchanged since the read: an admin toggle landing inside
+        // this window would otherwise be silently reverted — INCLUDING the Admin stamp, which
+        // erases Ben's permanent auto-hide immunity (#71). Sync yields; next run re-merges.
         let mut req = self
             .client
             .put_item()
@@ -1427,21 +1494,28 @@ impl Store {
         let cond = match &existing {
             None => "attribute_not_exists(pk)".to_string(),
             Some(e) => {
-                let status_str = serde_json::to_value(e.status)
-                    .expect("status serializes")
-                    .as_str()
-                    .expect("status is a string")
-                    .to_string();
+                // Clause list, not a format! branch matrix: every guarded field appends
+                // exactly one clause, so guard N+1 can't silently miss an arm.
+                let mut clauses = vec!["#st = :expected".to_string()];
                 req = req
                     .expression_attribute_names("#st", "status")
-                    .expression_attribute_values(":expected", schema::s(status_str));
+                    .expression_attribute_values(":expected", schema::s(e.status.as_wire()));
                 // If the existing game is owned, add the ownership clause to the condition.
                 if let Some(cid) = &e.claim_id {
                     req = req.expression_attribute_values(":cid", schema::s(cid.clone()));
-                    "#st = :expected AND claim_id = :cid".to_string()
-                } else {
-                    "#st = :expected".to_string()
+                    clauses.push("claim_id = :cid".to_string());
                 }
+                // hidden_source must be unchanged since our read: an admin toggle landing
+                // inside this window owns the record — sync yields (#71).
+                req = req.expression_attribute_names("#hsrc", "hidden_source");
+                match e.hidden_source {
+                    None => clauses.push("attribute_not_exists(#hsrc)".to_string()),
+                    Some(src) => {
+                        req = req.expression_attribute_values(":hsrc", schema::s(src.as_wire()));
+                        clauses.push("#hsrc = :hsrc".to_string());
+                    }
+                }
+                clauses.join(" AND ")
             }
         };
 
@@ -1913,11 +1987,7 @@ impl Store {
         game.appid_source = appid.map(|_| domain::AppidSource::Manual);
 
         // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
+        let status_str = game.status.as_wire();
 
         let res = self
             .client
@@ -1965,11 +2035,7 @@ impl Store {
         game.owned_by_ben = owned;
 
         // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
+        let status_str = game.status.as_wire();
 
         let res = self
             .client

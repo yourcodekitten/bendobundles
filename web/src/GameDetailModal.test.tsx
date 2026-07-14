@@ -51,6 +51,8 @@ import { withAuth } from "./admin/withAuth";
 const steamDetailFixture = {
   app_id: 413150,
   name: "Stardew Valley",
+  tags: [],
+  content_descriptor_ids: [],
   developers: ["ConcernedApe"],
   publishers: ["ConcernedApe"],
   genres: ["Indie", "RPG", "Simulation"],
@@ -99,6 +101,7 @@ const adminGame: AdminGame = {
   requires_choice: false,
   steam_app_id: 413150,
   owned_by_ben: false,
+  hidden_source: null,
   steam: null,
 };
 
@@ -738,4 +741,102 @@ describe("focus trap", () => {
     const dialog = screen.getByRole("dialog");
     expect(dialog.contains(last)).toBe(true);
   });
+  // ── #71: tags chips + admin descriptor note ──────────────────────────────────
+
+  it("modal chips prefer community tags over genres (#71)", async () => {
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: friendGame,
+      steam: {
+        detail: {
+          ...steamDetailFixture,
+          tags: ["Farming Sim", "Pixel Graphics"],
+        },
+        overall: null,
+        recent: null,
+      },
+    });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={friendGame}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByText("Farming Sim")).toBeInTheDocument(),
+    );
+    expect(screen.getByText("Pixel Graphics")).toBeInTheDocument();
+    expect(screen.queryByText("Indie")).not.toBeInTheDocument();
+  });
+
+  it("admin mount shows descriptor labels + steam note (#71)", async () => {
+    vi.mocked(adminGameDetail).mockResolvedValue({
+      game: adminGame,
+      steam: {
+        detail: {
+          ...steamDetailFixture,
+          content_descriptor_ids: [1, 5],
+          content_notes: "Some nudity.",
+        },
+        overall: null,
+        recent: null,
+      },
+    });
+    render(
+      <GameDetailModal
+        mount="admin"
+        game={adminGame}
+        onClose={vi.fn()}
+        armedId={null}
+        claiming={null}
+        onSelfClaim={vi.fn()}
+        adminSteamId={null}
+        selfClaimResult={null}
+        loadDetail={adminLoadDetail}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/some nudity or sexual content/),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/general mature content/)).toBeInTheDocument();
+    expect(screen.getByText(/Some nudity\./)).toBeInTheDocument();
+  });
+
+  it("friend mount never shows descriptor info (#71)", async () => {
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: friendGame,
+      steam: {
+        detail: {
+          ...steamDetailFixture,
+          content_descriptor_ids: [1, 5],
+          content_notes: "Some nudity.",
+        },
+        overall: null,
+        recent: null,
+      },
+    });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={friendGame}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("Indie")).toBeInTheDocument());
+    expect(
+      screen.queryByText(/some nudity or sexual content/),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Some nudity\./)).not.toBeInTheDocument();
+  });
+
 });

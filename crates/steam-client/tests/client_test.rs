@@ -640,6 +640,64 @@ async fn app_details_tolerates_mistyped_category_ids() {
 }
 
 #[tokio::test]
+async fn app_details_parses_content_descriptors() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .and(wiremock::matchers::query_param("appids", "413150"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(APPDETAILS_FIXTURE))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert_eq!(detail.content_descriptor_ids, vec![1, 5]);
+    assert_eq!(detail.content_notes, Some("Some nudity.".to_string()));
+    // get_app_details never fills tags — enrichment owns them (GetItems).
+    assert!(detail.tags.is_empty());
+}
+
+#[tokio::test]
+async fn app_details_tolerates_missing_content_descriptors() {
+    // Fixture WITHOUT the key — most apps. Serde default must yield empties, not a parse error.
+    let body = APPDETAILS_FIXTURE.replace(
+        r#""content_descriptors": { "ids": [1, 5], "notes": "Some nudity." },"#,
+        "",
+    );
+    assert_ne!(
+        body, APPDETAILS_FIXTURE,
+        "needle must have matched — fixture line drifted?"
+    );
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/api/appdetails"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(body))
+        .mount(&server)
+        .await;
+    let result = test_client(&server).get_app_details(413150).await.unwrap();
+    let detail = match result {
+        steam_client::AppDetails::Found(d) => d,
+        steam_client::AppDetails::Delisted => panic!("expected Found, got Delisted"),
+    };
+    assert!(detail.content_descriptor_ids.is_empty());
+    assert_eq!(detail.content_notes, None);
+}
+
+#[test]
+fn steam_app_detail_blob_backcompat() {
+    // A cache blob written before this build (no tags/descriptor fields) must deserialize.
+    let old = r#"{"app_id":1,"name":"x","developers":[],"publishers":[],"genres":["RPG"],
+        "release_date":null,"short_description":"","header_image":null,
+        "video_hls_url":null,"video_thumbnail":null}"#;
+    let d: steam_client::SteamAppDetail = serde_json::from_str(old).unwrap();
+    assert!(d.tags.is_empty());
+    assert!(d.content_descriptor_ids.is_empty());
+    assert_eq!(d.content_notes, None);
+}
+
+#[tokio::test]
 async fn app_details_delisted_is_success_false() {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -888,4 +946,88 @@ fn parse_release_date_observed_formats() {
     assert_eq!(d("TBA"), None);
     assert_eq!(d(""), None);
     assert_eq!(d("Q3 2026"), None);
+}
+
+// ── #71: GetTagList (tagid→name) + GetItems (batched community tags) ────────────────────────
+
+#[tokio::test]
+async fn tag_list_parses_id_name_map() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/IStoreService/GetTagList/v1/"))
+        .and(wiremock::matchers::query_param("language", "english"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"version_hash":"abc","tags":[
+                {"tagid":19,"name":"Action"},{"tagid":701,"name":"Sports"}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let map = test_client(&server).get_tag_list().await.unwrap();
+    assert_eq!(map.get(&19).map(String::as_str), Some("Action"));
+    assert_eq!(map.get(&701).map(String::as_str), Some("Sports"));
+    assert_eq!(map.len(), 2);
+}
+
+#[tokio::test]
+async fn store_items_parses_tags_in_popularity_order() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/IStoreBrowseService/GetItems/v1/",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"store_items":[
+                {"appid":1294420,"tagids":[19,701,1774],"content_descriptorids":[5]},
+                {"appid":981300,"tagids":[12095],"content_descriptorids":[1,3,5,4]},
+                {"appid":404,"visible":false,"tagids":[],"content_descriptorids":[]}
+            ]}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let map = test_client(&server)
+        .get_store_items(&[1294420, 981300, 404])
+        .await
+        .unwrap();
+    assert_eq!(map[&1294420].tagids, vec![19, 701, 1774]); // popularity order preserved
+    assert_eq!(map[&981300].content_descriptorids, vec![1, 3, 5, 4]);
+    // visible:false still lands in the map with empty tags — a SUCCESSFUL fetch of
+    // "no tags", which callers may legitimately store (genre fallback takes over).
+    assert!(map[&404].tagids.is_empty());
+}
+
+#[tokio::test]
+async fn store_items_chunks_batches_of_fifty() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/IStoreBrowseService/GetItems/v1/",
+        ))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string(r#"{"response":{"store_items":[]}}"#),
+        )
+        .expect(2) // 51 ids → 2 chunks
+        .mount(&server)
+        .await;
+    let ids: Vec<u32> = (1..=51).collect();
+    let map = test_client(&server).get_store_items(&ids).await.unwrap();
+    assert!(map.is_empty());
+    // wiremock asserts the .expect(2) on drop
+}
+
+#[tokio::test]
+async fn store_items_rate_limited_maps_to_error() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/IStoreBrowseService/GetItems/v1/",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    let err = test_client(&server)
+        .get_store_items(&[1])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, steam_client::SteamError::RateLimited));
 }

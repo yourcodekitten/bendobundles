@@ -1,8 +1,8 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
-    AppidWrite, ClaimTxError, HiddenWrite, OwnedWrite, SYNC_RUN_STALE_SECS, SteamAppCache, Store,
-    SyncBegin, SyncState, SyncWrite, sync_run_is_live,
+    AppidWrite, AutoHideWrite, ClaimTxError, HiddenWrite, OwnedWrite, SYNC_RUN_STALE_SECS,
+    SteamAppCache, Store, SyncBegin, SyncState, SyncWrite, sync_run_is_live,
 };
 use std::collections::HashMap;
 use time::macros::datetime;
@@ -70,6 +70,7 @@ fn game(n: u32, listable: bool) -> Game {
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     }
 }
 
@@ -1965,6 +1966,9 @@ fn steam_app_cache_full(app_id: u32) -> SteamAppCache {
             video_hls_url: None,
             video_thumbnail: None,
             screenshots: vec![],
+            tags: vec![],
+            content_descriptor_ids: vec![],
+            content_notes: None,
         }),
         overall: Some(steam_client::ReviewSummary {
             desc: "Mostly Positive".into(),
@@ -2077,4 +2081,173 @@ fn steam_app_cache_pre_screenshots_blob_deserializes() {
     let cache: dynamo::SteamAppCache =
         serde_json::from_str(body).expect("pre-screenshots blob must still deserialize");
     assert_eq!(cache.detail.expect("detail present").screenshots, vec![]);
+}
+
+// ── #71: auto_hide_game + hidden_source provenance ──────────────────────────────────────────
+
+/// Raw top-level attribute surgery: crafts the body/mirror mismatch the Store API can never
+/// produce, so the DDB-level condition (not the in-memory fast path) is what a test proves.
+async fn raw_set_top_level_string(test: &str, game_id: &str, attr: &str, val: &str) {
+    let client = raw_client(test).await;
+    client
+        .update_item()
+        .table_name(format!("t-{test}"))
+        .key("pk", AttributeValue::S(format!("GAME#{game_id}")))
+        .key("sk", AttributeValue::S("META".into()))
+        .update_expression("SET #a = :v")
+        .expression_attribute_names("#a", attr)
+        .expression_attribute_values(":v", AttributeValue::S(val.into()))
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn raw_get_top_level_string(test: &str, game_id: &str, attr: &str) -> Option<String> {
+    let client = raw_client(test).await;
+    let out = client
+        .get_item()
+        .table_name(format!("t-{test}"))
+        .key("pk", AttributeValue::S(format!("GAME#{game_id}")))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap();
+    out.item()
+        .and_then(|i| i.get(attr))
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+}
+
+#[tokio::test]
+async fn auto_hide_sets_hidden_and_sync_source() {
+    let Some(store) = store_or_skip("auto-hide-sets-sync").await else {
+        return;
+    };
+    let g = game(1, true);
+    store.put_game(&g).await.unwrap();
+    assert_eq!(
+        store.auto_hide_game(&g.id).await.unwrap(),
+        AutoHideWrite::Written
+    );
+    let read = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(read.hidden);
+    assert_eq!(read.hidden_source, Some(domain::HiddenSource::Sync));
+}
+
+#[tokio::test]
+async fn auto_hide_respects_admin_unhide_forever() {
+    let Some(store) = store_or_skip("auto-hide-admin-unhide").await else {
+        return;
+    };
+    let g = game(1, true);
+    store.put_game(&g).await.unwrap();
+    // Ben hides then unhides — both stamp Admin.
+    assert_eq!(
+        store.set_game_hidden(&g.id, true).await.unwrap(),
+        HiddenWrite::Written
+    );
+    assert_eq!(
+        store.set_game_hidden(&g.id, false).await.unwrap(),
+        HiddenWrite::Written
+    );
+    // Auto-hide must refuse.
+    assert_eq!(
+        store.auto_hide_game(&g.id).await.unwrap(),
+        AutoHideWrite::AdminOwned
+    );
+    let read = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(!read.hidden, "ben's unhide must stand");
+    assert_eq!(read.hidden_source, Some(domain::HiddenSource::Admin));
+}
+
+#[tokio::test]
+async fn auto_hide_already_hidden_is_noop() {
+    let Some(store) = store_or_skip("auto-hide-already-hidden").await else {
+        return;
+    };
+    let mut g = game(1, true);
+    g.hidden = true; // ben's manual hide from before provenance existed (Puss! today)
+    store.put_game(&g).await.unwrap();
+    assert_eq!(
+        store.auto_hide_game(&g.id).await.unwrap(),
+        AutoHideWrite::AlreadyHidden
+    );
+    let read = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(read.hidden_source, None, "no-op must not stamp provenance");
+}
+
+#[tokio::test]
+async fn auto_hide_mid_claim_is_contested() {
+    let Some(store) = store_or_skip("auto-hide-mid-claim").await else {
+        return;
+    };
+    let mut g = game(1, true);
+    g.status = GameStatus::Pending; // a claim is in flight
+    store.put_game(&g).await.unwrap();
+    assert_eq!(
+        store.auto_hide_game(&g.id).await.unwrap(),
+        AutoHideWrite::Contested
+    );
+    let read = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(!read.hidden, "mid-claim games are left alone");
+}
+
+#[tokio::test]
+async fn auto_hide_ddb_condition_fires_without_in_memory_guard() {
+    // The plan-2 lesson: prove the DDB-LEVEL guard, not the fast path. Seed an item whose
+    // BODY says hidden_source: null but whose TOP-LEVEL attribute says "admin" — only the
+    // condition expression can see the mismatch. (This state can't arise from our writers;
+    // it's a scalpel for the guard.)
+    let test = "auto-hide-ddb-condition";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let g = game(1, true);
+    store.put_game(&g).await.unwrap();
+    raw_set_top_level_string(test, &g.id, "hidden_source", "admin").await;
+    assert_eq!(
+        store.auto_hide_game(&g.id).await.unwrap(),
+        AutoHideWrite::Contested
+    );
+    let read = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(!read.hidden, "the guarded put must not have landed");
+}
+
+#[tokio::test]
+async fn admin_toggle_stamps_admin_source_top_level_snake_case() {
+    let test = "admin-toggle-stamps-admin";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let g = game(1, true);
+    store.put_game(&g).await.unwrap();
+    store.set_game_hidden(&g.id, true).await.unwrap();
+    // Raw attribute check: the mirror must exist and be serde-snake_case ("admin"),
+    // or every future condition against it is dead (void-conditional-write lesson).
+    let attr = raw_get_top_level_string(test, &g.id, "hidden_source").await;
+    assert_eq!(attr.as_deref(), Some("admin"));
+}
+
+#[tokio::test]
+async fn upsert_condition_protects_hidden_source_from_clobber() {
+    // The inherited sync-upsert TOCTOU, now higher-stakes (OMBB sign-off): an admin
+    // toggle landing inside upsert's read→put window would be silently reverted —
+    // INCLUDING the Admin stamp, erasing Ben's permanent immunity. Same raw-mismatch
+    // scalpel as the auto-hide test: body read says hidden_source null, top-level
+    // mirror says "admin" → only the DDB condition can see it.
+    let test = "upsert-protects-hsrc";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let g = game(1, true);
+    store.put_game(&g).await.unwrap();
+    raw_set_top_level_string(test, &g.id, "hidden_source", "admin").await;
+    let mut fresh = game(1, true);
+    fresh.title = "Renamed".into();
+    let res = store.upsert_game_from_sync(fresh).await.unwrap();
+    assert_eq!(
+        res,
+        SyncWrite::SkippedInFlight,
+        "the write must CCF, not clobber the admin stamp"
+    );
 }

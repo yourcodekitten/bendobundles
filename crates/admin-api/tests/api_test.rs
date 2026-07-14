@@ -193,6 +193,7 @@ fn test_game(n: u32) -> Game {
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     }
 }
 
@@ -1250,6 +1251,7 @@ fn sample_game(id: &str) -> Game {
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     }
 }
 
@@ -2059,6 +2061,9 @@ async fn admin_game_detail_superset_fields_and_steam_blob() {
                 video_hls_url: None,
                 video_thumbnail: None,
                 screenshots: vec![],
+                tags: vec![],
+                content_descriptor_ids: vec![],
+                content_notes: None,
             }),
             overall: Some(ReviewSummary {
                 desc: "Very Positive".into(),
@@ -2169,6 +2174,9 @@ async fn catalog_joins_steam_summary() {
                 video_hls_url: None,
                 video_thumbnail: None,
                 screenshots: vec![],
+                tags: vec![],
+                content_descriptor_ids: vec![],
+                content_notes: None,
             }),
             overall: Some(ReviewSummary {
                 desc: "Very Positive".into(),
@@ -2217,4 +2225,85 @@ async fn catalog_joins_steam_summary() {
 
     let u = rows.iter().find(|r| r["id"] == unmapped_id).unwrap();
     assert!(u["steam"].is_null(), "unmapped game must carry steam: null");
+}
+
+/// #71: catalog rows carry community tags, raw descriptor ids, and hidden provenance.
+#[tokio::test]
+async fn catalog_carries_tags_descriptors_and_hidden_source() {
+    let Some(store) = store_or_skip("catalog-tags-descriptors").await else {
+        return;
+    };
+    let mut flagged = test_game(1);
+    flagged.steam_app_id = Some(981300);
+    flagged.hidden = true;
+    flagged.hidden_source = Some(domain::HiddenSource::Sync);
+    let flagged_id = flagged.id.clone();
+    store.put_game(&flagged).await.unwrap();
+    let plain = test_game(2);
+    let plain_id = plain.id.clone();
+    store.put_game(&plain).await.unwrap();
+
+    store
+        .put_steam_app(&SteamAppCache {
+            app_id: 981300,
+            detail: Some(SteamAppDetail {
+                app_id: 981300,
+                name: "Flagged Game".into(),
+                developers: vec![],
+                publishers: vec![],
+                genres: vec!["Casual".into()],
+                release_date: None,
+                short_description: String::new(),
+                header_image: None,
+                video_hls_url: None,
+                video_thumbnail: None,
+                screenshots: vec![],
+                tags: vec!["Sexual Content".into(), "Casual".into()],
+                content_descriptor_ids: vec![1, 3, 5, 4],
+                content_notes: Some("This game have Nudity.".into()),
+            }),
+            overall: None,
+            recent: None,
+            fetched_at: 1,
+            reviews_fetched_at: 1,
+        })
+        .await
+        .unwrap();
+
+    let password = "steampw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let req = Request::get("/admin/api/catalog")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = body_json(resp).await;
+    let rows = rows.as_array().unwrap();
+
+    let f = rows.iter().find(|r| r["id"] == flagged_id).unwrap();
+    assert_eq!(
+        f["steam"]["tags"],
+        serde_json::json!(["Sexual Content", "Casual"])
+    );
+    assert_eq!(
+        f["steam"]["content_descriptor_ids"],
+        serde_json::json!([1, 3, 5, 4])
+    );
+    assert_eq!(
+        f["hidden_source"], "sync",
+        "sync provenance serializes snake_case"
+    );
+
+    let p = rows.iter().find(|r| r["id"] == plain_id).unwrap();
+    assert!(
+        p["hidden_source"].is_null(),
+        "provenance-less game serializes hidden_source: null"
+    );
 }

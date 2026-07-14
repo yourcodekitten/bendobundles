@@ -47,6 +47,20 @@ pub struct SteamAppDetail {
     /// or the cached blob predates the field (issue #61).
     #[serde(default)]
     pub screenshots: Vec<Screenshot>,
+    /// Top user-defined store tags by popularity (names, capped at 10 by the enrichment
+    /// pass — GetItems order preserved). Always empty from [`get_app_details`]; the
+    /// enrichment pass owns this field. Empty when the app is gated/delisted from the
+    /// browse surface or the blob predates the field; cards fall back to `genres` (#71).
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Raw Steam content descriptor ids (1 nudity/sexual · 2 violence/gore · 3 adult-only
+    /// sexual · 4 gratuitous sexual · 5 general mature). Semantics live in the consumers:
+    /// `domain::ADULT_HIDE_DESCRIPTOR_IDS` drives auto-hide, the web's badge set drives 🔞.
+    #[serde(default)]
+    pub content_descriptor_ids: Vec<u32>,
+    /// Steam's free-text descriptor note, verbatim (grammar and all). Admin detail only.
+    #[serde(default)]
+    pub content_notes: Option<String>,
 }
 
 /// One store screenshot: Steam's `path_thumbnail` (600x338) + `path_full` (1920x1080) tiers.
@@ -61,6 +75,24 @@ pub enum AppDetails {
     Found(Box<SteamAppDetail>),
     /// `success: false` from the API — app is delisted or never existed
     Delisted,
+}
+
+/// Tags requested per app from GetItems. Deliberate headroom over fulfillment's
+/// STEAM_TAG_STORE_CAP (10): widening the store cap up to this ceiling needs only a
+/// backfill, not a client change. Widening PAST it silently truncates — raise both.
+pub const REQUESTED_TAG_COUNT: usize = 20;
+
+/// One app's community-tag payload from `IStoreBrowseService/GetItems`: tag ids in
+/// popularity order + content descriptor ids. Names resolve via [`SteamClient::get_tag_list`].
+///
+/// `content_descriptorids` is deliberately fetched-but-unconsumed today: appdetails'
+/// `content_descriptors` (which also carries the notes) is the descriptor source of truth
+/// for enrichment, and the two agreed on every app checked live (#71). This copy exists as
+/// the documented fallback if appdetails ever drops the field — do not "clean it up".
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreItemTags {
+    pub tagids: Vec<u32>,
+    pub content_descriptorids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,6 +233,17 @@ struct AppDetailDataWire {
     movies: Vec<MovieWire>,
     #[serde(default)]
     screenshots: Vec<ScreenshotWire>,
+    #[serde(default)]
+    content_descriptors: Option<ContentDescriptorsWire>,
+}
+
+/// appdetails' `content_descriptors: {ids, notes}` — dev-selected checkboxes. `required_age`
+/// stays ignored (self-reported; Puss! says 0 — issue #71).
+#[derive(Deserialize)]
+struct ContentDescriptorsWire {
+    #[serde(default)]
+    ids: Vec<u32>,
+    notes: Option<String>,
 }
 
 /// Both tiers or the entry is dropped — a screenshot with only one URL would force the
@@ -260,6 +303,39 @@ struct ReleaseDateWire {
 struct MovieWire {
     hls_h264: Option<String>,
     thumbnail: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TagListWire {
+    response: TagListResp,
+}
+#[derive(Deserialize)]
+struct TagListResp {
+    #[serde(default)]
+    tags: Vec<TagEntry>,
+}
+#[derive(Deserialize)]
+struct TagEntry {
+    tagid: u32,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct StoreItemsWire {
+    response: StoreItemsResp,
+}
+#[derive(Deserialize)]
+struct StoreItemsResp {
+    #[serde(default)]
+    store_items: Vec<StoreItemWire>,
+}
+#[derive(Deserialize)]
+struct StoreItemWire {
+    appid: Option<u32>,
+    #[serde(default)]
+    tagids: Vec<u32>,
+    #[serde(default)]
+    content_descriptorids: Vec<u32>,
 }
 
 #[derive(Deserialize)]
@@ -439,6 +515,70 @@ impl SteamClient {
         Ok(out)
     }
 
+    /// Fetch the global tagid→name map (`IStoreService/GetTagList`, keyless, ~450 tags).
+    /// Callers fetch once per enrichment/backfill run and hold it in memory — the
+    /// `version_hash` the endpoint offers isn't worth persisting for one call a day (#71).
+    pub async fn get_tag_list(&self) -> Result<std::collections::HashMap<u32, String>, SteamError> {
+        let url = format!("{}/IStoreService/GetTagList/v1/", self.base_web_api);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("language", "english")])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: TagListWire = keyed_json(resp).await?;
+        Ok(wire
+            .response
+            .tags
+            .into_iter()
+            .map(|t| (t.tagid, t.name))
+            .collect())
+    }
+
+    /// Batched community tags + descriptor ids for `app_ids` (`GetItems`, keyless, chunks
+    /// of 50). Apps Steam omits (never existed) are absent from the map; gated/delisted
+    /// apps come back `visible:false` with EMPTY tagids and are present-with-empty — the
+    /// caller stores the empty and lets genre fallback take over (#71 caveat).
+    ///
+    /// Chunks are unpaced, like `get_app_list` pages — this is the lax api.steampowered.com
+    /// host, not throttled appdetails (#71 plan, decided deviation from the spec's 250ms).
+    pub async fn get_store_items(
+        &self,
+        app_ids: &[u32],
+    ) -> Result<std::collections::HashMap<u32, StoreItemTags>, SteamError> {
+        const CHUNK: usize = 50;
+        let url = format!("{}/IStoreBrowseService/GetItems/v1/", self.base_web_api);
+        let mut out = std::collections::HashMap::new();
+        for chunk in app_ids.chunks(CHUNK) {
+            let input = serde_json::json!({
+                "ids": chunk.iter().map(|id| serde_json::json!({"appid": id})).collect::<Vec<_>>(),
+                "context": {"language": "english", "country_code": "US"},
+                "data_request": {"include_tag_count": REQUESTED_TAG_COUNT}
+            });
+            let resp = self
+                .http
+                .get(&url)
+                .query(&[("input_json", input.to_string().as_str())])
+                .send()
+                .await
+                .map_err(net)?;
+            let wire: StoreItemsWire = keyed_json(resp).await?;
+            for item in wire.response.store_items {
+                if let Some(appid) = item.appid {
+                    out.insert(
+                        appid,
+                        StoreItemTags {
+                            tagids: item.tagids,
+                            content_descriptorids: item.content_descriptorids,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Fetch storefront detail for `app_id`. Returns `Delisted` when the response carries
     /// `success: false` (removed or private app) rather than erroring.
     pub async fn get_app_details(&self, app_id: u32) -> Result<AppDetails, SteamError> {
@@ -483,6 +623,14 @@ impl SteamClient {
             })
             .take(SCREENSHOT_CAP)
             .collect();
+        let (content_descriptor_ids, content_notes) = match data.content_descriptors {
+            Some(cd) => (
+                cd.ids,
+                // "" would render a phantom note line — collapse at the wire like the movie URLs.
+                cd.notes.filter(|s| !s.trim().is_empty()),
+            ),
+            None => (Vec::new(), None),
+        };
         let first_movie = data.movies.into_iter().next();
         Ok(AppDetails::Found(Box::new(SteamAppDetail {
             app_id,
@@ -503,6 +651,9 @@ impl SteamClient {
                 .and_then(|m| m.thumbnail)
                 .filter(|s| !s.is_empty()),
             screenshots,
+            tags: Vec::new(),
+            content_descriptor_ids,
+            content_notes,
         })))
     }
 

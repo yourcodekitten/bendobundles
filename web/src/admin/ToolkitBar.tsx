@@ -1,6 +1,8 @@
 import {
   IDLE_TOOLKIT,
+  filtersActive,
   type GroupKey,
+  type MatureFilter,
   type RatingFloor,
   type SortKey,
   type ToolkitState,
@@ -48,8 +50,7 @@ export function ToolkitBar({
   excludedNoData: number;
   onChange: (next: ToolkitState) => void;
 }) {
-  const filtersActive =
-    state.q !== '' || state.tags.length > 0 || state.rating !== 'any';
+  const active = filtersActive(state);
 
   const toggleTag = (tag: string) =>
     onChange({
@@ -134,8 +135,22 @@ export function ToolkitBar({
         </select>
       </label>
 
+      <label className="flex items-center gap-2 text-sm text-dust">
+        mature
+        <select
+          aria-label="mature"
+          value={state.mature}
+          onChange={(e) => onChange({ ...state, mature: e.target.value as MatureFilter })}
+          className={controlClass}
+        >
+          <option value="all">show all</option>
+          <option value="hide">hide 🔞</option>
+          <option value="only">only 🔞</option>
+        </select>
+      </label>
+
       <div className="ml-auto flex items-center gap-3 text-sm text-dust-faint">
-        {filtersActive ? (
+        {active ? (
           <>
             <span>
               showing {shown} of {total}
