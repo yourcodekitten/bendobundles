@@ -394,6 +394,11 @@ Public type near `SteamAppDetail`:
 ```rust
 /// One app's community-tag payload from `IStoreBrowseService/GetItems`: tag ids in
 /// popularity order + content descriptor ids. Names resolve via [`SteamClient::get_tag_list`].
+///
+/// `content_descriptorids` is deliberately fetched-but-unconsumed today: appdetails'
+/// `content_descriptors` (which also carries the notes) is the descriptor source of truth
+/// for enrichment, and the two agreed on every app checked live (#71). This copy exists as
+/// the documented fallback if appdetails ever drops the field — do not "clean it up".
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoreItemTags {
     pub tagids: Vec<u32>,
@@ -602,7 +607,12 @@ Available/BenRedeemed/Expired branch add `hidden_source: existing_game.hidden_so
 alongside the existing `hidden: existing_game.hidden,` — sync NEVER moves provenance.
 
 Sweep every `Game {` literal (fulfillment sync builders, all test fixtures):
-`hidden_source: None,`.
+`hidden_source: None,` — **EXCEPT the two `Game {` literals inside `merge_sync` itself**,
+which take `hidden_source: existing_game.hidden_source,` per the diff above. A mechanical
+`None` there wipes Admin provenance on every sync and re-arms auto-hide against games Ben
+unhid — the exact bug this field exists to prevent (Lilith, plan sign-off ③). The
+`merge_sync_carries_hidden_source_both_branches` test is the tripwire; if it reds after the
+sweep, this is why.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1940,14 +1950,20 @@ explicitly required the resync in the plan.
 
 ```bash
 cd /path/to/worktree
-TABLE_NAME=<prod table> AWS_PROFILE=kitten-deploy \
+TABLE_NAME=<prod table> SKIP_FRESH_SECS=0 AWS_PROFILE=kitten-deploy \
   cargo run -p fulfillment --features backfill --bin backfill_details
 ```
 
-  Expected: summary line with `fetched≈<mapped-app count>`, `auto_hidden ≥ 0`; rerun on a
-  429 abort (resume via skip-fresh window). Check the bin's actual env contract
-  (`crates/fulfillment/src/bin/backfill_details.rs`) before running — it may take the steam
-  key via env/SSM; follow what it reads.
+  **`SKIP_FRESH_SECS=0` is mandatory on the FIRST run** (Lilith, plan sign-off ①): the
+  default 12h skip-fresh window would skip every app the OLD code enriched that morning —
+  no tags, no descriptors, no auto-hide on exactly the games the resync exists to sweep —
+  and descriptors fail-open (empty = "not adult"). The bin's own doc comment
+  (`backfill_details.rs:12-15`) names this scenario; 0 disables skipping. On a 429-abort
+  RERUN, drop back to the default (unset) so already-rewritten items are skipped — their
+  `fetched_at` was stamped by the NEW code, so the skip is then correct.
+  Env contract (verified): `TABLE_NAME` required, `SKIP_FRESH_SECS` optional, key unused
+  (keyless endpoints, empty `SteamApiKey` is fine), creds from ambient AWS config.
+  Expected: summary line `fetched≈<mapped-app count> … auto_hidden=<n>`.
 - [ ] **Step 5:** Verify live (playwright): tags on friend cards, 🔞 badges + mature filter
   in admin, an auto-hidden row labeled, Puss! still hidden (Ben-hidden, untouched — its
   `hidden_source` stays null until Ben toggles).
