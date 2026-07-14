@@ -148,6 +148,7 @@ async fn seed_pending_claim(store: &Store, gamekey: &str, machine: &str) -> Stri
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     };
     store.put_game(&g).await.unwrap();
     store.create_link(&link("tok1")).await.unwrap();
@@ -869,6 +870,7 @@ async fn seed_aged_pending(
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     };
     store.put_game(&g).await.unwrap();
     store.create_link(&link(token)).await.unwrap();
@@ -1491,6 +1493,7 @@ async fn seed_pending_choice_claim(
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     };
     store.put_game(&g).await.unwrap();
     store.create_link(&link("tok1")).await.unwrap();
@@ -2735,6 +2738,7 @@ async fn seed_available_game(store: &Store, game_id_str: &str, title: &str) {
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     };
     store.put_game(&g).await.unwrap();
 }
@@ -3283,6 +3287,7 @@ async fn seed_choice_game(store: &Store, game_id_str: &str, title: &str) {
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     };
     store.put_game(&g).await.unwrap();
 }
@@ -3715,6 +3720,7 @@ async fn seed_steam_game(
         steam_app_id,
         appid_source,
         owned_by_ben: false,
+        hidden_source: None,
     };
     store.put_game(&g).await.unwrap();
     gid

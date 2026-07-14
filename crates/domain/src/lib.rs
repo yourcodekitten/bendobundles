@@ -33,6 +33,25 @@ pub enum AppidSource {
     Manual,
 }
 
+/// Who last decided a game's `hidden` flag. `Admin` is Ben's toggle and is FINAL: the
+/// auto-hide sweep never overrides it in either direction — his unhide of an adult game
+/// stays unhidden forever (#71 "never fights Ben"). `Sync` marks an automatic hide
+/// (adult content descriptors) so admin can label it. `None` (legacy / never touched)
+/// is auto-hide-eligible: every pre-existing unhidden game is untouched-by-Ben by
+/// definition; his first toggle stamps `Admin` and immunizes the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HiddenSource {
+    Admin,
+    Sync,
+}
+
+/// Content descriptor ids that auto-hide a game at sync/backfill time: 3 = adult-only
+/// sexual content, 4 = gratuitous sexual content (Puss! carries both). NOT 1 (some
+/// nudity — Witcher 3), NOT 5 (general mature — Rollerdrome), NOT 2 (violence).
+/// Ben tightens/loosens by editing this list (#71).
+pub const ADULT_HIDE_DESCRIPTOR_IDS: [u32; 2] = [3, 4];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Game {
     pub id: String,
@@ -89,6 +108,12 @@ pub struct Game {
     /// `#[serde(default)]`: records written before this field existed deserialize to `false`.
     #[serde(default)]
     pub owned_by_ben: bool,
+
+    /// Provenance of [`hidden`](Self::hidden) — see [`HiddenSource`]. `None` iff no
+    /// admin toggle or auto-hide has ever run on this record.
+    /// `#[serde(default)]`: records written before this field existed deserialize to `None`.
+    #[serde(default)]
+    pub hidden_source: Option<HiddenSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +272,7 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                         key_type: fresh.key_type,
                         giftable: existing_game.giftable,
                         hidden: existing_game.hidden,
+                        hidden_source: existing_game.hidden_source,
                         status: existing_game.status,
                         claim_id: existing_game.claim_id.clone(),
                         artwork_url: fresh.artwork_url,
@@ -265,6 +291,7 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                     let (steam_app_id, appid_source) = merge_appid(existing_game, &fresh);
                     Game {
                         hidden: existing_game.hidden,
+                        hidden_source: existing_game.hidden_source,
                         owned_by_ben: existing_game.owned_by_ben,
                         steam_app_id,
                         appid_source,
@@ -350,6 +377,7 @@ mod tests {
             steam_app_id: None,
             appid_source: None,
             owned_by_ben: false,
+            hidden_source: None,
         };
         assert!(g.is_listable());
         g.hidden = true;
@@ -435,12 +463,60 @@ mod tests {
             steam_app_id: None,
             appid_source: None,
             owned_by_ben: false,
+            hidden_source: None,
         }
     }
 
     #[test]
     fn merge_new_game_is_fresh() {
         assert_eq!(merge_sync(None, fresh_game()), Some(fresh_game()));
+    }
+
+    #[test]
+    fn hidden_source_serde_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&HiddenSource::Sync).unwrap(),
+            r#""sync""#
+        );
+        assert_eq!(
+            serde_json::to_string(&HiddenSource::Admin).unwrap(),
+            r#""admin""#
+        );
+    }
+
+    #[test]
+    fn game_blob_backcompat_hidden_source_defaults_none() {
+        // Serialize a pre-field game shape by stripping the key from a current one.
+        let mut v = serde_json::to_value(fresh_game()).unwrap();
+        v.as_object_mut().unwrap().remove("hidden_source");
+        let g: Game = serde_json::from_value(v).unwrap();
+        assert_eq!(g.hidden_source, None);
+    }
+
+    #[test]
+    fn merge_sync_carries_hidden_source_both_branches() {
+        // Humble-owned branch (Available). fresh MUST differ on a refreshed field
+        // (title) — if hidden/hidden_source were the only diffs, a correct merge
+        // carries both from existing, merged == existing, and merge_sync returns
+        // None (the no-op contract). The assertions below then prove carry-over
+        // happened on a merge that actually wrote.
+        let mut existing = fresh_game();
+        existing.hidden = true;
+        existing.hidden_source = Some(HiddenSource::Sync);
+        let mut fresh = fresh_game();
+        fresh.title = "renamed".into();
+        let merged = merge_sync(Some(&existing), fresh).expect("title differs → Some");
+        assert_eq!(merged.hidden_source, Some(HiddenSource::Sync));
+        assert!(merged.hidden);
+
+        // App-owned branch (Gifted)
+        let mut existing = fresh_game();
+        existing.status = GameStatus::Gifted;
+        existing.hidden_source = Some(HiddenSource::Admin);
+        let mut fresh = fresh_game();
+        fresh.title = "renamed".into();
+        let merged = merge_sync(Some(&existing), fresh).expect("title differs → Some");
+        assert_eq!(merged.hidden_source, Some(HiddenSource::Admin));
     }
 
     #[test]

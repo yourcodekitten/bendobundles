@@ -70,6 +70,7 @@ fn game(n: u32, listable: bool) -> Game {
         steam_app_id: None,
         appid_source: None,
         owned_by_ben: false,
+        hidden_source: None,
     }
 }
 
