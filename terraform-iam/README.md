@@ -7,12 +7,17 @@ bendobundles stack. Separate state from the main stack on purpose.
 
 - **`kitten-mgr`** — an IAM user whose long-lived access key is handed to
   kitten. It has **no permissions of its own** except `sts:AssumeRole` on the
-  two roles below. A leaked key can only assume a role; every assumed action is
+  three roles below. A leaked key can only assume a role; every assumed action is
   short-lived and attributable in CloudTrail.
 - **`kitten-debug`** (read-only) — tail logs, read Lambda config, inspect
   DynamoDB item/claim state, look at API Gateway / CloudFront / S3 / EventBridge.
   **Explicitly denied** `ssm:GetParameter*` and `kms:Decrypt` — kitten can never
   read the humble session cookie or admin hash, even holding these credentials.
+- **`kitten-maintenance`** (item data-plane) — run-once operator bins
+  (`backfill_details`): Get/BatchGet/Query/Scan/Put/UpdateItem on the app
+  tables + indexes, **no DeleteItem**, nothing else. Same
+  `ssm:GetParameter*`/`kms:Decrypt` hard-deny as debug. Exists so backfills
+  never ride console hand-edits again (#59, #71).
 - **`kitten-deploy`** (powerful) — enough to `terraform apply` the main stack
   and run `deploy-web.sh`. Assumed deliberately, only for deploys. Its terraform
   state access is scoped to the **`bendobundles`** prefix only — **not** this IAM
@@ -36,6 +41,7 @@ terraform output kitten_manager_access_key_id
 terraform output -raw kitten_manager_secret_access_key   # sensitive
 terraform output kitten_debug_role_arn
 terraform output kitten_deploy_role_arn
+terraform output kitten_maintenance_role_arn
 ```
 
 Give kitten the access key id + secret + both role ARNs. Kitten configures a

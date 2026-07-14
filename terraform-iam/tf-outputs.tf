@@ -18,3 +18,8 @@ output "kitten_deploy_role_arn" {
   value       = aws_iam_role.kitten_deploy.arn
   description = "Assume this to run terraform / deploy-web on the main stack."
 }
+
+output "kitten_maintenance_role_arn" {
+  value       = aws_iam_role.kitten_maintenance.arn
+  description = "Assume this to run operator maintenance bins (backfill_details) — item data-plane only."
+}
