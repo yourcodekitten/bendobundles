@@ -1860,6 +1860,74 @@ async fn refresh_ben_ownership(deps: &Deps) {
     }
 }
 
+/// Top-N user tags stored per app. Display caps are client-side (char-budget fit), so
+/// tuning what cards SHOW never needs a backfill — only widening storage does (#71).
+pub const STEAM_TAG_STORE_CAP: usize = 10;
+
+/// Resolve one app's stored tag list from the batch results. `tag_data` None = the
+/// GetItems/GetTagList batch failed → preserve the previous blob's tags (a network hiccup
+/// must never strip chips). Present-but-absent appid in a SUCCESSFUL batch = Steam hides
+/// the app from the browse surface → store empty and let genre fallback take over (#71).
+fn tags_for_app(
+    app_id: u32,
+    tag_data: Option<&(
+        std::collections::HashMap<u32, steam_client::StoreItemTags>,
+        std::collections::HashMap<u32, String>,
+    )>,
+    prev_detail: Option<&steam_client::SteamAppDetail>,
+) -> Vec<String> {
+    match tag_data {
+        Some((items, names)) => match items.get(&app_id) {
+            Some(item) => item
+                .tagids
+                .iter()
+                .filter_map(|id| names.get(id).cloned())
+                .take(STEAM_TAG_STORE_CAP)
+                .collect(),
+            None => Vec::new(),
+        },
+        None => prev_detail.map(|d| d.tags.clone()).unwrap_or_default(),
+    }
+}
+
+/// True when a detail carries any auto-hide descriptor ({3,4} — adult sexual content).
+fn has_adult_descriptors(detail: Option<&steam_client::SteamAppDetail>) -> bool {
+    detail.is_some_and(|d| {
+        d.content_descriptor_ids
+            .iter()
+            .any(|id| domain::ADULT_HIDE_DESCRIPTOR_IDS.contains(id))
+    })
+}
+
+/// One sweep over every appid known to carry adult descriptors: auto-hide each mapped
+/// game Ben hasn't decided on. Shared verbatim by enrichment and backfill so the two
+/// paths can never drift. Dynamo-only (no storefront calls), idempotent, safe to run
+/// after a 429 abort. Returns how many games were newly hidden (#71).
+async fn auto_hide_adult_games(
+    store: &dynamo::Store,
+    adult_appids: &std::collections::BTreeSet<u32>,
+    games_by_appid: &std::collections::HashMap<u32, Vec<String>>,
+) -> u32 {
+    let mut hidden = 0u32;
+    for app_id in adult_appids {
+        for gid in games_by_appid.get(app_id).map(Vec::as_slice).unwrap_or(&[]) {
+            match store.auto_hide_game(gid).await {
+                Ok(dynamo::AutoHideWrite::Written) => {
+                    hidden += 1;
+                    tracing::info!(app_id, game_id = %gid, "auto-hide: hid adult game");
+                }
+                Ok(outcome) => {
+                    tracing::debug!(app_id, game_id = %gid, ?outcome, "auto-hide: left alone");
+                }
+                Err(e) => {
+                    tracing::warn!(app_id, game_id = %gid, error = ?e, "auto-hide: write failed");
+                }
+            }
+        }
+    }
+    hidden
+}
+
 /// The budgeted, politely-paced Steam enrichment pass (spec §3). Runs in [`run_sync`] AFTER the
 /// ownership pass, and hits the Steam storefront endpoints ONLY here — never at request time
 /// (Ben's be-nice rule). Everything about it is throttled: `≥1.5s` between every storefront call,
@@ -1889,8 +1957,11 @@ async fn refresh_ben_ownership(deps: &Deps) {
 /// app. The `SteamError` match names every variant (no `_` arm) — the crate convention.
 ///
 /// One summary log line per run: `steam enrichment: fetched=<n> fresh=<n> negative=<n>
-/// aborted_429=<bool>` (`fetched` = apps whose cache item was written this run, `fresh` = of those,
-/// how many pulled live appdetails, `negative` = delisted stubs), plus a `deferred` field.
+/// aborted_429=<bool> auto_hidden=<n> tag_batch_failed=<bool>` (`fetched` = apps whose cache item
+/// was written this run, `fresh` = of those, how many pulled live appdetails, `negative` =
+/// delisted stubs, `auto_hidden` = games newly hidden by the adult sweep, `tag_batch_failed` =
+/// the grep-able signal that GetItems/GetTagList failed or answered implausibly — see #71),
+/// plus a `deferred` field.
 pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     // Kill switch (read via config, not raw env) → skip entirely.
     if deps.steam_enrich_disabled {
@@ -1925,6 +1996,10 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         cache: dynamo::SteamAppCache,
     }
 
+    // Every appid known to carry adult descriptors this pass — fed by BOTH the decide
+    // loop (existing cache) and the fetch loop (fresh detail); swept once at the end.
+    let mut adult_appids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
     // Decide the work list up front (cheap store reads only — no storefront calls yet).
     let mut worklist: Vec<Work> = Vec::new();
     for app_id in appids {
@@ -1935,6 +2010,15 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
                 continue;
             }
         };
+        // Adult appids are collected from the EXISTING cache too: a game newly mapped to
+        // an already-fresh {3,4} cache (same adult game, second bundle) never enters the
+        // worklist, and the sweep must still catch it. Cached descriptors don't need to
+        // be fresh to be true; the sweep is idempotent (#71).
+        if let Some(c) = &existing
+            && has_adult_descriptors(c.detail.as_ref())
+        {
+            adult_appids.insert(app_id);
+        }
         let (need_detail, need_reviews) = match &existing {
             // Missing item → fetch both halves.
             None => (true, true),
@@ -1957,6 +2041,63 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
 
     let deferred_by_cap = worklist.len().saturating_sub(STEAM_ENRICH_MAX_APPS);
     worklist.truncate(STEAM_ENRICH_MAX_APPS);
+
+    // Community tags ride ONE batched keyless call pair per pass (GetItems chunks +
+    // GetTagList), not per-app storefront calls. Both-or-nothing: resolving tag names
+    // with a partial map would silently store a truncated tag list.
+    // DECIDED DEVIATION from the spec's "GetItems 429 aborts the pass": ANY tag-batch
+    // failure (429 included) logs, preserves existing tags, and lets the pass continue —
+    // a keyless tag endpoint hiccup must not starve appdetails/reviews refreshes (#71).
+    let detail_ids: Vec<u32> = worklist
+        .iter()
+        .filter(|w| w.need_detail)
+        .map(|w| w.app_id)
+        .collect();
+    let mut tag_batch_failed = false;
+    // Deadline guard mirrors the fetch loop's: a spent budget means ZERO storefront calls,
+    // tag batch included — existing tags are preserved (tag_data None), not wiped.
+    let tag_data = if detail_ids.is_empty() || tokio::time::Instant::now() >= deadline {
+        None
+    } else {
+        match (
+            steam.get_store_items(&detail_ids).await,
+            steam.get_tag_list().await,
+        ) {
+            // Plausibility guard (shape-drift): a non-empty request answered with ZERO
+            // items is indistinguishable from a Valve field rename parsing as a
+            // "successful empty response" — treating it as success would progressively
+            // wipe every app's tags, invisibly behind the genre fallback. Real batches
+            // mix ordinary apps; all-gated is not a plausible answer (#71).
+            (Ok(items), Ok(names)) if items.is_empty() => {
+                tracing::warn!(
+                    requested = detail_ids.len(),
+                    names = names.len(),
+                    "steam enrichment: GetItems answered a non-empty request with zero items — treating as batch failure (shape drift?)"
+                );
+                tag_batch_failed = true;
+                None
+            }
+            (Ok(items), Ok(names)) => Some((items, names)),
+            (items_res, names_res) => {
+                tracing::warn!(
+                    items_err = items_res.is_err(),
+                    names_err = names_res.is_err(),
+                    "steam enrichment: tag batch failed — preserving existing tags this pass"
+                );
+                tag_batch_failed = true;
+                None
+            }
+        }
+    };
+
+    // appid → game ids, for the auto-hide sweep (games is already in memory).
+    let mut games_by_appid: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    for g in &games {
+        if let Some(id) = g.steam_app_id {
+            games_by_appid.entry(id).or_default().push(g.id.clone());
+        }
+    }
 
     let mut fetched = 0u32;
     let mut fresh = 0u32;
@@ -1984,7 +2125,9 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             tokio::time::sleep(deps.steam_enrich_pace).await;
             match steam.get_app_details(app_id).await {
                 Ok(steam_client::AppDetails::Found(d)) => {
-                    cache.detail = Some(*d);
+                    let mut detail = *d;
+                    detail.tags = tags_for_app(app_id, tag_data.as_ref(), cache.detail.as_ref());
+                    cache.detail = Some(detail);
                     cache.fetched_at = now;
                     fresh += 1;
                 }
@@ -2065,14 +2208,24 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             continue 'apps;
         }
         fetched += 1;
+        // Freshly-fetched adult descriptors join the sweep set (the decide loop already
+        // covered cached ones). One-way; the sweep never unhides.
+        if has_adult_descriptors(cache.detail.as_ref()) {
+            adult_appids.insert(app_id);
+        }
     }
     // Whatever's left unstarted (deadline stop, or the tail after a 429 abort) is deferred too.
     deferred_unstarted += it.count();
 
+    // The single adult sweep — deliberately AFTER a 429 abort too: it is dynamo-only, and
+    // decide-loop-collected appids must still be swept even when the storefront walk died
+    // early (#71).
+    let auto_hidden = auto_hide_adult_games(&deps.store, &adult_appids, &games_by_appid).await;
+
     let deferred = deferred_by_cap + deferred_unstarted;
     tracing::info!(
         deferred,
-        "steam enrichment: fetched={fetched} fresh={fresh} negative={negative} aborted_429={aborted_429}"
+        "steam enrichment: fetched={fetched} fresh={fresh} negative={negative} aborted_429={aborted_429} auto_hidden={auto_hidden} tag_batch_failed={tag_batch_failed}"
     );
 }
 

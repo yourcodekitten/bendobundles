@@ -4824,3 +4824,352 @@ async fn backfill_429_aborts_with_flag() {
     assert!(summary.aborted_429, "429 must abort the run");
     assert_eq!(summary.fetched, 0);
 }
+
+// =================================================================================================
+// #71: community tags + content descriptors + adult auto-hide
+// =================================================================================================
+
+/// appdetails body with content descriptors — minimal data object; absent fields serde-default.
+fn appdetails_descriptor_body(name: &str, ids: &[u32], notes: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "0": {
+            "success": true,
+            "data": {
+                "name": name,
+                "short_description": "desc",
+                "content_descriptors": { "ids": ids, "notes": notes }
+            }
+        }
+    })
+}
+
+/// appdetails body with NO content_descriptors key at all (most apps / descriptors cleared).
+fn appdetails_plain_body(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "0": { "success": true, "data": { "name": name, "short_description": "desc" } }
+    })
+}
+
+/// Mount appdetails (given body) + happy reviews + histogram for one appid.
+async fn mount_steam_detail(steam: &MockServer, app_id: u32, body: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", app_id.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(steam)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/appreviews/{app_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(reviews_body()))
+        .mount(steam)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/appreviewhistogram/{app_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(histogram_body()))
+        .mount(steam)
+        .await;
+}
+
+/// Mount GetTagList (19→Action, 12095→Sexual Content) + GetItems with the given store_items.
+/// The enrichment's tag fetch is both-or-nothing: leave either unmocked and the whole tag
+/// batch reads as failed (tags preserved), which is NOT what most tests here want.
+async fn mount_tag_endpoints(steam: &MockServer, store_items: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/IStoreService/GetTagList/v1/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": {"tags": [
+                {"tagid": 19, "name": "Action"},
+                {"tagid": 12095, "name": "Sexual Content"}
+            ]}
+        })))
+        .mount(steam)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/IStoreBrowseService/GetItems/v1/"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"response": {"store_items": store_items}})),
+        )
+        .mount(steam)
+        .await;
+}
+
+/// A stale-detail cache (fetched_at 31 days ago, reviews fresh) carrying the given tags —
+/// so a pass refreshes ONLY the detail half and the tag-preservation semantics are visible.
+fn stale_detail_cache(app_id: u32, now: i64, tags: Vec<String>) -> dynamo::SteamAppCache {
+    let mut c = fresh_cache(app_id, now);
+    c.fetched_at = days_ago(31);
+    if let Some(d) = c.detail.as_mut() {
+        d.tags = tags;
+    }
+    c
+}
+
+#[tokio::test]
+async fn enrich_merges_tags_descriptors_and_auto_hides_adult() {
+    let Some(store) = store_or_skip("t71-adult-merge").await else {
+        return;
+    };
+    let gid = seed_steam_game(&store, "gk-a", "mn-a", "Puss", Some(981300), None).await;
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(
+        &steam_mock,
+        981300,
+        appdetails_descriptor_body(
+            "Puss",
+            &[1, 3, 5, 4],
+            Some("This game have Nudity and Sexual Content."),
+        ),
+    )
+    .await;
+    mount_tag_endpoints(
+        &steam_mock,
+        serde_json::json!([{"appid": 981300, "tagids": [12095, 19], "content_descriptorids": [1,3,5,4]}]),
+    )
+    .await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let cache = d.store.get_steam_app(981300).await.unwrap().unwrap();
+    let detail = cache.detail.unwrap();
+    assert_eq!(
+        detail.tags,
+        vec!["Sexual Content".to_string(), "Action".to_string()],
+        "tag names in GetItems popularity order"
+    );
+    assert_eq!(detail.content_descriptor_ids, vec![1, 3, 5, 4]);
+    assert!(detail.content_notes.unwrap().contains("Nudity"));
+    let g = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(g.hidden, "descriptor {{3,4}} game must auto-hide");
+    assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
+}
+
+#[tokio::test]
+async fn enrich_does_not_hide_non_adult_descriptors() {
+    let Some(store) = store_or_skip("t71-nonadult").await else {
+        return;
+    };
+    let gid = seed_steam_game(&store, "gk-w", "mn-w", "Witcher", Some(292030), None).await;
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(
+        &steam_mock,
+        292030,
+        appdetails_descriptor_body("Witcher", &[1, 5], Some("Some nudity.")),
+    )
+    .await;
+    mount_tag_endpoints(
+        &steam_mock,
+        serde_json::json!([{"appid": 292030, "tagids": [19], "content_descriptorids": [1,5]}]),
+    )
+    .await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let cache = d.store.get_steam_app(292030).await.unwrap().unwrap();
+    assert_eq!(cache.detail.unwrap().tags, vec!["Action".to_string()]);
+    let g = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(!g.hidden, "{{1,5}} must NOT auto-hide (Witcher rule)");
+    assert_eq!(g.hidden_source, None);
+}
+
+#[tokio::test]
+async fn enrich_never_rehides_admin_unhidden_game() {
+    let Some(store) = store_or_skip("t71-admin-immunity").await else {
+        return;
+    };
+    let gid = seed_steam_game(&store, "gk-i", "mn-i", "Adult Game", Some(981300), None).await;
+    // Ben hides then unhides — Admin stamp lands.
+    store.set_game_hidden(&gid, true).await.unwrap();
+    store.set_game_hidden(&gid, false).await.unwrap();
+
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(
+        &steam_mock,
+        981300,
+        appdetails_descriptor_body("Adult Game", &[3], None),
+    )
+    .await;
+    mount_tag_endpoints(
+        &steam_mock,
+        serde_json::json!([{"appid": 981300, "tagids": [12095], "content_descriptorids": [3]}]),
+    )
+    .await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let g = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(!g.hidden, "ben's unhide must stand forever");
+    assert_eq!(g.hidden_source, Some(domain::HiddenSource::Admin));
+}
+
+#[tokio::test]
+async fn enrich_one_way_never_unhides_when_descriptors_clear() {
+    let Some(store) = store_or_skip("t71-one-way").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    // A prior auto-hide: hidden by sync, provenance Sync.
+    let gid = seed_steam_game(&store, "gk-o", "mn-o", "Once Adult", Some(555), None).await;
+    let mut g = store.get_game(&gid).await.unwrap().unwrap();
+    g.hidden = true;
+    g.hidden_source = Some(domain::HiddenSource::Sync);
+    store.put_game(&g).await.unwrap();
+    // Stale cache; the refetched appdetails now carries NO descriptors.
+    store
+        .put_steam_app(&stale_detail_cache(555, now, vec![]))
+        .await
+        .unwrap();
+
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(&steam_mock, 555, appdetails_plain_body("Once Adult")).await;
+    mount_tag_endpoints(&steam_mock, serde_json::json!([{"appid": 555, "tagids": [19]}])).await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let g = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(g.hidden, "descriptors clearing must never unhide (#71 one-way)");
+    assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
+}
+
+#[tokio::test]
+async fn enrich_preserves_old_tags_when_getitems_fails() {
+    let Some(store) = store_or_skip("t71-batch-fail").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    seed_steam_game(&store, "gk-p", "mn-p", "Tagged Game", Some(777), None).await;
+    store
+        .put_steam_app(&stale_detail_cache(777, now, vec!["Old Tag".into()]))
+        .await
+        .unwrap();
+
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(&steam_mock, 777, appdetails_plain_body("Fresh Name")).await;
+    // GetTagList OK, GetItems 500 — both-or-nothing → batch failed → preserve.
+    Mock::given(method("GET"))
+        .and(path("/IStoreService/GetTagList/v1/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"response": {"tags": [{"tagid": 19, "name": "Action"}]}}),
+        ))
+        .mount(&steam_mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/IStoreBrowseService/GetItems/v1/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&steam_mock)
+        .await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let cache = d.store.get_steam_app(777).await.unwrap().unwrap();
+    let detail = cache.detail.unwrap();
+    assert_eq!(
+        detail.tags,
+        vec!["Old Tag".to_string()],
+        "a failed tag batch must never wipe existing tags"
+    );
+    assert_eq!(detail.name, "Fresh Name", "the appdetails refresh itself must land");
+}
+
+#[tokio::test]
+async fn enrich_stores_empty_tags_when_app_absent_from_nonempty_batch() {
+    let Some(store) = store_or_skip("t71-absent-app").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    seed_steam_game(&store, "gk-x", "mn-x", "Present Game", Some(111), None).await;
+    seed_steam_game(&store, "gk-y", "mn-y", "Gated Game", Some(222), None).await;
+    store
+        .put_steam_app(&stale_detail_cache(111, now, vec!["Old Tag".into()]))
+        .await
+        .unwrap();
+    store
+        .put_steam_app(&stale_detail_cache(222, now, vec!["Old Tag".into()]))
+        .await
+        .unwrap();
+
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(&steam_mock, 111, appdetails_plain_body("Present Game")).await;
+    mount_steam_detail(&steam_mock, 222, appdetails_plain_body("Gated Game")).await;
+    // Successful NON-EMPTY batch containing only appid 111 — 222 is the gated/absent case.
+    mount_tag_endpoints(&steam_mock, serde_json::json!([{"appid": 111, "tagids": [19]}])).await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let present = d.store.get_steam_app(111).await.unwrap().unwrap();
+    assert_eq!(present.detail.unwrap().tags, vec!["Action".to_string()]);
+    let gated = d.store.get_steam_app(222).await.unwrap().unwrap();
+    assert!(
+        gated.detail.unwrap().tags.is_empty(),
+        "absence from a successful non-empty batch overwrites to empty (genre fallback)"
+    );
+}
+
+#[tokio::test]
+async fn enrich_treats_zero_items_for_nonempty_request_as_batch_failure() {
+    let Some(store) = store_or_skip("t71-zero-items").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    seed_steam_game(&store, "gk-z", "mn-z", "Drifted", Some(333), None).await;
+    store
+        .put_steam_app(&stale_detail_cache(333, now, vec!["Old Tag".into()]))
+        .await
+        .unwrap();
+
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(&steam_mock, 333, appdetails_plain_body("Drifted")).await;
+    // A non-empty request answered with ZERO items — the shape-drift signature.
+    mount_tag_endpoints(&steam_mock, serde_json::json!([])).await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let cache = d.store.get_steam_app(333).await.unwrap().unwrap();
+    assert_eq!(
+        cache.detail.unwrap().tags,
+        vec!["Old Tag".to_string()],
+        "zero items for a non-empty request must read as batch failure, not mass-wipe"
+    );
+}
+
+#[tokio::test]
+async fn enrich_sweeps_adult_games_with_fresh_cache_no_fetch() {
+    let Some(store) = store_or_skip("t71-fresh-sweep").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    // Second-bundle scenario: a game newly mapped to an appid whose cache is FRESH and
+    // already carries an adult descriptor — no worklist entry, no storefront call.
+    let gid = seed_steam_game(&store, "gk-s", "mn-s", "Second Copy", Some(888), None).await;
+    let mut cache = fresh_cache(888, now);
+    if let Some(d) = cache.detail.as_mut() {
+        d.content_descriptor_ids = vec![3];
+    }
+    store.put_steam_app(&cache).await.unwrap();
+
+    let steam_mock = steam_mock_empty().await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let g = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(g.hidden, "decide-loop sweep must catch fresh-cache adult games");
+    assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 0, "fresh cache must still mean zero storefront calls");
+}
