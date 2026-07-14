@@ -4703,7 +4703,16 @@ async fn backfill_rewrites_dirty_detail_and_preserves_reviews() {
     assert_eq!(cache.recent, dirty.recent, "recent reviews untouched");
     // Exactly ONE storefront call: appdetails. No reviews/histogram refetch.
     let reqs = steam_mock.received_requests().await.unwrap();
-    assert_eq!(reqs.len(), 1, "backfill must touch appdetails only");
+    // appdetails + the per-run GetItems/GetTagList tag batch (#71) — reviews NEVER refetched.
+    assert_eq!(
+        reqs.len(),
+        3,
+        "backfill must touch appdetails + the two keyless tag calls, never reviews"
+    );
+    assert!(
+        !reqs.iter().any(|r| r.url.path().contains("appreview")),
+        "reviews endpoints must not be called"
+    );
 }
 
 // (b) Items fetched within the skip-fresh window are skipped — zero storefront calls.
@@ -5172,4 +5181,80 @@ async fn enrich_sweeps_adult_games_with_fresh_cache_no_fetch() {
     assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
     let reqs = steam_mock.received_requests().await.unwrap();
     assert_eq!(reqs.len(), 0, "fresh cache must still mean zero storefront calls");
+}
+
+#[tokio::test]
+async fn backfill_populates_tags_and_auto_hides() {
+    let Some(store) = store_or_skip("t71-backfill").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let gid = seed_steam_game(&store, "gk-b", "mn-b", "Puss", Some(981300), None).await;
+    // Existing cache, stale detail, no tags/descriptors yet — the pre-#71 catalog state.
+    store
+        .put_steam_app(&stale_detail_cache(981300, now, vec![]))
+        .await
+        .unwrap();
+
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(
+        &steam_mock,
+        981300,
+        appdetails_descriptor_body("Puss", &[1, 3, 5, 4], Some("Nudity.")),
+    )
+    .await;
+    mount_tag_endpoints(
+        &steam_mock,
+        serde_json::json!([{"appid": 981300, "tagids": [12095, 19], "content_descriptorids": [1,3,5,4]}]),
+    )
+    .await;
+    let steam = steam_client_at(&steam_mock.uri());
+
+    let summary =
+        backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
+            .await
+            .unwrap();
+
+    assert_eq!(summary.fetched, 1);
+    assert_eq!(summary.auto_hidden, 1);
+    let cache = store.get_steam_app(981300).await.unwrap().unwrap();
+    let detail = cache.detail.unwrap();
+    assert_eq!(
+        detail.tags,
+        vec!["Sexual Content".to_string(), "Action".to_string()]
+    );
+    assert_eq!(detail.content_descriptor_ids, vec![1, 3, 5, 4]);
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(g.hidden);
+    assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
+}
+
+#[tokio::test]
+async fn backfill_skip_fresh_items_still_swept_for_adult() {
+    // Collection point (a): a skip-fresh'd item's EXISTING descriptors still hide newly
+    // mapped games — a resumed run must not lose the sweep for items it didn't refetch.
+    let Some(store) = store_or_skip("t71-backfill-skip-sweep").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let gid = seed_steam_game(&store, "gk-bs", "mn-bs", "Second Copy", Some(888), None).await;
+    let mut cache = fresh_cache(888, now); // fresh ⇒ skip-fresh window skips the refetch
+    if let Some(d) = cache.detail.as_mut() {
+        d.content_descriptor_ids = vec![3];
+    }
+    store.put_steam_app(&cache).await.unwrap();
+
+    let steam_mock = steam_mock_empty().await;
+    let steam = steam_client_at(&steam_mock.uri());
+
+    let summary =
+        backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
+            .await
+            .unwrap();
+
+    assert_eq!(summary.skipped, 1, "the fresh item must have been skip-fresh'd");
+    assert_eq!(summary.auto_hidden, 1, "…but its adult descriptors must still sweep");
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert!(g.hidden);
+    assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
 }

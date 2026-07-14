@@ -1890,6 +1890,43 @@ fn tags_for_app(
     }
 }
 
+/// One batched GetItems+GetTagList fetch with the shape-drift plausibility guard.
+/// `None` = failed or implausible → callers preserve existing tags. Both-or-nothing:
+/// resolving tag names with a partial map would silently store a truncated tag list (#71).
+async fn fetch_tag_batch(
+    steam: &steam_client::SteamClient,
+    ids: &[u32],
+    ctx: &str,
+) -> Option<(
+    std::collections::HashMap<u32, steam_client::StoreItemTags>,
+    std::collections::HashMap<u32, String>,
+)> {
+    match (steam.get_store_items(ids).await, steam.get_tag_list().await) {
+        // Plausibility guard (shape-drift): a non-empty request answered with ZERO items
+        // is indistinguishable from a Valve field rename parsing as a "successful empty
+        // response" — treating it as success would progressively wipe every app's tags,
+        // invisibly behind the genre fallback. Real batches mix ordinary apps; all-gated
+        // is not a plausible answer (#71).
+        (Ok(items), Ok(names)) if items.is_empty() => {
+            tracing::warn!(
+                requested = ids.len(),
+                names = names.len(),
+                "{ctx}: GetItems answered a non-empty request with zero items — treating as batch failure (shape drift?)"
+            );
+            None
+        }
+        (Ok(items), Ok(names)) => Some((items, names)),
+        (items_res, names_res) => {
+            tracing::warn!(
+                items_err = items_res.is_err(),
+                names_err = names_res.is_err(),
+                "{ctx}: tag batch failed — preserving existing tags"
+            );
+            None
+        }
+    }
+}
+
 /// True when a detail carries any auto-hide descriptor ({3,4} — adult sexual content).
 fn has_adult_descriptors(detail: Option<&steam_client::SteamAppDetail>) -> bool {
     detail.is_some_and(|d| {
@@ -2053,41 +2090,15 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         .filter(|w| w.need_detail)
         .map(|w| w.app_id)
         .collect();
-    let mut tag_batch_failed = false;
     // Deadline guard mirrors the fetch loop's: a spent budget means ZERO storefront calls,
     // tag batch included — existing tags are preserved (tag_data None), not wiped.
+    let mut tag_batch_failed = false;
     let tag_data = if detail_ids.is_empty() || tokio::time::Instant::now() >= deadline {
         None
     } else {
-        match (
-            steam.get_store_items(&detail_ids).await,
-            steam.get_tag_list().await,
-        ) {
-            // Plausibility guard (shape-drift): a non-empty request answered with ZERO
-            // items is indistinguishable from a Valve field rename parsing as a
-            // "successful empty response" — treating it as success would progressively
-            // wipe every app's tags, invisibly behind the genre fallback. Real batches
-            // mix ordinary apps; all-gated is not a plausible answer (#71).
-            (Ok(items), Ok(names)) if items.is_empty() => {
-                tracing::warn!(
-                    requested = detail_ids.len(),
-                    names = names.len(),
-                    "steam enrichment: GetItems answered a non-empty request with zero items — treating as batch failure (shape drift?)"
-                );
-                tag_batch_failed = true;
-                None
-            }
-            (Ok(items), Ok(names)) => Some((items, names)),
-            (items_res, names_res) => {
-                tracing::warn!(
-                    items_err = items_res.is_err(),
-                    names_err = names_res.is_err(),
-                    "steam enrichment: tag batch failed — preserving existing tags this pass"
-                );
-                tag_batch_failed = true;
-                None
-            }
-        }
+        let data = fetch_tag_batch(steam, &detail_ids, "steam enrichment").await;
+        tag_batch_failed = data.is_none();
+        data
     };
 
     // appid → game ids, for the auto-hide sweep (games is already in memory).
@@ -2242,6 +2253,8 @@ pub struct BackfillSummary {
     pub failed: u32,
     /// True when a 429 aborted the run early. Rerun to resume; persisted progress survives.
     pub aborted_429: bool,
+    /// Games auto-hidden by the adult-descriptor sweep during this run (#71).
+    pub auto_hidden: u32,
 }
 
 /// Run-once STEAMAPP# rebuild (issues #57, #61): refetch appdetails for EVERY catalog appid through
@@ -2266,6 +2279,28 @@ pub async fn backfill_steam_details(
     let total = appids.len();
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let mut summary = BackfillSummary::default();
+
+    // Same batched tag fetch + plausibility guard as enrichment (whole catalog this time),
+    // fetched LAZILY on the first item that actually needs a refetch — an all-skipped
+    // (fully fresh / resumed) run keeps the "zero storefront calls" contract.
+    let all_ids: Vec<u32> = appids.iter().copied().collect();
+    let mut tag_data: Option<
+        Option<(
+            std::collections::HashMap<u32, steam_client::StoreItemTags>,
+            std::collections::HashMap<u32, String>,
+        )>,
+    > = None;
+
+    // appid → game ids + the adult sweep set, mirroring enrichment.
+    let mut games_by_appid: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    for g in &games {
+        if let Some(id) = g.steam_app_id {
+            games_by_appid.entry(id).or_default().push(g.id.clone());
+        }
+    }
+    let mut adult_appids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+
     for app_id in appids {
         let existing = match store.get_steam_app(app_id).await {
             Ok(v) => v,
@@ -2275,6 +2310,13 @@ pub async fn backfill_steam_details(
                 continue;
             }
         };
+        // Skip-fresh items still get the auto-hide sweep: adult appids are collected from
+        // the EXISTING cache before the skip check, so resumed runs don't lose the sweep (#71).
+        if let Some(c) = &existing
+            && has_adult_descriptors(c.detail.as_ref())
+        {
+            adult_appids.insert(app_id);
+        }
         if let Some(c) = &existing
             && now - c.fetched_at < skip_fresh_secs
         {
@@ -2286,10 +2328,20 @@ pub async fn backfill_steam_details(
             continue;
         }
         let mut cache = existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id));
+        // First refetch of the run triggers the one tag batch.
+        if tag_data.is_none() {
+            tag_data = Some(fetch_tag_batch(steam, &all_ids, "backfill").await);
+        }
         tokio::time::sleep(pace).await;
         match steam.get_app_details(app_id).await {
             Ok(steam_client::AppDetails::Found(d)) => {
-                cache.detail = Some(*d);
+                let mut detail = *d;
+                detail.tags = tags_for_app(
+                    app_id,
+                    tag_data.as_ref().and_then(|d| d.as_ref()),
+                    cache.detail.as_ref(),
+                );
+                cache.detail = Some(detail);
                 cache.fetched_at = now;
             }
             // Delisted: negative stub, BOTH clocks stamped — same semantics as enrichment.
@@ -2326,15 +2378,22 @@ pub async fn backfill_steam_details(
         } else {
             summary.negative += 1;
         }
+        // Freshly-rewritten adult descriptors join the sweep set.
+        if has_adult_descriptors(cache.detail.as_ref()) {
+            adult_appids.insert(app_id);
+        }
         let done = summary.fetched + summary.negative + summary.skipped + summary.failed;
         tracing::info!(app_id, done, total, "backfill: item rewritten");
     }
+    // Single sweep, shared with enrichment — runs even after a 429 abort (dynamo-only).
+    summary.auto_hidden = auto_hide_adult_games(store, &adult_appids, &games_by_appid).await;
     tracing::info!(
         fetched = summary.fetched,
         negative = summary.negative,
         skipped = summary.skipped,
         failed = summary.failed,
         aborted_429 = summary.aborted_429,
+        auto_hidden = summary.auto_hidden,
         "backfill: done"
     );
     Ok(summary)

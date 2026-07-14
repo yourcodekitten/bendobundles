@@ -48,8 +48,13 @@ async fn main() {
     .await
     .expect("backfill: list_all_games failed");
     println!(
-        "backfill: fetched={} negative={} skipped={} failed={} aborted_429={}",
-        summary.fetched, summary.negative, summary.skipped, summary.failed, summary.aborted_429
+        "backfill: fetched={} negative={} skipped={} failed={} aborted_429={} auto_hidden={}",
+        summary.fetched,
+        summary.negative,
+        summary.skipped,
+        summary.failed,
+        summary.aborted_429,
+        summary.auto_hidden
     );
     if summary.aborted_429 {
         eprintln!("rate-limited — rerun to resume (items already rewritten are skipped)");
