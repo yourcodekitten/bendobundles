@@ -50,7 +50,10 @@ export function ToolkitBar({
   onChange: (next: ToolkitState) => void;
 }) {
   const filtersActive =
-    state.q !== '' || state.tags.length > 0 || state.rating !== 'any';
+    state.q !== '' ||
+    state.tags.length > 0 ||
+    state.rating !== 'any' ||
+    state.mature !== 'all';
 
   const toggleTag = (tag: string) =>
     onChange({

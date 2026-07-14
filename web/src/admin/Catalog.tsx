@@ -157,25 +157,28 @@ export function Catalog() {
 
     // Functional updates throughout: concurrent toggles must never revert
     // through a stale whole-list snapshot (that would clobber other rows).
-    const setRowHidden = (hidden: boolean) => {
+    // hidden_source rides along: the server stamps Admin on EVERY toggle (#71),
+    // so the local row must too — otherwise a re-hidden row keeps its stale
+    // 'sync' provenance and falsely re-labels as auto-hidden until a refetch.
+    const setRowHidden = (hidden: boolean, hidden_source: AdminGame['hidden_source']) => {
       setState((s) =>
         s.phase === 'loaded'
           ? {
               phase: 'loaded',
-              games: s.games.map((g) => (g.id === game.id ? { ...g, hidden } : g)),
+              games: s.games.map((g) => (g.id === game.id ? { ...g, hidden, hidden_source } : g)),
             }
           : s,
       );
     };
 
-    // Optimistic flip
-    setRowHidden(newHidden);
+    // Optimistic flip — with the Admin stamp the server is about to write
+    setRowHidden(newHidden, 'admin');
 
     withAuth(() => adminSetHidden(game.id, newHidden), navigate)
       .then((result) => {
         if (!result.ok) {
           // Server refused (e.g. mid-claim 409) — revert this row + show message
-          setRowHidden(game.hidden);
+          setRowHidden(game.hidden, game.hidden_source);
           setRowErrors((prev) => ({ ...prev, [game.id]: result.message }));
         } else {
           // Clear any previous row error on success
@@ -188,7 +191,7 @@ export function Catalog() {
       })
       .catch(() => {
         // Unexpected error — revert this row silently (withAuth already redirected on 401)
-        setRowHidden(game.hidden);
+        setRowHidden(game.hidden, game.hidden_source);
       });
   };
 

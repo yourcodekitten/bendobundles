@@ -46,10 +46,26 @@ pub enum HiddenSource {
     Sync,
 }
 
+impl HiddenSource {
+    /// The exact wire/DDB string for this variant — the ONE source for every place that
+    /// writes or compares the value (top-level mirror, condition-expression values).
+    /// Must equal the serde output byte-for-byte or every condition against the mirror
+    /// goes void; `hidden_source_serde_is_snake_case` pins the equality.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            HiddenSource::Admin => "admin",
+            HiddenSource::Sync => "sync",
+        }
+    }
+}
+
 /// Content descriptor ids that auto-hide a game at sync/backfill time: 3 = adult-only
 /// sexual content, 4 = gratuitous sexual content (Puss! carries both). NOT 1 (some
 /// nudity — Witcher 3), NOT 5 (general mature — Rollerdrome), NOT 2 (violence).
-/// Ben tightens/loosens by editing this list (#71).
+/// Ben tightens/loosens by editing this list (#71) — AND its client twin: the admin 🔞
+/// badge/mature-filter set lives in `web/src/tags.ts` (MATURE_DESCRIPTOR_IDS, {1,3,4}).
+/// Invariant to keep by hand: this hide set stays a SUBSET of the badge set, or
+/// auto-hidden rows stop badging and vanish from the mature=only filter.
 pub const ADULT_HIDE_DESCRIPTOR_IDS: [u32; 2] = [3, 4];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +498,13 @@ mod tests {
             serde_json::to_string(&HiddenSource::Admin).unwrap(),
             r#""admin""#
         );
+        // as_wire must track serde exactly — conditions compare against it (#71).
+        for src in [HiddenSource::Admin, HiddenSource::Sync] {
+            assert_eq!(
+                serde_json::to_value(src).unwrap().as_str().unwrap(),
+                src.as_wire()
+            );
+        }
     }
 
     #[test]

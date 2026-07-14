@@ -576,6 +576,23 @@ describe('Catalog', () => {
       expect(screen.getByText('auto-hidden: adult content')).toBeInTheDocument();
     });
 
+    it('re-hiding locally stamps admin provenance — no stale auto-hidden label (#71 review r1)', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:rehide', hidden: false, hidden_source: 'sync' },
+      ]);
+      vi.mocked(adminSetHidden).mockResolvedValue({ ok: true });
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      // Ben re-hides the (previously sync-hidden, then unhidden) row.
+      fireEvent.click(screen.getByRole('switch', { name: /hide base game/i }));
+      await waitFor(() =>
+        expect(screen.getByRole('switch', { name: /hide base game/i })).toBeChecked(),
+      );
+      // The server stamps Admin on every toggle — the local row must too, so the
+      // stale 'sync' provenance never re-labels the row as auto-hidden.
+      expect(screen.queryByText('auto-hidden: adult content')).not.toBeInTheDocument();
+    });
+
     it('no label for admin hides or unhidden sync rows', async () => {
       vi.mocked(adminCatalog).mockResolvedValue([
         { ...gameFixture, id: 'gx:adminhid', hidden: true, hidden_source: 'admin' },

@@ -57,6 +57,15 @@ pub enum HiddenWrite {
     Contested,
 }
 
+/// The DDB wire string for a game status — the much-duplicated serde round-trip, named once.
+pub(crate) fn status_wire(status: domain::GameStatus) -> String {
+    serde_json::to_value(status)
+        .expect("status serializes")
+        .as_str()
+        .expect("status is a string")
+        .to_string()
+}
+
 /// Outcome of the sync auto-hide write. Non-`Written` variants are all "leave it alone":
 /// the sweep re-evaluates next run, and Admin provenance is permanent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1371,12 +1380,6 @@ impl Store {
         game.hidden = true;
         game.hidden_source = Some(domain::HiddenSource::Sync);
 
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
-
         let res = self
             .client
             .put_item()
@@ -1384,8 +1387,8 @@ impl Store {
             .set_item(Some(game_item(&game)))
             .expression_attribute_names("#st", "status")
             .expression_attribute_names("#hsrc", "hidden_source")
-            .expression_attribute_values(":expected", schema::s(status_str))
-            .expression_attribute_values(":admin", schema::s("admin".to_string()))
+            .expression_attribute_values(":expected", schema::s(status_wire(game.status)))
+            .expression_attribute_values(":admin", schema::s(domain::HiddenSource::Admin.as_wire()))
             .condition_expression(
                 "#st = :expected AND (attribute_not_exists(#hsrc) OR #hsrc <> :admin)",
             )
@@ -1505,34 +1508,28 @@ impl Store {
         let cond = match &existing {
             None => "attribute_not_exists(pk)".to_string(),
             Some(e) => {
-                let status_str = serde_json::to_value(e.status)
-                    .expect("status serializes")
-                    .as_str()
-                    .expect("status is a string")
-                    .to_string();
+                // Clause list, not a format! branch matrix: every guarded field appends
+                // exactly one clause, so guard N+1 can't silently miss an arm.
+                let mut clauses = vec!["#st = :expected".to_string()];
                 req = req
                     .expression_attribute_names("#st", "status")
-                    .expression_attribute_values(":expected", schema::s(status_str))
-                    .expression_attribute_names("#hsrc", "hidden_source");
-                let hsrc_clause = match e.hidden_source {
-                    None => "attribute_not_exists(#hsrc)".to_string(),
-                    Some(src) => {
-                        let src_str = serde_json::to_value(src)
-                            .expect("hidden_source serializes")
-                            .as_str()
-                            .expect("hidden_source is a string")
-                            .to_string();
-                        req = req.expression_attribute_values(":hsrc", schema::s(src_str));
-                        "#hsrc = :hsrc".to_string()
-                    }
-                };
+                    .expression_attribute_values(":expected", schema::s(status_wire(e.status)));
                 // If the existing game is owned, add the ownership clause to the condition.
                 if let Some(cid) = &e.claim_id {
                     req = req.expression_attribute_values(":cid", schema::s(cid.clone()));
-                    format!("#st = :expected AND claim_id = :cid AND {hsrc_clause}")
-                } else {
-                    format!("#st = :expected AND {hsrc_clause}")
+                    clauses.push("claim_id = :cid".to_string());
                 }
+                // hidden_source must be unchanged since our read: an admin toggle landing
+                // inside this window owns the record — sync yields (#71).
+                req = req.expression_attribute_names("#hsrc", "hidden_source");
+                match e.hidden_source {
+                    None => clauses.push("attribute_not_exists(#hsrc)".to_string()),
+                    Some(src) => {
+                        req = req.expression_attribute_values(":hsrc", schema::s(src.as_wire()));
+                        clauses.push("#hsrc = :hsrc".to_string());
+                    }
+                }
+                clauses.join(" AND ")
             }
         };
 

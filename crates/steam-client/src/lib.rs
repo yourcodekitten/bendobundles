@@ -77,6 +77,11 @@ pub enum AppDetails {
     Delisted,
 }
 
+/// Tags requested per app from GetItems. Deliberate headroom over fulfillment's
+/// STEAM_TAG_STORE_CAP (10): widening the store cap up to this ceiling needs only a
+/// backfill, not a client change. Widening PAST it silently truncates — raise both.
+const REQUESTED_TAG_COUNT: usize = 20;
+
 /// One app's community-tag payload from `IStoreBrowseService/GetItems`: tag ids in
 /// popularity order + content descriptor ids. Names resolve via [`SteamClient::get_tag_list`].
 ///
@@ -549,7 +554,7 @@ impl SteamClient {
             let input = serde_json::json!({
                 "ids": chunk.iter().map(|id| serde_json::json!({"appid": id})).collect::<Vec<_>>(),
                 "context": {"language": "english", "country_code": "US"},
-                "data_request": {"include_tag_count": 20}
+                "data_request": {"include_tag_count": REQUESTED_TAG_COUNT}
             });
             let resp = self
                 .http

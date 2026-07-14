@@ -73,6 +73,12 @@ describe('ToolkitBar', () => {
     expect(onChange).toHaveBeenCalledWith({ ...state, rating: 'very-positive' });
   });
 
+  it('mature filter alone counts as an active filter (#71 review r1)', () => {
+    renderBar({ mature: 'only' });
+    // active-filter readout + clear button must render when only mature is set
+    expect(screen.getByRole('button', { name: /clear filters/i })).toBeInTheDocument();
+  });
+
   it('mature select renders all/hide/only and fires onChange (#71)', () => {
     const { onChange, state } = renderBar();
     const mature = screen.getByLabelText('mature') as HTMLSelectElement;

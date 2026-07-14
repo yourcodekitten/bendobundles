@@ -42,10 +42,13 @@ export type ClaimResult =
  * data. Mirrors admin-api's SteamSummaryView exactly. */
 export type SteamSummary = {
   genres: string[];
-  /** Top community tags (popularity order, ≤10) — the toolkit's chips + tag filter (#71). */
-  tags: string[];
-  /** Raw content descriptor ids — badge/mature-filter policy lives in tags.ts (#71). */
-  content_descriptor_ids: number[];
+  /** Top community tags (popularity order, ≤10) — the toolkit's chips + tag filter (#71).
+   * Optional like SteamAppDetail's mirror fields: an OLD lambda racing this bundle during
+   * deploy omits the key. Read via displayTags(). */
+  tags?: string[];
+  /** Raw content descriptor ids — badge/mature-filter policy lives in tags.ts (#71).
+   * Optional for the same deploy-window reason; isMature() tolerates undefined. */
+  content_descriptor_ids?: number[];
   developers: string[];
   publishers: string[];
   release_date: string | null;
@@ -70,8 +73,9 @@ export type AdminGame = {
   requires_choice: boolean;
   steam_app_id: number | null;
   owned_by_ben: boolean;
-  /** Who last set hidden — 'sync' rows are auto-hides (#71). */
-  hidden_source: 'admin' | 'sync' | null;
+  /** Who last set hidden — 'sync' rows are auto-hides (#71). Optional for the
+   * deploy window (old lambda omits it); absent reads as unknown = no label. */
+  hidden_source?: 'admin' | 'sync' | null;
   steam: SteamSummary | null;
 };
 

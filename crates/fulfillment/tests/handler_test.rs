@@ -5283,3 +5283,41 @@ async fn backfill_skip_fresh_items_still_swept_for_adult() {
     assert!(g.hidden);
     assert_eq!(g.hidden_source, Some(domain::HiddenSource::Sync));
 }
+
+#[tokio::test]
+async fn enrich_refetch_that_clears_descriptors_supersedes_stale_cache() {
+    // Review round 1: the decide loop collects adult appids from the STALE cache; if the
+    // same pass refetches and the fresh appdetails cleared the descriptors, the sweep
+    // must NOT hide from data the run itself just invalidated.
+    let Some(store) = store_or_skip("t71-supersede").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let gid = seed_steam_game(&store, "gk-sup", "mn-sup", "Reformed Game", Some(666), None).await;
+    // Stale cache carrying adult descriptors.
+    let mut cache = stale_detail_cache(666, now, vec![]);
+    if let Some(d) = cache.detail.as_mut() {
+        d.content_descriptor_ids = vec![3];
+    }
+    store.put_steam_app(&cache).await.unwrap();
+
+    let steam_mock = MockServer::start().await;
+    // Fresh appdetails WITHOUT descriptors — the dev removed the adult content.
+    mount_steam_detail(&steam_mock, 666, appdetails_plain_body("Reformed Game")).await;
+    mount_tag_endpoints(
+        &steam_mock,
+        serde_json::json!([{"appid": 666, "tagids": [19]}]),
+    )
+    .await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let g = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        !g.hidden,
+        "fresh cleared descriptors must supersede the stale cache's adult collection"
+    );
+    assert_eq!(g.hidden_source, None);
+}

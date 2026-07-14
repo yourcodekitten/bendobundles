@@ -3,7 +3,9 @@
  * 2 frequent violence/gore · 3 adult-ONLY sexual · 4 gratuitous sexual · 5 general mature. */
 
 /** Sexual-content family — drives the admin 🔞 badge and the mature filter.
- * Deliberately NOT 5 (Rollerdrome/Witcher carry it) and NOT 2 (violence). */
+ * Deliberately NOT 5 (Rollerdrome/Witcher carry it) and NOT 2 (violence).
+ * Server twin: the auto-HIDE set is `domain::ADULT_HIDE_DESCRIPTOR_IDS` ({3,4}) —
+ * keep that set a SUBSET of this one, or auto-hidden rows stop badging. */
 export const MATURE_DESCRIPTOR_IDS: readonly number[] = [1, 3, 4];
 
 export const DESCRIPTOR_LABELS: Record<number, string> = {

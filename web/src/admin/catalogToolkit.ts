@@ -98,14 +98,12 @@ export function applyToolkit(
       }
       if (rank < FLOOR_RANK[state.rating]) return false;
     }
-    if (state.mature !== 'all') {
-      const flagged = isMature(g.steam?.content_descriptor_ids);
-      if (state.mature === 'hide' && flagged) return false;
-      if (state.mature === 'only' && !flagged) {
-        // unmapped rows aren't provably mature — under 'only' they're no-data exclusions
-        if (g.steam === null) excludedNoData++;
-        return false;
-      }
+    const flagged = isMature(g.steam?.content_descriptor_ids);
+    if (state.mature === 'hide' && flagged) return false;
+    if (state.mature === 'only' && !flagged) {
+      // unmapped rows aren't provably mature — under 'only' they're no-data exclusions
+      if (g.steam === null) excludedNoData++;
+      return false;
     }
     return true;
   });
