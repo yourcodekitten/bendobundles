@@ -77,6 +77,7 @@ fn link(token: &str) -> Link {
     Link {
         token: token.into(),
         label: "dave".into(),
+        gift_note: None,
         claims_allowed: 1,
         claims_used: 0,
         revoked: false,
@@ -127,6 +128,200 @@ async fn link_and_claim_roundtrip() {
     store.put_claim(&claim).await.unwrap();
     assert_eq!(store.get_claim("tok1", "c1").await.unwrap().unwrap(), claim);
     assert_eq!(store.claims_for_link("tok1").await.unwrap(), vec![claim]);
+}
+
+/// `set_link_gift_note` is a single-attribute write and the top-level attr is
+/// authoritative on read. Two properties pinned here:
+///
+/// 1. **A stale body writer cannot clobber the note** (the lost-update the old
+///    body-only design had): set a note, then land `update_link_meta` with a
+///    Link snapshot taken BEFORE the note existed (exactly what a racing revoke
+///    carries) — the note must survive, and the revoke must stick.
+/// 2. **A note write cannot disturb enforcement**: the fn takes only
+///    (token, note), so there is no snapshot to carry stale `revoked` /
+///    `claims_allowed` / `expires_at` back in — un-revoking by note edit is
+///    unrepresentable. Asserted behaviorally: note ops on a revoked link leave
+///    it revoked.
+#[tokio::test]
+async fn gift_note_scoped_write_survives_stale_body_writers() {
+    let Some(store) = store_or_skip("gift-note-scoped").await else {
+        return;
+    };
+    store.create_link(&link("tok-note")).await.unwrap();
+    let pre_note_snapshot = store.get_link("tok-note").await.unwrap().unwrap();
+
+    // set the note via the scoped write
+    assert!(
+        store
+            .set_link_gift_note("tok-note", Some("wrote this later ♡"))
+            .await
+            .unwrap()
+    );
+
+    // a concurrent revoke commits from its pre-note snapshot (body has NO note)
+    let mut stale_revoke = pre_note_snapshot;
+    stale_revoke.revoked = true;
+    store.update_link_meta(&stale_revoke).await.unwrap();
+
+    let after = store.get_link("tok-note").await.unwrap().unwrap();
+    assert!(after.revoked, "the revoke must stick");
+    assert_eq!(
+        after.gift_note.as_deref(),
+        Some("wrote this later ♡"),
+        "a stale body write must not clobber the note (top-level attr is authoritative)"
+    );
+
+    // editing/clearing the note on the revoked link must leave it revoked
+    assert!(
+        store
+            .set_link_gift_note("tok-note", Some("edited ♡"))
+            .await
+            .unwrap()
+    );
+    let edited = store.get_link("tok-note").await.unwrap().unwrap();
+    assert!(edited.revoked, "a note edit must never un-revoke");
+    assert_eq!(edited.gift_note.as_deref(), Some("edited ♡"));
+
+    assert!(store.set_link_gift_note("tok-note", None).await.unwrap());
+    let cleared = store.get_link("tok-note").await.unwrap().unwrap();
+    assert!(cleared.revoked);
+    assert_eq!(cleared.gift_note, None, "REMOVE path clears the note");
+
+    // unknown token → Ok(false), and nothing is created
+    assert!(
+        !store
+            .set_link_gift_note("no-such-tok", Some("x"))
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.get_link("no-such-tok").await.unwrap(), None);
+}
+
+/// The note must survive `claim_game`'s `SET body` — the OTHER stale body writer
+/// named in `domain::Link`'s doc. Guards against a refactor that turns the
+/// claim's link write into a full-item replace (which would drop the top-level
+/// `gift_note` attr) or otherwise rewrites attrs it doesn't own.
+#[tokio::test]
+async fn gift_note_survives_claim_body_rewrite() {
+    let Some(store) = store_or_skip("gift-note-claim").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let mut noted = link("tok-noted");
+    noted.gift_note = Some("picked for you ♡".into());
+    store.create_link(&noted).await.unwrap();
+
+    let now = datetime!(2026-07-02 12:00 UTC);
+    store
+        .claim_game("tok-noted", &game_id("gk1", "mn"), "c1", now)
+        .await
+        .unwrap();
+
+    let after = store.get_link("tok-noted").await.unwrap().unwrap();
+    assert_eq!(after.claims_used, 1);
+    assert_eq!(
+        after.gift_note.as_deref(),
+        Some("picked for you ♡"),
+        "claim's body rewrite must not disturb the note"
+    );
+}
+
+/// The note lives ONLY in the top-level attribute — the `body` blob must never
+/// carry it (schema::link_body strips it at every writer). Otherwise a body
+/// written while a note was set retains the text verbatim at rest after a
+/// "clear", indefinitely on links that see no further body write — a delete
+/// that doesn't delete (OMBB, #69 review). Asserted RAW, against the stored
+/// item, across all three body writers: create, update_link_meta, claim_game.
+#[tokio::test]
+async fn gift_note_never_persisted_in_body_blob() {
+    let Some(store) = store_or_skip("gift-note-purge").await else {
+        return;
+    };
+    let client = raw_client("gift-note-purge").await;
+    let table = "t-gift-note-purge";
+    const SECRET: &str = "between us only ♡";
+
+    let raw_body = |token: &'static str| {
+        let client = client.clone();
+        async move {
+            let out = client
+                .get_item()
+                .table_name(table)
+                .key("pk", AttributeValue::S(format!("LINK#{token}")))
+                .key("sk", AttributeValue::S("META".into()))
+                .send()
+                .await
+                .unwrap();
+            let item = out.item.unwrap();
+            item.get("body").unwrap().as_s().unwrap().to_string()
+        }
+    };
+
+    // create (writer 1): note readable via the attr, absent from body
+    store.put_game(&game(1, true)).await.unwrap();
+    let mut noted = link("tok-purge");
+    noted.gift_note = Some(SECRET.into());
+    store.create_link(&noted).await.unwrap();
+    assert_eq!(
+        store
+            .get_link("tok-purge")
+            .await
+            .unwrap()
+            .unwrap()
+            .gift_note
+            .as_deref(),
+        Some(SECRET)
+    );
+    assert!(
+        !raw_body("tok-purge").await.contains("between us"),
+        "create must not serialize the note into body"
+    );
+
+    // claim_game (writer 2) rewrites body — still noteless
+    store
+        .claim_game(
+            "tok-purge",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-02 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !raw_body("tok-purge").await.contains("between us"),
+        "claim's body rewrite must not serialize the note"
+    );
+
+    // update_link_meta (writer 3, the revoke shape) — still noteless
+    let mut l = store.get_link("tok-purge").await.unwrap().unwrap();
+    l.revoked = true;
+    store.update_link_meta(&l).await.unwrap();
+    assert!(
+        !raw_body("tok-purge").await.contains("between us"),
+        "update_link_meta must not serialize the note"
+    );
+
+    // and after a clear, NOTHING anywhere holds the text
+    assert!(store.set_link_gift_note("tok-purge", None).await.unwrap());
+    let out = client
+        .get_item()
+        .table_name(table)
+        .key("pk", AttributeValue::S("LINK#tok-purge".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap();
+    let item = out.item.unwrap();
+    assert!(!item.contains_key("gift_note"), "attr removed on clear");
+    assert!(
+        !item
+            .get("body")
+            .unwrap()
+            .as_s()
+            .unwrap()
+            .contains("between us"),
+        "cleared note must leave no copy at rest"
+    );
 }
 
 #[tokio::test]
@@ -864,6 +1059,7 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
     let stale_body = Link {
         token: "tok-e".into(),
         label: "dave".into(),
+        gift_note: None,
         claims_allowed: 1,
         claims_used: 9,
         revoked: true,

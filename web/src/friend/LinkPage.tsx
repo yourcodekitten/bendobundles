@@ -22,6 +22,7 @@ import { GameGrid } from "./GameGrid";
 import { GameDetailModal } from "../GameDetailModal";
 import { CursorCompanion } from "./CursorCompanion";
 import { prefersReducedMotion, motionOK } from "../motion";
+import { graphemes } from "../text";
 import { BootScreen } from "./BootScreen";
 
 type ViewState =
@@ -43,20 +44,63 @@ export function LinkPage() {
   );
 }
 
+/** The dialog box's blinking block cursor — one definition for all beats. */
+function TwCursor() {
+  return (
+    <span aria-hidden="true" className="tw-cursor">
+      &#9646;
+    </span>
+  );
+}
+
 function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   const { token } = useParams<{ token: string }>();
   const [view, setView] = useState<ViewState>({ kind: "loading" });
   const [claimingGame, setClaimingGame] = useState<GameView | null>(null);
+  const viewLoaded = view.kind === "loaded";
   // ── dialog-box typewriter (the page's one entrance; see DESIGN.md motion) ──
   const DIALOG_BODY =
     "games from ben's humble stash, picked for you \u2661 open one for details, claim it, and the key is yours.";
   const typedLabel = view.kind === "loaded" ? view.data.label : "";
-  const typeTotal = typedLabel.length + DIALOG_BODY.length;
+  // ben's personal note types as a third beat after the standard body —
+  // absent on most links, so everything is length-0-safe
+  const giftNote = view.kind === "loaded" ? (view.data.gift_note ?? "") : "";
+  // Beats are measured and sliced in GRAPHEME CLUSTERS — .slice on the string
+  // cuts UTF-16 units (splits surrogate pairs into U+FFFD), and code points
+  // still split ZWJ sequences (a family emoji assembles member by member).
+  // Graphemes are the unit the eye sees; the gift note is exactly where emoji
+  // show up. (The server's 500 bound stays code points — that's an input
+  // limit, enforced where input happens.) Memoized: this component re-renders
+  // ~70×/s while typing, and re-deriving per tick is pure allocation churn.
+  const labelGr = useMemo(() => graphemes(typedLabel), [typedLabel]);
+  const bodyGr = useMemo(() => graphemes(DIALOG_BODY), [DIALOG_BODY]);
+  const noteGr = useMemo(() => graphemes(giftNote), [giftNote]);
+  // cumulative beat offsets — every slice and cursor handoff below reads from
+  // these, so the boundaries live in exactly one place
+  const bodyStart = labelGr.length;
+  const noteStart = bodyStart + bodyGr.length;
+  const typeTotal = noteStart + noteGr.length;
   const [typeChars, setTypeChars] = useState(0);
   const [typeKey, setTypeKey] = useState(0);
+  // the typeKey whose entrance has fully played, stamped ONLY at the explicit
+  // completion sites (interval clamp, skip, reduced-motion/already-played
+  // snap) — never derived from a render: a replay click's commit still sees
+  // the old completed typeChars, and a derived stamp would mark the new key
+  // played before it types a character. The note is editable post-creation,
+  // so a background refetch can change typeTotal mid-session: once the
+  // entrance has played, snap to the new text instead of replaying (a retype
+  // would re-disable the typeDone-gated controls under the friend for
+  // seconds). The replay button bumps typeKey, which re-arms the animation.
+  const playedKeyRef = useRef<number | null>(null);
   useEffect(() => {
-    if (typeTotal === 0) return;
-    if (prefersReducedMotion()) {
+    // The entrance belongs to the loaded page. Without this gate the effect
+    // types DIALOG_BODY invisibly behind the loading/error views (typeTotal
+    // is never 0 — the body is a constant) and stamps itself played, so a
+    // slow first fetch or an error→retry would render the box pre-typed and
+    // the entrance would never animate.
+    if (!viewLoaded) return;
+    if (prefersReducedMotion() || playedKeyRef.current === typeKey) {
+      playedKeyRef.current = typeKey;
       setTypeChars(typeTotal);
       return;
     }
@@ -75,7 +119,10 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
             if (iv !== undefined) clearInterval(iv);
             return c;
           }
-          return c + 1;
+          const next = c + 1;
+          // completion observed at the source (idempotent ref write)
+          if (next >= typeTotal) playedKeyRef.current = typeKey;
+          return next;
         });
       }, 14);
     }, 1000);
@@ -83,8 +130,34 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       clearTimeout(delay);
       if (iv !== undefined) clearInterval(iv);
     };
-  }, [typeKey, typeTotal, bootDone]);
+  }, [typeKey, typeTotal, bootDone, viewLoaded]);
   const typeDone = typeChars >= typeTotal;
+  // skip-to-end — click/tap on the dialog box, or Enter/Space anywhere (the
+  // JRPG "press A" this page is homaging; keyboard users get the same out).
+  // Skipping counts as played: a later refetch must snap, not retype.
+  const skipTyping = useCallback(() => {
+    playedKeyRef.current = typeKey;
+    setTypeChars(typeTotal);
+  }, [typeKey, typeTotal]);
+  useEffect(() => {
+    if (!viewLoaded || typeDone) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      const t = e.target;
+      if (
+        t instanceof HTMLInputElement ||
+        t instanceof HTMLTextAreaElement ||
+        t instanceof HTMLButtonElement ||
+        (t instanceof HTMLElement && t.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      skipTyping();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [viewLoaded, typeDone, skipTyping]);
   const [detailGame, setDetailGame] = useState<GameView | null>(null);
   const [refreshTick, setRefreshTick] = useState(0);
   const prevTokenRef = useRef<string | undefined>(undefined);
@@ -155,9 +228,14 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       }
       // Hard reset to the spinner only on token change (initial load / navigation).
       // refreshTick bumps refetch behind the current view — no blank flash mid-claim.
+      // (This branch ONLY — a reset on every refreshTick refetch would replay the
+      // entrance after each claim, the exact churn playedKeyRef exists to prevent.)
       if (prevTokenRef.current !== token) {
         prevTokenRef.current = token;
         setView({ kind: "loading" });
+        // a different link is a different page: its entrance hasn't played
+        playedKeyRef.current = null;
+        setTypeChars(0);
       }
       try {
         const data = await fetchLink(token);
@@ -294,10 +372,24 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
           </div>
           {/* ≤800px the box leaves the banner and drops into flow, still
               straddling the banner's bottom edge like a JRPG text box */}
-          <div className="absolute bottom-4 left-6 w-[34rem] max-w-[calc(100%-3rem)] rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)] max-[800px]:relative max-[800px]:bottom-auto max-[800px]:left-auto max-[800px]:w-auto max-[800px]:max-w-none max-[800px]:-mt-8 max-[800px]:mx-7">
+          {/* onClick: tap-to-complete, the JRPG-dialog convention this box is
+              homaging — a long note otherwise keeps the typeDone-gated steam
+              controls inert for seconds with nothing to do but watch */}
+          <div
+            onClick={() => {
+              if (!typeDone) skipTyping();
+            }}
+            className="absolute bottom-4 left-6 w-[34rem] max-w-[calc(100%-3rem)] rounded-xl border-[3px] border-pixel bg-floor px-5 py-3.5 [box-shadow:inset_0_0_0_3px_var(--color-floor),inset_0_0_0_5px_var(--color-pixel)] max-[800px]:relative max-[800px]:bottom-auto max-[800px]:left-auto max-[800px]:w-auto max-[800px]:max-w-none max-[800px]:-mt-8 max-[800px]:mx-7"
+          >
             <button
               type="button"
-              onClick={() => setTypeKey((k) => k + 1)}
+              onClick={(e) => {
+                // don't bubble into the box's tap-to-skip — one click must
+                // not mean both "skip" and "replay" (the skip half would
+                // paint a full-text frame before the restart)
+                e.stopPropagation();
+                setTypeKey((k) => k + 1);
+              }}
               aria-label="replay the text"
               title="replay"
               className="font-pixel absolute top-2.5 right-3 text-sm text-dust-faint hover:text-ink"
@@ -305,21 +397,34 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
               &#8635;
             </button>
             <h2 className="min-h-7 text-xl leading-tight text-give-soft">
-              {typedLabel.slice(0, typeChars)}
-              {typeChars < typedLabel.length && (
-                <span aria-hidden="true" className="tw-cursor">
-                  &#9646;
-                </span>
-              )}
+              {labelGr.slice(0, typeChars).join("")}
+              {typeChars < bodyStart && <TwCursor />}
             </h2>
             <p className="mt-1.5 min-h-10 max-w-[60ch] text-sm text-ink-soft">
-              {DIALOG_BODY.slice(0, Math.max(0, typeChars - typedLabel.length))}
-              {typeChars >= typedLabel.length && !typeDone && (
-                <span aria-hidden="true" className="tw-cursor">
-                  &#9646;
-                </span>
-              )}
+              {bodyGr.slice(0, Math.max(0, typeChars - bodyStart)).join("")}
+              {typeChars >= bodyStart && typeChars < noteStart && <TwCursor />}
             </p>
+            {/* ben's note — the personal beat. The container renders whenever a
+                note exists (empty while the earlier beats type) so the box
+                never grows mid-monologue. The cursor moves in at the boundary
+                (>= noteStart, like the body's handoff) so it never blips out
+                for a tick between beats. */}
+            {giftNote !== "" && (
+              <p className="mt-1.5 min-h-5 max-w-[60ch] text-sm italic text-give-soft">
+                {typeChars > noteStart && (
+                  <>&ldquo;{noteGr.slice(0, typeChars - noteStart).join("")}</>
+                )}
+                {typeChars >= noteStart && !typeDone && <TwCursor />}
+                {typeDone && (
+                  <>
+                    &rdquo;{" "}
+                    <span className="font-pixel not-italic text-xs text-dust">
+                      &mdash; ben
+                    </span>
+                  </>
+                )}
+              </p>
+            )}
             {steamIdentity !== null ? (
               <div
                 className={`mt-2 flex items-center gap-2 transition-opacity duration-300 ${typeDone ? "opacity-100" : "pointer-events-none opacity-0"}`}

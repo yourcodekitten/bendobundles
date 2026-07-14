@@ -190,6 +190,22 @@ fn is_ccf_put<R>(
     )
 }
 
+/// `is_ccf_put`'s sibling for conditional UpdateItem calls — same policy, same
+/// single home (see the doc above).
+fn is_ccf_update<R>(
+    e: &aws_sdk_dynamodb::error::SdkError<
+        aws_sdk_dynamodb::operation::update_item::UpdateItemError,
+        R,
+    >,
+) -> bool {
+    matches!(
+        e.as_service_error(),
+        Some(
+            aws_sdk_dynamodb::operation::update_item::UpdateItemError::ConditionalCheckFailedException(_)
+        )
+    )
+}
+
 /// Deserialize a LINK META item, overriding EVERY enforcer field from the authoritative
 /// top-level attributes. The `body` blob is a convenience copy; the fields `claim_game`'s
 /// condition expression actually enforces — `claims_used`, `claims_allowed`, `revoked`,
@@ -197,7 +213,11 @@ fn is_ccf_put<R>(
 /// concurrent writers (claim's atomic ADD, compensate's decrement, `update_link_meta`'s
 /// scoped SET/REMOVE) keep current. Reading any of them from `body` is a latent lost-update:
 /// harmless while body and attrs move in lockstep, live the day any writer moves an attr
-/// without rewriting body. So: body for identity/cosmetics, top-level attrs for enforcement.
+/// without rewriting body. So: body for immutable identity, top-level attrs for enforcement
+/// AND for anything editable post-creation (`gift_note` — see its scoped writer). A future
+/// editable field (label?) must follow the gift_note recipe, NOT ride in body alone: a
+/// body-only editable field gets silently reverted by claim's `SET body` from a
+/// pre-transaction read.
 ///
 /// `expires_at` absence is authoritative too — `link_item` omits it and `update_link_meta`
 /// REMOVEs it for never-expires — so the override is unconditional, not only-when-present.
@@ -227,6 +247,14 @@ fn link_from_item(
             )
         }
     };
+    // gift_note is post-creation-editable via `set_link_gift_note`'s scoped write, so the
+    // top-level attribute is authoritative and absence means no-note — unconditional
+    // override, same rule as expires_at. (body never carries the note at all — see
+    // `schema::link_body` — so this override is also the ONLY source, not just the winner.)
+    link.gift_note = item
+        .get("gift_note")
+        .and_then(|v| v.as_s().ok())
+        .map(String::from);
     Ok(link)
 }
 
@@ -406,10 +434,7 @@ impl Store {
             .key("pk", pk)
             .key("sk", sk)
             .update_expression(expr)
-            .expression_attribute_values(
-                ":b",
-                schema::s(serde_json::to_string(l).expect("link serializes")),
-            )
+            .expression_attribute_values(":b", schema::s(schema::link_body(l)))
             .expression_attribute_values(
                 ":ca",
                 aws_sdk_dynamodb::types::AttributeValue::N(l.claims_allowed.to_string()),
@@ -423,6 +448,39 @@ impl Store {
         }
         req.send().await?;
         Ok(())
+    }
+
+    /// Set/replace/clear a link's gift note via a single-attribute SET/REMOVE. Deliberately
+    /// NOT a read-modify-write through `update_link_meta`: that shape carries the caller's
+    /// possibly-stale `revoked`/`claims_allowed`/`expires_at` back into the write, so a note
+    /// save racing a revoke would silently un-revoke the link. Touching ONLY `gift_note`
+    /// (which reads override from the top-level attribute) makes the edit unable to disturb
+    /// enforcement by construction — and it's one round-trip instead of two.
+    /// Returns Ok(false) when no such link exists (the condition fails), Ok(true) on success.
+    pub async fn set_link_gift_note(
+        &self,
+        token: &str,
+        note: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(token), "META");
+        let req = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .condition_expression("attribute_exists(pk)");
+        let req = match note {
+            Some(n) => req
+                .update_expression("SET gift_note = :n")
+                .expression_attribute_values(":n", schema::s(n)),
+            None => req.update_expression("REMOVE gift_note"),
+        };
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
+            Err(sdk_err) => Err(StoreError::Aws(format!("{sdk_err:?}"))),
+        }
     }
 
     pub async fn get_link(&self, token: &str) -> Result<Option<Link>, StoreError> {
@@ -624,7 +682,7 @@ impl Store {
                 "revoked = :f AND claims_used < claims_allowed \
                  AND (attribute_not_exists(expires_at) OR expires_at > :now)",
             )
-            .expression_attribute_values(":b", av_s(&serde_json::to_string(&bumped).expect("link")))
+            .expression_attribute_values(":b", av_s(&schema::link_body(&bumped)))
             .expression_attribute_values(
                 ":one",
                 aws_sdk_dynamodb::types::AttributeValue::N("1".into()),

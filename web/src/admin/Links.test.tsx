@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -16,6 +16,7 @@ vi.mock('../api', async (importOriginal) => {
     adminCreateLink: vi.fn(),
     adminRevoke: vi.fn(),
     adminLinkClaims: vi.fn(),
+    adminSetLinkNote: vi.fn(),
   };
 });
 import {
@@ -23,6 +24,7 @@ import {
   adminCreateLink,
   adminRevoke,
   adminLinkClaims,
+  adminSetLinkNote,
   CreateLinkValidationError,
 } from '../api';
 
@@ -129,6 +131,154 @@ describe('Links', () => {
     });
   });
 
+  describe('note editing', () => {
+    it('shows the current note and saves an edited one', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([
+        { ...link1, gift_note: 'old words' },
+      ]);
+      vi.mocked(adminSetLinkNote).mockResolvedValue(undefined);
+
+      renderLinks();
+      await waitFor(() => screen.getByText(/old words/));
+
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+      expect(box).toHaveValue('old words');
+
+      await user.clear(box);
+      await user.type(box, '  new words  ');
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+
+      await waitFor(() => {
+        expect(adminSetLinkNote).toHaveBeenCalledWith('tok-abc123', 'new words');
+      });
+    });
+
+    it('offers "add note" on a note-less link and a blank save clears', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([
+        { ...link1, gift_note: 'kill me' },
+      ]);
+      vi.mocked(adminSetLinkNote).mockResolvedValue(undefined);
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      // link2 has no note → the affordance reads "add note"
+      vi.mocked(adminLinks).mockResolvedValue([link2]);
+
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+      await user.clear(box);
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+
+      await waitFor(() => {
+        expect(adminSetLinkNote).toHaveBeenCalledWith('tok-abc123', '');
+      });
+      // After the post-save reload (now returning link2), Bob shows "add note"
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'add note for Bob' }),
+      );
+    });
+
+    it('surfaces a save failure loudly and keeps the editor open', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([{ ...link1, gift_note: 'hi' }]);
+      vi.mocked(adminSetLinkNote).mockRejectedValue(
+        new Error("couldn't save the note — it may not have changed"),
+      );
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+      await user.clear(box);
+      await user.type(box, 'hello');
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+
+      await waitFor(() => {
+        expect(screen.getByRole('alert')).toHaveTextContent(/couldn't save the note/);
+      });
+      // Editor stays open with the draft intact
+      expect(
+        screen.getByRole('textbox', { name: 'note for Alice' }),
+      ).toBeInTheDocument();
+    });
+
+    it('an unchanged save is a no-op: closes the editor without a request', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([{ ...link1, gift_note: 'hi' }]);
+      vi.mocked(adminSetLinkNote).mockResolvedValue(undefined);
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('textbox', { name: 'note for Alice' }),
+        ).not.toBeInTheDocument(),
+      );
+      expect(adminSetLinkNote).not.toHaveBeenCalled();
+      // No refetch either — the list was loaded exactly once
+      expect(adminLinks).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancel clears a stale save-failure alert with the draft', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([{ ...link1, gift_note: 'hi' }]);
+      vi.mocked(adminSetLinkNote).mockRejectedValue(new Error('boom'));
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+      await user.clear(box);
+      await user.type(box, 'hello');
+      await user.click(screen.getByRole('button', { name: 'save note for Alice' }));
+      await waitFor(() => screen.getByRole('alert'));
+
+      await user.click(screen.getByRole('button', { name: 'cancel note for Alice' }));
+      // Abandoning the edit takes the failure message with it — a lingering
+      // alert would read as "something is still wrong"
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('textbox', { name: 'note for Alice' }),
+      ).not.toBeInTheDocument();
+    });
+
+    it('clamps and counts the note in code points, not UTF-16 units', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([{ ...link1, gift_note: 'hi' }]);
+
+      renderLinks();
+      await waitFor(() =>
+        screen.getByRole('button', { name: 'edit note for Alice' }),
+      );
+      await user.click(screen.getByRole('button', { name: 'edit note for Alice' }));
+      const box = screen.getByRole('textbox', { name: 'note for Alice' });
+
+      // 501 astral emoji = 501 code points (1002 UTF-16 units): the server
+      // bound is 500 code points, so the clamp keeps exactly 500 emoji —
+      // the old maxLength={500} would have cut at 250.
+      const emoji = '\u{1F381}';
+      fireEvent.change(box, { target: { value: emoji.repeat(501) } });
+      const clamped = (box as HTMLTextAreaElement).value;
+      expect(Array.from(clamped).length).toBe(500);
+      // and the counter reports code points, not the UTF-16 length (1000)
+      expect(screen.getByText('500/500')).toBeInTheDocument();
+    });
+  });
+
   describe('create form', () => {
     it('submits form and shows full invite URL with accessible copy button', async () => {
       const user = userEvent.setup();
@@ -148,7 +298,7 @@ describe('Links', () => {
       // Wait for both: api called AND full URL in DOM (after reload settles)
       const expectedUrl = `${window.location.origin}/l/tok-new`;
       await waitFor(() => {
-        expect(adminCreateLink).toHaveBeenCalledWith('Charlie', 1, undefined);
+        expect(adminCreateLink).toHaveBeenCalledWith('Charlie', 1, undefined, undefined);
         expect(screen.getByText(expectedUrl)).toBeInTheDocument();
       });
 
@@ -156,6 +306,34 @@ describe('Links', () => {
       expect(
         screen.getByRole('button', { name: 'copy invite for Charlie' }),
       ).toBeInTheDocument();
+    });
+
+    it('passes a trimmed gift note through and clears the field on success', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockResolvedValue({
+        token: 'tok-noted',
+        url_path: '/l/tok-noted',
+      });
+
+      renderLinks();
+      await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+      const noteBox = screen.getByRole('textbox', { name: 'note to your friend' });
+      await user.type(noteBox, '  enjoy the trove!  ');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+      await waitFor(() => {
+        expect(adminCreateLink).toHaveBeenCalledWith(
+          'Charlie',
+          1,
+          undefined,
+          'enjoy the trove!',
+        );
+      });
+      // Field resets with the rest of the form
+      expect(noteBox).toHaveValue('');
     });
 
     it('create copy button writes the full URL to navigator.clipboard', async () => {

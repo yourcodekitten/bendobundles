@@ -200,6 +200,7 @@ fn test_link(token: &str) -> Link {
     Link {
         token: token.into(),
         label: "Admin Test Link".into(),
+        gift_note: None,
         claims_allowed: 3,
         claims_used: 0,
         revoked: false,
@@ -496,6 +497,205 @@ async fn create_link_overlong_label_returns_422() {
         j["error"].as_str().unwrap().contains("label"),
         "error must name the bad field, got: {j}"
     );
+}
+
+/// POST /admin/api/links with an over-long gift_note → 422. The bound is checked on the
+/// TRIMMED text, so 500 chars of payload wrapped in whitespace still passes.
+#[tokio::test]
+async fn create_link_overlong_gift_note_returns_422() {
+    let Some(store) = store_or_skip("link-422-note").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Chatty", "claims_allowed": 1, "gift_note": "x".repeat(501)}),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"].as_str().unwrap().contains("gift_note"),
+        "error must name the bad field, got: {j}"
+    );
+
+    // Exactly 500 (padded with whitespace that trimming discards) is legal.
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Chatty", "claims_allowed": 1,
+            "gift_note": format!("  {}  ", "x".repeat(500))}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// gift_note round-trips trimmed; empty/whitespace-only collapses to ABSENT (not ""), so
+/// clients can gate rendering on field presence.
+#[tokio::test]
+async fn create_link_gift_note_roundtrips_trimmed_and_blank_collapses_to_absent() {
+    let Some(store) = store_or_skip("link-note-roundtrip").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Dave", "claims_allowed": 1,
+            "gift_note": "  enjoy the trove, dave!  "}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let noted_token = body_json(resp).await["token"].as_str().unwrap().to_string();
+
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "Quiet", "claims_allowed": 1, "gift_note": "   "}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let blank_token = body_json(resp).await["token"].as_str().unwrap().to_string();
+
+    let list_req = Request::get("/admin/api/links")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
+        .oneshot(list_req)
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let links = body_json(list_resp).await;
+    let arr = links.as_array().unwrap();
+
+    let noted = arr.iter().find(|l| l["token"] == noted_token).unwrap();
+    assert_eq!(noted["gift_note"], "enjoy the trove, dave!");
+
+    let blank = arr.iter().find(|l| l["token"] == blank_token).unwrap();
+    assert!(
+        blank.get("gift_note").is_none(),
+        "whitespace-only note must be stored as None and omitted from JSON, got: {blank}"
+    );
+}
+
+/// POST /admin/api/links/:token/note — set, clear (blank), 422 over-length, 404 unknown.
+/// Backed by `set_link_gift_note`'s single-attribute write; the note must never
+/// disturb enforcer fields (and structurally can't — the handler holds no link
+/// snapshot to write back stale).
+#[tokio::test]
+async fn set_link_note_after_create_edits_clears_and_validates() {
+    let Some(store) = store_or_skip("link-note-edit").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    store
+        .create_link(&test_link("note-edit-tok"))
+        .await
+        .unwrap();
+
+    let post_note = |body: serde_json::Value, token: &'static str| {
+        let store = Arc::clone(&store);
+        let invoker = Arc::clone(&invoker);
+        let admin_hash = admin_hash.clone();
+        let session = session.clone();
+        async move {
+            let req = Request::post(format!("/admin/api/links/{token}/note"))
+                .header("content-type", "application/json")
+                .header("cookie", format!("session={session}"))
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            router(store, invoker, admin_hash, None)
+                .oneshot(req)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Set a note after the fact (trimmed on the way in).
+    let resp = post_note(
+        serde_json::json!({"gift_note": "  wrote this later ♡  "}),
+        "note-edit-tok",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stored = store.get_link("note-edit-tok").await.unwrap().unwrap();
+    assert_eq!(stored.gift_note.as_deref(), Some("wrote this later ♡"));
+    // Enforcer fields untouched by the note write.
+    assert_eq!(stored.claims_allowed, 3);
+    assert!(!stored.revoked);
+
+    // Blank clears it.
+    let resp = post_note(serde_json::json!({"gift_note": "   "}), "note-edit-tok").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cleared = store.get_link("note-edit-tok").await.unwrap().unwrap();
+    assert_eq!(cleared.gift_note, None);
+
+    // Over-length → 422 naming the field; note stays cleared.
+    let resp = post_note(
+        serde_json::json!({"gift_note": "x".repeat(501)}),
+        "note-edit-tok",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(j["error"].as_str().unwrap().contains("gift_note"));
+    let still = store.get_link("note-edit-tok").await.unwrap().unwrap();
+    assert_eq!(still.gift_note, None);
+
+    // Unknown token → 404.
+    let resp = post_note(serde_json::json!({"gift_note": "hello?"}), "no-such-tok").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A note edit on a REVOKED link must not resurrect it. (The old
+    // read-modify-write shape could write a stale revoked=false back; the
+    // scoped write makes that unrepresentable — this pins the contract.)
+    let revoke = Request::post("/admin/api/links/note-edit-tok/revoke")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(revoke)
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = post_note(
+        serde_json::json!({"gift_note": "still here?"}),
+        "note-edit-tok",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after = store.get_link("note-edit-tok").await.unwrap().unwrap();
+    assert!(after.revoked, "note edit must never un-revoke a link");
+    assert_eq!(after.gift_note.as_deref(), Some("still here?"));
 }
 
 /// Regression guard: a valid create with expires_days at the max bound (3650) still succeeds —

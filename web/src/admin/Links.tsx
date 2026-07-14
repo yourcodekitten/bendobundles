@@ -5,11 +5,14 @@ import {
   adminCreateLink,
   adminRevoke,
   adminLinkClaims,
+  adminSetLinkNote,
   CreateLinkValidationError,
+  GIFT_NOTE_MAX,
   type AdminLink,
   type AdminClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
+import { clampCodePoints, codePointCount } from '../text';
 import { inviteUrl } from '../inviteUrl';
 
 // Page-level state machine
@@ -37,6 +40,22 @@ function stateBadgeClass(state: string): string {
   }
 }
 
+/** Immutably drop one key from a record — the destructuring-rest omit idiom
+ * trips this repo's no-unused-vars (no ignoreRestSiblings). */
+function omitKey<T>(map: Record<string, T>, key: string): Record<string, T> {
+  const next = { ...map };
+  delete next[key];
+  return next;
+}
+
+// Show the note character counter only near the bound — both note textareas
+// (create form + row editor) share this threshold so they can't drift.
+// Counted in CODE POINTS (the server's chars() unit) — maxLength/.length are
+// UTF-16 units and would cap an emoji-heavy note at half the real limit while
+// the counter lied about it (OMBB, #69 review). Input is clamped to the bound
+// via clampCodePoints instead of maxLength.
+const NOTE_COUNTER_AT = GIFT_NOTE_MAX - 100;
+
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
@@ -49,6 +68,7 @@ export function Links() {
   const [formLabel, setFormLabel] = useState('');
   const [claimsAllowed, setClaimsAllowed] = useState(1);
   const [expiresDays, setExpiresDays] = useState('');
+  const [giftNote, setGiftNote] = useState('');
   const [creating, setCreating] = useState(false);
   // Stored after successful create — separate from page state so reload doesn't clear it
   const [createdInfo, setCreatedInfo] = useState<{ fullUrl: string; label: string } | null>(null);
@@ -65,6 +85,14 @@ export function Links() {
 
   // Audit expansions: token → AuditData (noUncheckedIndexedAccess → AuditData | undefined)
   const [auditMap, setAuditMap] = useState<Record<string, AuditData>>({});
+
+  // Note editing: token → draft text (key presence = editor open). Saving a
+  // blank draft clears the note server-side.
+  const [noteDrafts, setNoteDrafts] = useState<Record<string, string>>({});
+  const [noteSaving, setNoteSaving] = useState<Set<string>>(new Set());
+  // Per-token note-save failure — a silent catch would leave ben unsure what
+  // the friend's page now says (mirrors the revoke-error pattern)
+  const [noteErrors, setNoteErrors] = useState<Record<string, string>>({});
 
   const load = useCallback(() => {
     setState({ phase: 'loading' });
@@ -85,13 +113,17 @@ export function Links() {
     setCreating(true);
     setCreateError(null);
     const expires = expiresDays !== '' ? parseInt(expiresDays, 10) : undefined;
-    withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires), navigate)
+    // Blank/whitespace note → omit the field; the server also normalizes, this
+    // just keeps the wire clean.
+    const note = giftNote.trim() !== '' ? giftNote.trim() : undefined;
+    withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires, note), navigate)
       .then((result) => {
         setCreatedInfo({ fullUrl: inviteUrl(result.token), label: trimmedLabel });
         setCreateError(null);
         setFormLabel('');
         setClaimsAllowed(1);
         setExpiresDays('');
+        setGiftNote('');
         // Reload to prepend the new link into the list
         load();
       })
@@ -116,6 +148,46 @@ export function Links() {
       });
   };
 
+  const handleSaveNote = (link: AdminLink) => {
+    const draft = noteDrafts[link.token];
+    if (draft === undefined) return;
+    // No-op save (unchanged text, e.g. open-then-save): just close the editor —
+    // no request, no server write, no list refetch.
+    if (draft.trim() === (link.gift_note ?? '')) {
+      setNoteDrafts((prev) => omitKey(prev, link.token));
+      return;
+    }
+    setNoteSaving((prev) => new Set(prev).add(link.token));
+    setNoteErrors((prev) => omitKey(prev, link.token));
+    withAuth(() => adminSetLinkNote(link.token, draft.trim()), navigate)
+      .then(() => {
+        // Only close the editor if the draft is still what we saved — the
+        // textarea stays editable during a slow save, and an unconditional
+        // delete here would silently discard anything typed since.
+        setNoteDrafts((prev) =>
+          prev[link.token] === draft ? omitKey(prev, link.token) : prev,
+        );
+        // Reload so the row reflects what the friend's page now says
+        load();
+      })
+      .catch((err: unknown) => {
+        setNoteErrors((prev) => ({
+          ...prev,
+          [link.token]:
+            err instanceof CreateLinkValidationError
+              ? err.message
+              : "couldn't save the note — the friend's page is unchanged.",
+        }));
+      })
+      .finally(() => {
+        setNoteSaving((prev) => {
+          const next = new Set(prev);
+          next.delete(link.token);
+          return next;
+        });
+      });
+  };
+
   const handleRevoke = (link: AdminLink) => {
     if (!revokeArmed.has(link.token)) {
       // First click: arm the button
@@ -130,11 +202,7 @@ export function Links() {
           next.delete(link.token);
           return next;
         });
-        setRevokeErrors((prev) => {
-          const next = { ...prev };
-          delete next[link.token];
-          return next;
-        });
+        setRevokeErrors((prev) => omitKey(prev, link.token));
         load();
       })
       .catch(() => {
@@ -152,11 +220,7 @@ export function Links() {
     const current = auditMap[token];
     if (current !== undefined) {
       // Already open — collapse
-      setAuditMap((prev) => {
-        const next = { ...prev };
-        delete next[token];
-        return next;
-      });
+      setAuditMap((prev) => omitKey(prev, token));
       return;
     }
     // Open: start loading
@@ -241,6 +305,24 @@ export function Links() {
             />
           </label>
         </div>
+        <label className="flex flex-col gap-1 text-xs text-dust">
+          note to your friend (optional — greets them on their page)
+          <textarea
+            aria-label="note to your friend"
+            value={giftNote}
+            onChange={(e) =>
+              setGiftNote(clampCodePoints(e.target.value, GIFT_NOTE_MAX))
+            }
+            rows={2}
+            placeholder="picked these with you in mind…"
+            className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
+          />
+          {codePointCount(giftNote) > NOTE_COUNTER_AT && (
+            <span className="text-right text-dust">
+              {codePointCount(giftNote)}/{GIFT_NOTE_MAX}
+            </span>
+          )}
+        </label>
         <button
           type="submit"
           disabled={creating}
@@ -287,6 +369,9 @@ export function Links() {
           const auditState = auditMap[link.token];
           const armed = revokeArmed.has(link.token);
           const revokeErr = revokeErrors[link.token];
+          const noteDraft = noteDrafts[link.token];
+          const noteErr = noteErrors[link.token];
+          const savingNote = noteSaving.has(link.token);
 
           return (
             <div key={link.token} className="rounded bg-floor p-4">
@@ -346,6 +431,29 @@ export function Links() {
 
                   <button
                     type="button"
+                    disabled={savingNote}
+                    onClick={() => {
+                      // Closing the editor abandons the edit — drop its stale
+                      // failure message along with the draft.
+                      setNoteErrors((prev) => omitKey(prev, link.token));
+                      setNoteDrafts((prev) =>
+                        prev[link.token] !== undefined
+                          ? omitKey(prev, link.token)
+                          : { ...prev, [link.token]: link.gift_note ?? '' },
+                      );
+                    }}
+                    aria-label={
+                      link.gift_note !== undefined
+                        ? `edit note for ${link.label}`
+                        : `add note for ${link.label}`
+                    }
+                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
+                  >
+                    {link.gift_note !== undefined ? 'edit note' : 'add note'}
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => handleAuditToggle(link.token)}
                     aria-label={
                       auditState !== undefined
@@ -358,6 +466,74 @@ export function Links() {
                   </button>
                 </div>
               </div>
+
+              {/* Current note — what the friend's dialog says today */}
+              {link.gift_note !== undefined && noteDraft === undefined && (
+                <p className="mt-2 text-xs italic text-dust">
+                  &ldquo;{link.gift_note}&rdquo;
+                </p>
+              )}
+
+              {/* Note editor — save persists; a blank save clears the note */}
+              {noteDraft !== undefined && (
+                <div className="mt-2 flex flex-col gap-2">
+                  <textarea
+                    aria-label={`note for ${link.label}`}
+                    value={noteDraft}
+                    disabled={savingNote}
+                    onChange={(e) =>
+                      setNoteDrafts((prev) => ({
+                        ...prev,
+                        [link.token]: clampCodePoints(
+                          e.target.value,
+                          GIFT_NOTE_MAX,
+                        ),
+                      }))
+                    }
+                    rows={2}
+                    placeholder="leave blank to remove the note"
+                    className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink disabled:opacity-50"
+                  />
+                  {codePointCount(noteDraft) > NOTE_COUNTER_AT && (
+                    <span className="text-right text-xs text-dust">
+                      {codePointCount(noteDraft)}/{GIFT_NOTE_MAX}
+                    </span>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={savingNote}
+                      onClick={() => handleSaveNote(link)}
+                      aria-label={`save note for ${link.label}`}
+                      className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
+                    >
+                      {savingNote ? 'saving…' : 'save note'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={savingNote}
+                      onClick={() => {
+                        // Cancel abandons the edit — a lingering failure alert
+                        // for a save nobody is retrying would just read as
+                        // "something is still wrong".
+                        setNoteErrors((prev) => omitKey(prev, link.token));
+                        setNoteDrafts((prev) => omitKey(prev, link.token));
+                      }}
+                      aria-label={`cancel note for ${link.label}`}
+                      className="rounded px-3 py-1.5 text-xs text-dust hover:text-ink"
+                    >
+                      cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Note-save failure — loud, per row */}
+              {noteErr !== undefined && (
+                <p role="alert" className="mt-2 text-xs text-red-700">
+                  {noteErr}
+                </p>
+              )}
 
               {/* Revoke failure — must be loud; the link may still be claimable */}
               {revokeErr !== undefined && (

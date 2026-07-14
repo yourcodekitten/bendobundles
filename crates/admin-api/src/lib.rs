@@ -101,6 +101,7 @@ pub fn router(
             post(handle_create_link).get(handle_list_links),
         )
         .route("/admin/api/links/:token/revoke", post(handle_revoke_link))
+        .route("/admin/api/links/:token/note", post(handle_set_link_note))
         .route("/admin/api/links/:token/claims", get(handle_link_claims))
         .route("/admin/api/claims/self", get(handle_self_claims))
         .route("/admin/api/sync", post(handle_sync))
@@ -491,12 +492,41 @@ async fn handle_game_detail(State(s): State<AppState>, Path(id): Path<String>) -
 const EXPIRES_DAYS_MAX: u32 = 3650; // ~10 years — nobody needs a longer-lived gift link
 const CLAIMS_ALLOWED_MAX: u32 = 100;
 const LABEL_MAX_CHARS: usize = 200;
+const GIFT_NOTE_MAX_CHARS: usize = 500; // fits the friend page's dialog box without scrolling
+
+/// Single owner of the gift-note input rules — create and edit-after-the-fact both
+/// call this, so the two paths can never drift apart, and validation can't be
+/// skipped by a call site that only wanted normalization.
+///
+/// Trims, bounds-checks the TRIMMED text (trailing whitespace shouldn't eat
+/// budget), and collapses empty/whitespace-only to `None` so the friend page can
+/// gate rendering on plain field presence (and blank means "clear" on edit).
+fn parse_gift_note(raw: Option<&str>) -> Result<Option<String>, String> {
+    let trimmed = raw.map(str::trim).filter(|n| !n.is_empty());
+    if trimmed.is_some_and(|n| n.chars().count() > GIFT_NOTE_MAX_CHARS) {
+        return Err(format!(
+            "gift_note must be at most {GIFT_NOTE_MAX_CHARS} characters"
+        ));
+    }
+    Ok(trimmed.map(String::from))
+}
+
+/// The crate's one 422 shape — `{"error": msg}` — which the web client's
+/// `throwIfValidation422` parses; both validated endpoints build it here.
+fn unprocessable(msg: String) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "error": msg })),
+    )
+        .into_response()
+}
 
 #[derive(Deserialize)]
 struct CreateLinkBody {
     label: String,
     claims_allowed: u32,
     expires_days: Option<u32>,
+    gift_note: Option<String>,
 }
 
 impl CreateLinkBody {
@@ -521,6 +551,7 @@ impl CreateLinkBody {
                 "label must be at most {LABEL_MAX_CHARS} characters"
             ));
         }
+        parse_gift_note(self.gift_note.as_deref())?;
         Ok(())
     }
 }
@@ -530,11 +561,7 @@ async fn handle_create_link(
     Json(body): Json<CreateLinkBody>,
 ) -> Response {
     if let Err(msg) = body.validate() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": msg})),
-        )
-            .into_response();
+        return unprocessable(msg);
     }
 
     // Token = two uuid-v4 simple-format (no hyphens) concatenated: 32 + 32 = 64 hex chars.
@@ -551,6 +578,8 @@ async fn handle_create_link(
 
     let link = domain::Link {
         token: token.clone(),
+        gift_note: parse_gift_note(body.gift_note.as_deref())
+            .expect("gift_note bound checked by validate() above"),
         label: body.label,
         claims_allowed: body.claims_allowed,
         claims_used: 0,
@@ -594,6 +623,40 @@ async fn handle_revoke_link(State(s): State<AppState>, Path(token): Path<String>
 
     match s.store.update_link_meta(&link).await {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── POST /admin/api/links/:token/note ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetLinkNoteBody {
+    /// The new note. Blank/whitespace-only (or null) CLEARS the note — one
+    /// endpoint covers set, edit, and remove.
+    gift_note: Option<String>,
+}
+
+/// Set/replace/clear a link's gift note after creation. NOT the revoke-shaped
+/// read-modify-write: `set_link_gift_note` is a single-attribute SET/REMOVE, so
+/// this handler holds no snapshot of the enforcer fields and a save racing a
+/// revoke/expiry change cannot write anything stale back (the old shape could
+/// silently un-revoke a link). One round-trip; the condition doubles as the 404.
+async fn handle_set_link_note(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+    Json(body): Json<SetLinkNoteBody>,
+) -> Response {
+    // Validation precedes existence (matching create): an over-length note on an
+    // unknown token 422s rather than 404s — the single-RTT design never reads
+    // first, so field errors are diagnosed before the write's condition runs.
+    let note = match parse_gift_note(body.gift_note.as_deref()) {
+        Ok(n) => n,
+        Err(msg) => return unprocessable(msg),
+    };
+
+    match s.store.set_link_gift_note(&token, note.as_deref()).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

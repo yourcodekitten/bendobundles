@@ -88,14 +88,26 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
 /// in `claim_game`'s transaction and enforced by that transaction's condition expression.
 /// `body.claims_used` may go stale under concurrent claims; `Store::get_link` overrides it on
 /// read from this top-level attribute so callers always see the enforcer's truth.
+/// Serialize a Link for the `body` attribute — WITHOUT the gift note. The note
+/// lives ONLY in the top-level `gift_note` attribute (`set_link_gift_note` is
+/// its one writer; `link_from_item` overrides from it on every read). Keeping
+/// it out of body entirely means "clear the note" leaves no copy at rest —
+/// a body blob written while a note was set would otherwise retain the text
+/// verbatim until the next body write (OMBB, #69 review). Every body writer
+/// (create, `update_link_meta`, `claim_game`) must use this.
+pub fn link_body(l: &Link) -> String {
+    let noteless = Link {
+        gift_note: None,
+        ..l.clone()
+    };
+    serde_json::to_string(&noteless).expect("link serializes")
+}
+
 pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::from([
         ("pk".into(), s(link_pk(&l.token))),
         ("sk".into(), s("META")),
-        (
-            "body".into(),
-            s(serde_json::to_string(l).expect("link serializes")),
-        ),
+        ("body".into(), s(link_body(l))),
         (
             "claims_allowed".into(),
             AttributeValue::N(l.claims_allowed.to_string()),
@@ -110,6 +122,14 @@ pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
     // Omitted when None (never-expires); update_link_meta REMOVEs it to match.
     if let Some(exp) = l.expires_at {
         item.insert("expires_at".into(), epoch_s(exp));
+    }
+    // Top-level `gift_note` is authoritative, like the enforcer attrs: the note is
+    // editable post-creation via `set_link_gift_note`'s single-attribute SET/REMOVE,
+    // so it must not live only in body where claim_game's `SET body` (serialized from
+    // a pre-transaction read) would silently revert an edit landing in the window.
+    // Omitted when None; `link_from_item` treats absence as no-note.
+    if let Some(n) = &l.gift_note {
+        item.insert("gift_note".into(), s(n));
     }
     item
 }

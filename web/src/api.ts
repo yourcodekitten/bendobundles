@@ -21,6 +21,8 @@ export type LinkState = 'active' | 'revoked' | 'expired' | 'exhausted';
 
 export type LinkView = {
   label: string;
+  /** Ben's personal note to the friend; absent when he didn't leave one. */
+  gift_note?: string;
   claims_allowed: number;
   claims_used: number;
   state: LinkState;
@@ -89,6 +91,8 @@ export type AdminClaimView = {
 export type AdminLink = {
   token: string;
   label: string;
+  /** Ben's note to the friend; absent when unset (list serializes domain::Link). */
+  gift_note?: string;
   claims_allowed: number;
   claims_used: number;
   revoked: boolean;
@@ -260,14 +264,39 @@ export async function adminSetHidden(
   return { ok: false, message: 'unknown error' };
 }
 
-/// The server rejected the create-link INPUT (422) — no link exists and the
-/// message names the violated bound, safe to show verbatim in the form.
+/// The server rejected a link-field INPUT (422) — thrown by create-link and
+/// note-edit alike; the message names the violated bound, safe to show
+/// verbatim in the form. (On the note path the link itself exists — only the
+/// field was refused.)
 export class CreateLinkValidationError extends Error {}
+
+/// Client mirror of the server's GIFT_NOTE_MAX_CHARS (admin-api). The server
+/// stays the authority — this only sizes textareas/counters so the UI and the
+/// 422 bound can't drift apart one literal at a time.
+export const GIFT_NOTE_MAX = 500;
+
+// Shared 422 contract: the body is {"error": msg} naming the violated bound.
+// Parse-and-throw lives here once so every 422-capable endpoint surfaces the
+// server's message identically (a fix to the parsing lands everywhere).
+async function throwIfValidation422(response: Response, fallback: string): Promise<void> {
+  if (response.status !== 422) return;
+  let message = fallback;
+  try {
+    const errBody = (await response.json()) as { error?: unknown };
+    if (typeof errBody.error === 'string') {
+      message = errBody.error;
+    }
+  } catch {
+    // non-JSON body — keep the generic message
+  }
+  throw new CreateLinkValidationError(message);
+}
 
 export async function adminCreateLink(
   label: string,
   claims: number,
   expiresDays?: number,
+  giftNote?: string,
 ): Promise<{ token: string; url_path: string }> {
   const response = await fetch('/admin/api/links', {
     method: 'POST',
@@ -276,6 +305,7 @@ export async function adminCreateLink(
       label,
       claims_allowed: claims,
       expires_days: expiresDays,
+      gift_note: giftNote,
     }),
   });
 
@@ -287,18 +317,7 @@ export async function adminCreateLink(
   // created. Non-ok must throw, never fake success. A 422 carries
   // {"error": msg} naming the violated bound — surface it so the form says WHY.
   if (!response.ok) {
-    if (response.status === 422) {
-      let message = 'invalid link parameters';
-      try {
-        const errBody = (await response.json()) as { error?: unknown };
-        if (typeof errBody.error === 'string') {
-          message = errBody.error;
-        }
-      } catch {
-        // non-JSON body — keep the generic message
-      }
-      throw new CreateLinkValidationError(message);
-    }
+    await throwIfValidation422(response, 'invalid link parameters');
     throw new Error('failed to create link');
   }
 
@@ -328,6 +347,21 @@ export async function adminRevoke(token: string): Promise<void> {
   // never resolve as if the link were dead.
   if (!response.ok) {
     throw new Error('revoke failed — the link may still be live');
+  }
+}
+
+/** Set, replace, or clear (blank note) a link's gift note after creation. */
+export async function adminSetLinkNote(token: string, note: string): Promise<void> {
+  const response = await fetch(`/admin/api/links/${token}/note`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ gift_note: note }),
+  });
+  await checkUnauthorized(response);
+
+  if (!response.ok) {
+    await throwIfValidation422(response, 'invalid note');
+    throw new Error("couldn't save the note — it may not have changed");
   }
 }
 

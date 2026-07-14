@@ -1,7 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { vi, describe, it, expect, beforeEach } from "vitest";
+import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { LinkPage } from "./LinkPage";
 import type { LinkView } from "../api";
 
@@ -62,6 +62,29 @@ describe("LinkPage", () => {
     vi.mocked(consumeReturnFragment).mockReturnValue(null);
     vi.mocked(loadIdentity).mockReturnValue(null);
     vi.mocked(beginConnect).mockImplementation(() => {});
+  });
+
+  it("renders ben's gift note with attribution when present", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({
+      ...baseLink,
+      gift_note: "picked these with you in mind",
+    });
+    renderLinkPage();
+    await waitFor(() => {
+      expect(
+        screen.getByText(/picked these with you in mind/),
+      ).toBeInTheDocument();
+    });
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
+
+  it("renders no note paragraph or attribution when gift_note is absent", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink });
+    renderLinkPage();
+    await waitFor(() => {
+      expect(screen.getByText("Test Bundle")).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
   });
 
   it("shows loading state initially", () => {
@@ -425,4 +448,138 @@ describe("LinkPage", () => {
       );
     });
   });
+
+// ── typewriter, animations ON ────────────────────────────────────────────────
+// test-setup.ts forces prefers-reduced-motion for the whole suite, so every
+// test above runs the instant-snap path. These tests override matchMedia to
+// motion-on + fake timers to exercise the animated entrance itself: the
+// tap-to-skip affordance, the error→retry entrance (regression: an invisible
+// pre-run behind the error view used to mark the entrance played and suppress
+// it), and code-point slicing around emoji.
+describe("typewriter (animations on)", () => {
+  const realMatchMedia = window.matchMedia;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    window.matchMedia = ((query: string) =>
+      ({
+        matches: false, // motion allowed
+        media: query,
+        onchange: null,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        dispatchEvent: () => false,
+      }) as MediaQueryList) as typeof window.matchMedia;
+  });
+
+  afterEach(() => {
+    window.matchMedia = realMatchMedia;
+    vi.useRealTimers();
+  });
+
+  const tick = async (ms: number) => {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+  };
+
+  // the dialog box is the replay button's direct parent
+  const dialogBox = () =>
+    screen.getByRole("button", { name: "replay the text" })
+      .parentElement as HTMLElement;
+
+  it("clicking the dialog box mid-typing completes the text (tap-to-skip)", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({
+      ...baseLink,
+      gift_note: "a note from ben",
+    });
+    renderLinkPage();
+    await tick(2900); // boot
+    await tick(1100); // 1s thinking beat + a few ticks — typing in progress
+    expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
+
+    fireEvent.click(dialogBox());
+    expect(screen.getByText(/a note from ben/)).toBeInTheDocument();
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
+
+  it("pressing Enter mid-typing completes the text (keyboard skip)", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({
+      ...baseLink,
+      gift_note: "a note from ben",
+    });
+    renderLinkPage();
+    await tick(2900);
+    await tick(1100);
+    expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Enter" });
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
+
+  it("error → retry still plays the entrance (no invisible pre-run suppression)", async () => {
+    vi.mocked(fetchLink)
+      .mockRejectedValueOnce(new FetchFailed())
+      .mockResolvedValueOnce({ ...baseLink, gift_note: "hello friend" });
+    renderLinkPage();
+    await tick(2900); // boot done; error view up
+    // dwell far past the old invisible-run window (~2.4s) — the regression
+    // stamped the entrance as played during this dwell
+    await tick(5000);
+
+    fireEvent.click(screen.getByRole("button", { name: /retry/i }));
+    await tick(0); // flush the refetch microtask
+
+    // the entrance must ANIMATE after retry, not appear pre-typed
+    await tick(1100); // 1s beat + a few ticks
+    expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
+
+    await tick(14 * 200); // let it finish
+    expect(screen.getByText(/hello friend/)).toBeInTheDocument();
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
+
+  it("never renders a split surrogate or U+FFFD while typing an emoji note", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({
+      ...baseLink,
+      gift_note: "\u{1F381}\u{1F381}\u{1F381}",
+    });
+    renderLinkPage();
+    await tick(2900);
+    await tick(1000); // thinking beat
+    // walk the entire animation one 14ms tick at a time and inspect each frame
+    for (let i = 0; i < 140; i++) {
+      await tick(14);
+      const text = document.body.textContent ?? "";
+      expect(text).not.toMatch(/\uFFFD/);
+      // a high surrogate not followed by a low surrogate = a split emoji
+      expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    }
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
+
+  it("types ZWJ emoji families atomically (grapheme clusters, not code points)", async () => {
+    const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // 👨‍👩‍👧, 5 code points
+    vi.mocked(fetchLink).mockResolvedValue({
+      ...baseLink,
+      gift_note: `for the ${family} and you`,
+    });
+    renderLinkPage();
+    await tick(2900);
+    await tick(1000);
+    // walk the animation; the family must only ever appear WHOLE — a lone
+    // member (or partial ZWJ join) means the slicer cut inside the cluster
+    for (let i = 0; i < 160; i++) {
+      await tick(14);
+      const text = document.body.textContent ?? "";
+      if (text.includes("\u{1F468}")) {
+        expect(text).toContain(family);
+      }
+    }
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
+});
+
 });
