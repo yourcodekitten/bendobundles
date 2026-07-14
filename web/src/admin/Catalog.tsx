@@ -12,6 +12,7 @@ import {
   type SelfClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
+import { isMature } from '../tags';
 import { titleColorClass } from '../titleColor';
 import { GameDetailModal } from '../GameDetailModal';
 import {
@@ -411,6 +412,19 @@ export function Catalog() {
                   </span>
                 )}
 
+                {/* 🔞 — sexual-content descriptor family {1,3,4}; violence-only (2) and
+                    general-mature-only (5) deliberately don't badge (#71) */}
+                {game.steam !== null && isMature(game.steam.content_descriptor_ids) && (
+                  <span
+                    role="img"
+                    aria-label="mature content"
+                    title="steam content descriptors: sexual content"
+                    className="rounded bg-red-950 px-2 py-0.5 text-xs text-red-200"
+                  >
+                    🔞
+                  </span>
+                )}
+
                 {/* owned_by_ben badge — hidden when adminSteamIdentity is null (frozen-stamps caveat) */}
                 {game.owned_by_ben && adminSteamId !== null && (
                   <span className="rounded bg-blue-900 px-2 py-0.5 text-xs text-blue-200">
@@ -459,6 +473,16 @@ export function Catalog() {
                   />
                   <span className="text-xs text-dust">hidden</span>
                 </label>
+
+                {/* not-silent auto-hide (#71): sync-hidden rows say so */}
+                {game.hidden && game.hidden_source === 'sync' && (
+                  <span
+                    className="text-xs text-dust"
+                    title="hidden automatically by sync — adult content descriptors; toggling makes your choice permanent"
+                  >
+                    auto-hidden: adult content
+                  </span>
+                )}
 
                 {/* Inline toggle error — shown when server refuses (e.g. mid-claim) */}
                 {rowErr !== undefined && (

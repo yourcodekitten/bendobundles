@@ -531,6 +531,61 @@ describe('Catalog', () => {
       expect(screen.getByRole('button', { name: /confirm\?/i })).toBeInTheDocument();
     });
   });
+
+  describe('mature badge + auto-hidden label (#71)', () => {
+    const steamWith = (ids: number[]) => ({
+      genres: ['Casual'],
+      tags: ['Sexual Content'],
+      content_descriptor_ids: ids,
+      developers: [],
+      publishers: [],
+      release_date: null,
+      release_date_iso: null,
+      review_desc: null,
+      review_percent: null,
+      review_count: null,
+      recent_percent: null,
+    });
+
+    it('shows the mature badge for sexual-content descriptors', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:mature', steam: steamWith([1, 5]) },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      expect(screen.getByRole('img', { name: /mature content/i })).toBeInTheDocument();
+    });
+
+    it('no badge for general-mature-only or violence-only descriptors', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:rollerdrome', steam: steamWith([5]) },
+        { ...gameFixture, id: 'gx:violent', title: 'Violent Game', steam: steamWith([2]) },
+        { ...gameFixture, id: 'gx:nosteam', title: 'No Steam Game' },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Violent Game')).toBeInTheDocument());
+      expect(screen.queryByRole('img', { name: /mature content/i })).not.toBeInTheDocument();
+    });
+
+    it('labels sync auto-hides next to the hidden toggle', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:autohid', hidden: true, hidden_source: 'sync' },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Base Game')).toBeInTheDocument());
+      expect(screen.getByText('auto-hidden: adult content')).toBeInTheDocument();
+    });
+
+    it('no label for admin hides or unhidden sync rows', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([
+        { ...gameFixture, id: 'gx:adminhid', hidden: true, hidden_source: 'admin' },
+        { ...gameFixture, id: 'gx:unhid', title: 'Unhidden Game', hidden: false, hidden_source: 'sync' },
+      ]);
+      renderCatalog();
+      await waitFor(() => expect(screen.getByText('Unhidden Game')).toBeInTheDocument());
+      expect(screen.queryByText('auto-hidden: adult content')).not.toBeInTheDocument();
+    });
+  });
 });
 
 // ── Toolkit wiring (URL state, grouped view, row readout) ─────────────────────
