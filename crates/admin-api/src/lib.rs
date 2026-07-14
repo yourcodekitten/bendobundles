@@ -264,6 +264,8 @@ struct CatalogGameView {
     requires_choice: bool,
     steam_app_id: Option<u32>,
     owned_by_ben: bool,
+    /// Provenance of `hidden` — "sync" rows get the "auto-hidden: adult content" label (#71).
+    hidden_source: Option<domain::HiddenSource>,
     steam: Option<SteamSummaryView>,
 }
 
@@ -273,6 +275,11 @@ struct CatalogGameView {
 #[derive(serde::Serialize)]
 struct SteamSummaryView {
     genres: Vec<String>,
+    /// Top community tags (popularity order, ≤10) — the toolkit's chips + tag filter (#71).
+    tags: Vec<String>,
+    /// Raw content descriptor ids — the 🔞 badge ({1,3,4} ∩) and mature filter are
+    /// client-side policy over these (#71).
+    content_descriptor_ids: Vec<u32>,
     developers: Vec<String>,
     publishers: Vec<String>,
     release_date: Option<String>,
@@ -304,6 +311,8 @@ fn steam_summary(cache: &dynamo::SteamAppCache) -> Option<SteamSummaryView> {
         .map(|o| ((o.total_positive * 100 + o.total_reviews / 2) / o.total_reviews) as u8);
     Some(SteamSummaryView {
         genres: d.map(|d| d.genres.clone()).unwrap_or_default(),
+        tags: d.map(|d| d.tags.clone()).unwrap_or_default(),
+        content_descriptor_ids: d.map(|d| d.content_descriptor_ids.clone()).unwrap_or_default(),
         developers: d.map(|d| d.developers.clone()).unwrap_or_default(),
         publishers: d.map(|d| d.publishers.clone()).unwrap_or_default(),
         release_date,
@@ -349,6 +358,7 @@ async fn handle_catalog(State(s): State<AppState>) -> Response {
                     requires_choice: g.requires_choice,
                     steam_app_id: g.steam_app_id,
                     owned_by_ben: g.owned_by_ben,
+                    hidden_source: g.hidden_source,
                 })
                 .collect();
             (StatusCode::OK, Json(views)).into_response()
@@ -471,6 +481,7 @@ async fn handle_game_detail(State(s): State<AppState>, Path(id): Path<String>) -
         requires_choice: game.requires_choice,
         steam_app_id: game.steam_app_id,
         owned_by_ben: game.owned_by_ben,
+        hidden_source: game.hidden_source,
     };
 
     (
