@@ -77,6 +77,19 @@ pub enum AppDetails {
     Delisted,
 }
 
+/// One app's community-tag payload from `IStoreBrowseService/GetItems`: tag ids in
+/// popularity order + content descriptor ids. Names resolve via [`SteamClient::get_tag_list`].
+///
+/// `content_descriptorids` is deliberately fetched-but-unconsumed today: appdetails'
+/// `content_descriptors` (which also carries the notes) is the descriptor source of truth
+/// for enrichment, and the two agreed on every app checked live (#71). This copy exists as
+/// the documented fallback if appdetails ever drops the field — do not "clean it up".
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreItemTags {
+    pub tagids: Vec<u32>,
+    pub content_descriptorids: Vec<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReviewSummary {
     pub desc: String,
@@ -288,6 +301,39 @@ struct MovieWire {
 }
 
 #[derive(Deserialize)]
+struct TagListWire {
+    response: TagListResp,
+}
+#[derive(Deserialize)]
+struct TagListResp {
+    #[serde(default)]
+    tags: Vec<TagEntry>,
+}
+#[derive(Deserialize)]
+struct TagEntry {
+    tagid: u32,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct StoreItemsWire {
+    response: StoreItemsResp,
+}
+#[derive(Deserialize)]
+struct StoreItemsResp {
+    #[serde(default)]
+    store_items: Vec<StoreItemWire>,
+}
+#[derive(Deserialize)]
+struct StoreItemWire {
+    appid: Option<u32>,
+    #[serde(default)]
+    tagids: Vec<u32>,
+    #[serde(default)]
+    content_descriptorids: Vec<u32>,
+}
+
+#[derive(Deserialize)]
 struct AppReviewsWire {
     query_summary: AppReviewsQuerySummary,
 }
@@ -459,6 +505,70 @@ impl SteamClient {
             match wire.response.last_appid {
                 Some(next) if cursor.is_none_or(|prev| next > prev) => cursor = Some(next),
                 _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch the global tagid→name map (`IStoreService/GetTagList`, keyless, ~450 tags).
+    /// Callers fetch once per enrichment/backfill run and hold it in memory — the
+    /// `version_hash` the endpoint offers isn't worth persisting for one call a day (#71).
+    pub async fn get_tag_list(&self) -> Result<std::collections::HashMap<u32, String>, SteamError> {
+        let url = format!("{}/IStoreService/GetTagList/v1/", self.base_web_api);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("language", "english")])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: TagListWire = keyed_json(resp).await?;
+        Ok(wire
+            .response
+            .tags
+            .into_iter()
+            .map(|t| (t.tagid, t.name))
+            .collect())
+    }
+
+    /// Batched community tags + descriptor ids for `app_ids` (`GetItems`, keyless, chunks
+    /// of 50). Apps Steam omits (never existed) are absent from the map; gated/delisted
+    /// apps come back `visible:false` with EMPTY tagids and are present-with-empty — the
+    /// caller stores the empty and lets genre fallback take over (#71 caveat).
+    ///
+    /// Chunks are unpaced, like `get_app_list` pages — this is the lax api.steampowered.com
+    /// host, not throttled appdetails (#71 plan, decided deviation from the spec's 250ms).
+    pub async fn get_store_items(
+        &self,
+        app_ids: &[u32],
+    ) -> Result<std::collections::HashMap<u32, StoreItemTags>, SteamError> {
+        const CHUNK: usize = 50;
+        let url = format!("{}/IStoreBrowseService/GetItems/v1/", self.base_web_api);
+        let mut out = std::collections::HashMap::new();
+        for chunk in app_ids.chunks(CHUNK) {
+            let input = serde_json::json!({
+                "ids": chunk.iter().map(|id| serde_json::json!({"appid": id})).collect::<Vec<_>>(),
+                "context": {"language": "english", "country_code": "US"},
+                "data_request": {"include_tag_count": 20}
+            });
+            let resp = self
+                .http
+                .get(&url)
+                .query(&[("input_json", input.to_string().as_str())])
+                .send()
+                .await
+                .map_err(net)?;
+            let wire: StoreItemsWire = keyed_json(resp).await?;
+            for item in wire.response.store_items {
+                if let Some(appid) = item.appid {
+                    out.insert(
+                        appid,
+                        StoreItemTags {
+                            tagids: item.tagids,
+                            content_descriptorids: item.content_descriptorids,
+                        },
+                    );
+                }
             }
         }
         Ok(out)
