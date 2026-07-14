@@ -57,15 +57,6 @@ pub enum HiddenWrite {
     Contested,
 }
 
-/// The DDB wire string for a game status — the much-duplicated serde round-trip, named once.
-pub(crate) fn status_wire(status: domain::GameStatus) -> String {
-    serde_json::to_value(status)
-        .expect("status serializes")
-        .as_str()
-        .expect("status is a string")
-        .to_string()
-}
-
 /// Outcome of the sync auto-hide write. Non-`Written` variants are all "leave it alone":
 /// the sweep re-evaluates next run, and Admin provenance is permanent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1329,11 +1320,7 @@ impl Store {
         game.hidden_source = Some(domain::HiddenSource::Admin);
 
         // Optimistic lock: status must match what we read. Mirrors upsert_game_from_sync.
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
+        let status_str = game.status.as_wire();
 
         let res = self
             .client
@@ -1387,7 +1374,7 @@ impl Store {
             .set_item(Some(game_item(&game)))
             .expression_attribute_names("#st", "status")
             .expression_attribute_names("#hsrc", "hidden_source")
-            .expression_attribute_values(":expected", schema::s(status_wire(game.status)))
+            .expression_attribute_values(":expected", schema::s(game.status.as_wire()))
             .expression_attribute_values(":admin", schema::s(domain::HiddenSource::Admin.as_wire()))
             .condition_expression(
                 "#st = :expected AND (attribute_not_exists(#hsrc) OR #hsrc <> :admin)",
@@ -1442,11 +1429,7 @@ impl Store {
         // inside our read→write window: if appid_source is now Manual in DynamoDB,
         // we must NOT clobber it. attribute_not_exists allows the write on items that
         // predate the appid_source attribute (Title/Humble/None all still map).
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
+        let status_str = game.status.as_wire();
 
         let res = self
             .client
@@ -1456,7 +1439,10 @@ impl Store {
             .expression_attribute_names("#st", "status")
             .expression_attribute_names("#asrc", "appid_source")
             .expression_attribute_values(":expected", schema::s(status_str))
-            .expression_attribute_values(":manual", schema::s("manual".to_string()))
+            .expression_attribute_values(
+                ":manual",
+                schema::s(domain::AppidSource::Manual.as_wire()),
+            )
             .condition_expression(
                 "#st = :expected AND (attribute_not_exists(#asrc) OR #asrc <> :manual)",
             )
@@ -1513,7 +1499,7 @@ impl Store {
                 let mut clauses = vec!["#st = :expected".to_string()];
                 req = req
                     .expression_attribute_names("#st", "status")
-                    .expression_attribute_values(":expected", schema::s(status_wire(e.status)));
+                    .expression_attribute_values(":expected", schema::s(e.status.as_wire()));
                 // If the existing game is owned, add the ownership clause to the condition.
                 if let Some(cid) = &e.claim_id {
                     req = req.expression_attribute_values(":cid", schema::s(cid.clone()));
@@ -2001,11 +1987,7 @@ impl Store {
         game.appid_source = appid.map(|_| domain::AppidSource::Manual);
 
         // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
+        let status_str = game.status.as_wire();
 
         let res = self
             .client
@@ -2053,11 +2035,7 @@ impl Store {
         game.owned_by_ben = owned;
 
         // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
-        let status_str = serde_json::to_value(game.status)
-            .expect("status serializes")
-            .as_str()
-            .expect("status is a string")
-            .to_string();
+        let status_str = game.status.as_wire();
 
         let res = self
             .client

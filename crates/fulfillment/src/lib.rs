@@ -1863,6 +1863,9 @@ async fn refresh_ben_ownership(deps: &Deps) {
 /// Top-N user tags stored per app. Display caps are client-side (char-budget fit), so
 /// tuning what cards SHOW never needs a backfill — only widening storage does (#71).
 pub const STEAM_TAG_STORE_CAP: usize = 10;
+// Compile-time pin: widening the store cap past what GetItems requests would silently
+// truncate every app's stored tags (review round 2) — raise both or neither.
+const _: () = assert!(STEAM_TAG_STORE_CAP <= steam_client::REQUESTED_TAG_COUNT);
 
 /// Resolve one app's stored tag list from the batch results. `tag_data` None = the
 /// GetItems/GetTagList batch failed → preserve the previous blob's tags (a network hiccup
@@ -1940,15 +1943,33 @@ fn games_by_appid(games: &[domain::Game]) -> std::collections::HashMap<u32, Vec<
     map
 }
 
-/// Collect `app_id` into the sweep set iff `detail` carries an auto-hide descriptor —
-/// the one definition of "cached descriptors say adult" shared by every collection site.
+/// Collect `app_id` into the sweep set iff the existing cache's detail carries an
+/// auto-hide descriptor — the one definition of "cached descriptors say adult" shared
+/// by every decide-pass collection site.
 fn collect_adult(
     set: &mut std::collections::BTreeSet<u32>,
     app_id: u32,
-    detail: Option<&steam_client::SteamAppDetail>,
+    cache: Option<&dynamo::SteamAppCache>,
 ) {
-    if has_adult_descriptors(detail) {
+    if has_adult_descriptors(cache.and_then(|c| c.detail.as_ref())) {
         set.insert(app_id);
+    }
+}
+
+/// Freshly-PERSISTED descriptors supersede the decide-pass collection: a refetch that
+/// cleared the adult descriptors must not be hidden by the very pass that proved them
+/// gone — and only a successful put counts, so the sweep never acts on truth that was
+/// never persisted (review round 2). Delisted is NOT a clear (no fresh descriptor
+/// truth); callers only invoke this after a Found-refetch landed in the store.
+fn supersede_adult(
+    set: &mut std::collections::BTreeSet<u32>,
+    app_id: u32,
+    persisted_detail: Option<&steam_client::SteamAppDetail>,
+) {
+    if has_adult_descriptors(persisted_detail) {
+        set.insert(app_id);
+    } else {
+        set.remove(&app_id);
     }
 }
 
@@ -2076,11 +2097,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         // an already-fresh {3,4} cache (same adult game, second bundle) never enters the
         // worklist, and the sweep must still catch it. Cached descriptors don't need to
         // be fresh to be true; the sweep is idempotent (#71).
-        collect_adult(
-            &mut adult_appids,
-            app_id,
-            existing.as_ref().and_then(|c| c.detail.as_ref()),
-        );
+        collect_adult(&mut adult_appids, app_id, existing.as_ref());
         let (need_detail, need_reviews) = match &existing {
             // Missing item → fetch both halves.
             None => (true, true),
@@ -2147,9 +2164,22 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             app_id,
             need_detail,
             need_reviews,
-            mut cache,
+            cache: _decided,
         } = work;
+        // Just-in-time re-read: the decide-pass snapshot can be minutes stale by the time
+        // this item's turn comes (paced loop), and the merge write below carries EVERY
+        // half of the cache — a concurrent writer's fresh reviews, or a backfill-migrated
+        // detail blob on a reviews-only item, must not be reverted from a stale snapshot
+        // (review round 2). The decide-pass snapshot only classified the work.
+        let mut cache = match deps.store.get_steam_app(app_id).await {
+            Ok(v) => v.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
+            Err(e) => {
+                tracing::warn!(app_id, error = ?e, "steam enrichment: re-read failed — skipping app");
+                continue 'apps;
+            }
+        };
         let mut delisted = false;
+        let mut fresh_detail = false;
 
         if need_detail {
             tokio::time::sleep(deps.steam_enrich_pace).await;
@@ -2157,18 +2187,10 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
                 Ok(steam_client::AppDetails::Found(d)) => {
                     let mut detail = *d;
                     detail.tags = tags_for_app(app_id, tag_data.as_ref(), cache.detail.as_ref());
-                    // Fresh descriptors SUPERSEDE the decide-loop's cached collection —
-                    // a refetch that cleared the adult descriptors must not be hidden by
-                    // the very pass that proved them gone (review round 1). Delisted is
-                    // NOT a clear (no fresh truth) — its decide-loop entry stands.
-                    if has_adult_descriptors(Some(&detail)) {
-                        adult_appids.insert(app_id);
-                    } else {
-                        adult_appids.remove(&app_id);
-                    }
                     cache.detail = Some(detail);
                     cache.fetched_at = now;
                     fresh += 1;
+                    fresh_detail = true;
                 }
                 // Delisted: negative-cache stub. Stamp BOTH clocks so it's retried on the 30d
                 // window (not every sync), and skip reviews — a dead app has none.
@@ -2247,6 +2269,9 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             continue 'apps;
         }
         fetched += 1;
+        if fresh_detail {
+            supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+        }
     }
     // Whatever's left unstarted (deadline stop, or the tail after a 429 abort) is deferred too.
     deferred_unstarted += it.count();
@@ -2310,7 +2335,7 @@ pub async fn backfill_steam_details(
     // existing caches. Skip-fresh'd and failed-read items are accounted here. Adult
     // descriptors collect from EVERY existing cache — skip-fresh'd included — so a
     // resumed run never loses the sweep for items it doesn't refetch (#71).
-    let mut worklist: Vec<(u32, dynamo::SteamAppCache)> = Vec::new();
+    let mut worklist: Vec<u32> = Vec::new();
     for app_id in appids {
         let existing = match store.get_steam_app(app_id).await {
             Ok(v) => v,
@@ -2320,11 +2345,7 @@ pub async fn backfill_steam_details(
                 continue;
             }
         };
-        collect_adult(
-            &mut adult_appids,
-            app_id,
-            existing.as_ref().and_then(|c| c.detail.as_ref()),
-        );
+        collect_adult(&mut adult_appids, app_id, existing.as_ref());
         if let Some(c) = &existing
             && now - c.fetched_at < skip_fresh_secs
         {
@@ -2335,37 +2356,39 @@ pub async fn backfill_steam_details(
             );
             continue;
         }
-        worklist.push((
-            app_id,
-            existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
-        ));
+        worklist.push(app_id);
     }
 
     // ONE tag batch for exactly the ids being refetched: an all-skipped resumed run keeps
     // the zero-storefront-calls contract, and a post-429 resume doesn't re-burst the whole
     // catalog's tags to serve its tail (review round 1).
-    let refetch_ids: Vec<u32> = worklist.iter().map(|(id, _)| *id).collect();
-    let tag_data = if refetch_ids.is_empty() {
+    let tag_data = if worklist.is_empty() {
         None
     } else {
-        fetch_tag_batch(steam, &refetch_ids, "backfill").await
+        fetch_tag_batch(steam, &worklist, "backfill").await
     };
 
-    for (app_id, mut cache) in worklist {
+    for app_id in worklist {
+        // Just-in-time re-read (review round 2): the decide-pass snapshot only
+        // classified skip/refetch — the merge write must carry the FRESHEST halves, or
+        // a concurrent sync's reviews land reverted from a minutes-stale snapshot.
+        let mut cache = match store.get_steam_app(app_id).await {
+            Ok(v) => v.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
+            Err(e) => {
+                tracing::warn!(app_id, error = ?e, "backfill: re-read failed — skipping app");
+                summary.failed += 1;
+                continue;
+            }
+        };
+        let mut fresh_detail = false;
         tokio::time::sleep(pace).await;
         match steam.get_app_details(app_id).await {
             Ok(steam_client::AppDetails::Found(d)) => {
                 let mut detail = *d;
                 detail.tags = tags_for_app(app_id, tag_data.as_ref(), cache.detail.as_ref());
-                // Fresh descriptors SUPERSEDE the decide-pass collection — same rule as
-                // enrichment; Delisted is not a clear, its decide-pass entry stands.
-                if has_adult_descriptors(Some(&detail)) {
-                    adult_appids.insert(app_id);
-                } else {
-                    adult_appids.remove(&app_id);
-                }
                 cache.detail = Some(detail);
                 cache.fetched_at = now;
+                fresh_detail = true;
             }
             // Delisted: negative stub, BOTH clocks stamped — same semantics as enrichment.
             Ok(steam_client::AppDetails::Delisted) => {
@@ -2400,6 +2423,9 @@ pub async fn backfill_steam_details(
             summary.fetched += 1;
         } else {
             summary.negative += 1;
+        }
+        if fresh_detail {
+            supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
         }
         let done = summary.fetched + summary.negative + summary.skipped + summary.failed;
         tracing::info!(app_id, done, total, "backfill: item rewritten");

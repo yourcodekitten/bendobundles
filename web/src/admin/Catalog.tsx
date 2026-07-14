@@ -170,6 +170,23 @@ export function Catalog() {
           : s,
       );
     };
+    // Compare-and-swap revert: only undo THIS request's optimistic write. A later
+    // toggle's optimistic state must not be clobbered back to this closure's stale
+    // snapshot (review round 2 — the resurrected 'auto-hidden' label).
+    const revertRow = () => {
+      setState((s) =>
+        s.phase === 'loaded'
+          ? {
+              phase: 'loaded',
+              games: s.games.map((g) =>
+                g.id === game.id && g.hidden === newHidden && g.hidden_source === 'admin'
+                  ? { ...g, hidden: game.hidden, hidden_source: game.hidden_source }
+                  : g,
+              ),
+            }
+          : s,
+      );
+    };
 
     // Optimistic flip — with the Admin stamp the server is about to write
     setRowHidden(newHidden, 'admin');
@@ -178,7 +195,7 @@ export function Catalog() {
       .then((result) => {
         if (!result.ok) {
           // Server refused (e.g. mid-claim 409) — revert this row + show message
-          setRowHidden(game.hidden, game.hidden_source);
+          revertRow();
           setRowErrors((prev) => ({ ...prev, [game.id]: result.message }));
         } else {
           // Clear any previous row error on success
@@ -191,7 +208,7 @@ export function Catalog() {
       })
       .catch(() => {
         // Unexpected error — revert this row silently (withAuth already redirected on 401)
-        setRowHidden(game.hidden, game.hidden_source);
+        revertRow();
       });
   };
 

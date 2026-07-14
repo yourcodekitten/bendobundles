@@ -255,6 +255,15 @@ describe('mature filter (#71)', () => {
     expect(r.excludedNoData).toBe(1); // the steam:null row isn't provably mature
   });
 
+  it("'only' counts descriptor-less mapped rows as no-data too (deploy window)", () => {
+    // steam present but content_descriptor_ids missing — the old-lambda payload shape.
+    const legacy = g('legacy', {}, {});
+    delete (legacy.steam as Record<string, unknown>)['content_descriptor_ids'];
+    const r = applyToolkit([...games, legacy], state({ mature: 'only' }));
+    expect(ids(r)).toEqual(['flagged']);
+    expect(r.excludedNoData).toBe(2); // unmapped + descriptor-less
+  });
+
   it("'all' is the idle default and filters nothing", () => {
     expect(IDLE_TOOLKIT.mature).toBe('all');
     expect(ids(applyToolkit(games, state({})))).toHaveLength(3);

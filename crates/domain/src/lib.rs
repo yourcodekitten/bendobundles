@@ -12,6 +12,20 @@ pub enum GameStatus {
     Expired,
 }
 
+impl GameStatus {
+    /// The exact wire/DDB string — see [`HiddenSource::as_wire`]; same contract, same
+    /// pinning test. Every mirror write and condition value goes through this.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            GameStatus::Available => "available",
+            GameStatus::Pending => "pending",
+            GameStatus::Gifted => "gifted",
+            GameStatus::BenRedeemed => "ben_redeemed",
+            GameStatus::Expired => "expired",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClaimState {
@@ -31,6 +45,18 @@ pub enum AppidSource {
     Humble,
     /// Set by an admin override — highest-confidence tier; never overwritten by a sync walk.
     Manual,
+}
+
+impl AppidSource {
+    /// The exact wire/DDB string — see [`HiddenSource::as_wire`]; same contract, same
+    /// pinning test. The Manual-guard condition compares against this.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            AppidSource::Title => "title",
+            AppidSource::Humble => "humble",
+            AppidSource::Manual => "manual",
+        }
+    }
 }
 
 /// Who last decided a game's `hidden` flag. `Admin` is Ben's toggle and is FINAL: the
@@ -503,6 +529,30 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(src).unwrap().as_str().unwrap(),
                 src.as_wire()
+            );
+        }
+    }
+
+    #[test]
+    fn wire_strings_track_serde_for_all_mirrored_enums() {
+        // Every enum mirrored to a top-level DDB attribute keeps as_wire == serde output,
+        // or condition expressions comparing against the mirror go silently void.
+        for s in [
+            GameStatus::Available,
+            GameStatus::Pending,
+            GameStatus::Gifted,
+            GameStatus::BenRedeemed,
+            GameStatus::Expired,
+        ] {
+            assert_eq!(
+                serde_json::to_value(s).unwrap().as_str().unwrap(),
+                s.as_wire()
+            );
+        }
+        for s in [AppidSource::Title, AppidSource::Humble, AppidSource::Manual] {
+            assert_eq!(
+                serde_json::to_value(s).unwrap().as_str().unwrap(),
+                s.as_wire()
             );
         }
     }

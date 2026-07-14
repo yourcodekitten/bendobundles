@@ -21,6 +21,18 @@ export type ToolkitState = {
   mature: MatureFilter;
 };
 
+/** The keys that FILTER rows (sort/group are view prefs — 'clear filters' keeps them).
+ * ToolkitBar derives its active-filter readout from this list, so filter N+1 registers
+ * in exactly one file (review round 2 — the forgotten-mature bug class). */
+export const FILTER_KEYS = ['q', 'tags', 'rating', 'mature'] as const;
+
+/** True when any FILTER key differs from its idle value. */
+export function filtersActive(state: ToolkitState): boolean {
+  return FILTER_KEYS.some((k) =>
+    k === 'tags' ? state.tags.length > 0 : state[k] !== IDLE_TOOLKIT[k],
+  );
+}
+
 export const IDLE_TOOLKIT: ToolkitState = {
   q: '',
   tags: [],
@@ -101,8 +113,10 @@ export function applyToolkit(
     const flagged = isMature(g.steam?.content_descriptor_ids);
     if (state.mature === 'hide' && flagged) return false;
     if (state.mature === 'only' && !flagged) {
-      // unmapped rows aren't provably mature — under 'only' they're no-data exclusions
-      if (g.steam === null) excludedNoData++;
+      // rows with NO descriptor data (unmapped, or a deploy-window/old-lambda payload
+      // omitting the field) aren't provably non-mature — count them as no-data so the
+      // trove never silently shrinks (review round 2).
+      if (g.steam === null || g.steam.content_descriptor_ids === undefined) excludedNoData++;
       return false;
     }
     return true;
