@@ -5321,3 +5321,44 @@ async fn enrich_refetch_that_clears_descriptors_supersedes_stale_cache() {
     );
     assert_eq!(g.hidden_source, None);
 }
+
+#[tokio::test]
+async fn backfill_reports_tag_batch_failure_in_summary() {
+    // #73 review: a first-run tag failure must be visible in the summary (the bin exits
+    // non-zero on it) — refetched items keep old tags but get stamped fresh, so the
+    // operator's SKIP_FRESH_SECS=0 rerun trigger depends on this flag.
+    let Some(store) = store_or_skip("t71-bf-tagfail").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    seed_steam_game(&store, "gk-tf", "mn-tf", "Tagless", Some(444), None).await;
+    store
+        .put_steam_app(&stale_detail_cache(444, now, vec!["Old Tag".into()]))
+        .await
+        .unwrap();
+
+    let steam_mock = MockServer::start().await;
+    mount_steam_detail(&steam_mock, 444, appdetails_plain_body("Tagless")).await;
+    Mock::given(method("GET"))
+        .and(path("/IStoreBrowseService/GetItems/v1/"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&steam_mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/IStoreService/GetTagList/v1/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"response": {"tags": [{"tagid": 19, "name": "Action"}]}}),
+        ))
+        .mount(&steam_mock)
+        .await;
+    let steam = steam_client_at(&steam_mock.uri());
+
+    let summary = backfill_steam_details(&store, &steam, std::time::Duration::ZERO, 43_200)
+        .await
+        .unwrap();
+
+    assert!(summary.tag_batch_failed, "the failure must be reportable");
+    assert_eq!(summary.fetched, 1, "detail refresh itself still lands");
+    let cache = store.get_steam_app(444).await.unwrap().unwrap();
+    assert_eq!(cache.detail.unwrap().tags, vec!["Old Tag".to_string()]);
+}

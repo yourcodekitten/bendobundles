@@ -2168,9 +2168,10 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         } = work;
         // Just-in-time re-read: the decide-pass snapshot can be minutes stale by the time
         // this item's turn comes (paced loop), and the merge write below carries EVERY
-        // half of the cache — a concurrent writer's fresh reviews, or a backfill-migrated
-        // detail blob on a reviews-only item, must not be reverted from a stale snapshot
-        // (review round 2). The decide-pass snapshot only classified the work.
+        // half of the cache. This NARROWS the lost-update window vs a concurrent writer
+        // (fresh reviews / a backfill-migrated blob) from run-length to per-item seconds —
+        // it does not close it; the put is unconditional (#73 review). The decide-pass
+        // snapshot only classified the work.
         let mut cache = match deps.store.get_steam_app(app_id).await {
             Ok(v) => v.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
             Err(e) => {
@@ -2303,6 +2304,10 @@ pub struct BackfillSummary {
     pub aborted_429: bool,
     /// Games auto-hidden by the adult-descriptor sweep during this run (#71).
     pub auto_hidden: u32,
+    /// True when the GetItems/GetTagList batch failed or answered implausibly — refetched
+    /// items kept their OLD tags but were stamped fresh, so the operator MUST rerun with
+    /// SKIP_FRESH_SECS=0 or the catalog stays tagless until the 30-day window (#73 review).
+    pub tag_batch_failed: bool,
 }
 
 /// Run-once STEAMAPP# rebuild (issues #57, #61): refetch appdetails for EVERY catalog appid through
@@ -2367,11 +2372,13 @@ pub async fn backfill_steam_details(
     } else {
         fetch_tag_batch(steam, &worklist, "backfill").await
     };
+    summary.tag_batch_failed = !worklist.is_empty() && tag_data.is_none();
 
     for app_id in worklist {
         // Just-in-time re-read (review round 2): the decide-pass snapshot only
-        // classified skip/refetch — the merge write must carry the FRESHEST halves, or
-        // a concurrent sync's reviews land reverted from a minutes-stale snapshot.
+        // classified skip/refetch — the merge write carries the freshest halves. This
+        // NARROWS the concurrent-writer window to per-item seconds; it does not close
+        // it (the put is unconditional), hence the don't-run-during-cron caveat.
         let mut cache = match store.get_steam_app(app_id).await {
             Ok(v) => v.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
             Err(e) => {
@@ -2439,6 +2446,7 @@ pub async fn backfill_steam_details(
         failed = summary.failed,
         aborted_429 = summary.aborted_429,
         auto_hidden = summary.auto_hidden,
+        tag_batch_failed = summary.tag_batch_failed,
         "backfill: done"
     );
     Ok(summary)

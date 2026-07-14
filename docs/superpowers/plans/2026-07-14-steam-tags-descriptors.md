@@ -2113,8 +2113,11 @@ explicitly required the resync in the plan.
   local `kitten-maintenance` AWS profile configured assuming the new role ARN. Verify
   empirically before trusting: `AWS_PROFILE=kitten-maintenance aws dynamodb scan
   --table-name <prod table> --max-items 1 --select COUNT` answers a Count, and the
-  no-op conditional-write probe (`update-item` on `pk=PROBE#never` with
-  `attribute_exists(pk)`) answers ConditionalCheckFailedException, NOT AccessDenied.
+  no-op conditional-write probe answers ConditionalCheckFailedException, NOT
+  AccessDenied — thrown with **`put-item`**, because every backfill write is a
+  conditional PutItem and a negative probe only ever disproves the exact verb it throws
+  (the debug-role lesson, learned live 2026-07-14):
+  `aws dynamodb put-item --table-name <prod table> --item '{"pk":{"S":"PROBE#never"},"sk":{"S":"META"}}' --condition-expression "attribute_exists(pk)"`
   Precision note for the role's comments: `auto_hide_game` is a conditional **PutItem**
   (full `game_item()` put), not an UpdateItem — the role carries both verbs, but don't
   let its documentation say otherwise.
@@ -2150,9 +2153,10 @@ TABLE_NAME=<prod table> SKIP_FRESH_SECS=0 AWS_PROFILE=kitten-maintenance \
   Env contract (verified): `TABLE_NAME` required, `SKIP_FRESH_SECS` optional, key unused
   (keyless endpoints, empty `SteamApiKey` is fine), creds from ambient AWS config.
   Expected: summary line `fetched≈<mapped-app count> … auto_hidden=<n>`.
-  **If the summary shows `failed>0`: rerun with `SKIP_FRESH_SECS=0` again** — a non-429
-  tag failure still stamps `fetched_at=now` on tagless items, so a default-skip rerun
-  would skip exactly the items that need retrying (OMBB sign-off, runbook note).
+  **If the summary shows `failed>0` OR `tag_batch_failed=true` (bin exit code 3): rerun
+  with `SKIP_FRESH_SECS=0` again** — both leave items stamped `fetched_at=now` without
+  the data the run existed to fetch, so a default-skip rerun would skip exactly the
+  items that need retrying (OMBB sign-off + PR review, runbook note).
 - [ ] **Step 5:** Verify live (playwright): tags on friend cards, 🔞 badges + mature filter
   in admin, an auto-hidden row labeled, Puss! still hidden (Ben-hidden, untouched — its
   `hidden_source` stays null because `auto_hide_game` no-ops on already-hidden games
