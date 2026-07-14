@@ -7,6 +7,7 @@ import type {
 } from "./api";
 import { MediaHeader } from "./MediaHeader";
 import { ClaimChest } from "./ClaimChest";
+import { DESCRIPTOR_LABELS, displayTags } from "./tags";
 import { titleColorClass, titleHueVar } from "./titleColor";
 import { gameDetailCache } from "./gameDetailCache";
 
@@ -440,9 +441,9 @@ export function GameDetailModal(props: GameDetailModalProps) {
                                 </a>
                               )}
                             </div>
-                            {detail.genres.length > 0 && (
+                            {displayTags(detail).length > 0 && (
                               <div className="flex flex-wrap gap-1.5">
-                                {detail.genres.map((genre) => (
+                                {displayTags(detail).map((genre) => (
                                   <span
                                     key={genre}
                                     className="rounded px-2 py-0.5 text-xs"
@@ -460,6 +461,24 @@ export function GameDetailModal(props: GameDetailModalProps) {
                             <p className="text-sm leading-relaxed text-ink-soft">
                               {detail.short_description}
                             </p>
+                            {/* content descriptors: admin-only (#71); ?? [] guards the
+                                deploy window where an old lambda omits the keys */}
+                            {mount === "admin" &&
+                              (detail.content_descriptor_ids ?? []).length > 0 && (
+                                <p className="text-xs text-dust">
+                                  content:{" "}
+                                  {(detail.content_descriptor_ids ?? [])
+                                    .map(
+                                      (id) =>
+                                        DESCRIPTOR_LABELS[id] ??
+                                        `descriptor ${id}`,
+                                    )
+                                    .join(" · ")}
+                                  {detail.content_notes
+                                    ? ` — ${detail.content_notes}`
+                                    : ""}
+                                </p>
+                              )}
                           </div>
                         )}
                         {(overall !== null || recent !== null) && (
