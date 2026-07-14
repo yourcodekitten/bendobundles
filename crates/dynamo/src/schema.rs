@@ -69,6 +69,19 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
                 .to_string()),
         );
     }
+    // Top-level `hidden_source` mirrors the body so auto-hide's PutItem condition can guard
+    // against racing an admin toggle. Only written when Some — attribute_not_exists then
+    // correctly matches legacy items (never admin-touched → auto-hide eligible).
+    if let Some(src) = g.hidden_source {
+        item.insert(
+            "hidden_source".into(),
+            s(serde_json::to_value(src)
+                .expect("hidden_source serializes")
+                .as_str()
+                .expect("hidden_source is a string")
+                .to_string()),
+        );
+    }
     // Top-level `claim_id` mirrors the body so fulfill's flip can condition on ownership
     // (`claim_id = :cid`). Omitted when None so compensate's re-list transparently clears it.
     if let Some(cid) = &g.claim_id {
