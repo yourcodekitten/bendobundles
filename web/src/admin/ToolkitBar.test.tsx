@@ -73,6 +73,14 @@ describe('ToolkitBar', () => {
     expect(onChange).toHaveBeenCalledWith({ ...state, rating: 'very-positive' });
   });
 
+  it('mature select renders all/hide/only and fires onChange (#71)', () => {
+    const { onChange, state } = renderBar();
+    const mature = screen.getByLabelText('mature') as HTMLSelectElement;
+    expect([...mature.options].map((o) => o.value)).toEqual(['all', 'hide', 'only']);
+    fireEvent.change(mature, { target: { value: 'hide' } });
+    expect(onChange).toHaveBeenCalledWith({ ...state, mature: 'hide' });
+  });
+
   it('active filters: shows counts + hidden-data note + clear that keeps view prefs', () => {
     const { onChange, state } = renderBar(
       { tags: ['Action'], sort: 'rating', group: 'publisher' },

@@ -1,6 +1,7 @@
 import {
   IDLE_TOOLKIT,
   type GroupKey,
+  type MatureFilter,
   type RatingFloor,
   type SortKey,
   type ToolkitState,
@@ -131,6 +132,20 @@ export function ToolkitBar({
               {o.label}
             </option>
           ))}
+        </select>
+      </label>
+
+      <label className="flex items-center gap-2 text-sm text-dust">
+        mature
+        <select
+          aria-label="mature"
+          value={state.mature}
+          onChange={(e) => onChange({ ...state, mature: e.target.value as MatureFilter })}
+          className={controlClass}
+        >
+          <option value="all">show all</option>
+          <option value="hide">hide 🔞</option>
+          <option value="only">only 🔞</option>
         </select>
       </label>
 

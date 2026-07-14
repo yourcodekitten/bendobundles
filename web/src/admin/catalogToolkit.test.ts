@@ -217,3 +217,46 @@ describe('applyToolkit grouping', () => {
     expect(r.groups[0]!.games.map((x) => x.id)).toEqual(['kept-a', 'kept-b']);
   });
 });
+
+// ── #71: displayTags-based options/filter + mature filter ─────────────────────
+
+describe('tags over genres (#71)', () => {
+  it('tag options and tag filter run on displayTags (tags, genre fallback)', () => {
+    const tagged = g('tagged', {}, { tags: ['Roguelike'], genres: ['Action'] });
+    const genred = g('genred', {}, { tags: [], genres: ['Action'] });
+    const games = [tagged, genred];
+    const opts = collectTagOptions(games).map((o) => o.tag);
+    expect(opts).toContain('Roguelike');
+    expect(opts).toContain('Action'); // from the fallback game only
+    // tagged game's genres must NOT leak into options
+    expect(collectTagOptions([tagged]).map((o) => o.tag)).toEqual(['Roguelike']);
+
+    expect(ids(applyToolkit(games, state({ tags: ['Roguelike'] })))).toEqual(['tagged']);
+    expect(ids(applyToolkit(games, state({ tags: ['Action'] })))).toEqual(['genred']);
+  });
+});
+
+describe('mature filter (#71)', () => {
+  const games = [
+    g('flagged', {}, { content_descriptor_ids: [1, 3] }),
+    g('rollerdrome', {}, { content_descriptor_ids: [5] }),
+    g('unmapped', {}),
+  ];
+
+  it("'hide' drops flagged games, keeps unmapped without excludedNoData", () => {
+    const r = applyToolkit(games, state({ mature: 'hide' }));
+    expect(ids(r)).toEqual(['rollerdrome', 'unmapped']);
+    expect(r.excludedNoData).toBe(0);
+  });
+
+  it("'only' keeps flagged games, counts unmapped as excludedNoData", () => {
+    const r = applyToolkit(games, state({ mature: 'only' }));
+    expect(ids(r)).toEqual(['flagged']);
+    expect(r.excludedNoData).toBe(1); // the steam:null row isn't provably mature
+  });
+
+  it("'all' is the idle default and filters nothing", () => {
+    expect(IDLE_TOOLKIT.mature).toBe('all');
+    expect(ids(applyToolkit(games, state({})))).toHaveLength(3);
+  });
+});

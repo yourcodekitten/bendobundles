@@ -672,6 +672,12 @@ describe('Catalog toolkit wiring', () => {
     expect(screen.queryByText('Zork Prime')).not.toBeInTheDocument();
   });
 
+  it('restores the mature filter from URL params (#71)', async () => {
+    renderCatalogAt('/admin/catalog?mature=hide');
+    await waitFor(() => screen.getByText('Action Hit'));
+    expect((screen.getByLabelText('mature') as HTMLSelectElement).value).toBe('hide');
+  });
+
   it('toggling a tag chip filters without reload; clear filters restores the trove', async () => {
     renderCatalogAt('/admin/catalog');
     await waitFor(() => screen.getByText('Action Hit'));

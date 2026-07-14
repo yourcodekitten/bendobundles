@@ -16,6 +16,7 @@ import { isMature } from '../tags';
 import { titleColorClass } from '../titleColor';
 import { GameDetailModal } from '../GameDetailModal';
 import {
+  type MatureFilter,
   applyToolkit,
   collectTagOptions,
   type GroupKey,
@@ -36,6 +37,7 @@ const RATING_KEYS: readonly RatingFloor[] = [
 ];
 const SORT_KEYS: readonly SortKey[] = ['title', 'rating', 'date-new', 'date-old'];
 const GROUP_KEYS: readonly GroupKey[] = ['none', 'publisher', 'studio', 'bundle'];
+const MATURE_KEYS: readonly MatureFilter[] = ['all', 'hide', 'only'];
 
 function keyOf<T extends string>(raw: string | null, known: readonly T[], idle: T): T {
   return raw !== null && (known as readonly string[]).includes(raw) ? (raw as T) : idle;
@@ -81,6 +83,7 @@ export function Catalog() {
       rating: keyOf(params.get('rating'), RATING_KEYS, 'any'),
       sort: keyOf(params.get('sort'), SORT_KEYS, 'title'),
       group: keyOf(params.get('group'), GROUP_KEYS, 'none'),
+      mature: keyOf(params.get('mature'), MATURE_KEYS, 'all'),
     }),
     [params],
   );
@@ -91,6 +94,7 @@ export function Catalog() {
     if (next.rating !== 'any') p.set('rating', next.rating);
     if (next.sort !== 'title') p.set('sort', next.sort);
     if (next.group !== 'none') p.set('group', next.group);
+    if (next.mature !== 'all') p.set('mature', next.mature);
     setParams(p, { replace: true });
   };
   // Per-row inline error for toggle refusals (mid-claim 409 from server)
