@@ -641,7 +641,9 @@ git commit -S -m "domain: HiddenSource provenance on Game + adult auto-hide desc
 - Produces: `pub enum AutoHideWrite { Written, NotFound, AlreadyHidden, AdminOwned, Contested }`
   and `Store::auto_hide_game(&self, game_id: &str) -> Result<AutoHideWrite, StoreError>`.
   `set_game_hidden` now stamps `hidden_source = Some(Admin)` on every admin toggle.
-  Tasks 6/7 consume `auto_hide_game`; Task 9 reads `hidden_source` off `Game`.
+  `upsert_game_from_sync`'s condition additionally locks `hidden_source` unchanged-since-read
+  (OMBB sign-off, upsert-clobber hardening). Tasks 6/7 consume `auto_hide_game`; Task 9
+  reads `hidden_source` off `Game`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -767,6 +769,28 @@ async fn admin_toggle_stamps_admin_source_top_level_snake_case() {
     let attr = raw_get_top_level_string(test, &g.id, "hidden_source").await;
     assert_eq!(attr.as_deref(), Some("admin"));
 }
+
+#[tokio::test]
+async fn upsert_condition_protects_hidden_source_from_clobber() {
+    // The inherited sync-upsert TOCTOU, now higher-stakes (OMBB sign-off): an admin
+    // toggle landing inside upsert's read→put window would be silently reverted —
+    // INCLUDING the Admin stamp, erasing Ben's permanent immunity. Same raw-mismatch
+    // scalpel as the auto-hide test: body read says hidden_source null, top-level
+    // mirror says "admin" → only the DDB condition can see it.
+    let test = "upsert_protects_hidden_source";
+    let Some(store) = store_or_skip(test).await else { return };
+    let g = game(1, true);
+    store.put_game(&g).await.unwrap();
+    raw_set_top_level_string(test, &g.id, "hidden_source", "admin").await;
+    let mut fresh = game(1, true);
+    fresh.title = "Renamed".into();
+    let res = store.upsert_game_from_sync(fresh).await.unwrap();
+    assert_eq!(
+        res,
+        SyncWrite::SkippedInFlight,
+        "the write must CCF, not clobber the admin stamp"
+    );
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -884,6 +908,50 @@ New method after `set_game_hidden`:
     }
 ```
 
+**Upsert-clobber hardening** (OMBB sign-off — `hidden_source` makes this pre-existing race
+higher-stakes): in `upsert_game_from_sync` (`lib.rs:1407`), the `Some(e)` arm of the
+condition builder currently produces `"#st = :expected"` (+ optional `claim_id` clause).
+Extend it so `hidden_source` must be unchanged since the read — an admin toggle landing
+inside the read→put window then CCFs to `SkippedInFlight` instead of silently reverting
+Ben's toggle and erasing the Admin stamp:
+
+```rust
+            Some(e) => {
+                let status_str = serde_json::to_value(e.status)
+                    .expect("status serializes")
+                    .as_str()
+                    .expect("status is a string")
+                    .to_string();
+                req = req
+                    .expression_attribute_names("#st", "status")
+                    .expression_attribute_values(":expected", schema::s(status_str))
+                    // hidden_source must be unchanged since our read: an admin toggle
+                    // landing inside this window owns the record — sync yields (#71).
+                    .expression_attribute_names("#hsrc", "hidden_source");
+                let hsrc_clause = match e.hidden_source {
+                    None => "attribute_not_exists(#hsrc)".to_string(),
+                    Some(src) => {
+                        let src_str = serde_json::to_value(src)
+                            .expect("hidden_source serializes")
+                            .as_str()
+                            .expect("hidden_source is a string")
+                            .to_string();
+                        req = req.expression_attribute_values(":hsrc", schema::s(src_str));
+                        "#hsrc = :hsrc".to_string()
+                    }
+                };
+                if let Some(cid) = &e.claim_id {
+                    req = req.expression_attribute_values(":cid", schema::s(cid.clone()));
+                    format!("#st = :expected AND claim_id = :cid AND {hsrc_clause}")
+                } else {
+                    format!("#st = :expected AND {hsrc_clause}")
+                }
+            }
+```
+
+(The `None => "attribute_not_exists(pk)"` arm is untouched — first-insert has no stamp to
+protect. Update the fn's doc comment to name the third clause.)
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p dynamo --test store_test` (dynamodb-local up — do not accept a skip as
@@ -910,9 +978,10 @@ git commit -S -m "dynamo: hidden_source mirror + admin stamping + guarded auto_h
 - Consumes: `steam.get_store_items`, `steam.get_tag_list` (Tasks 2-3),
   `store.auto_hide_game` + `AutoHideWrite` (Task 5), `domain::ADULT_HIDE_DESCRIPTOR_IDS`
   (Task 4).
-- Produces: `pub const STEAM_TAG_STORE_CAP: usize = 10;` and
-  `fn tags_for_app(app_id, tag_data, prev_detail) -> Vec<String>` (private, shared with
-  Task 7 in this same file).
+- Produces: `pub const STEAM_TAG_STORE_CAP: usize = 10;`,
+  `fn tags_for_app(app_id, tag_data, prev_detail) -> Vec<String>`, and
+  `async fn auto_hide_adult_games(store, adult_appids, games_by_appid) -> u32` (both
+  private, shared with Task 7 in this same file).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -983,13 +1052,37 @@ async fn enrich_preserves_old_tags_when_getitems_fails() {
 }
 
 #[tokio::test]
-async fn enrich_stores_empty_tags_when_app_absent_from_successful_batch() {
-    // seed STEAMAPP cache with detail.tags = vec!["Old Tag".into()] and fetched_at 0 —
-    // NON-EMPTY seed is the point: an empty seed would pass against a no-op.
-    // Mocks: appdetails 200, GetTagList 200, GetItems 200 with store_items: [] (the
-    // gated/delisted case — successful batch, app absent).
-    // run enrich; assert cache.detail.tags.is_empty() — a successful "no tags" answer
-    // OVERWRITES (genre fallback takes over client-side).
+async fn enrich_stores_empty_tags_when_app_absent_from_nonempty_batch() {
+    // TWO games mapped to TWO appids, both with stale caches carrying
+    // detail.tags = vec!["Old Tag".into()] — NON-EMPTY seeds are the point: an empty
+    // seed would pass against a no-op. Mocks: appdetails 200 for both, GetTagList 200,
+    // GetItems 200 whose store_items contains ONLY the first appid (the second is the
+    // gated/delisted case — successful NON-EMPTY batch, one app absent).
+    // run enrich; assert: first app's tags == the mocked names (updated); SECOND app's
+    // tags is_empty() — a successful batch's per-app absence OVERWRITES (genre fallback
+    // takes over client-side). Two apps are required: a fully-empty response now trips
+    // the shape-drift guard below.
+}
+
+#[tokio::test]
+async fn enrich_treats_zero_items_for_nonempty_request_as_batch_failure() {
+    // The shape-drift guard (OMBB): seed ONE mapped game, stale cache with
+    // detail.tags = vec!["Old Tag".into()]. Mocks: appdetails 200, GetTagList 200,
+    // GetItems 200 with store_items: [] — a non-empty request answered with zero items.
+    // run enrich; assert cache.detail.tags == ["Old Tag"] — treated as batch failure,
+    // tags preserved, NOT wiped. (A Valve field rename parses exactly like this.)
+}
+
+#[tokio::test]
+async fn enrich_sweeps_adult_games_with_fresh_cache_no_fetch() {
+    // The fresh-cache hole (OMBB): seed a STEAMAPP cache with BOTH clocks fresh
+    // (fetched_at = now, reviews_fetched_at = now — compute now the same way the file's
+    // other tests do) and detail.content_descriptor_ids = vec![3]; seed a mapped game
+    // hidden:false, hidden_source:None. NO steam mocks needed — both halves fresh means
+    // no worklist entry and no storefront call (mount nothing; a request would 404 and
+    // that's fine, none should happen).
+    // run enrich; assert: game.hidden == true, hidden_source == Some(Sync) — the
+    // decide-loop sweep caught the second-bundle adult game without any fetch.
 }
 ```
 
@@ -1064,6 +1157,20 @@ In `enrich_steam_apps`, after `worklist.truncate(STEAM_ENRICH_MAX_APPS);`:
             steam.get_store_items(&detail_ids).await,
             steam.get_tag_list().await,
         ) {
+            // Plausibility guard (OMBB sign-off, shape-drift): a non-empty request
+            // answered with ZERO items is indistinguishable from a Valve field rename
+            // parsing as a "successful empty response" — treating it as success would
+            // progressively wipe every app's tags, invisibly behind the genre fallback.
+            // Real batches mix ordinary apps; all-gated is not a plausible answer.
+            (Ok(items), Ok(names)) if items.is_empty() => {
+                tracing::warn!(
+                    requested = detail_ids.len(),
+                    got = items.len(),
+                    names = names.len(),
+                    "steam enrichment: GetItems answered a non-empty request with zero items — treating as batch failure (shape drift?)"
+                );
+                None
+            }
             (Ok(items), Ok(names)) => Some((items, names)),
             (items_res, names_res) => {
                 tracing::warn!(
@@ -1084,7 +1191,61 @@ In `enrich_steam_apps`, after `worklist.truncate(STEAM_ENRICH_MAX_APPS);`:
             games_by_appid.entry(id).or_default().push(g.id.clone());
         }
     }
-    let mut auto_hidden = 0u32;
+    // Every appid known to carry adult descriptors this pass — fed by BOTH the decide
+    // loop (existing cache) and the fetch loop (fresh detail); swept once at the end.
+    let mut adult_appids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+```
+
+ALSO in the decide loop (where `existing` is read, before the `need_detail`/`need_reviews`
+freshness check at ~:1938) — this is the fresh-cache-hole fix (OMBB sign-off condition 3):
+
+```rust
+        // Adult appids are collected from the EXISTING cache too: a game newly mapped to
+        // an already-fresh {3,4} cache (same adult game, second bundle) never enters the
+        // worklist, and the sweep must still catch it. Cached descriptors don't need to
+        // be fresh to be true; the sweep is idempotent.
+        if let Some(c) = &existing
+            && c.detail.as_ref().is_some_and(|d| {
+                d.content_descriptor_ids
+                    .iter()
+                    .any(|id| domain::ADULT_HIDE_DESCRIPTOR_IDS.contains(id))
+            })
+        {
+            adult_appids.insert(app_id);
+        }
+```
+
+And the shared sweep helper, next to `tags_for_app` (shared verbatim with the backfill —
+Task 7 calls it too, so the two paths can never drift):
+
+```rust
+/// One sweep over every appid known to carry adult descriptors: auto-hide each mapped
+/// game Ben hasn't decided on. Dynamo-only (no storefront calls), idempotent, safe to run
+/// after a 429 abort. Returns how many games were newly hidden.
+async fn auto_hide_adult_games(
+    store: &dynamo::Store,
+    adult_appids: &std::collections::BTreeSet<u32>,
+    games_by_appid: &std::collections::HashMap<u32, Vec<String>>,
+) -> u32 {
+    let mut hidden = 0u32;
+    for app_id in adult_appids {
+        for gid in games_by_appid.get(app_id).map(Vec::as_slice).unwrap_or(&[]) {
+            match store.auto_hide_game(gid).await {
+                Ok(dynamo::AutoHideWrite::Written) => {
+                    hidden += 1;
+                    tracing::info!(app_id, game_id = %gid, "auto-hide: hid adult game");
+                }
+                Ok(outcome) => {
+                    tracing::debug!(app_id, game_id = %gid, ?outcome, "auto-hide: left alone");
+                }
+                Err(e) => {
+                    tracing::warn!(app_id, game_id = %gid, error = ?e, "auto-hide: write failed");
+                }
+            }
+        }
+    }
+    hidden
+}
 ```
 
 In the detail-fetch arm, replace the `Ok(steam_client::AppDetails::Found(d))` body:
@@ -1099,39 +1260,36 @@ In the detail-fetch arm, replace the `Ok(steam_client::AppDetails::Found(d))` bo
                 }
 ```
 
-After the successful `put_steam_app` (`fetched += 1;`), the sweep:
+After the successful `put_steam_app` (`fetched += 1;`), collect freshly-confirmed adult
+appids (the actual hiding happens once, after the loop):
 
 ```rust
-        // Auto-hide: adult descriptors on the (possibly just-refreshed) detail hide every
-        // mapped game that Ben hasn't personally decided on. Runs even on reviews-only
-        // refreshes over CACHED descriptors — deliberate: a descriptor doesn't need to be
-        // fresh to be true, and the sweep is idempotent. One-way; all non-Written
-        // outcomes are deliberate leave-it-alones (see AutoHideWrite).
-        let adult = cache.detail.as_ref().is_some_and(|d| {
+        // Freshly-fetched adult descriptors join the sweep set (the decide loop already
+        // covered cached ones). One-way; the sweep never unhides.
+        if cache.detail.as_ref().is_some_and(|d| {
             d.content_descriptor_ids
                 .iter()
                 .any(|id| domain::ADULT_HIDE_DESCRIPTOR_IDS.contains(id))
-        });
-        if adult {
-            for gid in games_by_appid.get(&app_id).map(Vec::as_slice).unwrap_or(&[]) {
-                match deps.store.auto_hide_game(gid).await {
-                    Ok(dynamo::AutoHideWrite::Written) => {
-                        auto_hidden += 1;
-                        tracing::info!(app_id, game_id = %gid, "steam enrichment: auto-hid adult game");
-                    }
-                    Ok(outcome) => {
-                        tracing::debug!(app_id, game_id = %gid, ?outcome, "steam enrichment: auto-hide left alone");
-                    }
-                    Err(e) => {
-                        tracing::warn!(app_id, game_id = %gid, error = ?e, "steam enrichment: auto-hide write failed");
-                    }
-                }
-            }
+        }) {
+            adult_appids.insert(app_id);
         }
 ```
 
-Extend the summary log line with `auto_hidden={auto_hidden}` (and add `auto_hidden` to the
-doc comment's documented line shape at :1891).
+After the fetch loop (right after the `deferred_unstarted += it.count();` line, before the
+summary log) — the single sweep. Deliberately AFTER a 429 abort too: the sweep is
+dynamo-only, and decide-loop-collected appids must still be swept even when the storefront
+walk died early:
+
+```rust
+    let auto_hidden = auto_hide_adult_games(&deps.store, &adult_appids, &games_by_appid).await;
+    let tag_batch_failed = tag_data.is_none() && !detail_ids.is_empty();
+```
+
+Extend the summary log line with `auto_hidden={auto_hidden} tag_batch_failed={tag_batch_failed}`
+(and update the doc comment's documented line shape at :1891). `tag_batch_failed` is the
+grep-able CloudWatch signal for the "Valve gated/renamed the endpoint" failure mode — cards
+would otherwise regress to genres forever behind a warn nobody reads (OMBB nit; if it fires
+repeatedly, that's the trigger for the documented `g_rgAppTags` fallback decision in #71).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1232,21 +1390,33 @@ Replace the `Ok(steam_client::AppDetails::Found(d))` arm body:
             }
 ```
 
-After the successful `put_steam_app` (before the `done` accounting), copy the auto-hide
-sweep block from `enrich_steam_apps` in this same file (the `let adult = ...; if adult {`
-block after its `fetched += 1;`), with two mechanical swaps: `summary.auto_hidden += 1;`
-instead of `auto_hidden += 1;`, and `store.auto_hide_game(gid)` instead of
-`deps.store.auto_hide_game(gid)`. Update the run-summary `tracing::info!` at the end of the
-fn to include `auto_hidden = summary.auto_hidden`, and extend the bin's `println!` (see
-Files) so the operator sees the count.
-
-NOTE the skip-fresh interaction: an app skipped for freshness also skips the sweep — fine
-for the resync (fresh items were just enriched by Task 6's code, which sweeps), but document
-it in the fn doc comment:
+Adult appids collect at BOTH points, mirroring enrichment: declare
+`let mut adult_appids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();`
+before the loop; insert `app_id` (a) right after the `existing` read when the existing
+cache's `detail.content_descriptor_ids` intersects `domain::ADULT_HIDE_DESCRIPTOR_IDS`
+(covers skip-fresh'd items — with `SKIP_FRESH_SECS=0` mandated this is belt-and-braces,
+but a resumed run must not lose the skipped items' sweep), and (b) after a successful
+`put_steam_app` when the fresh detail intersects (same snippet as `enrich_steam_apps`).
+After the loop, before the final summary `tracing::info!`:
 
 ```rust
-/// Skip-fresh items skip the auto-hide sweep too — acceptable: anything fresh was written
-/// by the enrichment pass, which runs the identical sweep (#71).
+    summary.auto_hidden = auto_hide_adult_games(store, &adult_appids, &games_by_appid).await;
+```
+
+(`auto_hide_adult_games` and the intersect snippet live in this same file — written by the
+enrichment work that precedes this task; read them there. `games_by_appid` is built from
+`games` exactly as in `enrich_steam_apps`.) Update the run-summary `tracing::info!` at the
+end of the fn to include `auto_hidden = summary.auto_hidden`, and extend the bin's
+`println!` (see Files) so the operator sees the count.
+
+Skip-fresh interaction: skipped items still join the sweep via collection point (a) —
+their existing cache is read before the skip check, so a resumed run (or a
+default-skip-window run) never loses the adult sweep for items it didn't refetch. Note it
+in the fn doc comment:
+
+```rust
+/// Skip-fresh items still get the auto-hide sweep: adult appids are collected from the
+/// EXISTING cache before the skip check, so resumed runs don't lose the sweep (#71).
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1936,6 +2106,18 @@ Not subagent work — this is the live-prod sequence after the PR merges to main
 the standing deploy runbook (state/decisions.md:1038 lineage). Recorded here because Ben
 explicitly required the resync in the plan.
 
+- [ ] **Step 0 (IAM prerequisite):** OMBB's terraform-iam `kitten-maintenance` role PR
+  (dedicated manager-assumed role: Get/BatchGet/Query/Scan/Put/UpdateItem on the app table
+  + indexes, no DeleteItem, inside the boundary — replaces the dead hand-edit drift from
+  the #57-era backfill; Ben pre-approved) must be MERGED and APPLIED before Step 4, and a
+  local `kitten-maintenance` AWS profile configured assuming the new role ARN. Verify
+  empirically before trusting: `AWS_PROFILE=kitten-maintenance aws dynamodb scan
+  --table-name <prod table> --max-items 1 --select COUNT` answers a Count, and the
+  no-op conditional-write probe (`update-item` on `pk=PROBE#never` with
+  `attribute_exists(pk)`) answers ConditionalCheckFailedException, NOT AccessDenied.
+  Precision note for the role's comments: `auto_hide_game` is a conditional **PutItem**
+  (full `game_item()` put), not an UpdateItem — the role carries both verbs, but don't
+  let its documentation say otherwise.
 - [ ] **Step 1:** Pull artifacts (3 lambda zips + web-dist) from the GREEN main CI run of the
   merge commit.
 - [ ] **Step 2:** Terraform: recreate tfvars (boundary ARN, secrets from `~/.secrets`, admin
@@ -1945,14 +2127,18 @@ explicitly required the resync in the plan.
 - [ ] **Step 3:** Web: `aws s3 sync web/dist s3://<bucket> --delete --dryrun` (deletes = old
   hashed js/css pair ONLY), then real sync + CloudFront invalidation; curl the live bundle
   hash.
-- [ ] **Step 4 (THE RESYNC):** outside the 09:00Z cron window, with `~/.secrets` steam key +
-  deploy-role AWS creds:
+- [ ] **Step 4 (THE RESYNC):** outside the 09:00Z cron window (no steam key needed — the
+  bin's endpoints are keyless):
 
 ```bash
 cd /path/to/worktree
-TABLE_NAME=<prod table> SKIP_FRESH_SECS=0 AWS_PROFILE=kitten-deploy \
+TABLE_NAME=<prod table> SKIP_FRESH_SECS=0 AWS_PROFILE=kitten-maintenance \
   cargo run -p fulfillment --features backfill --bin backfill_details
 ```
+
+  NOT `kitten-deploy` — that role is control-plane only and was NEVER the identity that
+  ran a backfill (the 07-08 run rode a since-dead console hand-edit on kitten-debug; see
+  the #71 issue thread). `kitten-maintenance` (Step 0) is the codified identity.
 
   **`SKIP_FRESH_SECS=0` is mandatory on the FIRST run** (Lilith, plan sign-off ①): the
   default 12h skip-fresh window would skip every app the OLD code enriched that morning —
@@ -1964,11 +2150,32 @@ TABLE_NAME=<prod table> SKIP_FRESH_SECS=0 AWS_PROFILE=kitten-deploy \
   Env contract (verified): `TABLE_NAME` required, `SKIP_FRESH_SECS` optional, key unused
   (keyless endpoints, empty `SteamApiKey` is fine), creds from ambient AWS config.
   Expected: summary line `fetched≈<mapped-app count> … auto_hidden=<n>`.
+  **If the summary shows `failed>0`: rerun with `SKIP_FRESH_SECS=0` again** — a non-429
+  tag failure still stamps `fetched_at=now` on tagless items, so a default-skip rerun
+  would skip exactly the items that need retrying (OMBB sign-off, runbook note).
 - [ ] **Step 5:** Verify live (playwright): tags on friend cards, 🔞 badges + mature filter
   in admin, an auto-hidden row labeled, Puss! still hidden (Ben-hidden, untouched — its
-  `hidden_source` stays null until Ben toggles).
+  `hidden_source` stays null because `auto_hide_game` no-ops on already-hidden games
+  WITHOUT stamping provenance; the `auto_hide_already_hidden_is_noop` test is the proof
+  this verification leans on).
 
 ---
+
+## Sign-off round (2026-07-14, Lilith + OMBB — integrated)
+
+Lilith (conditional YES, 3): `SKIP_FRESH_SECS=0` on the first backfill run; `game_item()`
+full-put verified at the source (dynamo/src/lib.rs:1309-1313); merge_sync sweep carve-out.
+OMBB (conditional YES, 3 + 2 + nits — full record:
+yourcodekitten/bendobundles#71 issue comments): backfill IAM (resolved as a dedicated
+`kitten-maintenance` role, authored by OMBB in terraform-iam as a separate PR — the live
+policy probe proved kitten-deploy is control-plane-only and the #57-era grant was dead
+console drift, PR #59's closing comment called it); GetItems zero-items plausibility guard
++ test; fresh-cache auto-hide hole → decide-loop collection + single post-loop sweep via a
+shared `auto_hide_adult_games` helper (also kills the T6/T7 drift nit) + test;
+upsert-clobber HARDENED (hidden_source-unchanged condition clause + raw-mismatch test),
+not just documented; `failed>0` rerun runbook line; `tag_batch_failed` summary signal;
+stale steam-key mention deleted; Puss! verification claim pinned to the AlreadyHidden
+no-op test.
 
 ## Review round (2026-07-14, adversarial plan review — integrated)
 
