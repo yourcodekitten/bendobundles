@@ -79,6 +79,8 @@ fn link(token: &str) -> Link {
         token: token.into(),
         label: "dave".into(),
         gift_note: None,
+        thank_note: None,
+        thanked_at: None,
         claims_allowed: 1,
         claims_used: 0,
         revoked: false,
@@ -323,6 +325,121 @@ async fn gift_note_never_persisted_in_body_blob() {
             .contains("between us"),
         "cleared note must leave no copy at rest"
     );
+}
+
+/// `set_link_thanks` is write-once by construction: the conditional update refuses a
+/// second write (AlreadyThanked) and a missing link (NotFound), and the happy path
+/// stamps note + timestamp together so `thanked_at` can never exist without its note.
+#[tokio::test]
+async fn set_link_thanks_write_once_roundtrip_and_outcomes() {
+    let Some(store) = store_or_skip("thanks-once").await else {
+        return;
+    };
+    store.create_link(&link("tok-thx")).await.unwrap();
+    let at = datetime!(2026-07-15 17:00 UTC);
+
+    // happy path: both fields land, readable through the normal link read
+    assert_eq!(
+        store
+            .set_link_thanks("tok-thx", "omg thank you!!", at)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+    let got = store.get_link("tok-thx").await.unwrap().unwrap();
+    assert_eq!(got.thank_note.as_deref(), Some("omg thank you!!"));
+    assert_eq!(got.thanked_at, Some(at));
+
+    // write-once: a second attempt is refused and the original text is untouched
+    assert_eq!(
+        store
+            .set_link_thanks("tok-thx", "overwrite attempt", at)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::AlreadyThanked
+    );
+    let still = store.get_link("tok-thx").await.unwrap().unwrap();
+    assert_eq!(still.thank_note.as_deref(), Some("omg thank you!!"));
+
+    // unknown token is a distinct outcome, not a silent no-op
+    assert_eq!(
+        store
+            .set_link_thanks("no-such-tok", "hello?", at)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::NotFound
+    );
+}
+
+/// The thanks fields follow the full gift_note storage contract: authoritative in
+/// top-level attrs, surviving `claim_game`'s `SET body` rewrite, and NEVER serialized
+/// into the `body` blob by any writer (asserted RAW against the stored item).
+#[tokio::test]
+async fn thanks_survives_body_rewrites_and_never_rides_body() {
+    let Some(store) = store_or_skip("thanks-purge").await else {
+        return;
+    };
+    let client = raw_client("thanks-purge").await;
+    let table = "t-thanks-purge";
+    const THANKS: &str = "you absolute legend, thank you";
+
+    store.put_game(&game(1, true)).await.unwrap();
+    let mut l2 = link("tok-thx2");
+    l2.claims_allowed = 2;
+    store.create_link(&l2).await.unwrap();
+    let at = datetime!(2026-07-15 17:00 UTC);
+    assert_eq!(
+        store.set_link_thanks("tok-thx2", THANKS, at).await.unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+
+    let raw_body = || async {
+        let out = client
+            .get_item()
+            .table_name(table)
+            .key("pk", AttributeValue::S("LINK#tok-thx2".into()))
+            .key("sk", AttributeValue::S("META".into()))
+            .send()
+            .await
+            .unwrap();
+        let item = out.item.unwrap();
+        item.get("body").unwrap().as_s().unwrap().to_string()
+    };
+    assert!(
+        !raw_body().await.contains("legend"),
+        "thanks must not ride the body blob"
+    );
+
+    // claim_game's body rewrite (from a pre-thanks read shape) must not disturb it
+    store
+        .claim_game(
+            "tok-thx2",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-15 18:00 UTC),
+        )
+        .await
+        .unwrap();
+    let after = store.get_link("tok-thx2").await.unwrap().unwrap();
+    assert_eq!(after.claims_used, 1);
+    assert_eq!(
+        after.thank_note.as_deref(),
+        Some(THANKS),
+        "claim's body rewrite must not disturb the thanks"
+    );
+    assert_eq!(after.thanked_at, Some(at));
+    assert!(
+        !raw_body().await.contains("legend"),
+        "claim's body rewrite must not serialize the thanks into body"
+    );
+
+    // update_link_meta (revoke shape) — same guarantee
+    let mut l = store.get_link("tok-thx2").await.unwrap().unwrap();
+    l.revoked = true;
+    store.update_link_meta(&l).await.unwrap();
+    let revoked = store.get_link("tok-thx2").await.unwrap().unwrap();
+    assert_eq!(revoked.thank_note.as_deref(), Some(THANKS));
+    assert!(!raw_body().await.contains("legend"));
 }
 
 #[tokio::test]
@@ -1061,6 +1178,8 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
         token: "tok-e".into(),
         label: "dave".into(),
         gift_note: None,
+        thank_note: None,
+        thanked_at: None,
         claims_allowed: 1,
         claims_used: 9,
         revoked: true,

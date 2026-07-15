@@ -202,6 +202,8 @@ fn test_link(token: &str) -> Link {
         token: token.into(),
         label: "Admin Test Link".into(),
         gift_note: None,
+        thank_note: None,
+        thanked_at: None,
         claims_allowed: 3,
         claims_used: 0,
         revoked: false,
@@ -387,6 +389,57 @@ async fn create_link_token_is_64_chars_and_visible_in_list() {
     assert_eq!(created["label"], "Dave");
     assert_eq!(created["claims_allowed"], 2);
     assert_eq!(created["claims_used"], 0);
+}
+
+/// A friend's thank-you (written via the public API's `set_link_thanks`) surfaces in
+/// GET /admin/api/links — note text AND timestamp — and is absent (not null) on links
+/// never thanked. This is ben's payoff surface for the whole feature; pin the wire.
+#[tokio::test]
+async fn list_links_carries_thank_note_and_omits_when_unset() {
+    let Some(store) = store_or_skip("links-thanks").await else {
+        return;
+    };
+    let password = "thxpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    store.create_link(&test_link("thanked-tok")).await.unwrap();
+    store.create_link(&test_link("plain-tok")).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks(
+                "thanked-tok",
+                "ben you're the best ♡",
+                datetime!(2026-07-15 17:00 UTC),
+            )
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+
+    let list_req = Request::get("/admin/api/links")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
+        .oneshot(list_req)
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let links = body_json(list_resp).await;
+    let arr = links.as_array().unwrap();
+
+    let thanked = arr.iter().find(|l| l["token"] == "thanked-tok").unwrap();
+    assert_eq!(thanked["thank_note"], "ben you're the best ♡");
+    assert_eq!(thanked["thanked_at"], "2026-07-15T17:00:00Z");
+
+    let plain = arr.iter().find(|l| l["token"] == "plain-tok").unwrap();
+    assert!(
+        plain.get("thank_note").is_none(),
+        "unthanked link must omit the field, got: {plain}"
+    );
+    assert!(plain.get("thanked_at").is_none());
 }
 
 /// POST a create-link body and return the response. Shared by the input-validation tests.

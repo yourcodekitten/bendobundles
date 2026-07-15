@@ -18,6 +18,7 @@ import {
 } from "../steamIdentity";
 import { ClaimDialog } from "./ClaimDialog";
 import { ClaimsHistory } from "./ClaimsHistory";
+import { ThanksCard } from "./ThanksCard";
 import { GameGrid } from "./GameGrid";
 import { GameDetailModal } from "../GameDetailModal";
 import { CursorCompanion } from "./CursorCompanion";
@@ -467,6 +468,13 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       {/* your gifts — moved up under the banner (ben, 2026-07-09): the friend's
           claimed games sit right below the scene, not buried at the page bottom */}
       <ClaimsHistory claims={data.claims} />
+
+      {/* say thanks — the return path of ben's gift note, kept with the gifts it
+          answers. Gated on visible claims (thanks is the echo of an unwrap) and
+          on the link being alive; the server enforces both again. */}
+      {data.claims.length > 0 && !dead && token !== undefined && (
+        <ThanksCard token={token} thankNote={data.thank_note} />
+      )}
 
       {/* Steam privacy notice — spec §4 wording verbatim */}
       {steamPrivate && (

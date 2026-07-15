@@ -87,6 +87,18 @@ pub enum OwnedWrite {
     Contested,
 }
 
+/// Outcome of the friend's write-once thank-you write (`set_link_thanks`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetThanksOutcome {
+    /// Note + timestamp landed.
+    Set,
+    /// No link with that token exists; caller should 404.
+    NotFound,
+    /// A thank-you is already on the link — write-once, the first word stands.
+    /// Caller should 409.
+    AlreadyThanked,
+}
+
 /// Persisted summary of a catalog-sync run. Storage-shaped (lives in dynamo, not in domain).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SyncState {
@@ -272,6 +284,25 @@ fn link_from_item(
         .get("gift_note")
         .and_then(|v| v.as_s().ok())
         .map(String::from);
+    // The thanks pair follows the full gift_note contract (top-level authoritative,
+    // absent = never thanked, body never carries them) — same unconditional override.
+    // thanked_at is numeric epoch seconds, like expires_at.
+    link.thank_note = item
+        .get("thank_note")
+        .and_then(|v| v.as_s().ok())
+        .map(String::from);
+    link.thanked_at = match n_attr("thanked_at") {
+        None => None,
+        Some(n) => {
+            let secs = n
+                .parse::<i64>()
+                .map_err(|_| StoreError::Corrupt("link thanked_at not numeric"))?;
+            Some(
+                OffsetDateTime::from_unix_timestamp(secs)
+                    .map_err(|_| StoreError::Corrupt("link thanked_at out of range"))?,
+            )
+        }
+    };
     Ok(link)
 }
 
@@ -496,6 +527,43 @@ impl Store {
         match req.send().await {
             Ok(_) => Ok(true),
             Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
+            Err(sdk_err) => Err(StoreError::Aws(format!("{sdk_err:?}"))),
+        }
+    }
+
+    /// Write-once thank-you from the friend — `set_link_gift_note`'s mirror, with one
+    /// extra tooth: `attribute_not_exists(thank_note)` makes the first word stand
+    /// forever, so two tabs (or a retry) can't overwrite what was already said. Same
+    /// scoped single-update shape as the gift note, for the same reason: touching only
+    /// the attrs this write owns means it cannot disturb enforcement (`revoked`,
+    /// counters, `expires_at`) by construction. Note + timestamp land in ONE update,
+    /// so `thanked_at` can never exist without its note.
+    ///
+    /// A CCF is ambiguous (no such link / already thanked); it's disambiguated by a
+    /// follow-up read. Links are never deleted, so the re-read can't misclassify.
+    pub async fn set_link_thanks(
+        &self,
+        token: &str,
+        note: &str,
+        at: OffsetDateTime,
+    ) -> Result<SetThanksOutcome, StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(token), "META");
+        let req = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .condition_expression("attribute_exists(pk) AND attribute_not_exists(thank_note)")
+            .update_expression("SET thank_note = :n, thanked_at = :t")
+            .expression_attribute_values(":n", schema::s(note))
+            .expression_attribute_values(":t", schema::epoch_s(at));
+        match req.send().await {
+            Ok(_) => Ok(SetThanksOutcome::Set),
+            Err(sdk_err) if is_ccf_update(&sdk_err) => match self.get_link(token).await? {
+                None => Ok(SetThanksOutcome::NotFound),
+                Some(_) => Ok(SetThanksOutcome::AlreadyThanked),
+            },
             Err(sdk_err) => Err(StoreError::Aws(format!("{sdk_err:?}"))),
         }
     }

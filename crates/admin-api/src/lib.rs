@@ -593,6 +593,10 @@ async fn handle_create_link(
         token: token.clone(),
         gift_note: parse_gift_note(body.gift_note.as_deref())
             .expect("gift_note bound checked by validate() above"),
+        // Thanks only ever arrive post-creation, from the friend, via the public
+        // API's scoped write — a fresh link has none by definition.
+        thank_note: None,
+        thanked_at: None,
         label: body.label,
         claims_allowed: body.claims_allowed,
         claims_used: 0,

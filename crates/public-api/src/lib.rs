@@ -1,6 +1,7 @@
 //! Public (friend-facing) HTTP API: link view and claim flow.
 //!
 //! Routes: `GET /api/l/:token`, `POST /api/l/:token/claim`,
+//!         `POST /api/l/:token/thanks`,
 //!         `GET /api/steam/login`, `GET /api/steam/return`,
 //!         `GET /api/l/:token/steam/owned/:steamid`, fallback 404.
 use std::sync::Arc;
@@ -130,6 +131,11 @@ struct LinkView {
     /// Omitted from the JSON entirely when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     gift_note: Option<String>,
+    /// The friend's own thank-you, echoed back so a revisit renders "sent"
+    /// instead of the compose card. Omitted when never thanked — the client
+    /// gates on field presence, same as gift_note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thank_note: Option<String>,
     claims_allowed: u32,
     claims_used: u32,
     /// Explicit link state: "active" | "revoked" | "expired" | "exhausted".
@@ -160,6 +166,7 @@ pub fn router(
     Router::new()
         .route("/api/l/:token", get(handle_get_link))
         .route("/api/l/:token/claim", post(handle_post_claim))
+        .route("/api/l/:token/thanks", post(handle_post_thanks))
         .route(
             "/api/l/:token/steam/owned/:steamid",
             get(handle_steam_owned_proxy),
@@ -553,6 +560,9 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             // (revoked/expired) link must not serve ben's message to whoever
             // holds the URL. Same gate as the games list.
             gift_note: if hide_games { None } else { link.gift_note },
+            // Same personal-content gate: a dead link serves neither direction
+            // of the correspondence.
+            thank_note: if hide_games { None } else { link.thank_note },
             claims_allowed: link.claims_allowed,
             claims_used: link.claims_used,
             state,
@@ -689,6 +699,121 @@ async fn handle_post_claim(
         // Parked, Error, transport failure, or any unexpected variant:
         // claim intake succeeded; reconcile owns the fate.
         _ => park_response(),
+    }
+}
+
+// ── POST /api/l/:token/thanks ─────────────────────────────────────────────────
+
+/// Same budget as the gift note it answers (admin-api's `GIFT_NOTE_MAX_CHARS`) —
+/// the correspondence is symmetric on purpose.
+const THANK_NOTE_MAX_CHARS: usize = 500;
+
+#[derive(Deserialize)]
+struct ThanksBody {
+    note: String,
+}
+
+/// The friend's one thank-you back to ben. Write-once (the store's conditional
+/// update enforces it — two tabs can't overwrite the first word), link-level
+/// (the link IS the friend's identity here, same as the gift note it mirrors),
+/// and only meaningful after an unwrap: no claims yet → refused.
+async fn handle_post_thanks(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+    Json(body): Json<ThanksBody>,
+) -> Response {
+    // 1. Validate before any read. Unlike the admin's gift-note parser, empty is
+    //    an error rather than "clear" — there is no clearing a thank-you.
+    let note = body.note.trim();
+    if note.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "a thank-you needs some words"})),
+        )
+            .into_response();
+    }
+    if note.chars().count() > THANK_NOTE_MAX_CHARS {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("note must be at most {THANK_NOTE_MAX_CHARS} characters")
+            })),
+        )
+            .into_response();
+    }
+
+    // 2. Resolve link — same 404 shape as unknown token everywhere else.
+    let link = match s.store.get_link(&token).await {
+        Ok(Some(l)) => l,
+        Ok(None) => return link_not_found_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "try again"})),
+            )
+                .into_response();
+        }
+    };
+
+    // 3. Liveness gate: dead links don't take mail (same messages as the claim
+    //    handler). Exhausted is NOT dead here — a fully-claimed link is exactly
+    //    when a friend says thanks — so only Revoked/Expired refuse.
+    let now = OffsetDateTime::now_utc();
+    match link.can_claim(now) {
+        Ok(()) | Err(domain::ClaimRefusal::Exhausted) => {}
+        Err(domain::ClaimRefusal::Revoked) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "this link has been revoked"})),
+            )
+                .into_response();
+        }
+        Err(domain::ClaimRefusal::Expired) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "this link has expired"})),
+            )
+                .into_response();
+        }
+    }
+
+    // 4. Thanks is the echo of an unwrap, not a guestbook: no claim, no note.
+    if link.claims_used == 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "claim a game first"})),
+        )
+            .into_response();
+    }
+
+    // 5. Write-once conditional write. `at` is pre-truncated to whole seconds so
+    //    the value we echo back is byte-identical to what a re-read will serve
+    //    (storage is epoch seconds).
+    let at = OffsetDateTime::from_unix_timestamp(now.unix_timestamp())
+        .expect("truncating now() to seconds cannot leave the valid range");
+    match s.store.set_link_thanks(&token, note, at).await {
+        Ok(dynamo::SetThanksOutcome::Set) => {
+            tracing::info!("thanks: landed"); // never the note text
+            let ts = at
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"thank_note": note, "thanked_at": ts})),
+            )
+                .into_response()
+        }
+        Ok(dynamo::SetThanksOutcome::AlreadyThanked) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "thanks already sent"})),
+        )
+            .into_response(),
+        Ok(dynamo::SetThanksOutcome::NotFound) => link_not_found_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "try again"})),
+        )
+            .into_response(),
     }
 }
 

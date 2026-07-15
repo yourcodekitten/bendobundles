@@ -78,6 +78,8 @@ fn test_link(token: &str) -> Link {
         token: token.into(),
         label: "Test Friend".into(),
         gift_note: None,
+        thank_note: None,
+        thanked_at: None,
         claims_allowed: 1,
         claims_used: 0,
         revoked: false,
@@ -296,6 +298,288 @@ async fn dead_link_omits_gift_note() {
             "{state} link must not serve the gift note, got: {j}"
         );
     }
+}
+
+// ── POST /api/l/:token/thanks ─────────────────────────────────────────────────
+
+fn thanks_req(token: &str, note: &str) -> Request<Body> {
+    Request::post(format!("/api/l/{token}/thanks"))
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({ "note": note }).to_string()))
+        .unwrap()
+}
+
+/// Happy path on an EXHAUSTED link — the most common real shape (a 1-claim link
+/// is exhausted the moment the friend claims, which is exactly when they say
+/// thanks). 200 returns the canonical stored values; the link view then carries
+/// the note so the client can render "sent" on revisit.
+#[tokio::test]
+async fn thanks_happy_path_on_exhausted_link_and_reflected_in_view() {
+    let Some(store) = store_or_skip("thanks-happy").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    store.create_link(&test_link("thx-tok")).await.unwrap(); // claims_allowed = 1
+    store
+        .claim_game(
+            "thx-tok",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-15 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req("thx-tok", "  omg thank you!! ♡  "))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["thank_note"], "omg thank you!! ♡",
+        "stored value is trimmed"
+    );
+    assert!(j["thanked_at"].is_string(), "timestamp returned, got: {j}");
+
+    let req = Request::get("/api/l/thx-tok").body(Body::empty()).unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert_eq!(j["state"], "exhausted");
+    assert_eq!(j["thank_note"], "omg thank you!! ♡");
+}
+
+/// Write-once: the second attempt is refused with 409 and the first word stands.
+/// Runs on a still-ACTIVE link (claims_allowed=2, one claimed) so this also covers
+/// the active-link accept path.
+#[tokio::test]
+async fn thanks_write_once_second_attempt_409() {
+    let Some(store) = store_or_skip("thanks-once-api").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut lnk = test_link("thx2-tok");
+    lnk.claims_allowed = 2;
+    store.create_link(&lnk).await.unwrap();
+    store
+        .claim_game(
+            "thx2-tok",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-15 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req("thx2-tok", "first word"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req("thx2-tok", "second word"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"], "thanks already sent");
+
+    let req = Request::get("/api/l/thx2-tok").body(Body::empty()).unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert_eq!(j["thank_note"], "first word", "the first word stands");
+}
+
+/// Validation is 422 with the crate's one error shape: empty/whitespace-only
+/// notes and notes over the 500-char budget never reach the store.
+#[tokio::test]
+async fn thanks_validation_422() {
+    let Some(store) = store_or_skip("thanks-422").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    store.create_link(&test_link("thxv-tok")).await.unwrap();
+    store
+        .claim_game(
+            "thxv-tok",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-15 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    for bad in ["", "   ", &"x".repeat(501)] {
+        let resp = plain_router(Arc::clone(&store), mock.clone())
+            .oneshot(thanks_req("thxv-tok", bad))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "note {:?} must be rejected",
+            &bad[..bad.len().min(10)]
+        );
+    }
+    // exactly at the budget is fine
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req("thxv-tok", &"x".repeat(500)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Unknown token → the same 404 shape as every other link route (no oracle).
+#[tokio::test]
+async fn thanks_unknown_token_404() {
+    let Some(store) = store_or_skip("thanks-404").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(store, mock)
+        .oneshot(thanks_req("no-such-token", "hello?"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"], "unknown link");
+}
+
+/// Thanks is the echo of an unwrap: a link with no claims yet refuses the note.
+#[tokio::test]
+async fn thanks_without_claim_409() {
+    let Some(store) = store_or_skip("thanks-noclaim").await else {
+        return;
+    };
+    store.create_link(&test_link("thxn-tok")).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(store, mock)
+        .oneshot(thanks_req("thxn-tok", "premature thanks"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"], "claim a game first");
+}
+
+/// Dead links don't take mail: revoked and expired links refuse thanks with the
+/// claim handler's own refusal messages, even when a claim exists.
+#[tokio::test]
+async fn thanks_dead_link_409() {
+    let Some(store) = store_or_skip("thanks-dead").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    store.put_game(&test_game(2)).await.unwrap();
+    type Kill = fn(&mut Link);
+    let kills: [(&str, &str, Kill); 2] = [
+        ("thxr-tok", "gk1", |l| l.revoked = true),
+        ("thxe-tok", "gk2", |l| {
+            l.expires_at = Some(datetime!(2020-01-01 00:00 UTC))
+        }),
+    ];
+    for (token, gid, kill) in kills {
+        let mut lnk = test_link(token);
+        lnk.claims_allowed = 2;
+        store.create_link(&lnk).await.unwrap();
+        store
+            .claim_game(
+                token,
+                &game_id(gid, "mn"),
+                "c1",
+                datetime!(2026-07-15 12:00 UTC),
+            )
+            .await
+            .unwrap();
+        let mut dead = store.get_link(token).await.unwrap().unwrap();
+        kill(&mut dead);
+        store.update_link_meta(&dead).await.unwrap();
+    }
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    for (token, msg) in [
+        ("thxr-tok", "this link has been revoked"),
+        ("thxe-tok", "this link has expired"),
+    ] {
+        let resp = plain_router(Arc::clone(&store), mock.clone())
+            .oneshot(thanks_req(token, "too late"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "{token}");
+        let j = body_json(resp).await;
+        assert_eq!(j["error"], msg);
+    }
+}
+
+/// A dead link hides the friend's note in the view, same personal-content gate
+/// as gift_note — a revoked URL in the wrong hands serves neither direction of
+/// the correspondence.
+#[tokio::test]
+async fn dead_link_omits_thank_note() {
+    let Some(store) = store_or_skip("thanks-dead-view").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut lnk = test_link("thxdv-tok");
+    lnk.claims_allowed = 2;
+    store.create_link(&lnk).await.unwrap();
+    store
+        .claim_game(
+            "thxdv-tok",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-15 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req("thxdv-tok", "sent while alive"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut dead = store.get_link("thxdv-tok").await.unwrap().unwrap();
+    dead.revoked = true;
+    store.update_link_meta(&dead).await.unwrap();
+
+    let req = Request::get("/api/l/thxdv-tok")
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert_eq!(j["state"], "revoked");
+    assert!(
+        j.get("thank_note").is_none(),
+        "revoked link must not serve the thank note, got: {j}"
+    );
 }
 
 /// Exhausted link → 200, state:"exhausted", games STILL visible

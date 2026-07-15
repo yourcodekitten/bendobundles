@@ -15,6 +15,7 @@ vi.mock("../api", async (importOriginal) => {
     claimGame: vi.fn(),
     steamOwnedForLink: vi.fn(),
     fetchGameDetail: vi.fn(),
+    sendThanks: vi.fn(),
   };
 });
 
@@ -27,6 +28,7 @@ import {
   FetchFailed,
   steamOwnedForLink,
   fetchGameDetail,
+  sendThanks,
 } from "../api";
 import { clearGameDetailCache } from "../gameDetailCache";
 import {
@@ -85,6 +87,130 @@ describe("LinkPage", () => {
       expect(screen.getByText("Test Bundle")).toBeInTheDocument();
     });
     expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
+  });
+
+  describe("say-thanks card", () => {
+    const claimedLink: LinkView = {
+      ...baseLink,
+      claims: [
+        {
+          game_id: "gk1:mn",
+          title: "Dome Keeper",
+          state: "fulfilled",
+          gift_url: "https://humble.example/g",
+        },
+      ],
+    };
+
+    it("shows the compose card when claims exist and no note was sent", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+      expect(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("hides the card entirely when there are no claims", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText("Test Bundle")).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/say thanks to ben/)).not.toBeInTheDocument();
+    });
+
+    it("hides the card on a dead link even with claims", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...claimedLink,
+        state: "revoked",
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(
+          screen.getByText(/this invite isn't active anymore/),
+        ).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/say thanks to ben/)).not.toBeInTheDocument();
+    });
+
+    it("renders the sent note instead of the compose when thank_note is present", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...claimedLink,
+        thank_note: "omg thank you!!",
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/omg thank you!!/)).toBeInTheDocument();
+      });
+      expect(screen.getByText(/— you, delivered to ben/)).toBeInTheDocument();
+      expect(screen.queryByRole("textbox", { name: /your thank-you note/i })).not.toBeInTheDocument();
+    });
+
+    it("sends the trimmed note once and flips to the sent state", async () => {
+      const user = userEvent.setup();
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      vi.mocked(sendThanks).mockResolvedValue({
+        kind: "sent",
+        thank_note: "ben you legend",
+      });
+      renderLinkPage("tok123");
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+
+      const box = screen.getByRole("textbox", { name: /your thank-you note/i });
+      await user.type(box, "  ben you legend  ");
+      await user.click(screen.getByRole("button", { name: /send it/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/ben you legend/)).toBeInTheDocument();
+      });
+      expect(sendThanks).toHaveBeenCalledWith("tok123", "ben you legend");
+      expect(screen.getByText(/— you, delivered to ben/)).toBeInTheDocument();
+      expect(
+        screen.queryByRole("textbox", { name: /your thank-you note/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("keeps the compose and shows the message when the server refuses", async () => {
+      const user = userEvent.setup();
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      vi.mocked(sendThanks).mockResolvedValue({
+        kind: "refused",
+        message: "thanks already sent",
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+
+      await user.type(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+        "hello",
+      );
+      await user.click(screen.getByRole("button", { name: /send it/i }));
+
+      await waitFor(() => {
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "thanks already sent",
+        );
+      });
+      expect(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("disables send while the note is empty", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+      expect(screen.getByRole("button", { name: /send it/i })).toBeDisabled();
+    });
   });
 
   it("shows loading state initially", () => {
