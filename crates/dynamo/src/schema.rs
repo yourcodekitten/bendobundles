@@ -87,9 +87,13 @@ pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
 /// a body blob written while a note was set would otherwise retain the text
 /// verbatim until the next body write (OMBB, #69 review). Every body writer
 /// (create, `update_link_meta`, `claim_game`) must use this.
+/// The thanks pair follows the same rule for the same reason (the friend's words
+/// deserve the same no-copy-at-rest guarantee as ben's).
 pub fn link_body(l: &Link) -> String {
     let noteless = Link {
         gift_note: None,
+        thank_note: None,
+        thanked_at: None,
         ..l.clone()
     };
     serde_json::to_string(&noteless).expect("link serializes")
@@ -122,6 +126,17 @@ pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
     // Omitted when None; `link_from_item` treats absence as no-note.
     if let Some(n) = &l.gift_note {
         item.insert("gift_note".into(), s(n));
+    }
+    // Same contract for the thanks pair (`set_link_thanks` is the one live writer —
+    // links are created un-thanked — but a roundtrip through link_item must not
+    // silently drop the fields).
+    if let Some(n) = &l.thank_note {
+        item.insert("thank_note".into(), s(n));
+    }
+    // Numeric like expires_at (`epoch_s`'s blanket rule for top-level times), even
+    // though this one is display-only today.
+    if let Some(at) = l.thanked_at {
+        item.insert("thanked_at".into(), epoch_s(at));
     }
     item
 }

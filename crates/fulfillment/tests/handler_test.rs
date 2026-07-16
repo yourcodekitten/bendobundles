@@ -102,6 +102,8 @@ fn link(token: &str) -> Link {
         token: token.into(),
         label: "dave".into(),
         gift_note: None,
+        thank_note: None,
+        thanked_at: None,
         claims_allowed: 1,
         claims_used: 0,
         revoked: false,

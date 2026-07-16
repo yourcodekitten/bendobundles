@@ -95,6 +95,24 @@ describe('Links', () => {
       expect(screen.getByText(/expires never/i)).toBeInTheDocument();
     });
 
+    it("renders the friend's thank-you with their name and date when present", async () => {
+      vi.mocked(adminLinks).mockResolvedValue([
+        {
+          ...link1,
+          thank_note: 'ben you legend, thank you!!',
+          thanked_at: '2026-07-15T17:00:00Z',
+        },
+        link2,
+      ]);
+      renderLinks();
+
+      await waitFor(() => screen.getByText(/ben you legend, thank you!!/));
+      // signed with the friend's label + the formatted date
+      expect(screen.getByText(/— Alice,/)).toBeInTheDocument();
+      // link2 never thanked — no stray attribution
+      expect(screen.queryByText(/— Bob/)).not.toBeInTheDocument();
+    });
+
     it('shows error state when adminLinks fails', async () => {
       vi.mocked(adminLinks).mockRejectedValue(new Error('network timeout'));
       renderLinks();

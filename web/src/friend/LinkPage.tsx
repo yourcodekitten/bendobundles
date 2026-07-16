@@ -18,6 +18,7 @@ import {
 } from "../steamIdentity";
 import { ClaimDialog } from "./ClaimDialog";
 import { ClaimsHistory } from "./ClaimsHistory";
+import { ThanksCard } from "./ThanksCard";
 import { GameGrid } from "./GameGrid";
 import { GameDetailModal } from "../GameDetailModal";
 import { CursorCompanion } from "./CursorCompanion";
@@ -467,6 +468,26 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       {/* your gifts — moved up under the banner (ben, 2026-07-09): the friend's
           claimed games sit right below the scene, not buried at the page bottom */}
       <ClaimsHistory claims={data.claims} />
+
+      {/* say thanks — the return path of ben's gift note, kept with the gifts it
+          answers. Gated on claims_used (the SERVER's predicate — claims.length
+          also counts compensated claims, so a friend whose only claim failed
+          fulfillment would get a compose that can only 409; review pass 2) OR an
+          existing note (claims_used is non-monotonic: a compensate can drop it
+          to 0 AFTER a thanks landed, and the sent note must never vanish from
+          the friend's own page; converge pass), and on the link being alive;
+          the server enforces the compose path again. onRefused lets a refused
+          send refetch, so "already sent" from another tab converges to the sent
+          view instead of a dead-end error. */}
+      {(data.claims_used > 0 || data.thank_note !== undefined) &&
+        !dead &&
+        token !== undefined && (
+        <ThanksCard
+          token={token}
+          thankNote={data.thank_note}
+          onRefused={refresh}
+        />
+      )}
 
       {/* Steam privacy notice — spec §4 wording verbatim */}
       {steamPrivate && (

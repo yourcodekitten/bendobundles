@@ -79,6 +79,8 @@ fn link(token: &str) -> Link {
         token: token.into(),
         label: "dave".into(),
         gift_note: None,
+        thank_note: None,
+        thanked_at: None,
         claims_allowed: 1,
         claims_used: 0,
         revoked: false,
@@ -323,6 +325,235 @@ async fn gift_note_never_persisted_in_body_blob() {
             .contains("between us"),
         "cleared note must leave no copy at rest"
     );
+}
+
+/// `set_link_thanks` is write-once by construction: the conditional update refuses a
+/// second write (AlreadyThanked) and a missing link (NotFound), and the happy path
+/// stamps note + timestamp together so `thanked_at` can never exist without its note.
+#[tokio::test]
+async fn set_link_thanks_write_once_roundtrip_and_outcomes() {
+    let Some(store) = store_or_skip("thanks-once").await else {
+        return;
+    };
+    let mut claimed = link("tok-thx");
+    claimed.claims_used = 1; // the storage guard requires an unwrap before thanks
+    store.create_link(&claimed).await.unwrap();
+    let at = datetime!(2026-07-15 17:00 UTC);
+
+    // happy path: both fields land, readable through the normal link read
+    assert_eq!(
+        store
+            .set_link_thanks("tok-thx", "omg thank you!!", at)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+    let got = store.get_link("tok-thx").await.unwrap().unwrap();
+    assert_eq!(got.thank_note.as_deref(), Some("omg thank you!!"));
+    assert_eq!(got.thanked_at, Some(at));
+
+    // write-once: a second attempt is refused and the original text is untouched
+    assert_eq!(
+        store
+            .set_link_thanks("tok-thx", "overwrite attempt", at)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::AlreadyThanked
+    );
+    let still = store.get_link("tok-thx").await.unwrap().unwrap();
+    assert_eq!(still.thank_note.as_deref(), Some("omg thank you!!"));
+
+    // unknown token is a distinct outcome, not a silent no-op
+    assert_eq!(
+        store
+            .set_link_thanks("no-such-tok", "hello?", at)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::NotFound
+    );
+}
+
+/// The condition's `revoked = :f` guard makes liveness storage-enforced: even a
+/// caller that skipped (or raced) the handler's pre-check cannot land a note on a
+/// revoked link, and the outcome is distinct from AlreadyThanked/NotFound.
+#[tokio::test]
+async fn set_link_thanks_refused_on_revoked_link() {
+    let Some(store) = store_or_skip("thanks-revoked").await else {
+        return;
+    };
+    let mut claimed = link("tok-rvk");
+    claimed.claims_used = 1;
+    store.create_link(&claimed).await.unwrap();
+    let mut l = store.get_link("tok-rvk").await.unwrap().unwrap();
+    l.revoked = true;
+    store.update_link_meta(&l).await.unwrap();
+
+    assert_eq!(
+        store
+            .set_link_thanks("tok-rvk", "too late", datetime!(2026-07-15 17:00 UTC))
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Revoked
+    );
+    let after = store.get_link("tok-rvk").await.unwrap().unwrap();
+    assert_eq!(after.thank_note, None, "guard must refuse the write");
+    assert_eq!(after.thanked_at, None);
+}
+
+/// The other storage-enforced guards, each classified atomically from the CCF's
+/// own AllOld item (no follow-up read — the classification can't go stale):
+/// expiry uses claim_game's exact clause; no-claims covers the compensate window
+/// (claims_used is not monotonic); and a link that is BOTH revoked and thanked
+/// classifies Revoked — the pinned liveness-beats-already-sent precedence holds
+/// at the storage layer too, not just in the handler.
+#[tokio::test]
+async fn set_link_thanks_expired_noclaims_and_precedence_outcomes() {
+    let Some(store) = store_or_skip("thanks-guards").await else {
+        return;
+    };
+    let now = datetime!(2026-07-15 17:00 UTC);
+
+    // expired link (claimed, so only the expiry guard can fire)
+    let mut expired = link("tok-exp");
+    expired.claims_used = 1;
+    expired.expires_at = Some(datetime!(2026-07-01 00:00 UTC));
+    store.create_link(&expired).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-exp", "too late", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Expired
+    );
+
+    // no claims yet — the guestbook guard, enforced at the storage layer
+    store.create_link(&link("tok-fresh")).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-fresh", "premature", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::NoClaims
+    );
+
+    // revoked AND thanked: Revoked wins (liveness-first precedence)
+    let mut both = link("tok-both");
+    both.claims_used = 1;
+    store.create_link(&both).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-both", "first word", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+    let mut l = store.get_link("tok-both").await.unwrap().unwrap();
+    l.revoked = true;
+    store.update_link_meta(&l).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-both", "second word", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Revoked,
+        "revoked must beat already-thanked in the CCF classification"
+    );
+
+    // expired AND thanked: Expired wins too — liveness-first means BOTH halves,
+    // so this path answers exactly like the handler's pre-check would (pass 2)
+    let mut expboth = link("tok-expboth");
+    expboth.claims_used = 1;
+    store.create_link(&expboth).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-expboth", "first word", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+    let mut l = store.get_link("tok-expboth").await.unwrap().unwrap();
+    l.expires_at = Some(datetime!(2026-07-10 00:00 UTC));
+    store.update_link_meta(&l).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-expboth", "second word", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Expired,
+        "expired must beat already-thanked in the CCF classification"
+    );
+}
+
+/// The thanks fields follow the full gift_note storage contract: authoritative in
+/// top-level attrs, surviving `claim_game`'s `SET body` rewrite, and NEVER serialized
+/// into the `body` blob by any writer (asserted RAW against the stored item).
+#[tokio::test]
+async fn thanks_survives_body_rewrites_and_never_rides_body() {
+    let Some(store) = store_or_skip("thanks-purge").await else {
+        return;
+    };
+    let client = raw_client("thanks-purge").await;
+    let table = "t-thanks-purge";
+    const THANKS: &str = "you absolute legend, thank you";
+
+    store.put_game(&game(1, true)).await.unwrap();
+    let mut l2 = link("tok-thx2");
+    l2.claims_allowed = 2;
+    l2.claims_used = 1; // storage guard: thanks only after an unwrap
+    store.create_link(&l2).await.unwrap();
+    let at = datetime!(2026-07-15 17:00 UTC);
+    assert_eq!(
+        store.set_link_thanks("tok-thx2", THANKS, at).await.unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+
+    let raw_body = || async {
+        let out = client
+            .get_item()
+            .table_name(table)
+            .key("pk", AttributeValue::S("LINK#tok-thx2".into()))
+            .key("sk", AttributeValue::S("META".into()))
+            .send()
+            .await
+            .unwrap();
+        let item = out.item.unwrap();
+        item.get("body").unwrap().as_s().unwrap().to_string()
+    };
+    assert!(
+        !raw_body().await.contains("legend"),
+        "thanks must not ride the body blob"
+    );
+
+    // claim_game's body rewrite (from a pre-thanks read shape) must not disturb it
+    store
+        .claim_game(
+            "tok-thx2",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-15 18:00 UTC),
+        )
+        .await
+        .unwrap();
+    let after = store.get_link("tok-thx2").await.unwrap().unwrap();
+    assert_eq!(after.claims_used, 2);
+    assert_eq!(
+        after.thank_note.as_deref(),
+        Some(THANKS),
+        "claim's body rewrite must not disturb the thanks"
+    );
+    assert_eq!(after.thanked_at, Some(at));
+    assert!(
+        !raw_body().await.contains("legend"),
+        "claim's body rewrite must not serialize the thanks into body"
+    );
+
+    // update_link_meta (revoke shape) — same guarantee
+    let mut l = store.get_link("tok-thx2").await.unwrap().unwrap();
+    l.revoked = true;
+    store.update_link_meta(&l).await.unwrap();
+    let revoked = store.get_link("tok-thx2").await.unwrap().unwrap();
+    assert_eq!(revoked.thank_note.as_deref(), Some(THANKS));
+    assert!(!raw_body().await.contains("legend"));
 }
 
 #[tokio::test]
@@ -1061,6 +1292,8 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
         token: "tok-e".into(),
         label: "dave".into(),
         gift_note: None,
+        thank_note: None,
+        thanked_at: None,
         claims_allowed: 1,
         claims_used: 9,
         revoked: true,

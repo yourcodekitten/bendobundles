@@ -25,12 +25,20 @@ export type LinkView = {
   label: string;
   /** Ben's personal note to the friend; absent when he didn't leave one. */
   gift_note?: string;
+  /** The friend's own thank-you, echoed back; absent when never sent. The
+   * say-thanks card gates on presence — absent = compose, present = sent. */
+  thank_note?: string;
   claims_allowed: number;
   claims_used: number;
   state: LinkState;
   games: GameView[];
   claims: ClaimView[];
 };
+
+export type ThanksResult =
+  | { kind: 'sent'; thank_note: string }
+  | { kind: 'refused'; message: string }
+  | { kind: 'error'; message: string };
 
 export type ClaimResult =
   | { kind: 'gifted'; gift_url: string }
@@ -105,6 +113,11 @@ export type AdminLink = {
   label: string;
   /** Ben's note to the friend; absent when unset (list serializes domain::Link). */
   gift_note?: string;
+  /** The friend's thank-you back; absent when never sent. Read-only — ben
+   * receives their words, he doesn't edit them. */
+  thank_note?: string;
+  /** RFC3339; present iff thank_note is. */
+  thanked_at?: string;
   claims_allowed: number;
   claims_used: number;
   revoked: boolean;
@@ -196,6 +209,33 @@ export async function claimGame(token: string, gameId: string): Promise<ClaimRes
     }
 
     if (response.status === 409 || response.status === 410) {
+      const data = (await response.json()) as { error: string };
+      return { kind: 'refused', message: data.error };
+    }
+
+    return { kind: 'error', message: 'something hiccuped — try again' };
+  } catch {
+    return { kind: 'error', message: 'something hiccuped — try again' };
+  }
+}
+
+/** Send the friend's one thank-you note. 409/422 surface the server's message
+ * (already-sent, dead link, validation); everything else degrades to the same
+ * soft retry line the claim flow uses. */
+export async function sendThanks(token: string, note: string): Promise<ThanksResult> {
+  try {
+    const response = await fetch(`/api/l/${token}/thanks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note }),
+    });
+
+    if (response.status === 200) {
+      const data = (await response.json()) as { thank_note: string };
+      return { kind: 'sent', thank_note: data.thank_note };
+    }
+
+    if (response.status === 409 || response.status === 422) {
       const data = (await response.json()) as { error: string };
       return { kind: 'refused', message: data.error };
     }

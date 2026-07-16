@@ -1,6 +1,7 @@
 //! Public (friend-facing) HTTP API: link view and claim flow.
 //!
 //! Routes: `GET /api/l/:token`, `POST /api/l/:token/claim`,
+//!         `POST /api/l/:token/thanks`,
 //!         `GET /api/steam/login`, `GET /api/steam/return`,
 //!         `GET /api/l/:token/steam/owned/:steamid`, fallback 404.
 use std::sync::Arc;
@@ -130,6 +131,11 @@ struct LinkView {
     /// Omitted from the JSON entirely when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     gift_note: Option<String>,
+    /// The friend's own thank-you, echoed back so a revisit renders "sent"
+    /// instead of the compose card. Omitted when never thanked — the client
+    /// gates on field presence, same as gift_note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thank_note: Option<String>,
     claims_allowed: u32,
     claims_used: u32,
     /// Explicit link state: "active" | "revoked" | "expired" | "exhausted".
@@ -160,6 +166,7 @@ pub fn router(
     Router::new()
         .route("/api/l/:token", get(handle_get_link))
         .route("/api/l/:token/claim", post(handle_post_claim))
+        .route("/api/l/:token/thanks", post(handle_post_thanks))
         .route(
             "/api/l/:token/steam/owned/:steamid",
             get(handle_steam_owned_proxy),
@@ -553,6 +560,9 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             // (revoked/expired) link must not serve ben's message to whoever
             // holds the URL. Same gate as the games list.
             gift_note: if hide_games { None } else { link.gift_note },
+            // Same personal-content gate: a dead link serves neither direction
+            // of the correspondence.
+            thank_note: if hide_games { None } else { link.thank_note },
             claims_allowed: link.claims_allowed,
             claims_used: link.claims_used,
             state,
@@ -689,6 +699,240 @@ async fn handle_post_claim(
         // Parked, Error, transport failure, or any unexpected variant:
         // claim intake succeeded; reconcile owns the fate.
         _ => park_response(),
+    }
+}
+
+// ── POST /api/l/:token/thanks ─────────────────────────────────────────────────
+
+/// Same budget as the gift note it answers (admin-api's `GIFT_NOTE_MAX_CHARS`) —
+/// the correspondence is symmetric on purpose.
+const THANK_NOTE_MAX_CHARS: usize = 500;
+
+/// Characters that can visually reorder or invisibly pad the note when it renders
+/// beside trusted admin chrome — the friend's text sits immediately before the
+/// "— label, date" attribution ben reads, and a U+202E override would let it spoof
+/// that signature (OMBB, #76 review; display-spoofing, not XSS — React escaping
+/// holds). This is the Unicode Cf (format) category minus three carve-outs,
+/// spelled out because `char::is_control` covers only Cc: bidi
+/// embeddings/overrides/isolates, zero-width space, soft hyphen, word joiner +
+/// invisible operators + deprecated formatting (the FULL U+2060–206F block —
+/// pass 2 caught pass 1 stopping at 2069 and re-opening the invisible-note hole
+/// through U+206A–206F; U+2065 is unassigned-and-default-ignorable, swept on
+/// purpose), Arabic/Syriac/other prepended marks, interlinear annotation,
+/// musical formatting, BOM, and the tag block (U+E0000–E007F — note this
+/// degrades RGI subdivision-flag emoji like Scotland's to a plain black flag; an
+/// accepted trade-off, the tag block is the canonical invisible-smuggling
+/// channel and the base flag survives). Carve-outs, all "load-bearing in real
+/// scripts, zero reordering power": ZWJ/ZWNJ (U+200C/D — emoji sequences, Indic)
+/// and MVS (U+180E — selects Mongolian final-vowel forms; bidi class BN).
+/// Intrinsic RTL text (Arabic/Hebrew letters) is untouched — only the invisible
+/// controls are the spoofing vector.
+fn is_spoofing_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Kept by the sanitizer (legitimate in real text) but rendering as nothing when
+/// standing alone: the ZWJ/ZWNJ/MVS carve-outs, variation selectors, and the
+/// blank-note classics — Hangul fillers (U+3164 is *the* "empty message"
+/// character; Lo, so no category check catches it) and the Khmer inherent
+/// vowels. Used by the emptiness gate: a note made ONLY of these is refused as
+/// wordless rather than stored as a visibly blank note that permanently consumes
+/// the friend's write-once slot (review pass 2 — the pass-1 guarantee held for
+/// Cc/Cf but not for these).
+fn is_invisible_standalone(c: char) -> bool {
+    matches!(
+        c,
+        '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180E}'
+            | '\u{200C}'
+            | '\u{200D}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FFA0}'
+            | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// Normalize a raw note before validation: line/segment separators (newline, CR,
+/// tab, VT, FF, NEL, U+2028/U+2029 — everything that breaks lines in some text
+/// lineage; a PDF-paste's form feeds are word boundaries too, review pass 2)
+/// become plain spaces so a multiline paste keeps its word boundaries, and every
+/// other control character or spoofing format char is stripped. Runs BEFORE the
+/// emptiness/length checks, so a note of nothing but invisibles is refused as
+/// empty, and stripped characters can't smuggle a 501st visible char past the
+/// budget.
+fn sanitize_note(raw: &str) -> String {
+    raw.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
+                Some(' ')
+            }
+            c if c.is_control() || is_spoofing_format_char(c) => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+#[derive(Deserialize)]
+struct ThanksBody {
+    note: String,
+}
+
+/// The friend's one thank-you back to ben. Write-once (the store's conditional
+/// update enforces it — two tabs can't overwrite the first word), link-level
+/// (the link IS the friend's identity here, same as the gift note it mirrors),
+/// and only meaningful after an unwrap: no claims yet → refused.
+async fn handle_post_thanks(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+    Json(body): Json<ThanksBody>,
+) -> Response {
+    // 1. Validate before any read. Unlike the admin's gift-note parser, empty is
+    //    an error rather than "clear" — there is no clearing a thank-you.
+    //    Sanitize first: control/bidi strip precedes emptiness and budget checks.
+    let sanitized = sanitize_note(&body.note);
+    let note = sanitized.trim();
+    // "Empty" means no visible ink, not just no characters: the sanitizer keeps
+    // ZWJ/ZWNJ/MVS/variation-selectors/Hangul-fillers because they're legitimate
+    // INSIDE text, but a note made only of them renders blank beside ben's
+    // attribution and burns the write-once slot on nothing (review pass 2).
+    // Whitespace is inkless too — trim only strips the EDGES, and invisible
+    // chars at the edges shield interior spaces from it (ZWJ\nZWJ sanitizes to
+    // "ZWJ ZWJ" and sailed through an is_invisible-only check; converge pass).
+    if note
+        .chars()
+        .all(|c| c.is_whitespace() || is_invisible_standalone(c))
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "a thank-you needs some words"})),
+        )
+            .into_response();
+    }
+    if note.chars().count() > THANK_NOTE_MAX_CHARS {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("note must be at most {THANK_NOTE_MAX_CHARS} characters")
+            })),
+        )
+            .into_response();
+    }
+
+    // 2. Resolve link — same 404 shape as unknown token everywhere else.
+    let link = match s.store.get_link(&token).await {
+        Ok(Some(l)) => l,
+        Ok(None) => return link_not_found_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "try again"})),
+            )
+                .into_response();
+        }
+    };
+
+    // 3. Liveness gate: dead links don't take mail (same messages as the claim
+    //    handler). Exhausted is NOT dead here — a fully-claimed link is exactly
+    //    when a friend says thanks — so only Revoked/Expired refuse.
+    let now = OffsetDateTime::now_utc();
+    match link.can_claim(now) {
+        Ok(()) | Err(domain::ClaimRefusal::Exhausted) => {}
+        Err(domain::ClaimRefusal::Revoked) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "this link has been revoked"})),
+            )
+                .into_response();
+        }
+        Err(domain::ClaimRefusal::Expired) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "this link has expired"})),
+            )
+                .into_response();
+        }
+    }
+
+    // 4. Thanks is the echo of an unwrap, not a guestbook: no claim, no note.
+    if link.claims_used == 0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "claim a game first"})),
+        )
+            .into_response();
+    }
+
+    // 5. Write-once conditional write. `at` is pre-truncated to whole seconds so
+    //    the value we echo back is byte-identical to what a re-read will serve
+    //    (storage is epoch seconds).
+    let at = OffsetDateTime::from_unix_timestamp(now.unix_timestamp())
+        .expect("truncating now() to seconds cannot leave the valid range");
+    match s.store.set_link_thanks(&token, note, at).await {
+        Ok(dynamo::SetThanksOutcome::Set) => {
+            tracing::info!("thanks: landed"); // never the note text
+            let ts = at
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"thank_note": note, "thanked_at": ts})),
+            )
+                .into_response()
+        }
+        Ok(dynamo::SetThanksOutcome::AlreadyThanked) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "thanks already sent"})),
+        )
+            .into_response(),
+        // Steps 3-4 raced past the pre-checks and the storage guards caught them —
+        // same messages as the pre-checks, the friend can't tell the paths apart.
+        Ok(dynamo::SetThanksOutcome::Revoked) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "this link has been revoked"})),
+        )
+            .into_response(),
+        Ok(dynamo::SetThanksOutcome::Expired) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "this link has expired"})),
+        )
+            .into_response(),
+        Ok(dynamo::SetThanksOutcome::NoClaims) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "claim a game first"})),
+        )
+            .into_response(),
+        Ok(dynamo::SetThanksOutcome::NotFound) => link_not_found_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "try again"})),
+        )
+            .into_response(),
     }
 }
 

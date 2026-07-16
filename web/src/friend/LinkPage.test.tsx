@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { LinkPage } from "./LinkPage";
+import { ThanksCard } from "./ThanksCard";
 import type { LinkView } from "../api";
 
 // Partial mock: fetch functions mocked, error classes REAL so instanceof
@@ -15,6 +16,7 @@ vi.mock("../api", async (importOriginal) => {
     claimGame: vi.fn(),
     steamOwnedForLink: vi.fn(),
     fetchGameDetail: vi.fn(),
+    sendThanks: vi.fn(),
   };
 });
 
@@ -27,6 +29,7 @@ import {
   FetchFailed,
   steamOwnedForLink,
   fetchGameDetail,
+  sendThanks,
 } from "../api";
 import { clearGameDetailCache } from "../gameDetailCache";
 import {
@@ -85,6 +88,262 @@ describe("LinkPage", () => {
       expect(screen.getByText("Test Bundle")).toBeInTheDocument();
     });
     expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
+  });
+
+  describe("say-thanks card", () => {
+    const claimedLink: LinkView = {
+      ...baseLink,
+      claims: [
+        {
+          game_id: "gk1:mn",
+          title: "Dome Keeper",
+          state: "fulfilled",
+          gift_url: "https://humble.example/g",
+        },
+      ],
+    };
+
+    it("shows the compose card when claims exist and no note was sent", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+      expect(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("hides the card entirely when nothing has been claimed", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, claims_used: 0 });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText("Test Bundle")).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/say thanks to ben/)).not.toBeInTheDocument();
+    });
+
+    it("still shows a SENT note when claims_used dropped to 0 after compensation", async () => {
+      // claims_used is non-monotonic: a thanks can land during the
+      // claim→park→compensate span, ending at claims_used 0 WITH a note. The
+      // friend's delivered note must never vanish from their own page — only
+      // the COMPOSE is gated on claims_used (converge pass).
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...baseLink,
+        claims_used: 0,
+        thank_note: "sent before the gift fell through",
+        claims: [
+          {
+            game_id: "gk1:mn",
+            title: "Dome Keeper",
+            state: "compensated",
+            gift_url: null,
+          },
+        ],
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(
+          screen.getByText(/sent before the gift fell through/),
+        ).toBeInTheDocument();
+      });
+      expect(
+        screen.queryByRole("textbox", { name: /your thank-you note/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("hides the card when the only claim was compensated (claims_used back to 0)", async () => {
+      // the gate must use claims_used — the server's predicate — not
+      // claims.length: the claims list includes compensated records, so a
+      // friend whose one claim failed fulfillment would otherwise get a
+      // compose box that can only ever 409 (review pass 2)
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...baseLink,
+        claims_used: 0,
+        claims: [
+          {
+            game_id: "gk1:mn",
+            title: "Dome Keeper",
+            state: "compensated",
+            gift_url: null,
+          },
+        ],
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText("Test Bundle")).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/say thanks to ben/)).not.toBeInTheDocument();
+    });
+
+    it("hides the card on a dead link even with claims", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...claimedLink,
+        state: "revoked",
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(
+          screen.getByText(/this invite isn't active anymore/),
+        ).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/say thanks to ben/)).not.toBeInTheDocument();
+    });
+
+    it("renders the sent note instead of the compose when thank_note is present", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...claimedLink,
+        thank_note: "omg thank you!!",
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/omg thank you!!/)).toBeInTheDocument();
+      });
+      expect(screen.getByText(/— you, delivered to ben/)).toBeInTheDocument();
+      expect(screen.queryByRole("textbox", { name: /your thank-you note/i })).not.toBeInTheDocument();
+    });
+
+    it("sends the trimmed note once and flips to the sent state", async () => {
+      const user = userEvent.setup();
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      vi.mocked(sendThanks).mockResolvedValue({
+        kind: "sent",
+        thank_note: "ben you legend",
+      });
+      renderLinkPage("tok123");
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+
+      const box = screen.getByRole("textbox", { name: /your thank-you note/i });
+      await user.type(box, "  ben you legend  ");
+      await user.click(screen.getByRole("button", { name: /send it/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/ben you legend/)).toBeInTheDocument();
+      });
+      expect(sendThanks).toHaveBeenCalledWith("tok123", "ben you legend");
+      expect(sendThanks).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(/— you, delivered to ben/)).toBeInTheDocument();
+      expect(
+        screen.queryByRole("textbox", { name: /your thank-you note/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("keeps the compose and shows the message when the server refuses", async () => {
+      const user = userEvent.setup();
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      vi.mocked(sendThanks).mockResolvedValue({
+        kind: "refused",
+        message: "thanks already sent",
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+
+      await user.type(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+        "hello",
+      );
+      await user.click(screen.getByRole("button", { name: /send it/i }));
+
+      await waitFor(() => {
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "thanks already sent",
+        );
+      });
+      // the compose must be USABLE after a refusal, not just present — a
+      // sending-flag that never resets would freeze both controls forever
+      // and this test would still pass on presence alone (review pass 1)
+      expect(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+      ).toBeEnabled();
+      expect(screen.getByRole("button", { name: /send it/i })).toBeEnabled();
+    });
+
+    it("refused send triggers a refetch so a cross-tab 'already sent' converges", async () => {
+      // the 409 body carries only the error string, so the refetch is the ONLY
+      // path that can deliver the other tab's note text (review pass 2)
+      const user = userEvent.setup();
+      vi.mocked(fetchLink)
+        .mockResolvedValueOnce({ ...claimedLink })
+        .mockResolvedValue({
+          ...claimedLink,
+          thank_note: "sent from my phone",
+        });
+      vi.mocked(sendThanks).mockResolvedValue({
+        kind: "refused",
+        message: "thanks already sent",
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+
+      await user.type(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+        "hello again",
+      );
+      await user.click(screen.getByRole("button", { name: /send it/i }));
+
+      // the refused path bumps refreshTick → second fetchLink resolves with the
+      // note → the derived prop flips the card to the sent view
+      await waitFor(() => {
+        expect(screen.getByText(/sent from my phone/)).toBeInTheDocument();
+      });
+      expect(fetchLink).toHaveBeenCalledTimes(2);
+      expect(
+        screen.queryByRole("textbox", { name: /your thank-you note/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("flips to the sent view when a later thankNote prop surfaces a note sent elsewhere", async () => {
+      // cross-tab: the card is mounted composing; a refetch (claim in another
+      // tab bumps refreshTick) delivers thank_note through the prop. The card
+      // derives its view from the prop, so it must flip WITHOUT a remount —
+      // mount-time-only seeding would show the compose forever (review pass 1).
+      const { rerender } = render(<ThanksCard token="tok123" />);
+      expect(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+      ).toBeInTheDocument();
+
+      rerender(<ThanksCard token="tok123" thankNote="sent from my phone" />);
+      expect(screen.getByText(/sent from my phone/)).toBeInTheDocument();
+      expect(
+        screen.queryByRole("textbox", { name: /your thank-you note/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("disables the button while a send is in flight — a double-click can't fire twice", async () => {
+      const user = userEvent.setup();
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      // never resolves: the send stays in flight for the whole test
+      vi.mocked(sendThanks).mockImplementation(() => new Promise(() => {}));
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+
+      await user.type(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+        "hello",
+      );
+      const send = screen.getByRole("button", { name: /send/i });
+      await user.click(send);
+      expect(send).toBeDisabled();
+      await user.click(send); // second click lands on a disabled button
+      expect(sendThanks).toHaveBeenCalledTimes(1);
+    });
+
+    it("disables send while the note is empty", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+      expect(screen.getByRole("button", { name: /send it/i })).toBeDisabled();
+    });
   });
 
   it("shows loading state initially", () => {

@@ -173,6 +173,24 @@ pub struct Link {
     /// existed deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gift_note: Option<String>,
+    /// The friend's thank-you back to ben — `gift_note`'s return path. Same storage
+    /// rules as the note it mirrors: authoritative ONLY in a top-level dynamo
+    /// attribute (written by `set_link_thanks`' scoped conditional update, write-once),
+    /// stripped from the stored `body` blob by `schema::link_body`, overridden on read
+    /// by `link_from_item`. `#[serde(default)]`: every pre-existing record reads back
+    /// as None (never thanked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thank_note: Option<String>,
+    /// When the thank-you landed. `Some` iff [`thank_note`](Self::thank_note) is `Some` —
+    /// `set_link_thanks` writes both in one update. Same serde shape as `expires_at`
+    /// (`default` restores None-on-missing under the `with` module) plus skip-on-None
+    /// so absent stays absent on the wire.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub thanked_at: Option<OffsetDateTime>,
     pub claims_allowed: u32,
     pub claims_used: u32,
     pub revoked: bool,
@@ -392,6 +410,8 @@ mod tests {
             token: "tok".into(),
             label: "dave".into(),
             gift_note: None,
+            thank_note: None,
+            thanked_at: None,
             claims_allowed: 2,
             claims_used: 0,
             revoked: false,
@@ -472,6 +492,27 @@ mod tests {
         some_link.expires_at = Some(datetime!(2026-08-01 00:00 UTC));
         let back: Link = serde_json::from_str(&serde_json::to_string(&some_link).unwrap()).unwrap();
         assert_eq!(back, some_link);
+    }
+
+    #[test]
+    fn link_thanks_fields_missing_is_none_and_roundtrips() {
+        // Every stored link predates the thanks feature: JSON without either field
+        // must deserialize (thank_note=None, thanked_at=None), not error. A fresh
+        // serialization already omits both keys (skip_serializing_if, asserted
+        // below), so it IS the legacy shape — no key-stripping needed.
+        let json = serde_json::to_value(link()).unwrap();
+        assert!(json.get("thank_note").is_none());
+        assert!(json.get("thanked_at").is_none());
+        let l: Link = serde_json::from_value(json).unwrap();
+        assert_eq!(l.thank_note, None);
+        assert_eq!(l.thanked_at, None);
+
+        // Set values roundtrip.
+        let mut thanked = link();
+        thanked.thank_note = Some("omg thank you!!".into());
+        thanked.thanked_at = Some(datetime!(2026-07-15 12:00 UTC));
+        let back: Link = serde_json::from_str(&serde_json::to_string(&thanked).unwrap()).unwrap();
+        assert_eq!(back, thanked);
     }
 
     #[test]

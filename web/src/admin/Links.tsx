@@ -474,6 +474,21 @@ export function Links() {
                 </p>
               )}
 
+              {/* The friend's thank-you — read-only, ben receives their words.
+                  Signed with the link's label: "♡ …" — Dave, 7/15/2026 */}
+              {link.thank_note !== undefined && (
+                <p className="mt-2 text-xs italic text-give-soft">
+                  <span aria-hidden="true">♡ </span>
+                  &ldquo;{link.thank_note}&rdquo;{' '}
+                  <span className="not-italic text-dust-faint">
+                    &mdash; {link.label}
+                    {link.thanked_at !== undefined
+                      ? `, ${formatDate(link.thanked_at)}`
+                      : ''}
+                  </span>
+                </p>
+              )}
+
               {/* Note editor — save persists; a blank save clears the note */}
               {noteDraft !== undefined && (
                 <div className="mt-2 flex flex-col gap-2">
