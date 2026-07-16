@@ -102,6 +102,17 @@ pub enum SetThanksOutcome {
     /// write; a dead link takes no mail even in that window (OMBB, #76 review).
     /// Caller should 409 with the revoked message.
     Revoked,
+    /// The link is expired — the condition's expiry guard fired. Same storage-enforced
+    /// liveness as `Revoked` (and the same clause `claim_game` uses), so the docstring's
+    /// "liveness is storage-enforced" holds for BOTH halves. Caller should 409.
+    Expired,
+    /// The link has no claims — `claims_used >= :one` fired. The handler pre-checks
+    /// this too, but `claims_used` is NOT monotonic (`compensate_claim` decrements it
+    /// when fulfillment fails), so the pre-check's read can be stale for the whole
+    /// claim→park→compensate span. Without this guard a thanks accepted in that span
+    /// would permanently consume the friend's one note on a gift that was never
+    /// delivered (#76 review pass 1). Caller should 409 "claim a game first".
+    NoClaims,
 }
 
 /// Persisted summary of a catalog-sync run. Storage-shaped (lives in dynamo, not in domain).
@@ -544,14 +555,22 @@ impl Store {
     /// counters, `expires_at`) by construction. Note + timestamp land in ONE update,
     /// so `thanked_at` can never exist without its note.
     ///
-    /// The condition also carries `revoked = :f` so a revoke landing between the
-    /// caller's liveness pre-check and this write still refuses the note — liveness
-    /// is storage-enforced, not just handler-checked (OMBB, #76 review). `revoked`
-    /// always exists as a top-level attr (`link_item` writes it at creation,
-    /// `update_link_meta` SETs it), so the compare never NULL-fails on a real item.
+    /// The condition storage-enforces the FULL guard ladder, not just write-once:
+    /// `revoked = :f` (a revoke racing the handler's pre-check still refuses — OMBB,
+    /// #76 review), the same expiry clause `claim_game` uses, and `claims_used >= :one`
+    /// (claims are NOT monotonic — `compensate_claim` decrements on fulfillment
+    /// failure, so the pre-check can be stale for the whole claim→park→compensate
+    /// span). `revoked`/`claims_used` always exist as top-level attrs (`link_item`
+    /// writes both at creation), so the compares never NULL-fail on a real item.
     ///
-    /// A CCF is ambiguous (no such link / already thanked / revoked); it's
-    /// disambiguated by a follow-up read.
+    /// A CCF is classified ATOMICALLY from the failed write's own
+    /// `ReturnValuesOnConditionCheckFailure::AllOld` item — the exact item the
+    /// condition was evaluated against. No follow-up read: a plain re-read is
+    /// eventually consistent, and a stale replica that hadn't applied a concurrent
+    /// tab's thanks write would misclassify AlreadyThanked as something else
+    /// (#76 review pass 1 — moto can't see this, its reads are always strong).
+    /// Classification order matches the pinned guard precedence: dead link first,
+    /// then already-thanked, then no-claims.
     pub async fn set_link_thanks(
         &self,
         token: &str,
@@ -566,25 +585,54 @@ impl Store {
             .key("pk", pk)
             .key("sk", sk)
             .condition_expression(
-                "attribute_exists(pk) AND attribute_not_exists(thank_note) AND revoked = :f",
+                "attribute_exists(pk) AND attribute_not_exists(thank_note) \
+                 AND revoked = :f AND claims_used >= :one \
+                 AND (attribute_not_exists(expires_at) OR expires_at > :now)",
             )
             .update_expression("SET thank_note = :n, thanked_at = :t")
             .expression_attribute_values(":n", schema::s(note))
             .expression_attribute_values(":f", aws_sdk_dynamodb::types::AttributeValue::Bool(false))
-            .expression_attribute_values(":t", schema::epoch_s(at));
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .expression_attribute_values(":now", schema::epoch_s(at))
+            .expression_attribute_values(":t", schema::epoch_s(at))
+            .return_values_on_condition_check_failure(
+                aws_sdk_dynamodb::types::ReturnValuesOnConditionCheckFailure::AllOld,
+            );
         match req.send().await {
             Ok(_) => Ok(SetThanksOutcome::Set),
-            // The re-read below leans on links NEVER being deleted (the only
-            // delete_items in this crate are sync-mutex/session/steam-identity):
-            // None can only mean "never existed", so it cannot misclassify. If a
-            // link-deletion feature ever lands, THIS disambiguation is the first
-            // thing it breaks — revisit before shipping that.
-            Err(sdk_err) if is_ccf_update(&sdk_err) => match self.get_link(token).await? {
-                None => Ok(SetThanksOutcome::NotFound),
-                Some(l) if l.thank_note.is_some() => Ok(SetThanksOutcome::AlreadyThanked),
-                // Real item, no note, condition still failed ⇒ the revoked guard.
-                Some(_) => Ok(SetThanksOutcome::Revoked),
-            },
+            Err(sdk_err) if is_ccf_update(&sdk_err) => {
+                let item = match sdk_err.as_service_error() {
+                    Some(
+                        aws_sdk_dynamodb::operation::update_item::UpdateItemError::ConditionalCheckFailedException(ccf),
+                    ) => ccf.item.clone(),
+                    _ => unreachable!("guarded by is_ccf_update"),
+                };
+                // Item absent from the CCF payload ⇒ the key didn't exist at
+                // evaluation time ⇒ the token never existed (links are never
+                // deleted — the only delete_items in this crate are
+                // sync-mutex/session/steam-identity; a link-deletion feature
+                // would break this and must revisit here).
+                let Some(item) = item.filter(|i| !i.is_empty()) else {
+                    return Ok(SetThanksOutcome::NotFound);
+                };
+                let link = link_from_item(&item)?;
+                if link.revoked {
+                    Ok(SetThanksOutcome::Revoked)
+                } else if link.thank_note.is_some() {
+                    Ok(SetThanksOutcome::AlreadyThanked)
+                } else if link.expires_at.is_some_and(|exp| exp <= at) {
+                    Ok(SetThanksOutcome::Expired)
+                } else if link.claims_used == 0 {
+                    Ok(SetThanksOutcome::NoClaims)
+                } else {
+                    // Every conjunct accounted for above — reaching here means the
+                    // condition and this classifier disagree. Fail loudly.
+                    Err(StoreError::Corrupt("thanks CCF with no classifiable cause"))
+                }
+            }
             Err(sdk_err) => Err(StoreError::Aws(format!("{sdk_err:?}"))),
         }
     }

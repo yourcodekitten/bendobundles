@@ -14,11 +14,15 @@ is the echo after it.
 
 - **link-level, not claim-level.** the link IS the friend's identity in this system; the
   gift note rides the link, so the thanks does too. one note per link, write-once.
-- **storage:** top-level dynamo attrs `thank_note` (S) + `thanked_at` (S, RFC3339) on
-  `LINK#<token>/META`. written ONLY by `Store::set_link_thanks`, a single-attribute
-  conditional `UpdateItem` — never through `update_link_meta`, never in `body`
-  (`schema::link_body` strips both, same no-copy-at-rest rule OMBB set in #69).
-  write-once by construction: `attribute_exists(pk) AND attribute_not_exists(thank_note)`.
+- **storage:** top-level dynamo attrs `thank_note` (S) + `thanked_at` (N, epoch seconds —
+  `epoch_s`'s blanket rule for top-level times) on `LINK#<token>/META`. written ONLY by
+  `Store::set_link_thanks`, a scoped conditional `UpdateItem` — never through
+  `update_link_meta`, never in `body` (`schema::link_body` strips both, same
+  no-copy-at-rest rule OMBB set in #69). the condition storage-enforces the full guard
+  ladder: `attribute_exists(pk) AND attribute_not_exists(thank_note) AND revoked = :f
+  AND claims_used >= :one AND (attribute_not_exists(expires_at) OR expires_at > :now)`
+  — write-once, dead links take no mail even racing a revoke, and the compensate
+  window (claims_used is not monotonic) can't leave a note on a zero-claim link.
 - **read:** `link_from_item` overrides both unconditionally from the top-level attrs
   (absence = never thanked), same as `gift_note`.
 
@@ -39,8 +43,12 @@ body `{"note": string}`. guards, in order:
 5. `set_link_thanks` → `AlreadyThanked` → 409 `"thanks already sent"`; success → 200
    `{"thank_note", "thanked_at"}` (canonical stored values).
 
-CCF on the conditional write is disambiguated by a follow-up `get_link` (missing → 404,
-note present → AlreadyThanked); links are never deleted, so the re-read can't lie.
+CCF on the conditional write is classified ATOMICALLY from the failed write's own
+`ReturnValuesOnConditionCheckFailure::AllOld` item (missing → 404, revoked → 409 revoked,
+note present → 409 already-sent, expired → 409 expired, zero claims → 409 claim-first —
+liveness before already-sent, matching the handler's ladder). no follow-up read: an
+eventually-consistent re-read racing a concurrent tab's write could misclassify
+AlreadyThanked as something scarier (pass-1 review find).
 
 ### reads
 

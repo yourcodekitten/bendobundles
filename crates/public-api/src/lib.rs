@@ -712,34 +712,56 @@ const THANK_NOTE_MAX_CHARS: usize = 500;
 /// beside trusted admin chrome — the friend's text sits immediately before the
 /// "— label, date" attribution ben reads, and a U+202E override would let it spoof
 /// that signature (OMBB, #76 review; display-spoofing, not XSS — React escaping
-/// holds). Explicit bidi embeddings/overrides/isolates, the zero-width space, BOM,
-/// and the Arabic letter mark. ZWJ/ZWNJ (U+200C/U+200D) are deliberately KEPT:
-/// they're load-bearing in emoji sequences and Indic scripts and have no
-/// reordering power. Intrinsic RTL text (Arabic/Hebrew letters) is untouched —
-/// only the explicit control characters are the spoofing vector.
+/// holds). This is the Unicode Cf (format) category minus ZWJ/ZWNJ, spelled out
+/// because `char::is_control` covers only Cc: bidi embeddings/overrides/isolates,
+/// zero-width space, soft hyphen, word joiner + the invisible operators
+/// (U+2060–2064 — an all-U+2060 note read as visibly empty otherwise slips past
+/// the emptiness check; review pass 1), Arabic/Syriac/other prepended marks,
+/// interlinear annotation, musical formatting, BOM, and the tag block
+/// (U+E0000–E007F). ZWJ/ZWNJ (U+200C/U+200D) are deliberately KEPT: load-bearing
+/// in emoji sequences and Indic scripts, no reordering power. Intrinsic RTL text
+/// (Arabic/Hebrew letters) is untouched — only the invisible controls are the
+/// spoofing vector.
 fn is_spoofing_format_char(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
             | '\u{200B}'
             | '\u{200E}'
             | '\u{200F}'
             | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
             | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
     )
 }
 
 /// Normalize a raw note before validation: whitespace controls (newline, CR, tab)
-/// become plain spaces so a multiline paste keeps its word boundaries (both
-/// surfaces render the note single-line), and every other control character or
-/// spoofing format char is stripped. Runs BEFORE the emptiness/length checks, so
-/// a note of nothing but bidi controls is refused as empty, and stripped
-/// characters can't smuggle a 501st visible char past the budget.
+/// and the Unicode line/paragraph separators (U+2028/U+2029 — not Cc, not Cf, but
+/// they'd still break the single-line rendering next to the attribution) become
+/// plain spaces so a multiline paste keeps its word boundaries, and every other
+/// control character or spoofing format char is stripped. Runs BEFORE the
+/// emptiness/length checks, so a note of nothing but invisibles is refused as
+/// empty, and stripped characters can't smuggle a 501st visible char past the
+/// budget.
 fn sanitize_note(raw: &str) -> String {
     raw.chars()
         .filter_map(|c| match c {
-            '\n' | '\r' | '\t' => Some(' '),
+            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => Some(' '),
             c if c.is_control() || is_spoofing_format_char(c) => None,
             c => Some(c),
         })
@@ -848,11 +870,21 @@ async fn handle_post_thanks(
             Json(serde_json::json!({"error": "thanks already sent"})),
         )
             .into_response(),
-        // A revoke raced past the step-3 pre-check and the storage guard caught
-        // it — same message as the pre-check, the friend can't tell the paths apart.
+        // Steps 3-4 raced past the pre-checks and the storage guards caught them —
+        // same messages as the pre-checks, the friend can't tell the paths apart.
         Ok(dynamo::SetThanksOutcome::Revoked) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "this link has been revoked"})),
+        )
+            .into_response(),
+        Ok(dynamo::SetThanksOutcome::Expired) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "this link has expired"})),
+        )
+            .into_response(),
+        Ok(dynamo::SetThanksOutcome::NoClaims) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "claim a game first"})),
         )
             .into_response(),
         Ok(dynamo::SetThanksOutcome::NotFound) => link_not_found_response(),

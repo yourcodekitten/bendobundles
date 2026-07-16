@@ -437,24 +437,44 @@ async fn thanks_validation_422() {
             &bad[..bad.len().min(10)]
         );
     }
-    // a note that is NOTHING but bidi/zero-width controls sanitizes to empty → 422,
-    // not a stored invisible note
+    // a note that is NOTHING but invisibles sanitizes to empty → 422, not a
+    // stored invisible note. Covers the bidi set AND the non-bidi format chars
+    // (word joiner, soft hyphen, invisible times, tag chars) that char::is_control
+    // misses — an all-U+2060 note reads as visibly empty on the admin surface.
+    for invisible in [
+        "\u{202E}\u{200B}\u{2066}\u{200F}",
+        "\u{2060}\u{2060}",
+        "\u{00AD}\u{2061}\u{E0041}",
+    ] {
+        let resp = plain_router(Arc::clone(&store), mock.clone())
+            .oneshot(thanks_req("thxv-tok", invisible))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "all-invisible note {invisible:?} must be refused as empty"
+        );
+    }
+
+    // sanitize-before-budget ORDERING pin: 500 visible chars plus a smuggled bidi
+    // override is 501 raw chars — budget-after-sanitize accepts it (the stored
+    // value is the clean 500), budget-before-sanitize would 422. This is the only
+    // case in this test where the two orderings disagree; don't drop it.
     let resp = plain_router(Arc::clone(&store), mock.clone())
-        .oneshot(thanks_req("thxv-tok", "\u{202E}\u{200B}\u{2066}\u{200F}"))
+        .oneshot(thanks_req(
+            "thxv-tok",
+            &format!("{}\u{202E}", "x".repeat(500)),
+        ))
         .await
         .unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "all-bidi note must be refused as empty"
+        StatusCode::OK,
+        "501 raw chars that sanitize to 500 must pass — the budget applies to what is stored"
     );
-
-    // exactly at the budget is fine
-    let resp = plain_router(Arc::clone(&store), mock.clone())
-        .oneshot(thanks_req("thxv-tok", &"x".repeat(500)))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(j["thank_note"], "x".repeat(500));
 }
 
 /// Guard-ladder precedence: validation is token-independent and runs FIRST — an

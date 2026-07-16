@@ -34,14 +34,23 @@ function SentNote({ note }: { note: string }) {
 export function ThanksCard({ token, thankNote }: ThanksCardProps) {
   const [note, setNote] = useState('');
   const [sending, setSending] = useState(false);
-  const [sent, setSent] = useState<string | null>(thankNote ?? null);
+  const [sent, setSent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  if (sent !== null) {
-    return <SentNote note={sent} />;
+  // Own send wins for immediacy, else whatever the server last said. Deriving
+  // (not seeding state from the prop) means a refetch that surfaces a note sent
+  // in ANOTHER tab flips this tab to the sent view too — mount-time seeding
+  // would ignore prop updates forever (review pass 1).
+  const effectiveSent = sent ?? thankNote ?? null;
+  if (effectiveSent !== null) {
+    return <SentNote note={effectiveSent} />;
   }
 
-  const remaining = MAX_CHARS - [...note].length;
+  // Counted in UTF-16 units to agree with maxLength, which the browser enforces
+  // in the same units — else 250 pasted emoji lock the box while the counter
+  // still claims 250 left. The server's scalar count is never larger than the
+  // UTF-16 count, so anything the box admits, the server admits.
+  const remaining = MAX_CHARS - note.length;
 
   const submit = async () => {
     setSending(true);

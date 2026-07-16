@@ -335,7 +335,9 @@ async fn set_link_thanks_write_once_roundtrip_and_outcomes() {
     let Some(store) = store_or_skip("thanks-once").await else {
         return;
     };
-    store.create_link(&link("tok-thx")).await.unwrap();
+    let mut claimed = link("tok-thx");
+    claimed.claims_used = 1; // the storage guard requires an unwrap before thanks
+    store.create_link(&claimed).await.unwrap();
     let at = datetime!(2026-07-15 17:00 UTC);
 
     // happy path: both fields land, readable through the normal link read
@@ -379,7 +381,9 @@ async fn set_link_thanks_refused_on_revoked_link() {
     let Some(store) = store_or_skip("thanks-revoked").await else {
         return;
     };
-    store.create_link(&link("tok-rvk")).await.unwrap();
+    let mut claimed = link("tok-rvk");
+    claimed.claims_used = 1;
+    store.create_link(&claimed).await.unwrap();
     let mut l = store.get_link("tok-rvk").await.unwrap().unwrap();
     l.revoked = true;
     store.update_link_meta(&l).await.unwrap();
@@ -394,6 +398,66 @@ async fn set_link_thanks_refused_on_revoked_link() {
     let after = store.get_link("tok-rvk").await.unwrap().unwrap();
     assert_eq!(after.thank_note, None, "guard must refuse the write");
     assert_eq!(after.thanked_at, None);
+}
+
+/// The other storage-enforced guards, each classified atomically from the CCF's
+/// own AllOld item (no follow-up read — the classification can't go stale):
+/// expiry uses claim_game's exact clause; no-claims covers the compensate window
+/// (claims_used is not monotonic); and a link that is BOTH revoked and thanked
+/// classifies Revoked — the pinned liveness-beats-already-sent precedence holds
+/// at the storage layer too, not just in the handler.
+#[tokio::test]
+async fn set_link_thanks_expired_noclaims_and_precedence_outcomes() {
+    let Some(store) = store_or_skip("thanks-guards").await else {
+        return;
+    };
+    let now = datetime!(2026-07-15 17:00 UTC);
+
+    // expired link (claimed, so only the expiry guard can fire)
+    let mut expired = link("tok-exp");
+    expired.claims_used = 1;
+    expired.expires_at = Some(datetime!(2026-07-01 00:00 UTC));
+    store.create_link(&expired).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-exp", "too late", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Expired
+    );
+
+    // no claims yet — the guestbook guard, enforced at the storage layer
+    store.create_link(&link("tok-fresh")).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-fresh", "premature", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::NoClaims
+    );
+
+    // revoked AND thanked: Revoked wins (liveness-first precedence)
+    let mut both = link("tok-both");
+    both.claims_used = 1;
+    store.create_link(&both).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-both", "first word", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+    let mut l = store.get_link("tok-both").await.unwrap().unwrap();
+    l.revoked = true;
+    store.update_link_meta(&l).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-both", "second word", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Revoked,
+        "revoked must beat already-thanked in the CCF classification"
+    );
 }
 
 /// The thanks fields follow the full gift_note storage contract: authoritative in
@@ -411,6 +475,7 @@ async fn thanks_survives_body_rewrites_and_never_rides_body() {
     store.put_game(&game(1, true)).await.unwrap();
     let mut l2 = link("tok-thx2");
     l2.claims_allowed = 2;
+    l2.claims_used = 1; // storage guard: thanks only after an unwrap
     store.create_link(&l2).await.unwrap();
     let at = datetime!(2026-07-15 17:00 UTC);
     assert_eq!(
@@ -446,7 +511,7 @@ async fn thanks_survives_body_rewrites_and_never_rides_body() {
         .await
         .unwrap();
     let after = store.get_link("tok-thx2").await.unwrap().unwrap();
-    assert_eq!(after.claims_used, 1);
+    assert_eq!(after.claims_used, 2);
     assert_eq!(
         after.thank_note.as_deref(),
         Some(THANKS),

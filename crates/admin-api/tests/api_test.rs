@@ -404,7 +404,9 @@ async fn list_links_carries_thank_note_and_omits_when_unset() {
     let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
     let session = admin_login(&store, &invoker, &admin_hash, password).await;
 
-    store.create_link(&test_link("thanked-tok")).await.unwrap();
+    let mut claimed = test_link("thanked-tok");
+    claimed.claims_used = 1; // the thanks guard requires an unwrap first
+    store.create_link(&claimed).await.unwrap();
     store.create_link(&test_link("plain-tok")).await.unwrap();
     assert_eq!(
         store

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { LinkPage } from "./LinkPage";
+import { ThanksCard } from "./ThanksCard";
 import type { LinkView } from "../api";
 
 // Partial mock: fetch functions mocked, error classes REAL so instanceof
@@ -199,9 +200,30 @@ describe("LinkPage", () => {
           "thanks already sent",
         );
       });
+      // the compose must be USABLE after a refusal, not just present — a
+      // sending-flag that never resets would freeze both controls forever
+      // and this test would still pass on presence alone (review pass 1)
+      expect(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+      ).toBeEnabled();
+      expect(screen.getByRole("button", { name: /send it/i })).toBeEnabled();
+    });
+
+    it("flips to the sent view when a later thankNote prop surfaces a note sent elsewhere", async () => {
+      // cross-tab: the card is mounted composing; a refetch (claim in another
+      // tab bumps refreshTick) delivers thank_note through the prop. The card
+      // derives its view from the prop, so it must flip WITHOUT a remount —
+      // mount-time-only seeding would show the compose forever (review pass 1).
+      const { rerender } = render(<ThanksCard token="tok123" />);
       expect(
         screen.getByRole("textbox", { name: /your thank-you note/i }),
       ).toBeInTheDocument();
+
+      rerender(<ThanksCard token="tok123" thankNote="sent from my phone" />);
+      expect(screen.getByText(/sent from my phone/)).toBeInTheDocument();
+      expect(
+        screen.queryByRole("textbox", { name: /your thank-you note/i }),
+      ).not.toBeInTheDocument();
     });
 
     it("disables the button while a send is in flight — a double-click can't fire twice", async () => {
