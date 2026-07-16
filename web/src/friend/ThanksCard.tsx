@@ -60,7 +60,7 @@ export function ThanksCard({ token, thankNote }: ThanksCardProps) {
       <div className="max-w-[34rem] rounded bg-floor px-4 py-3">
         <h2 className="font-pixel text-sm text-give-soft">say thanks to ben ♡</h2>
         <p className="mt-1 text-xs text-dust">
-          he picked these for you — leave him a word back. you get one, so make it count~
+          he opened his stash for you — leave him a word back. you get one, so make it count~
         </p>
         <textarea
           value={note}
