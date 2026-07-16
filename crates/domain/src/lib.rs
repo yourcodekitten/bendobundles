@@ -497,19 +497,17 @@ mod tests {
     #[test]
     fn link_thanks_fields_missing_is_none_and_roundtrips() {
         // Every stored link predates the thanks feature: JSON without either field
-        // must deserialize (thank_note=None, thanked_at=None), not error.
-        let mut json = serde_json::to_value(link()).unwrap();
-        json.as_object_mut().unwrap().remove("thank_note");
-        json.as_object_mut().unwrap().remove("thanked_at");
+        // must deserialize (thank_note=None, thanked_at=None), not error. A fresh
+        // serialization already omits both keys (skip_serializing_if, asserted
+        // below), so it IS the legacy shape — no key-stripping needed.
+        let json = serde_json::to_value(link()).unwrap();
+        assert!(json.get("thank_note").is_none());
+        assert!(json.get("thanked_at").is_none());
         let l: Link = serde_json::from_value(json).unwrap();
         assert_eq!(l.thank_note, None);
         assert_eq!(l.thanked_at, None);
 
-        // Set values roundtrip, and None serializes to ABSENT keys (mirrors
-        // gift_note's skip_serializing_if — no nulls on the wire or in body blobs).
-        let none_json = serde_json::to_value(link()).unwrap();
-        assert!(none_json.get("thank_note").is_none());
-        assert!(none_json.get("thanked_at").is_none());
+        // Set values roundtrip.
         let mut thanked = link();
         thanked.thank_note = Some("omg thank you!!".into());
         thanked.thanked_at = Some(datetime!(2026-07-15 12:00 UTC));

@@ -97,6 +97,11 @@ pub enum SetThanksOutcome {
     /// A thank-you is already on the link — write-once, the first word stands.
     /// Caller should 409.
     AlreadyThanked,
+    /// The link is revoked — the condition's `revoked = :f` guard fired. Covers the
+    /// race where a revoke lands between the caller's liveness pre-check and this
+    /// write; a dead link takes no mail even in that window (OMBB, #76 review).
+    /// Caller should 409 with the revoked message.
+    Revoked,
 }
 
 /// Persisted summary of a catalog-sync run. Storage-shaped (lives in dynamo, not in domain).
@@ -539,8 +544,14 @@ impl Store {
     /// counters, `expires_at`) by construction. Note + timestamp land in ONE update,
     /// so `thanked_at` can never exist without its note.
     ///
-    /// A CCF is ambiguous (no such link / already thanked); it's disambiguated by a
-    /// follow-up read. Links are never deleted, so the re-read can't misclassify.
+    /// The condition also carries `revoked = :f` so a revoke landing between the
+    /// caller's liveness pre-check and this write still refuses the note — liveness
+    /// is storage-enforced, not just handler-checked (OMBB, #76 review). `revoked`
+    /// always exists as a top-level attr (`link_item` writes it at creation,
+    /// `update_link_meta` SETs it), so the compare never NULL-fails on a real item.
+    ///
+    /// A CCF is ambiguous (no such link / already thanked / revoked); it's
+    /// disambiguated by a follow-up read.
     pub async fn set_link_thanks(
         &self,
         token: &str,
@@ -554,15 +565,25 @@ impl Store {
             .table_name(&self.table)
             .key("pk", pk)
             .key("sk", sk)
-            .condition_expression("attribute_exists(pk) AND attribute_not_exists(thank_note)")
+            .condition_expression(
+                "attribute_exists(pk) AND attribute_not_exists(thank_note) AND revoked = :f",
+            )
             .update_expression("SET thank_note = :n, thanked_at = :t")
             .expression_attribute_values(":n", schema::s(note))
+            .expression_attribute_values(":f", aws_sdk_dynamodb::types::AttributeValue::Bool(false))
             .expression_attribute_values(":t", schema::epoch_s(at));
         match req.send().await {
             Ok(_) => Ok(SetThanksOutcome::Set),
+            // The re-read below leans on links NEVER being deleted (the only
+            // delete_items in this crate are sync-mutex/session/steam-identity):
+            // None can only mean "never existed", so it cannot misclassify. If a
+            // link-deletion feature ever lands, THIS disambiguation is the first
+            // thing it breaks — revisit before shipping that.
             Err(sdk_err) if is_ccf_update(&sdk_err) => match self.get_link(token).await? {
                 None => Ok(SetThanksOutcome::NotFound),
-                Some(_) => Ok(SetThanksOutcome::AlreadyThanked),
+                Some(l) if l.thank_note.is_some() => Ok(SetThanksOutcome::AlreadyThanked),
+                // Real item, no note, condition still failed ⇒ the revoked guard.
+                Some(_) => Ok(SetThanksOutcome::Revoked),
             },
             Err(sdk_err) => Err(StoreError::Aws(format!("{sdk_err:?}"))),
         }

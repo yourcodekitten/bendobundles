@@ -371,6 +371,31 @@ async fn set_link_thanks_write_once_roundtrip_and_outcomes() {
     );
 }
 
+/// The condition's `revoked = :f` guard makes liveness storage-enforced: even a
+/// caller that skipped (or raced) the handler's pre-check cannot land a note on a
+/// revoked link, and the outcome is distinct from AlreadyThanked/NotFound.
+#[tokio::test]
+async fn set_link_thanks_refused_on_revoked_link() {
+    let Some(store) = store_or_skip("thanks-revoked").await else {
+        return;
+    };
+    store.create_link(&link("tok-rvk")).await.unwrap();
+    let mut l = store.get_link("tok-rvk").await.unwrap().unwrap();
+    l.revoked = true;
+    store.update_link_meta(&l).await.unwrap();
+
+    assert_eq!(
+        store
+            .set_link_thanks("tok-rvk", "too late", datetime!(2026-07-15 17:00 UTC))
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Revoked
+    );
+    let after = store.get_link("tok-rvk").await.unwrap().unwrap();
+    assert_eq!(after.thank_note, None, "guard must refuse the write");
+    assert_eq!(after.thanked_at, None);
+}
+
 /// The thanks fields follow the full gift_note storage contract: authoritative in
 /// top-level attrs, surviving `claim_game`'s `SET body` rewrite, and NEVER serialized
 /// into the `body` blob by any writer (asserted RAW against the stored item).

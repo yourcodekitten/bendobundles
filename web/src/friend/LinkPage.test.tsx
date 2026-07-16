@@ -169,6 +169,7 @@ describe("LinkPage", () => {
         expect(screen.getByText(/ben you legend/)).toBeInTheDocument();
       });
       expect(sendThanks).toHaveBeenCalledWith("tok123", "ben you legend");
+      expect(sendThanks).toHaveBeenCalledTimes(1);
       expect(screen.getByText(/— you, delivered to ben/)).toBeInTheDocument();
       expect(
         screen.queryByRole("textbox", { name: /your thank-you note/i }),
@@ -201,6 +202,27 @@ describe("LinkPage", () => {
       expect(
         screen.getByRole("textbox", { name: /your thank-you note/i }),
       ).toBeInTheDocument();
+    });
+
+    it("disables the button while a send is in flight — a double-click can't fire twice", async () => {
+      const user = userEvent.setup();
+      vi.mocked(fetchLink).mockResolvedValue({ ...claimedLink });
+      // never resolves: the send stays in flight for the whole test
+      vi.mocked(sendThanks).mockImplementation(() => new Promise(() => {}));
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+
+      await user.type(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+        "hello",
+      );
+      const send = screen.getByRole("button", { name: /send/i });
+      await user.click(send);
+      expect(send).toBeDisabled();
+      await user.click(send); // second click lands on a disabled button
+      expect(sendThanks).toHaveBeenCalledTimes(1);
     });
 
     it("disables send while the note is empty", async () => {

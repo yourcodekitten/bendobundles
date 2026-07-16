@@ -708,6 +708,44 @@ async fn handle_post_claim(
 /// the correspondence is symmetric on purpose.
 const THANK_NOTE_MAX_CHARS: usize = 500;
 
+/// Characters that can visually reorder or invisibly pad the note when it renders
+/// beside trusted admin chrome — the friend's text sits immediately before the
+/// "— label, date" attribution ben reads, and a U+202E override would let it spoof
+/// that signature (OMBB, #76 review; display-spoofing, not XSS — React escaping
+/// holds). Explicit bidi embeddings/overrides/isolates, the zero-width space, BOM,
+/// and the Arabic letter mark. ZWJ/ZWNJ (U+200C/U+200D) are deliberately KEPT:
+/// they're load-bearing in emoji sequences and Indic scripts and have no
+/// reordering power. Intrinsic RTL text (Arabic/Hebrew letters) is untouched —
+/// only the explicit control characters are the spoofing vector.
+fn is_spoofing_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Normalize a raw note before validation: whitespace controls (newline, CR, tab)
+/// become plain spaces so a multiline paste keeps its word boundaries (both
+/// surfaces render the note single-line), and every other control character or
+/// spoofing format char is stripped. Runs BEFORE the emptiness/length checks, so
+/// a note of nothing but bidi controls is refused as empty, and stripped
+/// characters can't smuggle a 501st visible char past the budget.
+fn sanitize_note(raw: &str) -> String {
+    raw.chars()
+        .filter_map(|c| match c {
+            '\n' | '\r' | '\t' => Some(' '),
+            c if c.is_control() || is_spoofing_format_char(c) => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct ThanksBody {
     note: String,
@@ -724,7 +762,9 @@ async fn handle_post_thanks(
 ) -> Response {
     // 1. Validate before any read. Unlike the admin's gift-note parser, empty is
     //    an error rather than "clear" — there is no clearing a thank-you.
-    let note = body.note.trim();
+    //    Sanitize first: control/bidi strip precedes emptiness and budget checks.
+    let sanitized = sanitize_note(&body.note);
+    let note = sanitized.trim();
     if note.is_empty() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -806,6 +846,13 @@ async fn handle_post_thanks(
         Ok(dynamo::SetThanksOutcome::AlreadyThanked) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "thanks already sent"})),
+        )
+            .into_response(),
+        // A revoke raced past the step-3 pre-check and the storage guard caught
+        // it — same message as the pre-check, the friend can't tell the paths apart.
+        Ok(dynamo::SetThanksOutcome::Revoked) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "this link has been revoked"})),
         )
             .into_response(),
         Ok(dynamo::SetThanksOutcome::NotFound) => link_not_found_response(),

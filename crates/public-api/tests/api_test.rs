@@ -437,12 +437,90 @@ async fn thanks_validation_422() {
             &bad[..bad.len().min(10)]
         );
     }
+    // a note that is NOTHING but bidi/zero-width controls sanitizes to empty → 422,
+    // not a stored invisible note
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req("thxv-tok", "\u{202E}\u{200B}\u{2066}\u{200F}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "all-bidi note must be refused as empty"
+    );
+
     // exactly at the budget is fine
     let resp = plain_router(Arc::clone(&store), mock.clone())
         .oneshot(thanks_req("thxv-tok", &"x".repeat(500)))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Guard-ladder precedence: validation is token-independent and runs FIRST — an
+/// empty note on an unknown token is 422, not 404 (and leaks nothing: the 422 is
+/// identical whether or not the token exists).
+#[tokio::test]
+async fn thanks_validation_precedes_unknown_token_404() {
+    let Some(store) = store_or_skip("thanks-prec-422").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(store, mock)
+        .oneshot(thanks_req("no-such-token", "   "))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// Control and bidi characters are stripped server-side before storage: a U+202E
+/// override next to the admin's trusted "— label, date" attribution could visually
+/// spoof the signature ben reads (OMBB, #76 review). Whitespace controls become
+/// plain spaces so a multiline paste keeps its word boundaries.
+#[tokio::test]
+async fn thanks_strips_bidi_and_control_chars() {
+    let Some(store) = store_or_skip("thanks-bidi").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    store.create_link(&test_link("thxb-tok")).await.unwrap();
+    store
+        .claim_game(
+            "thxb-tok",
+            &game_id("gk1", "mn"),
+            "c1",
+            datetime!(2026-07-15 12:00 UTC),
+        )
+        .await
+        .unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req(
+            "thxb-tok",
+            "thanks\u{202E} ben\u{200B}!\u{0007}\nyou rule\u{2066}",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["thank_note"], "thanks ben! you rule",
+        "bidi/zero-width/control stripped, newline becomes a space"
+    );
+
+    // the STORED value is the sanitized one — re-read through the link view
+    let req = Request::get("/api/l/thxb-tok").body(Body::empty()).unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    let j = body_json(resp).await;
+    assert_eq!(j["thank_note"], "thanks ben! you rule");
 }
 
 /// Unknown token → the same 404 shape as every other link route (no oracle).
@@ -580,6 +658,17 @@ async fn dead_link_omits_thank_note() {
         j.get("thank_note").is_none(),
         "revoked link must not serve the thank note, got: {j}"
     );
+
+    // Guard-ladder precedence: this link is BOTH revoked and already-thanked —
+    // liveness wins. The friend hears "revoked", not "already sent" (which would
+    // confirm to a leaked-URL holder that a note exists).
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req("thxdv-tok", "second attempt"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"], "this link has been revoked");
 }
 
 /// Exhausted link → 200, state:"exhausted", games STILL visible
