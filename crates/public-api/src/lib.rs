@@ -712,16 +712,21 @@ const THANK_NOTE_MAX_CHARS: usize = 500;
 /// beside trusted admin chrome — the friend's text sits immediately before the
 /// "— label, date" attribution ben reads, and a U+202E override would let it spoof
 /// that signature (OMBB, #76 review; display-spoofing, not XSS — React escaping
-/// holds). This is the Unicode Cf (format) category minus ZWJ/ZWNJ, spelled out
-/// because `char::is_control` covers only Cc: bidi embeddings/overrides/isolates,
-/// zero-width space, soft hyphen, word joiner + the invisible operators
-/// (U+2060–2064 — an all-U+2060 note read as visibly empty otherwise slips past
-/// the emptiness check; review pass 1), Arabic/Syriac/other prepended marks,
-/// interlinear annotation, musical formatting, BOM, and the tag block
-/// (U+E0000–E007F). ZWJ/ZWNJ (U+200C/U+200D) are deliberately KEPT: load-bearing
-/// in emoji sequences and Indic scripts, no reordering power. Intrinsic RTL text
-/// (Arabic/Hebrew letters) is untouched — only the invisible controls are the
-/// spoofing vector.
+/// holds). This is the Unicode Cf (format) category minus three carve-outs,
+/// spelled out because `char::is_control` covers only Cc: bidi
+/// embeddings/overrides/isolates, zero-width space, soft hyphen, word joiner +
+/// invisible operators + deprecated formatting (the FULL U+2060–206F block —
+/// pass 2 caught pass 1 stopping at 2069 and re-opening the invisible-note hole
+/// through U+206A–206F; U+2065 is unassigned-and-default-ignorable, swept on
+/// purpose), Arabic/Syriac/other prepended marks, interlinear annotation,
+/// musical formatting, BOM, and the tag block (U+E0000–E007F — note this
+/// degrades RGI subdivision-flag emoji like Scotland's to a plain black flag; an
+/// accepted trade-off, the tag block is the canonical invisible-smuggling
+/// channel and the base flag survives). Carve-outs, all "load-bearing in real
+/// scripts, zero reordering power": ZWJ/ZWNJ (U+200C/D — emoji sequences, Indic)
+/// and MVS (U+180E — selects Mongolian final-vowel forms; bidi class BN).
+/// Intrinsic RTL text (Arabic/Hebrew letters) is untouched — only the invisible
+/// controls are the spoofing vector.
 fn is_spoofing_format_char(c: char) -> bool {
     matches!(
         c,
@@ -732,13 +737,11 @@ fn is_spoofing_format_char(c: char) -> bool {
             | '\u{070F}'
             | '\u{0890}'..='\u{0891}'
             | '\u{08E2}'
-            | '\u{180E}'
             | '\u{200B}'
             | '\u{200E}'
             | '\u{200F}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2060}'..='\u{206F}'
             | '\u{FEFF}'
             | '\u{FFF9}'..='\u{FFFB}'
             | '\u{110BD}'
@@ -750,18 +753,45 @@ fn is_spoofing_format_char(c: char) -> bool {
     )
 }
 
-/// Normalize a raw note before validation: whitespace controls (newline, CR, tab)
-/// and the Unicode line/paragraph separators (U+2028/U+2029 — not Cc, not Cf, but
-/// they'd still break the single-line rendering next to the attribution) become
-/// plain spaces so a multiline paste keeps its word boundaries, and every other
-/// control character or spoofing format char is stripped. Runs BEFORE the
+/// Kept by the sanitizer (legitimate in real text) but rendering as nothing when
+/// standing alone: the ZWJ/ZWNJ/MVS carve-outs, variation selectors, and the
+/// blank-note classics — Hangul fillers (U+3164 is *the* "empty message"
+/// character; Lo, so no category check catches it) and the Khmer inherent
+/// vowels. Used by the emptiness gate: a note made ONLY of these is refused as
+/// wordless rather than stored as a visibly blank note that permanently consumes
+/// the friend's write-once slot (review pass 2 — the pass-1 guarantee held for
+/// Cc/Cf but not for these).
+fn is_invisible_standalone(c: char) -> bool {
+    matches!(
+        c,
+        '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180E}'
+            | '\u{200C}'
+            | '\u{200D}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FFA0}'
+            | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// Normalize a raw note before validation: line/segment separators (newline, CR,
+/// tab, VT, FF, NEL, U+2028/U+2029 — everything that breaks lines in some text
+/// lineage; a PDF-paste's form feeds are word boundaries too, review pass 2)
+/// become plain spaces so a multiline paste keeps its word boundaries, and every
+/// other control character or spoofing format char is stripped. Runs BEFORE the
 /// emptiness/length checks, so a note of nothing but invisibles is refused as
 /// empty, and stripped characters can't smuggle a 501st visible char past the
 /// budget.
 fn sanitize_note(raw: &str) -> String {
     raw.chars()
         .filter_map(|c| match c {
-            '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}' => Some(' '),
+            '\n' | '\r' | '\t' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
+                Some(' ')
+            }
             c if c.is_control() || is_spoofing_format_char(c) => None,
             c => Some(c),
         })
@@ -787,7 +817,11 @@ async fn handle_post_thanks(
     //    Sanitize first: control/bidi strip precedes emptiness and budget checks.
     let sanitized = sanitize_note(&body.note);
     let note = sanitized.trim();
-    if note.is_empty() {
+    // "Empty" means no visible ink, not just no characters: the sanitizer keeps
+    // ZWJ/ZWNJ/MVS/variation-selectors/Hangul-fillers because they're legitimate
+    // INSIDE text, but a note made only of them renders blank beside ben's
+    // attribution and burns the write-once slot on nothing (review pass 2).
+    if note.chars().all(is_invisible_standalone) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": "a thank-you needs some words"})),

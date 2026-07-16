@@ -458,6 +458,30 @@ async fn set_link_thanks_expired_noclaims_and_precedence_outcomes() {
         dynamo::SetThanksOutcome::Revoked,
         "revoked must beat already-thanked in the CCF classification"
     );
+
+    // expired AND thanked: Expired wins too — liveness-first means BOTH halves,
+    // so this path answers exactly like the handler's pre-check would (pass 2)
+    let mut expboth = link("tok-expboth");
+    expboth.claims_used = 1;
+    store.create_link(&expboth).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-expboth", "first word", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Set
+    );
+    let mut l = store.get_link("tok-expboth").await.unwrap().unwrap();
+    l.expires_at = Some(datetime!(2026-07-10 00:00 UTC));
+    store.update_link_meta(&l).await.unwrap();
+    assert_eq!(
+        store
+            .set_link_thanks("tok-expboth", "second word", now)
+            .await
+            .unwrap(),
+        dynamo::SetThanksOutcome::Expired,
+        "expired must beat already-thanked in the CCF classification"
+    );
 }
 
 /// The thanks fields follow the full gift_note storage contract: authoritative in

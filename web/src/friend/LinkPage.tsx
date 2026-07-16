@@ -470,10 +470,18 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       <ClaimsHistory claims={data.claims} />
 
       {/* say thanks — the return path of ben's gift note, kept with the gifts it
-          answers. Gated on visible claims (thanks is the echo of an unwrap) and
-          on the link being alive; the server enforces both again. */}
-      {data.claims.length > 0 && !dead && token !== undefined && (
-        <ThanksCard token={token} thankNote={data.thank_note} />
+          answers. Gated on claims_used (the SERVER's predicate — claims.length
+          also counts compensated claims, so a friend whose only claim failed
+          fulfillment would get a compose that can only 409; review pass 2) and
+          on the link being alive; the server enforces both again. onRefresh lets
+          a refused send refetch, so "already sent" from another tab converges to
+          the sent view instead of a dead-end error. */}
+      {data.claims_used > 0 && !dead && token !== undefined && (
+        <ThanksCard
+          token={token}
+          thankNote={data.thank_note}
+          onRefused={refresh}
+        />
       )}
 
       {/* Steam privacy notice — spec §4 wording verbatim */}

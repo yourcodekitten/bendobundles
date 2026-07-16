@@ -44,11 +44,12 @@ body `{"note": string}`. guards, in order:
    `{"thank_note", "thanked_at"}` (canonical stored values).
 
 CCF on the conditional write is classified ATOMICALLY from the failed write's own
-`ReturnValuesOnConditionCheckFailure::AllOld` item (missing → 404, revoked → 409 revoked,
-note present → 409 already-sent, expired → 409 expired, zero claims → 409 claim-first —
-liveness before already-sent, matching the handler's ladder). no follow-up read: an
-eventually-consistent re-read racing a concurrent tab's write could misclassify
-AlreadyThanked as something scarier (pass-1 review find).
+`ReturnValuesOnConditionCheckFailure::AllOld` item, in this order: missing → 404,
+revoked → 409 revoked, expired → 409 expired, note present → 409 already-sent, zero
+claims → 409 claim-first. liveness (BOTH halves) before already-sent, byte-matching the
+handler's pre-check ladder so the same link state gets the same message on either path
+(pass-2 find). no follow-up read: an eventually-consistent re-read racing a concurrent
+tab's write could misclassify AlreadyThanked as something scarier (pass-1 find).
 
 ### reads
 

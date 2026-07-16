@@ -114,8 +114,32 @@ describe("LinkPage", () => {
       ).toBeInTheDocument();
     });
 
-    it("hides the card entirely when there are no claims", async () => {
-      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink });
+    it("hides the card entirely when nothing has been claimed", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, claims_used: 0 });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText("Test Bundle")).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/say thanks to ben/)).not.toBeInTheDocument();
+    });
+
+    it("hides the card when the only claim was compensated (claims_used back to 0)", async () => {
+      // the gate must use claims_used — the server's predicate — not
+      // claims.length: the claims list includes compensated records, so a
+      // friend whose one claim failed fulfillment would otherwise get a
+      // compose box that can only ever 409 (review pass 2)
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...baseLink,
+        claims_used: 0,
+        claims: [
+          {
+            game_id: "gk1:mn",
+            title: "Dome Keeper",
+            state: "compensated",
+            gift_url: null,
+          },
+        ],
+      });
       renderLinkPage();
       await waitFor(() => {
         expect(screen.getByText("Test Bundle")).toBeInTheDocument();
@@ -207,6 +231,42 @@ describe("LinkPage", () => {
         screen.getByRole("textbox", { name: /your thank-you note/i }),
       ).toBeEnabled();
       expect(screen.getByRole("button", { name: /send it/i })).toBeEnabled();
+    });
+
+    it("refused send triggers a refetch so a cross-tab 'already sent' converges", async () => {
+      // the 409 body carries only the error string, so the refetch is the ONLY
+      // path that can deliver the other tab's note text (review pass 2)
+      const user = userEvent.setup();
+      vi.mocked(fetchLink)
+        .mockResolvedValueOnce({ ...claimedLink })
+        .mockResolvedValue({
+          ...claimedLink,
+          thank_note: "sent from my phone",
+        });
+      vi.mocked(sendThanks).mockResolvedValue({
+        kind: "refused",
+        message: "thanks already sent",
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(screen.getByText(/say thanks to ben/)).toBeInTheDocument();
+      });
+
+      await user.type(
+        screen.getByRole("textbox", { name: /your thank-you note/i }),
+        "hello again",
+      );
+      await user.click(screen.getByRole("button", { name: /send it/i }));
+
+      // the refused path bumps refreshTick → second fetchLink resolves with the
+      // note → the derived prop flips the card to the sent view
+      await waitFor(() => {
+        expect(screen.getByText(/sent from my phone/)).toBeInTheDocument();
+      });
+      expect(fetchLink).toHaveBeenCalledTimes(2);
+      expect(
+        screen.queryByRole("textbox", { name: /your thank-you note/i }),
+      ).not.toBeInTheDocument();
     });
 
     it("flips to the sent view when a later thankNote prop surfaces a note sent elsewhere", async () => {

@@ -619,12 +619,16 @@ impl Store {
                     return Ok(SetThanksOutcome::NotFound);
                 };
                 let link = link_from_item(&item)?;
+                // Liveness — BOTH halves — before already-sent, matching the
+                // handler's ladder exactly (pass 2: expired-after-thanked here
+                // answered a thanked+expired link differently than the handler
+                // pre-check would, depending on which path caught it).
                 if link.revoked {
                     Ok(SetThanksOutcome::Revoked)
-                } else if link.thank_note.is_some() {
-                    Ok(SetThanksOutcome::AlreadyThanked)
                 } else if link.expires_at.is_some_and(|exp| exp <= at) {
                     Ok(SetThanksOutcome::Expired)
+                } else if link.thank_note.is_some() {
+                    Ok(SetThanksOutcome::AlreadyThanked)
                 } else if link.claims_used == 0 {
                     Ok(SetThanksOutcome::NoClaims)
                 } else {

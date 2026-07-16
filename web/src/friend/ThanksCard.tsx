@@ -11,6 +11,11 @@ interface ThanksCardProps {
   /** Server-echoed note when one was already sent — a revisit renders the
    * sent state directly, no compose. */
   thankNote?: string;
+  /** Called when the server refuses a send (409/422). The 409 body carries only
+   * the error string, not the existing note — so on "thanks already sent" from
+   * another tab, the parent's refetch is the only path that can deliver the
+   * note text and flip this card to the sent view (review pass 2). */
+  onRefused?: () => void;
 }
 
 /** The friend's one word back to ben — gift_note's return path (write-once;
@@ -31,7 +36,7 @@ function SentNote({ note }: { note: string }) {
   );
 }
 
-export function ThanksCard({ token, thankNote }: ThanksCardProps) {
+export function ThanksCard({ token, thankNote, onRefused }: ThanksCardProps) {
   const [note, setNote] = useState('');
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState<string | null>(null);
@@ -61,6 +66,11 @@ export function ThanksCard({ token, thankNote }: ThanksCardProps) {
       setSent(result.thank_note);
     } else {
       setError(result.message);
+      // A refusal means the server knows something we don't (note already sent
+      // in another tab, link state changed) — refetch so the view converges.
+      if (result.kind === 'refused') {
+        onRefused?.();
+      }
     }
   };
 

@@ -437,14 +437,23 @@ async fn thanks_validation_422() {
             &bad[..bad.len().min(10)]
         );
     }
-    // a note that is NOTHING but invisibles sanitizes to empty → 422, not a
-    // stored invisible note. Covers the bidi set AND the non-bidi format chars
-    // (word joiner, soft hyphen, invisible times, tag chars) that char::is_control
-    // misses — an all-U+2060 note reads as visibly empty on the admin surface.
+    // a note with NO VISIBLE INK is refused as empty → 422, never a stored blank
+    // note that burns the write-once slot. Three classes: (a) STRIPPED invisibles
+    // (bidi set + non-bidi format chars char::is_control misses — word joiner,
+    // soft hyphen, invisible times, tag chars, and the deprecated U+206A–206F
+    // range pass 2 caught pass 1 skipping); (b) KEPT-but-invisible chars (ZWJ,
+    // MVS, variation selectors, the Hangul-filler "blank message" family — not
+    // Cf, deliberately not stripped, but a note of ONLY them renders blank);
+    // (c) a mix of both classes.
     for invisible in [
         "\u{202E}\u{200B}\u{2066}\u{200F}",
         "\u{2060}\u{2060}",
         "\u{00AD}\u{2061}\u{E0041}",
+        "\u{206A}\u{206F}",
+        "\u{3164}\u{3164}",
+        "\u{115F}\u{1160}\u{FFA0}\u{17B4}\u{17B5}",
+        "\u{200D}\u{200C}\u{180E}\u{FE0F}",
+        "\u{2063}\u{3164}\u{200D}",
     ] {
         let resp = plain_router(Arc::clone(&store), mock.clone())
             .oneshot(thanks_req("thxv-tok", invisible))
@@ -475,6 +484,28 @@ async fn thanks_validation_422() {
     );
     let j = body_json(resp).await;
     assert_eq!(j["thank_note"], "x".repeat(500));
+
+    // carve-outs survive INSIDE real text: MVS keeps Mongolian final-vowel
+    // shaping, ZWJ keeps emoji sequences, variation selectors keep presentation —
+    // and line-lineage separators (form feed, vertical tab, NEL) become word
+    // boundaries like \n, not deletions that weld words together (pass 2).
+    // Fresh link: thxv-tok's write-once slot is already spent above.
+    let mut second = test_link("thxv-tok2");
+    second.claims_used = 1;
+    store.create_link(&second).await.unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(thanks_req(
+            "thxv-tok2",
+            "ᠬᠠᠨ᠎ᠠ 👍\u{FE0F} 👩\u{200D}💻 so\u{000C}much\u{000B}thanks\u{0085}ben",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert_eq!(
+        j["thank_note"], "ᠬᠠᠨ᠎ᠠ 👍\u{FE0F} 👩\u{200D}💻 so much thanks ben",
+        "MVS/ZWJ/VS16 kept in mixed text; FF/VT/NEL space, not weld"
+    );
 }
 
 /// Guard-ladder precedence: validation is token-independent and runs FIRST — an
