@@ -454,6 +454,13 @@ async fn thanks_validation_422() {
         "\u{115F}\u{1160}\u{FFA0}\u{17B4}\u{17B5}",
         "\u{200D}\u{200C}\u{180E}\u{FE0F}",
         "\u{2063}\u{3164}\u{200D}",
+        // interior whitespace between invisibles: trim only strips EDGES, and
+        // invisible edge chars shield the interior space — whitespace must
+        // count as inkless in the gate itself (converge pass). The \n case is
+        // two keystrokes: the sanitizer's own newline→space mapping builds it.
+        "\u{200D} \u{200D}",
+        "\u{3164}\n\u{3164}",
+        "\u{200D}\u{00A0}\u{200D}",
     ] {
         let resp = plain_router(Arc::clone(&store), mock.clone())
             .oneshot(thanks_req("thxv-tok", invisible))

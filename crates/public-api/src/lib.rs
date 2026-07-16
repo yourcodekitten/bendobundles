@@ -821,7 +821,13 @@ async fn handle_post_thanks(
     // ZWJ/ZWNJ/MVS/variation-selectors/Hangul-fillers because they're legitimate
     // INSIDE text, but a note made only of them renders blank beside ben's
     // attribution and burns the write-once slot on nothing (review pass 2).
-    if note.chars().all(is_invisible_standalone) {
+    // Whitespace is inkless too — trim only strips the EDGES, and invisible
+    // chars at the edges shield interior spaces from it (ZWJ\nZWJ sanitizes to
+    // "ZWJ ZWJ" and sailed through an is_invisible-only check; converge pass).
+    if note
+        .chars()
+        .all(|c| c.is_whitespace() || is_invisible_standalone(c))
+    {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": "a thank-you needs some words"})),

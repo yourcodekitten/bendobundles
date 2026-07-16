@@ -123,6 +123,35 @@ describe("LinkPage", () => {
       expect(screen.queryByText(/say thanks to ben/)).not.toBeInTheDocument();
     });
 
+    it("still shows a SENT note when claims_used dropped to 0 after compensation", async () => {
+      // claims_used is non-monotonic: a thanks can land during the
+      // claim→park→compensate span, ending at claims_used 0 WITH a note. The
+      // friend's delivered note must never vanish from their own page — only
+      // the COMPOSE is gated on claims_used (converge pass).
+      vi.mocked(fetchLink).mockResolvedValue({
+        ...baseLink,
+        claims_used: 0,
+        thank_note: "sent before the gift fell through",
+        claims: [
+          {
+            game_id: "gk1:mn",
+            title: "Dome Keeper",
+            state: "compensated",
+            gift_url: null,
+          },
+        ],
+      });
+      renderLinkPage();
+      await waitFor(() => {
+        expect(
+          screen.getByText(/sent before the gift fell through/),
+        ).toBeInTheDocument();
+      });
+      expect(
+        screen.queryByRole("textbox", { name: /your thank-you note/i }),
+      ).not.toBeInTheDocument();
+    });
+
     it("hides the card when the only claim was compensated (claims_used back to 0)", async () => {
       // the gate must use claims_used — the server's predicate — not
       // claims.length: the claims list includes compensated records, so a
