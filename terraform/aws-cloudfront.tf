@@ -28,7 +28,7 @@ resource "aws_cloudfront_function" "spa_rewrite" {
 
 module "site" {
   source  = "bendoerr-terraform-modules/cloudfront-and-s3-origin/aws"
-  version = "0.5.0"
+  version = "0.6.0"
   context = module.context.shared
   name    = "site"
 
