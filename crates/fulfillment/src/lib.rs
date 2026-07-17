@@ -2436,6 +2436,9 @@ pub struct BackfillSummary {
     /// items kept their OLD tags but were stamped fresh, so the operator MUST rerun with
     /// SKIP_FRESH_SECS=0 or the catalog stays tagless until the 30-day window (#73 review).
     pub tag_batch_failed: bool,
+    /// STEAMAPP# write races detected by the #75 guard (each was re-merged and
+    /// retried; a twice-lost app is also counted in `failed`).
+    pub lost_race: u32,
 }
 
 /// Run-once STEAMAPP# rebuild (issues #57, #61): refetch appdetails for EVERY catalog appid through
@@ -2503,33 +2506,38 @@ pub async fn backfill_steam_details(
     summary.tag_batch_failed = !worklist.is_empty() && tag_data.is_none();
 
     for app_id in worklist {
-        // Just-in-time re-read (review round 2): the decide-pass snapshot only
-        // classified skip/refetch — the merge write carries the freshest halves. This
-        // NARROWS the concurrent-writer window to per-item seconds; it does not close
-        // it (the put is unconditional), hence the don't-run-during-cron caveat.
-        let mut cache = match store.get_steam_app(app_id).await {
-            Ok(v) => v.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
+        // Just-in-time versioned read (#75): snapshot + token seed the guarded
+        // merge write; a concurrent writer is detected and re-merged, not
+        // clobbered — the don't-run-during-cron rule is now politeness, not
+        // load-bearing.
+        let snapshot = match store.get_steam_app_versioned(app_id).await {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(app_id, error = ?e, "backfill: re-read failed — skipping app");
                 summary.failed += 1;
                 continue;
             }
         };
-        let mut fresh_detail = false;
+        let mut ours = FetchedHalves {
+            now,
+            detail: None,
+            reviews: None,
+        };
         tokio::time::sleep(pace).await;
         match steam.get_app_details(app_id).await {
             Ok(steam_client::AppDetails::Found(d)) => {
                 let mut detail = *d;
-                detail.tags = tags_for_app(app_id, tag_data.as_ref(), cache.detail.as_ref());
-                cache.detail = Some(detail);
-                cache.fetched_at = now;
-                fresh_detail = true;
+                detail.tags = tags_for_app(
+                    app_id,
+                    tag_data.as_ref(),
+                    snapshot.as_ref().and_then(|(c, _)| c.detail.as_ref()),
+                );
+                ours.detail = Some(DetailFetch::Live(Box::new(detail)));
             }
-            // Delisted: negative stub, BOTH clocks stamped — same semantics as enrichment.
+            // Delisted: negative stub, BOTH clocks stamped by the merge — same
+            // semantics as enrichment.
             Ok(steam_client::AppDetails::Delisted) => {
-                cache.detail = None;
-                cache.fetched_at = now;
-                cache.reviews_fetched_at = now;
+                ours.detail = Some(DetailFetch::Delisted);
             }
             Err(steam_client::SteamError::RateLimited) => {
                 summary.aborted_429 = true;
@@ -2548,19 +2556,35 @@ pub async fn backfill_steam_details(
                 continue;
             }
         }
-        if let Err(e) = store.put_steam_app(&cache).await {
-            tracing::warn!(app_id, error = ?e, "backfill: put_steam_app failed — this app not persisted");
-            summary.failed += 1;
-            continue;
-        }
-        // What was just written IS the outcome: Some detail = live refetch, None = stub.
-        if cache.detail.is_some() {
-            summary.fetched += 1;
-        } else {
-            summary.negative += 1;
-        }
-        if fresh_detail {
-            supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+        let fresh_detail = matches!(ours.detail, Some(DetailFetch::Live(_)));
+        match persist_fetched_halves(store, app_id, snapshot, &ours).await {
+            Ok(PersistResult::Written { cache, after_race }) => {
+                if after_race {
+                    summary.lost_race += 1;
+                }
+                // What was just written IS the outcome: Some detail = live refetch,
+                // None = stub. (Post-merge, a concurrent writer's newer half may be
+                // what landed — still the honest count.)
+                if cache.detail.is_some() {
+                    summary.fetched += 1;
+                } else {
+                    summary.negative += 1;
+                }
+                if fresh_detail {
+                    supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+                }
+            }
+            Ok(PersistResult::LostTwice) => {
+                summary.lost_race += 1;
+                summary.failed += 1;
+                tracing::warn!(app_id, "backfill: lost the STEAMAPP# race twice — skipping app, next pass retries");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(app_id, error = ?e, "backfill: put_steam_app failed — this app not persisted");
+                summary.failed += 1;
+                continue;
+            }
         }
         let done = summary.fetched + summary.negative + summary.skipped + summary.failed;
         tracing::info!(app_id, done, total, "backfill: item rewritten");
@@ -2575,6 +2599,7 @@ pub async fn backfill_steam_details(
         aborted_429 = summary.aborted_429,
         auto_hidden = summary.auto_hidden,
         tag_batch_failed = summary.tag_batch_failed,
+        lost_race = summary.lost_race,
         "backfill: done"
     );
     Ok(summary)
