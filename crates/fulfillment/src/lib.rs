@@ -2185,12 +2185,12 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     let appids: std::collections::BTreeSet<u32> =
         games.iter().filter_map(|g| g.steam_app_id).collect();
 
-    /// One appid's decided work: which half(s) are stale, plus the cache item to merge into.
+    /// One appid's decided work: which half(s) are stale. (The decide-pass snapshot
+    /// is deliberately NOT carried — the fetch loop re-reads just-in-time, #75.)
     struct Work {
         app_id: u32,
         need_detail: bool,
         need_reviews: bool,
-        cache: dynamo::SteamAppCache,
     }
 
     // Every appid known to carry adult descriptors this pass — fed by BOTH the decide
@@ -2223,12 +2223,10 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         if !need_detail && !need_reviews {
             continue; // both halves fresh — nothing to do
         }
-        let cache = existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id));
         worklist.push(Work {
             app_id,
             need_detail,
             need_reviews,
-            cache,
         });
     }
 
@@ -2263,6 +2261,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     let mut fetched = 0u32;
     let mut fresh = 0u32;
     let mut negative = 0u32;
+    let mut lost_race = 0u32;
     let mut aborted_429 = false;
     let mut deferred_unstarted = 0usize;
 
@@ -2278,41 +2277,44 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             app_id,
             need_detail,
             need_reviews,
-            cache: _decided,
         } = work;
-        // Just-in-time re-read: the decide-pass snapshot can be minutes stale by the time
-        // this item's turn comes (paced loop), and the merge write below carries EVERY
-        // half of the cache. This NARROWS the lost-update window vs a concurrent writer
-        // (fresh reviews / a backfill-migrated blob) from run-length to per-item seconds —
-        // it does not close it; the put is unconditional (#73 review). The decide-pass
-        // snapshot only classified the work.
-        let mut cache = match deps.store.get_steam_app(app_id).await {
-            Ok(v) => v.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
+        // Just-in-time versioned read: the decide-pass snapshot can be minutes stale
+        // by the time this item's turn comes (paced loop). The snapshot + token seed
+        // the guarded merge write below — a concurrent writer inside the read→put
+        // gap is now DETECTED (LostRace ⇒ re-merge + retry, #75), not silently
+        // overwritten. The decide-pass snapshot only classified the work.
+        let snapshot = match deps.store.get_steam_app_versioned(app_id).await {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(app_id, error = ?e, "steam enrichment: re-read failed — skipping app");
                 continue 'apps;
             }
         };
+        let mut ours = FetchedHalves {
+            now,
+            detail: None,
+            reviews: None,
+        };
         let mut delisted = false;
-        let mut fresh_detail = false;
 
         if need_detail {
             tokio::time::sleep(deps.steam_enrich_pace).await;
             match steam.get_app_details(app_id).await {
                 Ok(steam_client::AppDetails::Found(d)) => {
                     let mut detail = *d;
-                    detail.tags = tags_for_app(app_id, tag_data.as_ref(), cache.detail.as_ref());
-                    cache.detail = Some(detail);
-                    cache.fetched_at = now;
+                    detail.tags = tags_for_app(
+                        app_id,
+                        tag_data.as_ref(),
+                        snapshot.as_ref().and_then(|(c, _)| c.detail.as_ref()),
+                    );
+                    ours.detail = Some(DetailFetch::Live(Box::new(detail)));
                     fresh += 1;
-                    fresh_detail = true;
                 }
-                // Delisted: negative-cache stub. Stamp BOTH clocks so it's retried on the 30d
-                // window (not every sync), and skip reviews — a dead app has none.
+                // Delisted: negative-cache stub. The merge stamps BOTH clocks so it's
+                // retried on the 30d window (not every sync), and reviews are skipped —
+                // a dead app has none.
                 Ok(steam_client::AppDetails::Delisted) => {
-                    cache.detail = None;
-                    cache.fetched_at = now;
-                    cache.reviews_fetched_at = now;
+                    ours.detail = Some(DetailFetch::Delisted);
                     negative += 1;
                     delisted = true;
                 }
@@ -2373,19 +2375,31 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
                     continue 'apps;
                 }
             };
-            cache.overall = Some(overall);
-            cache.recent = Some(recent);
-            cache.reviews_fetched_at = now;
+            ours.reviews = Some((overall, recent));
         }
 
-        // Merge write per-item: partial progress survives an abort/timeout later in the pass.
-        if let Err(e) = deps.store.put_steam_app(&cache).await {
-            tracing::warn!(app_id, error = ?e, "steam enrichment: put_steam_app failed — this app not persisted");
-            continue 'apps;
-        }
-        fetched += 1;
-        if fresh_detail {
-            supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+        // Merge write per-item: partial progress survives an abort/timeout later
+        // in the pass. Guarded + re-merged per #75 — see persist_fetched_halves.
+        let fresh_detail = matches!(ours.detail, Some(DetailFetch::Live(_)));
+        match persist_fetched_halves(&deps.store, app_id, snapshot, &ours).await {
+            Ok(PersistResult::Written { cache, after_race }) => {
+                if after_race {
+                    lost_race += 1;
+                }
+                fetched += 1;
+                if fresh_detail {
+                    supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+                }
+            }
+            Ok(PersistResult::LostTwice) => {
+                lost_race += 1;
+                tracing::warn!(app_id, "steam enrichment: lost the STEAMAPP# race twice — skipping app, next sync retries");
+                continue 'apps;
+            }
+            Err(e) => {
+                tracing::warn!(app_id, error = ?e, "steam enrichment: put_steam_app failed — this app not persisted");
+                continue 'apps;
+            }
         }
     }
     // Whatever's left unstarted (deadline stop, or the tail after a 429 abort) is deferred too.
@@ -2399,7 +2413,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     let deferred = deferred_by_cap + deferred_unstarted;
     tracing::info!(
         deferred,
-        "steam enrichment: fetched={fetched} fresh={fresh} negative={negative} aborted_429={aborted_429} auto_hidden={auto_hidden} tag_batch_failed={tag_batch_failed}"
+        "steam enrichment: fetched={fetched} fresh={fresh} negative={negative} lost_race={lost_race} aborted_429={aborted_429} auto_hidden={auto_hidden} tag_batch_failed={tag_batch_failed}"
     );
 }
 
