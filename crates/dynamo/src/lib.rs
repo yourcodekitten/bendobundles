@@ -166,6 +166,36 @@ impl SteamAppCache {
     }
 }
 
+/// Opaque optimistic-lock token for a STEAMAPP# item — obtainable ONLY from
+/// [`Store::get_steam_app_versioned`] (private field: a guard value cannot be
+/// fabricated, it must come from a read). `None` inside = legacy item written
+/// before the `version` attribute existed; the guarded put adopts it (#75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SteamAppVersion(Option<i64>);
+
+/// The caller's precondition for [`Store::put_steam_app`] — what the read that
+/// seeded this write saw. Deliberately no unguarded variant: an unconditional
+/// escape hatch is the next silent lost-update waiting for a caller (#75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteamAppPutGuard {
+    /// The read returned `None`: create-only.
+    Absent,
+    /// The read returned an item carrying this token: write only if it still does.
+    Unchanged(SteamAppVersion),
+}
+
+/// Errors from the guarded [`Store::put_steam_app`].
+#[derive(Debug, thiserror::Error)]
+pub enum SteamAppPutError {
+    /// The item changed between the caller's read and this put — a concurrent
+    /// writer won. Nothing is wrong with the payload; re-read, re-merge, retry.
+    /// (`ClaimTxError::TxConflict` precedent: a timing race is not an AWS error.)
+    #[error("STEAMAPP# item changed since read — lost the race, safe to re-merge")]
+    LostRace,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
 /// A sync-run marker older than this is dead: the fulfillment lambda's hard timeout is 900s, so
 /// a run that began more than 900s (+ a skew margin) ago cannot still be executing. A stale
 /// marker means a run crashed/timed out before reporting — it may be taken over.
@@ -1991,17 +2021,76 @@ impl Store {
         Ok(cache.map(|c| (c.appids, c.fetched_at)))
     }
 
-    /// Write (or refresh) a Steam app enrichment cache entry.
-    /// pk="STEAMAPP#<app_id>", sk="META", body=JSON of [`SteamAppCache`].
-    /// Idempotent — overwrites any existing entry. `detail: None` is a valid negative-cache stub.
-    pub async fn put_steam_app(&self, cache: &SteamAppCache) -> Result<(), StoreError> {
-        self.client
-            .put_item()
+    /// Write (or refresh) a Steam app enrichment cache entry — guarded (#75).
+    /// pk="STEAMAPP#<app_id>", sk="META", body=JSON of [`SteamAppCache`],
+    /// version=N monotonic counter. Succeeds only if the item still matches the
+    /// read in `guard`; otherwise [`SteamAppPutError::LostRace`] — re-read via
+    /// [`Store::get_steam_app_versioned`], re-merge, retry. `detail: None` is a
+    /// valid negative-cache stub.
+    pub async fn put_steam_app(
+        &self,
+        cache: &SteamAppCache,
+        guard: SteamAppPutGuard,
+    ) -> Result<(), SteamAppPutError> {
+        let req = self.client.put_item().table_name(&self.table);
+        let req = match guard {
+            SteamAppPutGuard::Absent => req
+                .set_item(Some(steam_app_item(cache, 1)))
+                .condition_expression("attribute_not_exists(pk)"),
+            // Legacy item (pre-version): adopt at version 1. Cannot false-pass —
+            // any concurrent new-code write stamps `version`, flipping this arm
+            // to a CCF. (A vanished item also passes, which is create — correct.)
+            SteamAppPutGuard::Unchanged(SteamAppVersion(None)) => req
+                .set_item(Some(steam_app_item(cache, 1)))
+                .condition_expression("attribute_not_exists(version)"),
+            SteamAppPutGuard::Unchanged(SteamAppVersion(Some(v))) => req
+                .set_item(Some(steam_app_item(cache, v + 1)))
+                .condition_expression("version = :v")
+                .expression_attribute_values(
+                    ":v",
+                    aws_sdk_dynamodb::types::AttributeValue::N(v.to_string()),
+                ),
+        };
+        req.send().await.map_err(|e| {
+            if is_ccf_put(&e) {
+                SteamAppPutError::LostRace
+            } else {
+                SteamAppPutError::Store(e.into())
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Writer-side read of a STEAMAPP# item: parsed cache + the optimistic-lock
+    /// token for a subsequent guarded [`Store::put_steam_app`]. Read-only paths
+    /// (admin/public views) keep using [`Store::get_steam_app`].
+    pub async fn get_steam_app_versioned(
+        &self,
+        app_id: u32,
+    ) -> Result<Option<(SteamAppCache, SteamAppVersion)>, StoreError> {
+        let (pk, sk) = schema::key_pair(&steam_app_pk(app_id), "META");
+        let out = self
+            .client
+            .get_item()
             .table_name(&self.table)
-            .set_item(Some(steam_app_item(cache)))
+            .key("pk", pk)
+            .key("sk", sk)
             .send()
             .await?;
-        Ok(())
+        let Some(item) = out.item else {
+            return Ok(None);
+        };
+        let cache: SteamAppCache = parse_body(&item)?;
+        let version = match item.get("version") {
+            None => SteamAppVersion(None),
+            Some(v) => SteamAppVersion(Some(
+                v.as_n()
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .ok_or(StoreError::Corrupt("bad version attr"))?,
+            )),
+        };
+        Ok(Some((cache, version)))
     }
 
     /// Look up a Steam app enrichment cache entry by app_id, or `None` if absent.

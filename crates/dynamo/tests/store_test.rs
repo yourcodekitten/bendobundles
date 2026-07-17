@@ -2,7 +2,8 @@ use aws_sdk_dynamodb::types::AttributeValue;
 use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
     AppidWrite, AutoHideWrite, ClaimTxError, HiddenWrite, OwnedWrite, SYNC_RUN_STALE_SECS,
-    SteamAppCache, Store, SyncBegin, SyncState, SyncWrite, sync_run_is_live,
+    SteamAppCache, SteamAppPutError, SteamAppPutGuard, Store, SyncBegin, SyncState, SyncWrite,
+    sync_run_is_live,
 };
 use std::collections::HashMap;
 use time::macros::datetime;
@@ -1177,8 +1178,14 @@ async fn batch_get_steam_apps_found_and_missing() {
     };
     let full = steam_app_cache_full(570);
     let stub = steam_app_cache_stub(571);
-    store.put_steam_app(&full).await.unwrap();
-    store.put_steam_app(&stub).await.unwrap();
+    store
+        .put_steam_app(&full, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+    store
+        .put_steam_app(&stub, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let map = store
         .batch_get_steam_apps(&[570, 571, 99999])
@@ -2245,8 +2252,14 @@ async fn steam_app_cache_roundtrip() {
     assert_eq!(store.get_steam_app(620).await.unwrap(), None);
 
     // Put both.
-    store.put_steam_app(&full).await.unwrap();
-    store.put_steam_app(&stub).await.unwrap();
+    store
+        .put_steam_app(&full, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+    store
+        .put_steam_app(&stub, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     // Full item round-trips exactly.
     let got_full = store.get_steam_app(570).await.unwrap().unwrap();
@@ -2273,11 +2286,11 @@ async fn list_steam_app_ids_excludes_non_steamapp_items() {
 
     // Write two STEAMAPP items (one full, one stub).
     store
-        .put_steam_app(&steam_app_cache_full(100))
+        .put_steam_app(&steam_app_cache_full(100), SteamAppPutGuard::Absent)
         .await
         .unwrap();
     store
-        .put_steam_app(&steam_app_cache_stub(200))
+        .put_steam_app(&steam_app_cache_stub(200), SteamAppPutGuard::Absent)
         .await
         .unwrap();
 
@@ -2293,9 +2306,10 @@ async fn list_steam_app_ids_excludes_non_steamapp_items() {
         "list must return exactly the two STEAMAPP ids"
     );
 
-    // Idempotent overwrite: re-put one item, list must not grow.
+    // Overwrite via the guarded path (#75): re-put one item, list must not grow.
+    let (_, v100) = store.get_steam_app_versioned(100).await.unwrap().unwrap();
     store
-        .put_steam_app(&steam_app_cache_full(100))
+        .put_steam_app(&steam_app_cache_full(100), SteamAppPutGuard::Unchanged(v100))
         .await
         .unwrap();
     let ids2 = store.list_steam_app_ids().await.unwrap();
@@ -2483,4 +2497,118 @@ async fn upsert_condition_protects_hidden_source_from_clobber() {
         SyncWrite::SkippedInFlight,
         "the write must CCF, not clobber the admin stamp"
     );
+}
+
+/// #75: Absent guard — create-only. Writes version=1; a second Absent put is a
+/// detected race, not a silent overwrite.
+#[tokio::test]
+async fn put_steam_app_absent_guard() {
+    let Some(store) = store_or_skip("steamapp-absent-guard").await else {
+        return;
+    };
+    let full = steam_app_cache_full(570);
+    store
+        .put_steam_app(&full, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+
+    // enforcement attr present alongside body, at 1
+    let raw = raw_client("steamapp-absent-guard").await;
+    let item = raw
+        .get_item()
+        .table_name("t-steamapp-absent-guard")
+        .key("pk", AttributeValue::S("STEAMAPP#570".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert_eq!(item.get("version").unwrap().as_n().unwrap(), "1");
+
+    let err = store
+        .put_steam_app(&full, SteamAppPutGuard::Absent)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SteamAppPutError::LostRace));
+}
+
+/// #75: Unchanged guard — the current token writes and moves the version; a stale
+/// token is a detected race; the fresh token works again.
+#[tokio::test]
+async fn put_steam_app_unchanged_guard() {
+    let Some(store) = store_or_skip("steamapp-unchanged-guard").await else {
+        return;
+    };
+    store
+        .put_steam_app(&steam_app_cache_stub(570), SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+
+    let (cache, v1) = store.get_steam_app_versioned(570).await.unwrap().unwrap();
+    assert!(cache.detail.is_none(), "stub round-trips");
+
+    let full = steam_app_cache_full(570);
+    store
+        .put_steam_app(&full, SteamAppPutGuard::Unchanged(v1))
+        .await
+        .unwrap();
+
+    let err = store
+        .put_steam_app(&full, SteamAppPutGuard::Unchanged(v1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SteamAppPutError::LostRace), "stale token loses");
+
+    let (read_back, v2) = store.get_steam_app_versioned(570).await.unwrap().unwrap();
+    assert!(read_back.detail.is_some(), "guarded write landed");
+    assert_ne!(v1, v2, "token moved");
+    store
+        .put_steam_app(&read_back, SteamAppPutGuard::Unchanged(v2))
+        .await
+        .unwrap();
+}
+
+/// #75: legacy items ({pk, sk, body} written before the version attr) are adopted
+/// by the migration arm — and fully guarded from then on.
+#[tokio::test]
+async fn put_steam_app_legacy_migration() {
+    let Some(store) = store_or_skip("steamapp-legacy").await else {
+        return;
+    };
+    // Pre-#75 item shape — impossible via the Store API, hence the raw client.
+    let raw = raw_client("steamapp-legacy").await;
+    let legacy = steam_app_cache_full(570);
+    raw.put_item()
+        .table_name("t-steamapp-legacy")
+        .item("pk", AttributeValue::S("STEAMAPP#570".into()))
+        .item("sk", AttributeValue::S("META".into()))
+        .item(
+            "body",
+            AttributeValue::S(serde_json::to_string(&legacy).unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let (cache, legacy_token) = store.get_steam_app_versioned(570).await.unwrap().unwrap();
+    assert_eq!(cache.app_id, 570, "legacy body parses");
+
+    // migration arm accepts exactly once…
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Unchanged(legacy_token))
+        .await
+        .unwrap();
+
+    // …then the item is versioned and the legacy token is dead.
+    let err = store
+        .put_steam_app(&cache, SteamAppPutGuard::Unchanged(legacy_token))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SteamAppPutError::LostRace));
+    let (_, v) = store.get_steam_app_versioned(570).await.unwrap().unwrap();
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Unchanged(v))
+        .await
+        .unwrap();
 }
