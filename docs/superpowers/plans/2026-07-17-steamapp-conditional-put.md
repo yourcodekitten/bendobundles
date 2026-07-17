@@ -312,22 +312,23 @@ git commit -S -m "feat(dynamo): guarded put_steam_app with opaque version token 
 
 ---
 
-### Task 2: admin-api test call sites
+### Task 2: reader-crate test call sites (admin-api + public-api)
 
 **Files:**
 - Modify: `crates/admin-api/tests/api_test.rs:2105,2218,2302`
+- Modify: `crates/public-api/tests/api_test.rs:1817,2172,2263,2270`
 
 **Interfaces:**
 - Consumes: `SteamAppPutGuard::Absent` from Task 1.
 - Produces: nothing new — mechanical compile fix.
 
-- [ ] **Step 1: Update the three seeding calls** — each seeds a fresh per-test table (verify: distinct app_id, first write) → `.put_steam_app(&SteamAppCache { ... }, SteamAppPutGuard::Absent)`. Add `SteamAppPutGuard` to the `use dynamo::{...}` import.
-- [ ] **Step 2: Run** — `cargo test -p admin-api` → pass.
+- [ ] **Step 1: Update the seven seeding calls** (3 admin-api + 4 public-api; `crates/public-api/tests/api_test.rs:2179` is a comment, not a call) — each seeds a fresh per-test table (verify: distinct app_id, first write for that id in its test) → append `, SteamAppPutGuard::Absent`. Add `SteamAppPutGuard` to each file's `use dynamo::{...}` import. If any site turns out to overwrite an id already written in the same test, read the token back with `get_steam_app_versioned` and use `Unchanged` instead.
+- [ ] **Step 2: Run** — `cargo test -p admin-api -p public-api` → pass.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/admin-api
-git commit -S -m "test(admin-api): put_steam_app call sites adopt the Absent guard (#75)"
+git add crates/admin-api crates/public-api
+git commit -S -m "test(admin-api,public-api): put_steam_app call sites adopt the Absent guard (#75)"
 ```
 
 ---
@@ -346,7 +347,7 @@ git commit -S -m "test(admin-api): put_steam_app call sites adopt the Absent gua
   - `pub enum PersistResult { Written { cache: dynamo::SteamAppCache, after_race: bool }, LostTwice }`
   - `pub async fn persist_fetched_halves(store: &Store, app_id: u32, snapshot: Option<(dynamo::SteamAppCache, dynamo::SteamAppVersion)>, ours: &FetchedHalves) -> Result<PersistResult, StoreError>`
 
-- [ ] **Step 1: Write the failing unit tests** for the pure merge in the existing `#[cfg(test)]` module (construct `SteamAppDetail` inline — all fields pub; use `..` shorthand only if a helper exists, otherwise write the full struct once in a local `fn test_detail(app_id: u32) -> steam_client::SteamAppDetail` builder with empty vecs / None options / `name: "T".into()`):
+- [ ] **Step 1: Write the failing unit tests** for the pure merge inside the EXISTING `#[cfg(test)] mod tests { use super::*; … }` at the tail of `crates/fulfillment/src/lib.rs` (verified at ~line 3257 — `use super::*;` is already there, so the new pub items resolve without imports). Add the three local builders below and the tests:
 
 ```rust
     fn halves(now: i64) -> FetchedHalves {
@@ -488,7 +489,7 @@ Local builders for the module (exact code — all fields pub):
     }
 ```
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p fulfillment --lib merge_` → compile error (types don't exist yet). Note: `-p fulfillment` won't fully compile until Tasks 4–5 fix the two prod call sites — expected mid-flight state; the workspace is whole again by Task 5 and verified in Task 6.
+- [ ] **Step 2: Run to verify failure** — `cargo check -p fulfillment 2>&1 | head -40` → expected errors, ALL of them known: (a) missing types `FetchedHalves`/`DetailFetch`/`merge_fetched_halves` in the test module (the RED for this task), and (b) `E0061: this function takes 2 arguments but 1 argument was supplied` at exactly two prod call sites — the enrichment put (~lib.rs:2268) and the backfill put (~lib.rs:2423). (b) is Task 4/5's work — do NOT fix those sites in this task.
 
 - [ ] **Step 3: Implement** — new section in `crates/fulfillment/src/lib.rs` directly above `run_steam_enrichment`:
 
@@ -608,7 +609,7 @@ pub async fn persist_fetched_halves(
 }
 ```
 
-- [ ] **Step 4: Run the pure tests** — `cargo test -p fulfillment --lib merge_` → pass (the lib target compiles once Task 4/5's call sites are also updated; if running Task 3 standalone, `cargo check -p fulfillment 2>&1 | grep -v "put_steam_app"` confirms only the two known prod call sites remain broken).
+- [ ] **Step 4: Verify scope** — `cargo check -p fulfillment 2>&1 | head -40` → the ONLY remaining errors are the two known `E0061` prod call sites (enrichment ~2268, backfill ~2423); the new types and the test module produce no errors. The merge_ tests first RUN GREEN in Task 5 Step 4, after both call sites are fixed — do not chase a passing test run in this task.
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -695,9 +696,13 @@ git commit -S -m "feat(fulfillment): shared #75 write policy — pure newest-win
         }
 
         if need_reviews && !delisted {
-            // [UNCHANGED: the two paced review fetches — keep the existing
-            //  get_review_summary / get_recent_reviews match blocks verbatim,
-            //  except the final assignments become:]
+            // Keep the existing two paced fetches (`get_review_summary` then
+            // `get_recent_reviews`, each with its sleep + full SteamError match)
+            // VERBATIM — then DELETE the old three assignment lines:
+            //     cache.overall = Some(overall);
+            //     cache.recent = Some(recent);
+            //     cache.reviews_fetched_at = now;
+            // and replace them with this single line:
             ours.reviews = Some((overall, recent));
         }
 
@@ -727,7 +732,7 @@ git commit -S -m "feat(fulfillment): shared #75 write policy — pure newest-win
 ```
 
 Also in this step:
-- Remove the now-dead `cache` field from `Work` (~line 2075) and from the decide-pass `worklist.push` (the decide pass keeps reading via plain `get_steam_app` — classification only).
+- Remove the now-dead `cache` field from `Work` (~line 2075) and from the decide-pass `worklist.push`; ALSO delete the decide-pass binding `let cache = existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id));` that fed it — leaving it dead fails clippy `-D warnings` in Task 6. (The decide pass keeps reading via plain `get_steam_app` — classification only.)
 - Note the old loop's `reviews_fetched_at`/`overall`/`recent` assignments and `cache.fetched_at = now` lines are all subsumed by the merge; delete them with the old body.
 - Declare `let mut lost_race = 0u32;` beside the other counters (~line 2150).
 - Extend the summary line: `"steam enrichment: fetched={fetched} fresh={fresh} negative={negative} lost_race={lost_race} aborted_429={aborted_429} auto_hidden={auto_hidden} tag_batch_failed={tag_batch_failed}"`.
@@ -933,7 +938,7 @@ async fn persist_fetched_halves_remerges_on_lost_race() {
 }
 ```
 
-(If `fresh_cache(570, 100)` doesn't set both clocks to its `now` argument, read its body at line ~4283 and adjust the seeded stamps so both are 100 — the test's arithmetic depends on seed=100 < theirs=500 < ours=600.)
+(Verified: `fresh_cache(app_id, now)` sets BOTH `fetched_at: now` and `reviews_fetched_at: now` — handler_test.rs:4312-13 — so the seed's clocks are 100 and the arithmetic seed=100 < theirs=500 < ours=600 holds as written.)
 
 - [ ] **Step 3: Full verify** — dynamodb-local up, then:
 
