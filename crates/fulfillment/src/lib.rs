@@ -2067,7 +2067,7 @@ pub fn merge_fetched_halves(cache: &mut dynamo::SteamAppCache, ours: &FetchedHal
 pub enum PersistResult {
     /// The merged cache below is what's now in the store.
     Written {
-        cache: dynamo::SteamAppCache,
+        cache: Box<dynamo::SteamAppCache>,
         /// True = the first put lost a race and the retry (re-read + re-merge)
         /// landed.
         after_race: bool,
@@ -2103,7 +2103,7 @@ pub async fn persist_fetched_halves(
     match store.put_steam_app(&cache, guard).await {
         Ok(()) => {
             return Ok(PersistResult::Written {
-                cache,
+                cache: Box::new(cache),
                 after_race: false,
             });
         }
@@ -2117,7 +2117,7 @@ pub async fn persist_fetched_halves(
     merge_fetched_halves(&mut cache, ours);
     match store.put_steam_app(&cache, guard).await {
         Ok(()) => Ok(PersistResult::Written {
-            cache,
+            cache: Box::new(cache),
             after_race: true,
         }),
         Err(dynamo::SteamAppPutError::Store(e)) => Err(e),
@@ -2393,7 +2393,10 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             }
             Ok(PersistResult::LostTwice) => {
                 lost_race += 1;
-                tracing::warn!(app_id, "steam enrichment: lost the STEAMAPP# race twice — skipping app, next sync retries");
+                tracing::warn!(
+                    app_id,
+                    "steam enrichment: lost the STEAMAPP# race twice — skipping app, next sync retries"
+                );
                 continue 'apps;
             }
             Err(e) => {
@@ -2577,7 +2580,10 @@ pub async fn backfill_steam_details(
             Ok(PersistResult::LostTwice) => {
                 summary.lost_race += 1;
                 summary.failed += 1;
-                tracing::warn!(app_id, "backfill: lost the STEAMAPP# race twice — skipping app, next pass retries");
+                tracing::warn!(
+                    app_id,
+                    "backfill: lost the STEAMAPP# race twice — skipping app, next pass retries"
+                );
                 continue;
             }
             Err(e) => {

@@ -2309,7 +2309,10 @@ async fn list_steam_app_ids_excludes_non_steamapp_items() {
     // Overwrite via the guarded path (#75): re-put one item, list must not grow.
     let (_, v100) = store.get_steam_app_versioned(100).await.unwrap().unwrap();
     store
-        .put_steam_app(&steam_app_cache_full(100), SteamAppPutGuard::Unchanged(v100))
+        .put_steam_app(
+            &steam_app_cache_full(100),
+            SteamAppPutGuard::Unchanged(v100),
+        )
         .await
         .unwrap();
     let ids2 = store.list_steam_app_ids().await.unwrap();
@@ -2558,7 +2561,10 @@ async fn put_steam_app_unchanged_guard() {
         .put_steam_app(&full, SteamAppPutGuard::Unchanged(v1))
         .await
         .unwrap_err();
-    assert!(matches!(err, SteamAppPutError::LostRace), "stale token loses");
+    assert!(
+        matches!(err, SteamAppPutError::LostRace),
+        "stale token loses"
+    );
 
     let (read_back, v2) = store.get_steam_app_versioned(570).await.unwrap().unwrap();
     assert!(read_back.detail.is_some(), "guarded write landed");

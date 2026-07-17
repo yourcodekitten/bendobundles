@@ -2068,7 +2068,7 @@ impl Store {
         &self,
         app_id: u32,
     ) -> Result<Option<(SteamAppCache, SteamAppVersion)>, StoreError> {
-        let (pk, sk) = schema::key_pair(&steam_app_pk(app_id), "META");
+        let (pk, sk) = schema::key_pair(steam_app_pk(app_id), "META");
         let out = self
             .client
             .get_item()

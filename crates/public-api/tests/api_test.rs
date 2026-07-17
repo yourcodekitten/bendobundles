@@ -1814,7 +1814,10 @@ async fn game_detail_listable_200_with_steam_blob() {
     g.steam_app_id = Some(99001);
     let gid = g.id.clone();
     store.put_game(&g).await.unwrap();
-    store.put_steam_app(&test_steam_cache(99001), SteamAppPutGuard::Absent).await.unwrap();
+    store
+        .put_steam_app(&test_steam_cache(99001), SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let tok = format!("gdl{}", &uid[..28]);
     let lnk = test_link(&tok);
@@ -2169,7 +2172,10 @@ async fn link_list_carries_genres_from_steam_cache() {
         "Casual".into(),
         "Sports".into(),
     ];
-    store.put_steam_app(&cache, SteamAppPutGuard::Absent).await.unwrap();
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     // game B: no steam appid → genres key must be absent
     let b = test_game(61);
@@ -2260,14 +2266,20 @@ async fn link_list_carries_tags_from_steam_cache() {
     store.put_game(&a).await.unwrap();
     let mut cache = test_steam_cache(99201);
     cache.detail.as_mut().unwrap().tags = vec!["Roguelike".into(), "Sci-fi".into()];
-    store.put_steam_app(&cache, SteamAppPutGuard::Absent).await.unwrap();
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     // game B: warm cache, EMPTY tags (gated/pre-backfill) → tags key absent
     let mut b = test_game(71);
     b.steam_app_id = Some(99202);
     let bid = b.id.clone();
     store.put_game(&b).await.unwrap();
-    store.put_steam_app(&test_steam_cache(99202), SteamAppPutGuard::Absent).await.unwrap();
+    store
+        .put_steam_app(&test_steam_cache(99202), SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let tok = format!("tag{}", &uid[..28]);
     store.create_link(&test_link(&tok)).await.unwrap();
