@@ -108,7 +108,12 @@ Condition expressions and written version:
 - `Unchanged(None)` (legacy item) → `attribute_not_exists(version)`; writes
   `version = 1`. This is the **migration arm**: pre-change items have no `version`,
   and the first guarded write adopts them. It cannot false-pass — any concurrent
-  new-code write stamps `version`, which flips the arm to a CCF.
+  new-code write stamps `version`, which flips the arm to a CCF. **Scope (OMBB
+  review):** that guarantee assumes an all-new-code fleet. During a mixed-fleet
+  window (rollback, or a partial deploy running old and new fulfillment code
+  side by side), an old-code unconditional put strips `version` and re-opens an
+  ABA on legacy tokens — acceptable here because the fleet is one lambda deployed
+  atomically, and any such window merely reverts to today's unguarded behavior.
 - `Unchanged(Some(v))` → `version = :v`; writes `version = v + 1`.
 
 (Considered and rejected: conditioning on `body = :old_body` string equality —

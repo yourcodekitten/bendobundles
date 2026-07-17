@@ -392,6 +392,23 @@ git commit -S -m "test(admin-api,public-api): put_steam_app call sites adopt the
         assert_eq!(cache.reviews_fetched_at, 0, "delisted reviews stamp only applies with the detail half");
     }
 
+    /// #75 merge policy, mirror direction: a NEWER concurrent Delisted verdict is
+    /// not resurrected by our stale Live detail — the dead app stays dead.
+    #[test]
+    fn merge_theirs_newer_delisted_not_resurrected() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.detail = None; // concurrent writer's delisted stub…
+        cache.fetched_at = 800; // …stamped fresher than our fetch
+        cache.reviews_fetched_at = 800;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Live(Box::new(test_detail(570)))),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.detail.is_none(), "our stale Live must not resurrect their newer Delisted");
+        assert_eq!(cache.fetched_at, 800);
+    }
+
     /// #75 merge policy: equal stamps go to us — we hold data fetched moments ago.
     #[test]
     fn merge_equal_stamp_ours_wins() {
@@ -489,7 +506,7 @@ Local builders for the module (exact code — all fields pub):
     }
 ```
 
-- [ ] **Step 2: Run to verify failure** — `cargo check -p fulfillment 2>&1 | head -40` → expected errors, ALL of them known: (a) missing types `FetchedHalves`/`DetailFetch`/`merge_fetched_halves` in the test module (the RED for this task), and (b) `E0061: this function takes 2 arguments but 1 argument was supplied` at exactly two prod call sites — the enrichment put (~lib.rs:2268) and the backfill put (~lib.rs:2423). (b) is Task 4/5's work — do NOT fix those sites in this task.
+- [ ] **Step 2: Run to verify failure** — `cargo check -p fulfillment --tests 2>&1 | head -40` (`--tests` matters: a plain `cargo check` never compiles `#[cfg(test)]` code, so the RED below would be invisible) → expected errors, ALL of them known: (a) missing types `FetchedHalves`/`DetailFetch`/`merge_fetched_halves` in the test module (the RED for this task), and (b) `E0061: this function takes 2 arguments but 1 argument was supplied` at exactly two prod call sites — the enrichment put (~lib.rs:2268) and the backfill put (~lib.rs:2423). (b) is Task 4/5's work — do NOT fix those sites in this task.
 
 - [ ] **Step 3: Implement** — new section in `crates/fulfillment/src/lib.rs` directly above `run_steam_enrichment`:
 
@@ -609,7 +626,7 @@ pub async fn persist_fetched_halves(
 }
 ```
 
-- [ ] **Step 4: Verify scope** — `cargo check -p fulfillment 2>&1 | head -40` → the ONLY remaining errors are the two known `E0061` prod call sites (enrichment ~2268, backfill ~2423); the new types and the test module produce no errors. The merge_ tests first RUN GREEN in Task 5 Step 4, after both call sites are fixed — do not chase a passing test run in this task.
+- [ ] **Step 4: Verify scope** — `cargo check -p fulfillment --tests 2>&1 | head -40` → the ONLY remaining errors are the two known `E0061` prod call sites (enrichment ~2268, backfill ~2423); the new types and the test module produce no errors. The merge_ tests first RUN GREEN in Task 5 Step 4, after both call sites are fixed — do not chase a passing test run in this task.
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -737,7 +754,7 @@ Also in this step:
 - Declare `let mut lost_race = 0u32;` beside the other counters (~line 2150).
 - Extend the summary line: `"steam enrichment: fetched={fetched} fresh={fresh} negative={negative} lost_race={lost_race} aborted_429={aborted_429} auto_hidden={auto_hidden} tag_batch_failed={tag_batch_failed}"`.
 
-- [ ] **Step 2: Run** — `cargo check -p fulfillment` → only the backfill call site still broken (Task 5); `cargo test -p fulfillment --lib merge_` → pass.
+- [ ] **Step 2: Run** — `cargo check -p fulfillment --tests` → exactly ONE error remains: the backfill `E0061` at ~lib.rs:2423 (Task 5's work — do not fix it here). No test run is possible yet; the merge_ tests first run green in Task 5 Step 4.
 - [ ] **Step 3: Commit**
 
 ```bash
