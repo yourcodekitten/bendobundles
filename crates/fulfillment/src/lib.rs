@@ -2154,11 +2154,12 @@ pub async fn persist_fetched_halves(
 /// app. The `SteamError` match names every variant (no `_` arm) — the crate convention.
 ///
 /// One summary log line per run: `steam enrichment: fetched=<n> fresh=<n> negative=<n>
-/// aborted_429=<bool> auto_hidden=<n> tag_batch_failed=<bool>` (`fetched` = apps whose cache item
-/// was written this run, `fresh` = of those, how many pulled live appdetails, `negative` =
-/// delisted stubs, `auto_hidden` = games newly hidden by the adult sweep, `tag_batch_failed` =
-/// the grep-able signal that GetItems/GetTagList failed or answered implausibly — see #71),
-/// plus a `deferred` field.
+/// lost_race=<n> aborted_429=<bool> auto_hidden=<n> tag_batch_failed=<bool>` (`fetched` = apps
+/// whose cache item was written this run, `fresh` = of those, how many pulled live appdetails,
+/// `negative` = delisted stubs, `lost_race` = apps whose guarded write hit a concurrent writer
+/// at least once — re-merged and retried, or skipped on a second loss (#75), `auto_hidden` =
+/// games newly hidden by the adult sweep, `tag_batch_failed` = the grep-able signal that
+/// GetItems/GetTagList failed or answered implausibly — see #71), plus a `deferred` field.
 pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     // Kill switch (read via config, not raw env) → skip entirely.
     if deps.steam_enrich_disabled {
