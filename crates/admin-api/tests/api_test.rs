@@ -15,7 +15,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
-use dynamo::{SteamAppCache, Store};
+use dynamo::{SteamAppCache, SteamAppPutGuard, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use steam_client::{RecentReviews, ReviewSummary, SteamApiKey, SteamAppDetail, SteamClient};
 use time::macros::datetime;
@@ -2132,7 +2132,7 @@ async fn admin_game_detail_superset_fields_and_steam_blob() {
             }),
             fetched_at: 1_700_000_000,
             reviews_fetched_at: 1_700_000_000,
-        })
+        }, SteamAppPutGuard::Absent)
         .await
         .unwrap();
 
@@ -2245,7 +2245,7 @@ async fn catalog_joins_steam_summary() {
             }),
             fetched_at: 1,
             reviews_fetched_at: 1,
-        })
+        }, SteamAppPutGuard::Absent)
         .await
         .unwrap();
 
@@ -2321,7 +2321,7 @@ async fn catalog_carries_tags_descriptors_and_hidden_source() {
             recent: None,
             fetched_at: 1,
             reviews_fetched_at: 1,
-        })
+        }, SteamAppPutGuard::Absent)
         .await
         .unwrap();
 
