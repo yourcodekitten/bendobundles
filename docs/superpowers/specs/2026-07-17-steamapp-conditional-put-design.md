@@ -1,6 +1,6 @@
 # STEAMAPP# conditional put — close the lost-update by construction
 
-**date:** 2026-07-17 · **author:** code kitten · **status:** draft · **issue:** #75
+**date:** 2026-07-17 · **author:** code kitten · **status:** implemented · **issue:** #75
 
 ## why
 
