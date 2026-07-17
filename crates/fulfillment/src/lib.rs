@@ -2011,6 +2011,120 @@ async fn auto_hide_adult_games(
     hidden
 }
 
+// ── #75: guarded STEAMAPP# persistence ───────────────────────────────────────
+
+/// One pass's freshly fetched Steam halves for a single app — what the writer
+/// wants to persist, independent of which snapshot it lands on (#75).
+pub struct FetchedHalves {
+    /// The pass clock: the `fetched_at`/`reviews_fetched_at` stamp for whichever
+    /// halves are present.
+    pub now: i64,
+    /// Detail half, if fetched this pass.
+    pub detail: Option<DetailFetch>,
+    /// Reviews half (summary + recent histogram), if fetched this pass.
+    pub reviews: Option<(steam_client::ReviewSummary, steam_client::RecentReviews)>,
+}
+
+/// Outcome of a detail fetch.
+pub enum DetailFetch {
+    Live(Box<steam_client::SteamAppDetail>),
+    /// Steam says the app no longer exists: negative-cache stub. Stamps BOTH
+    /// clocks (a dead app has no reviews to fetch).
+    Delisted,
+}
+
+/// Newest-wins-per-half merge of this pass's fetched halves onto a store
+/// snapshot. Pure — the single definition of the re-merge policy shared by
+/// enrichment and backfill, unit-testable without staging a live race (#75).
+///
+/// Each half applies only if our stamp is >= the snapshot's (ties go to us: we
+/// hold data fetched moments ago). A snapshot half NEWER than ours survives —
+/// that's the concurrent writer's fresher fetch, not a loss.
+pub fn merge_fetched_halves(cache: &mut dynamo::SteamAppCache, ours: &FetchedHalves) {
+    match &ours.detail {
+        Some(DetailFetch::Live(d)) if ours.now >= cache.fetched_at => {
+            cache.detail = Some((**d).clone());
+            cache.fetched_at = ours.now;
+        }
+        Some(DetailFetch::Delisted) if ours.now >= cache.fetched_at => {
+            cache.detail = None;
+            cache.fetched_at = ours.now;
+            // Both clocks, forward-only: never regress a fresher concurrent stamp.
+            cache.reviews_fetched_at = cache.reviews_fetched_at.max(ours.now);
+        }
+        _ => {}
+    }
+    if let Some((overall, recent)) = &ours.reviews
+        && ours.now >= cache.reviews_fetched_at
+    {
+        cache.overall = Some(overall.clone());
+        cache.recent = Some(recent.clone());
+        cache.reviews_fetched_at = ours.now;
+    }
+}
+
+/// Result of [`persist_fetched_halves`].
+pub enum PersistResult {
+    /// The merged cache below is what's now in the store.
+    Written {
+        cache: dynamo::SteamAppCache,
+        /// True = the first put lost a race and the retry (re-read + re-merge)
+        /// landed.
+        after_race: bool,
+    },
+    /// Two consecutive lost races — this app is skipped; the next pass retries.
+    LostTwice,
+}
+
+fn snapshot_parts(
+    app_id: u32,
+    snapshot: Option<(dynamo::SteamAppCache, dynamo::SteamAppVersion)>,
+) -> (dynamo::SteamAppCache, dynamo::SteamAppPutGuard) {
+    match snapshot {
+        None => (
+            dynamo::SteamAppCache::empty(app_id),
+            dynamo::SteamAppPutGuard::Absent,
+        ),
+        Some((c, v)) => (c, dynamo::SteamAppPutGuard::Unchanged(v)),
+    }
+}
+
+/// The single home of the #75 write policy: guarded put; on a lost race,
+/// re-read, re-merge (newest-wins per half — zero extra Steam calls, the data
+/// is in hand), retry exactly once; a second loss yields the pass.
+pub async fn persist_fetched_halves(
+    store: &Store,
+    app_id: u32,
+    snapshot: Option<(dynamo::SteamAppCache, dynamo::SteamAppVersion)>,
+    ours: &FetchedHalves,
+) -> Result<PersistResult, StoreError> {
+    let (mut cache, guard) = snapshot_parts(app_id, snapshot);
+    merge_fetched_halves(&mut cache, ours);
+    match store.put_steam_app(&cache, guard).await {
+        Ok(()) => {
+            return Ok(PersistResult::Written {
+                cache,
+                after_race: false,
+            });
+        }
+        Err(dynamo::SteamAppPutError::Store(e)) => return Err(e),
+        Err(dynamo::SteamAppPutError::LostRace) => {}
+    }
+    // Lost the race: someone wrote between our read and our put. Their write is
+    // real data — re-read, merge ours onto THEIR item, retry once.
+    let fresh = store.get_steam_app_versioned(app_id).await?;
+    let (mut cache, guard) = snapshot_parts(app_id, fresh);
+    merge_fetched_halves(&mut cache, ours);
+    match store.put_steam_app(&cache, guard).await {
+        Ok(()) => Ok(PersistResult::Written {
+            cache,
+            after_race: true,
+        }),
+        Err(dynamo::SteamAppPutError::Store(e)) => Err(e),
+        Err(dynamo::SteamAppPutError::LostRace) => Ok(PersistResult::LostTwice),
+    }
+}
+
 /// The budgeted, politely-paced Steam enrichment pass (spec §3). Runs in [`run_sync`] AFTER the
 /// ownership pass, and hits the Steam storefront endpoints ONLY here — never at request time
 /// (Ben's be-nice rule). Everything about it is throttled: `≥1.5s` between every storefront call,
@@ -3445,5 +3559,172 @@ mod tests {
             serde_json::from_str::<FulfillResponse>(&json).unwrap(),
             resp
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #75: merge_fetched_halves — the newest-wins-per-half re-merge policy
+    // -----------------------------------------------------------------------------------------
+
+    fn test_detail(app_id: u32) -> steam_client::SteamAppDetail {
+        steam_client::SteamAppDetail {
+            app_id,
+            name: "T".into(),
+            developers: vec![],
+            publishers: vec![],
+            genres: vec![],
+            release_date: None,
+            short_description: "t".into(),
+            header_image: None,
+            video_hls_url: None,
+            video_thumbnail: None,
+            screenshots: vec![],
+            tags: vec![],
+            content_descriptor_ids: vec![],
+            content_notes: None,
+        }
+    }
+
+    fn test_review_summary() -> steam_client::ReviewSummary {
+        steam_client::ReviewSummary {
+            desc: "Positive".into(),
+            total_positive: 10,
+            total_negative: 1,
+            total_reviews: 11,
+        }
+    }
+
+    fn test_recent_reviews() -> steam_client::RecentReviews {
+        steam_client::RecentReviews {
+            percent_positive: 90,
+            count: 11,
+        }
+    }
+
+    fn halves(now: i64) -> FetchedHalves {
+        FetchedHalves {
+            now,
+            detail: None,
+            reviews: None,
+        }
+    }
+
+    /// #75 merge policy: our fresh detail applies over a staler snapshot half; the
+    /// snapshot's untouched reviews half survives.
+    #[test]
+    fn merge_ours_newer_detail_applies() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.fetched_at = 100;
+        cache.reviews_fetched_at = 900;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Live(Box::new(test_detail(570)))),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.detail.is_some());
+        assert_eq!(cache.fetched_at, 500);
+        assert_eq!(cache.reviews_fetched_at, 900, "reviews half untouched");
+    }
+
+    /// #75 merge policy: a snapshot half NEWER than ours survives — the concurrent
+    /// writer's fresher fetch wins, ours is dropped (correct, not a loss).
+    #[test]
+    fn merge_theirs_newer_detail_survives() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.detail = Some(test_detail(570));
+        cache.fetched_at = 800;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Delisted),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(
+            cache.detail.is_some(),
+            "their live detail survives our stale stub"
+        );
+        assert_eq!(cache.fetched_at, 800);
+        assert_eq!(
+            cache.reviews_fetched_at, 0,
+            "delisted reviews stamp only applies with the detail half"
+        );
+    }
+
+    /// #75 merge policy, mirror direction: a NEWER concurrent Delisted verdict is
+    /// not resurrected by our stale Live detail — the dead app stays dead.
+    #[test]
+    fn merge_theirs_newer_delisted_not_resurrected() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.detail = None; // concurrent writer's delisted stub…
+        cache.fetched_at = 800; // …stamped fresher than our fetch
+        cache.reviews_fetched_at = 800;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Live(Box::new(test_detail(570)))),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(
+            cache.detail.is_none(),
+            "our stale Live must not resurrect their newer Delisted"
+        );
+        assert_eq!(cache.fetched_at, 800);
+    }
+
+    /// #75 merge policy: equal stamps go to us — we hold data fetched moments ago.
+    #[test]
+    fn merge_equal_stamp_ours_wins() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.fetched_at = 500;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Live(Box::new(test_detail(570)))),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.detail.is_some());
+    }
+
+    /// #75 merge policy: delisted stamps BOTH clocks (dead apps skip review fetches
+    /// for the whole window) but never regresses a fresher concurrent reviews stamp.
+    #[test]
+    fn merge_delisted_stamps_both_clocks_forward_only() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.fetched_at = 100;
+        cache.reviews_fetched_at = 100;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Delisted),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.detail.is_none());
+        assert_eq!(cache.fetched_at, 500);
+        assert_eq!(cache.reviews_fetched_at, 500);
+
+        let mut cache2 = dynamo::SteamAppCache::empty(571);
+        cache2.fetched_at = 100;
+        cache2.reviews_fetched_at = 800; // concurrent writer's fresher reviews
+        merge_fetched_halves(
+            &mut cache2,
+            &FetchedHalves {
+                detail: Some(DetailFetch::Delisted),
+                ..halves(500)
+            },
+        );
+        assert_eq!(cache2.reviews_fetched_at, 800, "never stamps backward");
+    }
+
+    /// #75 merge policy: the reviews half applies independently of the detail half.
+    #[test]
+    fn merge_reviews_half_independent() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.detail = Some(test_detail(570));
+        cache.fetched_at = 800;
+        cache.reviews_fetched_at = 100;
+        let ours = FetchedHalves {
+            reviews: Some((test_review_summary(), test_recent_reviews())),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.overall.is_some());
+        assert!(cache.recent.is_some());
+        assert_eq!(cache.reviews_fetched_at, 500);
+        assert_eq!(cache.fetched_at, 800, "detail half untouched");
     }
 }
