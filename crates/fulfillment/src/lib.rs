@@ -2439,8 +2439,9 @@ pub struct BackfillSummary {
     /// items kept their OLD tags but were stamped fresh, so the operator MUST rerun with
     /// SKIP_FRESH_SECS=0 or the catalog stays tagless until the 30-day window (#73 review).
     pub tag_batch_failed: bool,
-    /// STEAMAPP# write races detected by the #75 guard (each was re-merged and
-    /// retried; a twice-lost app is also counted in `failed`).
+    /// Apps whose STEAMAPP# write hit the #75 guard at least once this run.
+    /// Most re-merge and land on the retry; an app that lost twice was NOT
+    /// persisted this run (skipped, also counted in `failed` — next pass retries).
     pub lost_race: u32,
 }
 
