@@ -2011,6 +2011,120 @@ async fn auto_hide_adult_games(
     hidden
 }
 
+// ── #75: guarded STEAMAPP# persistence ───────────────────────────────────────
+
+/// One pass's freshly fetched Steam halves for a single app — what the writer
+/// wants to persist, independent of which snapshot it lands on (#75).
+pub struct FetchedHalves {
+    /// The pass clock: the `fetched_at`/`reviews_fetched_at` stamp for whichever
+    /// halves are present.
+    pub now: i64,
+    /// Detail half, if fetched this pass.
+    pub detail: Option<DetailFetch>,
+    /// Reviews half (summary + recent histogram), if fetched this pass.
+    pub reviews: Option<(steam_client::ReviewSummary, steam_client::RecentReviews)>,
+}
+
+/// Outcome of a detail fetch.
+pub enum DetailFetch {
+    Live(Box<steam_client::SteamAppDetail>),
+    /// Steam says the app no longer exists: negative-cache stub. Stamps BOTH
+    /// clocks (a dead app has no reviews to fetch).
+    Delisted,
+}
+
+/// Newest-wins-per-half merge of this pass's fetched halves onto a store
+/// snapshot. Pure — the single definition of the re-merge policy shared by
+/// enrichment and backfill, unit-testable without staging a live race (#75).
+///
+/// Each half applies only if our stamp is >= the snapshot's (ties go to us: we
+/// hold data fetched moments ago). A snapshot half NEWER than ours survives —
+/// that's the concurrent writer's fresher fetch, not a loss.
+pub fn merge_fetched_halves(cache: &mut dynamo::SteamAppCache, ours: &FetchedHalves) {
+    match &ours.detail {
+        Some(DetailFetch::Live(d)) if ours.now >= cache.fetched_at => {
+            cache.detail = Some((**d).clone());
+            cache.fetched_at = ours.now;
+        }
+        Some(DetailFetch::Delisted) if ours.now >= cache.fetched_at => {
+            cache.detail = None;
+            cache.fetched_at = ours.now;
+            // Both clocks, forward-only: never regress a fresher concurrent stamp.
+            cache.reviews_fetched_at = cache.reviews_fetched_at.max(ours.now);
+        }
+        _ => {}
+    }
+    if let Some((overall, recent)) = &ours.reviews
+        && ours.now >= cache.reviews_fetched_at
+    {
+        cache.overall = Some(overall.clone());
+        cache.recent = Some(recent.clone());
+        cache.reviews_fetched_at = ours.now;
+    }
+}
+
+/// Result of [`persist_fetched_halves`].
+pub enum PersistResult {
+    /// The merged cache below is what's now in the store.
+    Written {
+        cache: Box<dynamo::SteamAppCache>,
+        /// True = the first put lost a race and the retry (re-read + re-merge)
+        /// landed.
+        after_race: bool,
+    },
+    /// Two consecutive lost races — this app is skipped; the next pass retries.
+    LostTwice,
+}
+
+fn snapshot_parts(
+    app_id: u32,
+    snapshot: Option<(dynamo::SteamAppCache, dynamo::SteamAppVersion)>,
+) -> (dynamo::SteamAppCache, dynamo::SteamAppPutGuard) {
+    match snapshot {
+        None => (
+            dynamo::SteamAppCache::empty(app_id),
+            dynamo::SteamAppPutGuard::Absent,
+        ),
+        Some((c, v)) => (c, dynamo::SteamAppPutGuard::Unchanged(v)),
+    }
+}
+
+/// The single home of the #75 write policy: guarded put; on a lost race,
+/// re-read, re-merge (newest-wins per half — zero extra Steam calls, the data
+/// is in hand), retry exactly once; a second loss yields the pass.
+pub async fn persist_fetched_halves(
+    store: &Store,
+    app_id: u32,
+    snapshot: Option<(dynamo::SteamAppCache, dynamo::SteamAppVersion)>,
+    ours: &FetchedHalves,
+) -> Result<PersistResult, StoreError> {
+    let (mut cache, guard) = snapshot_parts(app_id, snapshot);
+    merge_fetched_halves(&mut cache, ours);
+    match store.put_steam_app(&cache, guard).await {
+        Ok(()) => {
+            return Ok(PersistResult::Written {
+                cache: Box::new(cache),
+                after_race: false,
+            });
+        }
+        Err(dynamo::SteamAppPutError::Store(e)) => return Err(e),
+        Err(dynamo::SteamAppPutError::LostRace) => {}
+    }
+    // Lost the race: someone wrote between our read and our put. Their write is
+    // real data — re-read, merge ours onto THEIR item, retry once.
+    let fresh = store.get_steam_app_versioned(app_id).await?;
+    let (mut cache, guard) = snapshot_parts(app_id, fresh);
+    merge_fetched_halves(&mut cache, ours);
+    match store.put_steam_app(&cache, guard).await {
+        Ok(()) => Ok(PersistResult::Written {
+            cache: Box::new(cache),
+            after_race: true,
+        }),
+        Err(dynamo::SteamAppPutError::Store(e)) => Err(e),
+        Err(dynamo::SteamAppPutError::LostRace) => Ok(PersistResult::LostTwice),
+    }
+}
+
 /// The budgeted, politely-paced Steam enrichment pass (spec §3). Runs in [`run_sync`] AFTER the
 /// ownership pass, and hits the Steam storefront endpoints ONLY here — never at request time
 /// (Ben's be-nice rule). Everything about it is throttled: `≥1.5s` between every storefront call,
@@ -2040,11 +2154,12 @@ async fn auto_hide_adult_games(
 /// app. The `SteamError` match names every variant (no `_` arm) — the crate convention.
 ///
 /// One summary log line per run: `steam enrichment: fetched=<n> fresh=<n> negative=<n>
-/// aborted_429=<bool> auto_hidden=<n> tag_batch_failed=<bool>` (`fetched` = apps whose cache item
-/// was written this run, `fresh` = of those, how many pulled live appdetails, `negative` =
-/// delisted stubs, `auto_hidden` = games newly hidden by the adult sweep, `tag_batch_failed` =
-/// the grep-able signal that GetItems/GetTagList failed or answered implausibly — see #71),
-/// plus a `deferred` field.
+/// lost_race=<n> aborted_429=<bool> auto_hidden=<n> tag_batch_failed=<bool>` (`fetched` = apps
+/// whose cache item was written this run, `fresh` = of those, how many pulled live appdetails,
+/// `negative` = delisted stubs, `lost_race` = apps whose guarded write hit a concurrent writer
+/// at least once — re-merged and retried, or skipped on a second loss (#75), `auto_hidden` =
+/// games newly hidden by the adult sweep, `tag_batch_failed` = the grep-able signal that
+/// GetItems/GetTagList failed or answered implausibly — see #71), plus a `deferred` field.
 pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     // Kill switch (read via config, not raw env) → skip entirely.
     if deps.steam_enrich_disabled {
@@ -2071,12 +2186,12 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     let appids: std::collections::BTreeSet<u32> =
         games.iter().filter_map(|g| g.steam_app_id).collect();
 
-    /// One appid's decided work: which half(s) are stale, plus the cache item to merge into.
+    /// One appid's decided work: which half(s) are stale. (The decide-pass snapshot
+    /// is deliberately NOT carried — the fetch loop re-reads just-in-time, #75.)
     struct Work {
         app_id: u32,
         need_detail: bool,
         need_reviews: bool,
-        cache: dynamo::SteamAppCache,
     }
 
     // Every appid known to carry adult descriptors this pass — fed by BOTH the decide
@@ -2109,12 +2224,10 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
         if !need_detail && !need_reviews {
             continue; // both halves fresh — nothing to do
         }
-        let cache = existing.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id));
         worklist.push(Work {
             app_id,
             need_detail,
             need_reviews,
-            cache,
         });
     }
 
@@ -2149,6 +2262,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     let mut fetched = 0u32;
     let mut fresh = 0u32;
     let mut negative = 0u32;
+    let mut lost_race = 0u32;
     let mut aborted_429 = false;
     let mut deferred_unstarted = 0usize;
 
@@ -2164,41 +2278,44 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             app_id,
             need_detail,
             need_reviews,
-            cache: _decided,
         } = work;
-        // Just-in-time re-read: the decide-pass snapshot can be minutes stale by the time
-        // this item's turn comes (paced loop), and the merge write below carries EVERY
-        // half of the cache. This NARROWS the lost-update window vs a concurrent writer
-        // (fresh reviews / a backfill-migrated blob) from run-length to per-item seconds —
-        // it does not close it; the put is unconditional (#73 review). The decide-pass
-        // snapshot only classified the work.
-        let mut cache = match deps.store.get_steam_app(app_id).await {
-            Ok(v) => v.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
+        // Just-in-time versioned read: the decide-pass snapshot can be minutes stale
+        // by the time this item's turn comes (paced loop). The snapshot + token seed
+        // the guarded merge write below — a concurrent writer inside the read→put
+        // gap is now DETECTED (LostRace ⇒ re-merge + retry, #75), not silently
+        // overwritten. The decide-pass snapshot only classified the work.
+        let snapshot = match deps.store.get_steam_app_versioned(app_id).await {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(app_id, error = ?e, "steam enrichment: re-read failed — skipping app");
                 continue 'apps;
             }
         };
+        let mut ours = FetchedHalves {
+            now,
+            detail: None,
+            reviews: None,
+        };
         let mut delisted = false;
-        let mut fresh_detail = false;
 
         if need_detail {
             tokio::time::sleep(deps.steam_enrich_pace).await;
             match steam.get_app_details(app_id).await {
                 Ok(steam_client::AppDetails::Found(d)) => {
                     let mut detail = *d;
-                    detail.tags = tags_for_app(app_id, tag_data.as_ref(), cache.detail.as_ref());
-                    cache.detail = Some(detail);
-                    cache.fetched_at = now;
+                    detail.tags = tags_for_app(
+                        app_id,
+                        tag_data.as_ref(),
+                        snapshot.as_ref().and_then(|(c, _)| c.detail.as_ref()),
+                    );
+                    ours.detail = Some(DetailFetch::Live(Box::new(detail)));
                     fresh += 1;
-                    fresh_detail = true;
                 }
-                // Delisted: negative-cache stub. Stamp BOTH clocks so it's retried on the 30d
-                // window (not every sync), and skip reviews — a dead app has none.
+                // Delisted: negative-cache stub. The merge stamps BOTH clocks so it's
+                // retried on the 30d window (not every sync), and reviews are skipped —
+                // a dead app has none.
                 Ok(steam_client::AppDetails::Delisted) => {
-                    cache.detail = None;
-                    cache.fetched_at = now;
-                    cache.reviews_fetched_at = now;
+                    ours.detail = Some(DetailFetch::Delisted);
                     negative += 1;
                     delisted = true;
                 }
@@ -2259,19 +2376,34 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
                     continue 'apps;
                 }
             };
-            cache.overall = Some(overall);
-            cache.recent = Some(recent);
-            cache.reviews_fetched_at = now;
+            ours.reviews = Some((overall, recent));
         }
 
-        // Merge write per-item: partial progress survives an abort/timeout later in the pass.
-        if let Err(e) = deps.store.put_steam_app(&cache).await {
-            tracing::warn!(app_id, error = ?e, "steam enrichment: put_steam_app failed — this app not persisted");
-            continue 'apps;
-        }
-        fetched += 1;
-        if fresh_detail {
-            supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+        // Merge write per-item: partial progress survives an abort/timeout later
+        // in the pass. Guarded + re-merged per #75 — see persist_fetched_halves.
+        let fresh_detail = matches!(ours.detail, Some(DetailFetch::Live(_)));
+        match persist_fetched_halves(&deps.store, app_id, snapshot, &ours).await {
+            Ok(PersistResult::Written { cache, after_race }) => {
+                if after_race {
+                    lost_race += 1;
+                }
+                fetched += 1;
+                if fresh_detail {
+                    supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+                }
+            }
+            Ok(PersistResult::LostTwice) => {
+                lost_race += 1;
+                tracing::warn!(
+                    app_id,
+                    "steam enrichment: lost the STEAMAPP# race twice — skipping app, next sync retries"
+                );
+                continue 'apps;
+            }
+            Err(e) => {
+                tracing::warn!(app_id, error = ?e, "steam enrichment: put_steam_app failed — this app not persisted");
+                continue 'apps;
+            }
         }
     }
     // Whatever's left unstarted (deadline stop, or the tail after a 429 abort) is deferred too.
@@ -2285,7 +2417,7 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     let deferred = deferred_by_cap + deferred_unstarted;
     tracing::info!(
         deferred,
-        "steam enrichment: fetched={fetched} fresh={fresh} negative={negative} aborted_429={aborted_429} auto_hidden={auto_hidden} tag_batch_failed={tag_batch_failed}"
+        "steam enrichment: fetched={fetched} fresh={fresh} negative={negative} lost_race={lost_race} aborted_429={aborted_429} auto_hidden={auto_hidden} tag_batch_failed={tag_batch_failed}"
     );
 }
 
@@ -2308,6 +2440,10 @@ pub struct BackfillSummary {
     /// items kept their OLD tags but were stamped fresh, so the operator MUST rerun with
     /// SKIP_FRESH_SECS=0 or the catalog stays tagless until the 30-day window (#73 review).
     pub tag_batch_failed: bool,
+    /// Apps whose STEAMAPP# write hit the #75 guard at least once this run.
+    /// Most re-merge and land on the retry; an app that lost twice was NOT
+    /// persisted this run (skipped, also counted in `failed` — next pass retries).
+    pub lost_race: u32,
 }
 
 /// Run-once STEAMAPP# rebuild (issues #57, #61): refetch appdetails for EVERY catalog appid through
@@ -2375,33 +2511,38 @@ pub async fn backfill_steam_details(
     summary.tag_batch_failed = !worklist.is_empty() && tag_data.is_none();
 
     for app_id in worklist {
-        // Just-in-time re-read (review round 2): the decide-pass snapshot only
-        // classified skip/refetch — the merge write carries the freshest halves. This
-        // NARROWS the concurrent-writer window to per-item seconds; it does not close
-        // it (the put is unconditional), hence the don't-run-during-cron caveat.
-        let mut cache = match store.get_steam_app(app_id).await {
-            Ok(v) => v.unwrap_or_else(|| dynamo::SteamAppCache::empty(app_id)),
+        // Just-in-time versioned read (#75): snapshot + token seed the guarded
+        // merge write; a concurrent writer is detected and re-merged, not
+        // clobbered — the don't-run-during-cron rule is now politeness, not
+        // load-bearing.
+        let snapshot = match store.get_steam_app_versioned(app_id).await {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(app_id, error = ?e, "backfill: re-read failed — skipping app");
                 summary.failed += 1;
                 continue;
             }
         };
-        let mut fresh_detail = false;
+        let mut ours = FetchedHalves {
+            now,
+            detail: None,
+            reviews: None,
+        };
         tokio::time::sleep(pace).await;
         match steam.get_app_details(app_id).await {
             Ok(steam_client::AppDetails::Found(d)) => {
                 let mut detail = *d;
-                detail.tags = tags_for_app(app_id, tag_data.as_ref(), cache.detail.as_ref());
-                cache.detail = Some(detail);
-                cache.fetched_at = now;
-                fresh_detail = true;
+                detail.tags = tags_for_app(
+                    app_id,
+                    tag_data.as_ref(),
+                    snapshot.as_ref().and_then(|(c, _)| c.detail.as_ref()),
+                );
+                ours.detail = Some(DetailFetch::Live(Box::new(detail)));
             }
-            // Delisted: negative stub, BOTH clocks stamped — same semantics as enrichment.
+            // Delisted: negative stub, BOTH clocks stamped by the merge — same
+            // semantics as enrichment.
             Ok(steam_client::AppDetails::Delisted) => {
-                cache.detail = None;
-                cache.fetched_at = now;
-                cache.reviews_fetched_at = now;
+                ours.detail = Some(DetailFetch::Delisted);
             }
             Err(steam_client::SteamError::RateLimited) => {
                 summary.aborted_429 = true;
@@ -2420,19 +2561,38 @@ pub async fn backfill_steam_details(
                 continue;
             }
         }
-        if let Err(e) = store.put_steam_app(&cache).await {
-            tracing::warn!(app_id, error = ?e, "backfill: put_steam_app failed — this app not persisted");
-            summary.failed += 1;
-            continue;
-        }
-        // What was just written IS the outcome: Some detail = live refetch, None = stub.
-        if cache.detail.is_some() {
-            summary.fetched += 1;
-        } else {
-            summary.negative += 1;
-        }
-        if fresh_detail {
-            supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+        let fresh_detail = matches!(ours.detail, Some(DetailFetch::Live(_)));
+        match persist_fetched_halves(store, app_id, snapshot, &ours).await {
+            Ok(PersistResult::Written { cache, after_race }) => {
+                if after_race {
+                    summary.lost_race += 1;
+                }
+                // What was just written IS the outcome: Some detail = live refetch,
+                // None = stub. (Post-merge, a concurrent writer's newer half may be
+                // what landed — still the honest count.)
+                if cache.detail.is_some() {
+                    summary.fetched += 1;
+                } else {
+                    summary.negative += 1;
+                }
+                if fresh_detail {
+                    supersede_adult(&mut adult_appids, app_id, cache.detail.as_ref());
+                }
+            }
+            Ok(PersistResult::LostTwice) => {
+                summary.lost_race += 1;
+                summary.failed += 1;
+                tracing::warn!(
+                    app_id,
+                    "backfill: lost the STEAMAPP# race twice — skipping app, next pass retries"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(app_id, error = ?e, "backfill: put_steam_app failed — this app not persisted");
+                summary.failed += 1;
+                continue;
+            }
         }
         let done = summary.fetched + summary.negative + summary.skipped + summary.failed;
         tracing::info!(app_id, done, total, "backfill: item rewritten");
@@ -2447,6 +2607,7 @@ pub async fn backfill_steam_details(
         aborted_429 = summary.aborted_429,
         auto_hidden = summary.auto_hidden,
         tag_batch_failed = summary.tag_batch_failed,
+        lost_race = summary.lost_race,
         "backfill: done"
     );
     Ok(summary)
@@ -3445,5 +3606,172 @@ mod tests {
             serde_json::from_str::<FulfillResponse>(&json).unwrap(),
             resp
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #75: merge_fetched_halves — the newest-wins-per-half re-merge policy
+    // -----------------------------------------------------------------------------------------
+
+    fn test_detail(app_id: u32) -> steam_client::SteamAppDetail {
+        steam_client::SteamAppDetail {
+            app_id,
+            name: "T".into(),
+            developers: vec![],
+            publishers: vec![],
+            genres: vec![],
+            release_date: None,
+            short_description: "t".into(),
+            header_image: None,
+            video_hls_url: None,
+            video_thumbnail: None,
+            screenshots: vec![],
+            tags: vec![],
+            content_descriptor_ids: vec![],
+            content_notes: None,
+        }
+    }
+
+    fn test_review_summary() -> steam_client::ReviewSummary {
+        steam_client::ReviewSummary {
+            desc: "Positive".into(),
+            total_positive: 10,
+            total_negative: 1,
+            total_reviews: 11,
+        }
+    }
+
+    fn test_recent_reviews() -> steam_client::RecentReviews {
+        steam_client::RecentReviews {
+            percent_positive: 90,
+            count: 11,
+        }
+    }
+
+    fn halves(now: i64) -> FetchedHalves {
+        FetchedHalves {
+            now,
+            detail: None,
+            reviews: None,
+        }
+    }
+
+    /// #75 merge policy: our fresh detail applies over a staler snapshot half; the
+    /// snapshot's untouched reviews half survives.
+    #[test]
+    fn merge_ours_newer_detail_applies() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.fetched_at = 100;
+        cache.reviews_fetched_at = 900;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Live(Box::new(test_detail(570)))),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.detail.is_some());
+        assert_eq!(cache.fetched_at, 500);
+        assert_eq!(cache.reviews_fetched_at, 900, "reviews half untouched");
+    }
+
+    /// #75 merge policy: a snapshot half NEWER than ours survives — the concurrent
+    /// writer's fresher fetch wins, ours is dropped (correct, not a loss).
+    #[test]
+    fn merge_theirs_newer_detail_survives() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.detail = Some(test_detail(570));
+        cache.fetched_at = 800;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Delisted),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(
+            cache.detail.is_some(),
+            "their live detail survives our stale stub"
+        );
+        assert_eq!(cache.fetched_at, 800);
+        assert_eq!(
+            cache.reviews_fetched_at, 0,
+            "delisted reviews stamp only applies with the detail half"
+        );
+    }
+
+    /// #75 merge policy, mirror direction: a NEWER concurrent Delisted verdict is
+    /// not resurrected by our stale Live detail — the dead app stays dead.
+    #[test]
+    fn merge_theirs_newer_delisted_not_resurrected() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.detail = None; // concurrent writer's delisted stub…
+        cache.fetched_at = 800; // …stamped fresher than our fetch
+        cache.reviews_fetched_at = 800;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Live(Box::new(test_detail(570)))),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(
+            cache.detail.is_none(),
+            "our stale Live must not resurrect their newer Delisted"
+        );
+        assert_eq!(cache.fetched_at, 800);
+    }
+
+    /// #75 merge policy: equal stamps go to us — we hold data fetched moments ago.
+    #[test]
+    fn merge_equal_stamp_ours_wins() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.fetched_at = 500;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Live(Box::new(test_detail(570)))),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.detail.is_some());
+    }
+
+    /// #75 merge policy: delisted stamps BOTH clocks (dead apps skip review fetches
+    /// for the whole window) but never regresses a fresher concurrent reviews stamp.
+    #[test]
+    fn merge_delisted_stamps_both_clocks_forward_only() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.fetched_at = 100;
+        cache.reviews_fetched_at = 100;
+        let ours = FetchedHalves {
+            detail: Some(DetailFetch::Delisted),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.detail.is_none());
+        assert_eq!(cache.fetched_at, 500);
+        assert_eq!(cache.reviews_fetched_at, 500);
+
+        let mut cache2 = dynamo::SteamAppCache::empty(571);
+        cache2.fetched_at = 100;
+        cache2.reviews_fetched_at = 800; // concurrent writer's fresher reviews
+        merge_fetched_halves(
+            &mut cache2,
+            &FetchedHalves {
+                detail: Some(DetailFetch::Delisted),
+                ..halves(500)
+            },
+        );
+        assert_eq!(cache2.reviews_fetched_at, 800, "never stamps backward");
+    }
+
+    /// #75 merge policy: the reviews half applies independently of the detail half.
+    #[test]
+    fn merge_reviews_half_independent() {
+        let mut cache = dynamo::SteamAppCache::empty(570);
+        cache.detail = Some(test_detail(570));
+        cache.fetched_at = 800;
+        cache.reviews_fetched_at = 100;
+        let ours = FetchedHalves {
+            reviews: Some((test_review_summary(), test_recent_reviews())),
+            ..halves(500)
+        };
+        merge_fetched_halves(&mut cache, &ours);
+        assert!(cache.overall.is_some());
+        assert!(cache.recent.is_some());
+        assert_eq!(cache.reviews_fetched_at, 500);
+        assert_eq!(cache.fetched_at, 800, "detail half untouched");
     }
 }

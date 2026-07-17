@@ -211,10 +211,17 @@ pub fn steam_app_pk(app_id: u32) -> String {
 }
 
 /// Build the full item for a STEAMAPP enrichment cache entry.
-/// pk="STEAMAPP#<app_id>", sk="META", body=JSON of [`crate::SteamAppCache`].
-/// Use `Store::put_steam_app` / `Store::get_steam_app` — do not write STEAMAPP# items directly.
+/// pk="STEAMAPP#<app_id>", sk="META", body=JSON of [`crate::SteamAppCache`],
+/// version=N (optimistic-lock counter — `Store::put_steam_app` computes it from
+/// the guard).
+/// INVARIANT (#75, recorded as a decision): `version` and `body` travel together,
+/// always, atomically — this is the only builder of the item shape, the guarded
+/// put is the only writer, and no UpdateItem ever touches STEAMAPP# items.
+/// Use `Store::put_steam_app` / `Store::get_steam_app` — do not write STEAMAPP#
+/// items directly.
 pub fn steam_app_item(
     cache: &crate::SteamAppCache,
+    version: i64,
 ) -> std::collections::HashMap<String, AttributeValue> {
     std::collections::HashMap::from([
         ("pk".into(), s(steam_app_pk(cache.app_id))),
@@ -223,6 +230,7 @@ pub fn steam_app_item(
             "body".into(),
             s(serde_json::to_string(cache).expect("SteamAppCache serializes")),
         ),
+        ("version".into(), AttributeValue::N(version.to_string())),
     ])
 }
 

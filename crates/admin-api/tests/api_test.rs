@@ -15,7 +15,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
-use dynamo::{SteamAppCache, Store};
+use dynamo::{SteamAppCache, SteamAppPutGuard, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use steam_client::{RecentReviews, ReviewSummary, SteamApiKey, SteamAppDetail, SteamClient};
 use time::macros::datetime;
@@ -2102,37 +2102,40 @@ async fn admin_game_detail_superset_fields_and_steam_blob() {
 
     // Seed steam cache
     store
-        .put_steam_app(&SteamAppCache {
-            app_id: 77770,
-            detail: Some(SteamAppDetail {
+        .put_steam_app(
+            &SteamAppCache {
                 app_id: 77770,
-                name: "Detail Test Game".into(),
-                developers: vec!["Dev".into()],
-                publishers: vec!["Pub".into()],
-                genres: vec!["RPG".into()],
-                release_date: None,
-                short_description: "Admin detail test.".into(),
-                header_image: None,
-                video_hls_url: None,
-                video_thumbnail: None,
-                screenshots: vec![],
-                tags: vec![],
-                content_descriptor_ids: vec![],
-                content_notes: None,
-            }),
-            overall: Some(ReviewSummary {
-                desc: "Very Positive".into(),
-                total_positive: 900,
-                total_negative: 100,
-                total_reviews: 1000,
-            }),
-            recent: Some(RecentReviews {
-                percent_positive: 90,
-                count: 200,
-            }),
-            fetched_at: 1_700_000_000,
-            reviews_fetched_at: 1_700_000_000,
-        })
+                detail: Some(SteamAppDetail {
+                    app_id: 77770,
+                    name: "Detail Test Game".into(),
+                    developers: vec!["Dev".into()],
+                    publishers: vec!["Pub".into()],
+                    genres: vec!["RPG".into()],
+                    release_date: None,
+                    short_description: "Admin detail test.".into(),
+                    header_image: None,
+                    video_hls_url: None,
+                    video_thumbnail: None,
+                    screenshots: vec![],
+                    tags: vec![],
+                    content_descriptor_ids: vec![],
+                    content_notes: None,
+                }),
+                overall: Some(ReviewSummary {
+                    desc: "Very Positive".into(),
+                    total_positive: 900,
+                    total_negative: 100,
+                    total_reviews: 1000,
+                }),
+                recent: Some(RecentReviews {
+                    percent_positive: 90,
+                    count: 200,
+                }),
+                fetched_at: 1_700_000_000,
+                reviews_fetched_at: 1_700_000_000,
+            },
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 
@@ -2215,37 +2218,40 @@ async fn catalog_joins_steam_summary() {
     store.put_game(&unmapped).await.unwrap();
 
     store
-        .put_steam_app(&SteamAppCache {
-            app_id: 570,
-            detail: Some(SteamAppDetail {
+        .put_steam_app(
+            &SteamAppCache {
                 app_id: 570,
-                name: "Mapped Game".into(),
-                developers: vec!["Dev Studio".into()],
-                publishers: vec!["Pub House".into()],
-                genres: vec!["Action".into(), "Co-op".into()],
-                release_date: Some("12 Nov 2019".into()),
-                short_description: String::new(),
-                header_image: None,
-                video_hls_url: None,
-                video_thumbnail: None,
-                screenshots: vec![],
-                tags: vec![],
-                content_descriptor_ids: vec![],
-                content_notes: None,
-            }),
-            overall: Some(ReviewSummary {
-                desc: "Very Positive".into(),
-                total_positive: 2,
-                total_negative: 1,
-                total_reviews: 3,
-            }),
-            recent: Some(RecentReviews {
-                percent_positive: 80,
-                count: 40,
-            }),
-            fetched_at: 1,
-            reviews_fetched_at: 1,
-        })
+                detail: Some(SteamAppDetail {
+                    app_id: 570,
+                    name: "Mapped Game".into(),
+                    developers: vec!["Dev Studio".into()],
+                    publishers: vec!["Pub House".into()],
+                    genres: vec!["Action".into(), "Co-op".into()],
+                    release_date: Some("12 Nov 2019".into()),
+                    short_description: String::new(),
+                    header_image: None,
+                    video_hls_url: None,
+                    video_thumbnail: None,
+                    screenshots: vec![],
+                    tags: vec![],
+                    content_descriptor_ids: vec![],
+                    content_notes: None,
+                }),
+                overall: Some(ReviewSummary {
+                    desc: "Very Positive".into(),
+                    total_positive: 2,
+                    total_negative: 1,
+                    total_reviews: 3,
+                }),
+                recent: Some(RecentReviews {
+                    percent_positive: 80,
+                    count: 40,
+                }),
+                fetched_at: 1,
+                reviews_fetched_at: 1,
+            },
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 
@@ -2299,29 +2305,32 @@ async fn catalog_carries_tags_descriptors_and_hidden_source() {
     store.put_game(&plain).await.unwrap();
 
     store
-        .put_steam_app(&SteamAppCache {
-            app_id: 981300,
-            detail: Some(SteamAppDetail {
+        .put_steam_app(
+            &SteamAppCache {
                 app_id: 981300,
-                name: "Flagged Game".into(),
-                developers: vec![],
-                publishers: vec![],
-                genres: vec!["Casual".into()],
-                release_date: None,
-                short_description: String::new(),
-                header_image: None,
-                video_hls_url: None,
-                video_thumbnail: None,
-                screenshots: vec![],
-                tags: vec!["Sexual Content".into(), "Casual".into()],
-                content_descriptor_ids: vec![1, 3, 5, 4],
-                content_notes: Some("This game have Nudity.".into()),
-            }),
-            overall: None,
-            recent: None,
-            fetched_at: 1,
-            reviews_fetched_at: 1,
-        })
+                detail: Some(SteamAppDetail {
+                    app_id: 981300,
+                    name: "Flagged Game".into(),
+                    developers: vec![],
+                    publishers: vec![],
+                    genres: vec!["Casual".into()],
+                    release_date: None,
+                    short_description: String::new(),
+                    header_image: None,
+                    video_hls_url: None,
+                    video_thumbnail: None,
+                    screenshots: vec![],
+                    tags: vec!["Sexual Content".into(), "Casual".into()],
+                    content_descriptor_ids: vec![1, 3, 5, 4],
+                    content_notes: Some("This game have Nudity.".into()),
+                }),
+                overall: None,
+                recent: None,
+                fetched_at: 1,
+                reviews_fetched_at: 1,
+            },
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 

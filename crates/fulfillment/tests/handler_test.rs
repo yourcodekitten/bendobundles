@@ -5,10 +5,11 @@
 //! never a local pass.
 
 use domain::{AppidSource, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
-use dynamo::{Store, SyncState};
+use dynamo::{SteamAppPutGuard, Store, SyncState};
 use fulfillment::{
-    Decision, Deps, FulfillRequest, FulfillResponse, SessionStore, backfill_steam_details,
-    enrich_steam_apps, gift_decision, handle, reveal_decision,
+    Decision, Deps, DetailFetch, FetchedHalves, FulfillRequest, FulfillResponse, PersistResult,
+    SessionStore, backfill_steam_details, enrich_steam_apps, gift_decision, handle,
+    persist_fetched_halves, reveal_decision,
 };
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use std::sync::Arc;
@@ -4334,7 +4335,7 @@ async fn enrich_fresh_items_make_zero_storefront_calls() {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     seed_steam_game(&store, "gk-f", "mn-f", "Fresh Game", Some(413150), None).await;
     store
-        .put_steam_app(&fresh_cache(413150, now))
+        .put_steam_app(&fresh_cache(413150, now), SteamAppPutGuard::Absent)
         .await
         .unwrap();
 
@@ -4367,7 +4368,10 @@ async fn enrich_stale_reviews_only_skips_appdetails() {
     // Detail fresh (now), reviews stale (15 days old > 14d window).
     let mut cache = fresh_cache(app_id, now);
     cache.reviews_fetched_at = days_ago(15);
-    store.put_steam_app(&cache).await.unwrap();
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let steam_mock = steam_mock_empty().await;
     mount_steam_ok(&steam_mock, app_id).await;
@@ -4666,7 +4670,10 @@ async fn backfill_rewrites_dirty_detail_and_preserves_reviews() {
         "Steam Achievements".into(),
         "Family Sharing".into(),
     ];
-    store.put_steam_app(&dirty).await.unwrap();
+    store
+        .put_steam_app(&dirty, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let steam_mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -4726,7 +4733,10 @@ async fn backfill_skips_items_within_skip_fresh_window() {
     };
     let now = OffsetDateTime::now_utc().unix_timestamp();
     seed_steam_game(&store, "gk-bf2", "mn-bf2", "Fresh Game", Some(570), None).await;
-    store.put_steam_app(&fresh_cache(570, now)).await.unwrap();
+    store
+        .put_steam_app(&fresh_cache(570, now), SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let steam_mock = steam_mock_empty().await;
     let steam = steam_client_at(&steam_mock.uri());
@@ -4787,7 +4797,10 @@ async fn backfill_delisted_writes_negative_stub() {
     seed_steam_game(&store, "gk-bf4", "mn-bf4", "Dead Game", Some(999), None).await;
     let mut dirty = fresh_cache(999, now);
     dirty.fetched_at = days_ago(1);
-    store.put_steam_app(&dirty).await.unwrap();
+    store
+        .put_steam_app(&dirty, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let steam_mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -5033,7 +5046,10 @@ async fn enrich_one_way_never_unhides_when_descriptors_clear() {
     store.put_game(&g).await.unwrap();
     // Stale cache; the refetched appdetails now carries NO descriptors.
     store
-        .put_steam_app(&stale_detail_cache(555, now, vec![]))
+        .put_steam_app(
+            &stale_detail_cache(555, now, vec![]),
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 
@@ -5065,7 +5081,10 @@ async fn enrich_preserves_old_tags_when_getitems_fails() {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     seed_steam_game(&store, "gk-p", "mn-p", "Tagged Game", Some(777), None).await;
     store
-        .put_steam_app(&stale_detail_cache(777, now, vec!["Old Tag".into()]))
+        .put_steam_app(
+            &stale_detail_cache(777, now, vec!["Old Tag".into()]),
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 
@@ -5111,11 +5130,17 @@ async fn enrich_stores_empty_tags_when_app_absent_from_nonempty_batch() {
     seed_steam_game(&store, "gk-x", "mn-x", "Present Game", Some(111), None).await;
     seed_steam_game(&store, "gk-y", "mn-y", "Gated Game", Some(222), None).await;
     store
-        .put_steam_app(&stale_detail_cache(111, now, vec!["Old Tag".into()]))
+        .put_steam_app(
+            &stale_detail_cache(111, now, vec!["Old Tag".into()]),
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
     store
-        .put_steam_app(&stale_detail_cache(222, now, vec!["Old Tag".into()]))
+        .put_steam_app(
+            &stale_detail_cache(222, now, vec!["Old Tag".into()]),
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 
@@ -5150,7 +5175,10 @@ async fn enrich_treats_zero_items_for_nonempty_request_as_batch_failure() {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     seed_steam_game(&store, "gk-z", "mn-z", "Drifted", Some(333), None).await;
     store
-        .put_steam_app(&stale_detail_cache(333, now, vec!["Old Tag".into()]))
+        .put_steam_app(
+            &stale_detail_cache(333, now, vec!["Old Tag".into()]),
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 
@@ -5184,7 +5212,10 @@ async fn enrich_sweeps_adult_games_with_fresh_cache_no_fetch() {
     if let Some(d) = cache.detail.as_mut() {
         d.content_descriptor_ids = vec![3];
     }
-    store.put_steam_app(&cache).await.unwrap();
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let steam_mock = steam_mock_empty().await;
     let mut d = deps(store, "http://unused", None);
@@ -5215,7 +5246,10 @@ async fn backfill_populates_tags_and_auto_hides() {
     let gid = seed_steam_game(&store, "gk-b", "mn-b", "Puss", Some(981300), None).await;
     // Existing cache, stale detail, no tags/descriptors yet — the pre-#71 catalog state.
     store
-        .put_steam_app(&stale_detail_cache(981300, now, vec![]))
+        .put_steam_app(
+            &stale_detail_cache(981300, now, vec![]),
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 
@@ -5264,7 +5298,10 @@ async fn backfill_skip_fresh_items_still_swept_for_adult() {
     if let Some(d) = cache.detail.as_mut() {
         d.content_descriptor_ids = vec![3];
     }
-    store.put_steam_app(&cache).await.unwrap();
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let steam_mock = steam_mock_empty().await;
     let steam = steam_client_at(&steam_mock.uri());
@@ -5301,7 +5338,10 @@ async fn enrich_refetch_that_clears_descriptors_supersedes_stale_cache() {
     if let Some(d) = cache.detail.as_mut() {
         d.content_descriptor_ids = vec![3];
     }
-    store.put_steam_app(&cache).await.unwrap();
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
 
     let steam_mock = MockServer::start().await;
     // Fresh appdetails WITHOUT descriptors — the dev removed the adult content.
@@ -5335,7 +5375,10 @@ async fn backfill_reports_tag_batch_failure_in_summary() {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     seed_steam_game(&store, "gk-tf", "mn-tf", "Tagless", Some(444), None).await;
     store
-        .put_steam_app(&stale_detail_cache(444, now, vec!["Old Tag".into()]))
+        .put_steam_app(
+            &stale_detail_cache(444, now, vec!["Old Tag".into()]),
+            SteamAppPutGuard::Absent,
+        )
         .await
         .unwrap();
 
@@ -5363,4 +5406,68 @@ async fn backfill_reports_tag_batch_failure_in_summary() {
     assert_eq!(summary.fetched, 1, "detail refresh itself still lands");
     let cache = store.get_steam_app(444).await.unwrap().unwrap();
     assert_eq!(cache.detail.unwrap().tags, vec!["Old Tag".to_string()]);
+}
+
+/// #75: a concurrent STEAMAPP# writer between the JIT read and the put is
+/// detected (LostRace), re-merged newest-wins, and retried — NEITHER writer's
+/// half is lost. This is the deterministic version of the race the guard closes:
+/// we hand persist_fetched_halves a stale snapshot on purpose.
+#[tokio::test]
+async fn persist_fetched_halves_remerges_on_lost_race() {
+    let Some(store) = store_or_skip("persist-lost-race").await else {
+        return;
+    };
+    // Seed (clocks at 100, all halves present — fresh_cache's shape), then take
+    // the snapshot a writer would hold.
+    store
+        .put_steam_app(&fresh_cache(570, 100), SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+    let stale_snapshot = store.get_steam_app_versioned(570).await.unwrap();
+
+    // Concurrent writer lands a fresh, DISTINGUISHABLE reviews half after our read.
+    let (mut theirs, v) = store.get_steam_app_versioned(570).await.unwrap().unwrap();
+    theirs.overall = Some(steam_client::ReviewSummary {
+        desc: "Overwhelmingly Positive".into(),
+        total_positive: 99,
+        total_negative: 1,
+        total_reviews: 100,
+    });
+    theirs.reviews_fetched_at = 500;
+    store
+        .put_steam_app(&theirs, SteamAppPutGuard::Unchanged(v))
+        .await
+        .unwrap();
+
+    // We persist a fresh, DISTINGUISHABLE detail half against the STALE snapshot.
+    let mut our_detail = fresh_cache(570, 600).detail.unwrap();
+    our_detail.name = "Fresh".into();
+    let ours = FetchedHalves {
+        now: 600,
+        detail: Some(DetailFetch::Live(Box::new(our_detail))),
+        reviews: None,
+    };
+    let result = persist_fetched_halves(&store, 570, stale_snapshot, &ours)
+        .await
+        .unwrap();
+
+    let PersistResult::Written { cache, after_race } = result else {
+        panic!("expected Written, got LostTwice");
+    };
+    assert!(after_race, "first put must lose to the concurrent write");
+    // BOTH halves survive, provably each writer's own: our detail, their reviews.
+    assert_eq!(cache.detail.as_ref().unwrap().name, "Fresh");
+    assert_eq!(cache.fetched_at, 600);
+    assert_eq!(
+        cache.overall.as_ref().unwrap().desc,
+        "Overwhelmingly Positive"
+    );
+    assert_eq!(cache.reviews_fetched_at, 500);
+    // The store agrees with the return value.
+    let (in_store, _) = store.get_steam_app_versioned(570).await.unwrap().unwrap();
+    assert_eq!(in_store.detail.as_ref().unwrap().name, "Fresh");
+    assert_eq!(
+        in_store.overall.as_ref().unwrap().desc,
+        "Overwhelmingly Positive"
+    );
 }
