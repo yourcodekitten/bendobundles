@@ -853,8 +853,8 @@ impl Store {
                 ":b",
                 av_s(&serde_json::to_string(&pending).expect("game")),
             )
-            .expression_attribute_values(":pending", av_s("pending"))
-            .expression_attribute_values(":available", av_s("available"))
+            .expression_attribute_values(":pending", av_s(GameStatus::Pending.as_wire()))
+            .expression_attribute_values(":available", av_s(GameStatus::Available.as_wire()))
             .expression_attribute_values(":cid", av_s(claim_id))
             .build()
             .expect("game_update");
@@ -986,8 +986,8 @@ impl Store {
                 ":b",
                 av_s(&serde_json::to_string(&pending).expect("game")),
             )
-            .expression_attribute_values(":pending", av_s("pending"))
-            .expression_attribute_values(":available", av_s("available"))
+            .expression_attribute_values(":pending", av_s(GameStatus::Pending.as_wire()))
+            .expression_attribute_values(":available", av_s(GameStatus::Available.as_wire()))
             .expression_attribute_values(":cid", av_s(claim_id))
             .build()
             .expect("game_update");
@@ -1170,7 +1170,7 @@ impl Store {
             .table_name(&self.table)
             .set_item(Some(game_item(&game)))
             .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":pending", schema::s("pending"));
+            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()));
         let cond = if let Some(cid) = claim_id {
             req = req.expression_attribute_values(":cid", schema::s(cid));
             "#st = :pending AND claim_id = :cid"
@@ -1290,7 +1290,7 @@ impl Store {
             .set_item(Some(game_item(&game)))
             .condition_expression("#st = :pending")
             .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":pending", schema::s("pending"))
+            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()))
             .build()
             .expect("game_put");
         // item 2: LINK decrement — atomic ADD, guarded ≥ 1 so it can't go negative.
@@ -1401,7 +1401,7 @@ impl Store {
             .set_item(Some(game_item(&game)))
             .condition_expression("#st = :pending")
             .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":pending", schema::s("pending"))
+            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()))
             .build()
             .expect("game_put");
 
