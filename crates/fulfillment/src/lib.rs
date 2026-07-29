@@ -2954,11 +2954,15 @@ async fn map_missing_appids(deps: &Deps) {
     );
 }
 
-/// The sync walk. Runs [`reconcile`] first (parked-claim recovery against humble truth), then
+/// The sync walk. Runs [`pending_age_sweep`] first (the watchdog — see its doc for why it comes
+/// before everything else), then [`reconcile`] (parked-claim recovery against humble truth), then
 /// walks every order and upserts each key's `Game` via the guarded sync-upsert. Every exit path
 /// persists a `SyncState` — the caller holds the run marker, so this must always report.
 async fn run_sync(deps: &Deps) {
     tracing::info!("sync started (ensure session, reconcile, then order walk)");
+    // Watchdog first (gate review B-4): needs no humble session — must run before
+    // anything that can die. Do not add early returns above this line.
+    pending_age_sweep(deps).await;
     // Enrichment deadline is threaded from the caller via deps.steam_enrich_deadline. It was
     // computed from the lambda context's remaining time (minus the 180s margin) so `persist_sync`
     // + `end_sync_run` always have room to land — see compute_enrich_deadline.
@@ -3309,6 +3313,46 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
         }
     }
     written
+}
+
+/// ── Pending-age sweep (spec §3, set-driven; placement per gate review B-4) ──────
+/// The FIRST thing run_sync does, before any humble acquisition: the sweep needs
+/// only dynamo + the discord webhook, so no session death, listing failure, or
+/// reconcile regression can starve it. The invariant is on the SET: every claim
+/// both pending and older than RECONCILE_STUCK_ALERT_AGE pings, every sync, until
+/// a terminal transition removes it from the GSI. Daily-by-cadence (sync schedule),
+/// deliberately NOT deduplicated: a once-ever alert that scrolls away IS the
+/// silent-loop bug this exists to kill (family review 2026-07-29). Placement is
+/// PINNED by stale_pending_claim_pings_even_when_listing_is_dead — an early return
+/// added above this call fails that test.
+async fn pending_age_sweep(deps: &Deps) {
+    let claims = match deps.store.list_pending_claims().await {
+        Ok(c) => c,
+        Err(_) => return, // can't read this pass — the next sync retries.
+    };
+    let now = OffsetDateTime::now_utc();
+    for claim in &claims {
+        let age = now - claim.created_at;
+        if age > RECONCILE_STUCK_ALERT_AGE {
+            let days = age.whole_days();
+            tracing::warn!(
+                claim_id = %claim.id,
+                game_id = %claim.game_id,
+                age_days = days,
+                "pending-age sweep: claim is still pending past the alert age"
+            );
+            ping(
+                deps,
+                &format!(
+                    "claim {} ({}) is STILL PENDING after ~{days}d. Reconcile retries \
+                     it every sync (or cannot reach it — see logs for this run). It \
+                     will nag daily until it completes, compensates, or fails.",
+                    claim.id, claim.game_id
+                ),
+            )
+            .await;
+        }
+    }
 }
 
 /// Reconcile parked (`Pending`) claims older than [`RECONCILE_MIN_AGE`] against humble's truth.
