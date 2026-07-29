@@ -1968,6 +1968,7 @@ async fn game_detail_claimed_by_this_link_200() {
             created_at: datetime!(2026-07-07 00:00 UTC),
             choice_pre_tpks: None,
             revealed_key: None,
+            failure_reason: None,
         })
         .await
         .unwrap();
@@ -2029,6 +2030,7 @@ async fn game_detail_other_links_claimed_game_404() {
             created_at: datetime!(2026-07-07 00:00 UTC),
             choice_pre_tpks: None,
             revealed_key: None,
+            failure_reason: None,
         })
         .await
         .unwrap();

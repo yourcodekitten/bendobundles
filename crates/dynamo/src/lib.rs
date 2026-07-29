@@ -831,6 +831,7 @@ impl Store {
             // claim and only after the pre-read — never at intake.
             choice_pre_tpks: None,
             revealed_key: None,
+            failure_reason: None,
         };
         let av_s = |v: &str| aws_sdk_dynamodb::types::AttributeValue::S(v.to_string());
 
@@ -966,6 +967,7 @@ impl Store {
             revealed_key: None,
             created_at: now,
             choice_pre_tpks: None,
+            failure_reason: None,
         };
 
         let av_s = |v: &str| aws_sdk_dynamodb::types::AttributeValue::S(v.to_string());
@@ -1085,7 +1087,7 @@ impl Store {
                     .ok_or(StoreError::Corrupt("fulfill: claim missing on recheck"))?;
                 if current.state != ClaimState::Fulfilled {
                     return Err(StoreError::Corrupt(
-                        "fulfill lost to compensate — gift URL needs manual/reconcile recovery",
+                        "fulfill lost — claim already terminal (compensated or failed); gift URL needs manual/reconcile recovery",
                     ));
                 }
                 // idempotent retry: URL already durable. Fall through to re-attempt the
@@ -1137,7 +1139,7 @@ impl Store {
                     ))?;
                 if current.state != ClaimState::Fulfilled {
                     return Err(StoreError::Corrupt(
-                        "fulfill_self lost to compensate — revealed key needs manual/reconcile recovery",
+                        "fulfill_self lost — claim already terminal (compensated or failed); revealed key needs manual/reconcile recovery",
                     ));
                 }
                 // idempotent retry: key already durable; fall through to re-attempt the flip.
@@ -1356,6 +1358,10 @@ impl Store {
                             ClaimState::Compensated => return Ok(()),
                             // fulfill won the race and owns the game; its retry completes the flip.
                             ClaimState::Fulfilled => return Ok(()),
+                            // Failed is terminal and owned by the dead-key transaction —
+                            // like Fulfilled, someone else already decided this claim's
+                            // fate; a late compensate/fulfill retry is a no-op.
+                            ClaimState::Failed => return Ok(()),
                             // marker gone but still Pending is impossible-by-construction → fall
                             // through to the loud error below.
                             ClaimState::Pending => {}
@@ -1446,6 +1452,10 @@ impl Store {
                             ClaimState::Compensated => return Ok(()),
                             // fulfill won the race and owns the game; its retry completes the flip.
                             ClaimState::Fulfilled => return Ok(()),
+                            // Failed is terminal and owned by the dead-key transaction —
+                            // like Fulfilled, someone else already decided this claim's
+                            // fate; a late compensate/fulfill retry is a no-op.
+                            ClaimState::Failed => return Ok(()),
                             // marker gone but still Pending is impossible-by-construction → fall
                             // through to the loud error below.
                             ClaimState::Pending => {}

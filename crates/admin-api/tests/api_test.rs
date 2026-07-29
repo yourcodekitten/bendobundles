@@ -1081,6 +1081,7 @@ async fn link_claims_redact_gift_url_to_issued_bool() {
             created_at: datetime!(2026-07-03 14:00 UTC),
             choice_pre_tpks: None,
             revealed_key: None,
+            failure_reason: None,
         })
         .await
         .unwrap();
@@ -1502,6 +1503,7 @@ async fn gift_link_claims_still_hide_gift_url() {
             created_at: datetime!(2026-07-04 00:00 UTC),
             choice_pre_tpks: None,
             revealed_key: None,
+            failure_reason: None,
         })
         .await
         .unwrap();
