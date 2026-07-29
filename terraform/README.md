@@ -115,6 +115,15 @@ AWS_PROFILE=kitten-deploy terraform apply tf.plan
 change you didn't intend, a breaking infra change, or unrecognised providers (a wrong-workspace /
 foreign-state slip — see [bootstrap step 3](#one-time-bootstrap)). Routine web + code deploys don't need it.
 
+> **⚠️ Rollback caveat (dead-key-truth, 2026-07-29): once a claim lands `failed`, this deploy is
+> forward-only.** `domain::ClaimState` has no `#[serde(other)]` fallback, so the first post-deploy
+> sync writing a claim with `state: "failed"` (expected — the stuck doom claim resolves that way)
+> means a pre-branch lambda binary can no longer deserialize that item. Rolling the lambda zips back
+> to a pre-dead-key-truth build after that point breaks `claims_for_link` parsing for that link:
+> **the friend history endpoint and the admin link-audit view both 500 on it.** Symptom → cause: if
+> either 500s right after a rollback, this is why. Fix forward (redeploy dead-key-truth or later),
+> don't roll the binaries back.
+
 Authoritative outputs (`s3_bucket_id`, `cloudfront_distribution_id`, `site_url`) always come from
 `terraform output`; the values inlined in this doc are 2026-07-08 conveniences, not the source of truth.
 
