@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { Catalog } from './Catalog';
-import type { AdminGame } from '../api';
+import type { AdminGame, SelfClaimView } from '../api';
 import { Unauthorized } from '../api';
 
 vi.mock('../api');
@@ -419,6 +419,28 @@ describe('Catalog', () => {
       fireEvent.click(await screen.findByRole('button', { name: /claim for me/i }));
       fireEvent.click(screen.getByRole('button', { name: /confirm\?/i }));
       await waitFor(() => expect(screen.getByText('login page')).toBeInTheDocument());
+    });
+  });
+
+  describe('self-claims list', () => {
+    it('renders the raw "failed" state with a rose-toned class in the self-claims section', async () => {
+      const failedSelfClaim: SelfClaimView = {
+        game_id: 'gk:dome-keeper',
+        state: 'failed',
+        revealed_key: null,
+        created_at: '2026-07-20T00:00:00Z',
+      };
+      vi.mocked(adminCatalog).mockResolvedValue([gameAvailable]);
+      vi.mocked(adminSelfClaims).mockResolvedValue([failedSelfClaim]);
+      renderCatalog();
+
+      await waitFor(() => expect(screen.getByText('gk:dome-keeper')).toBeInTheDocument());
+
+      // Admin surfaces show the raw wire state verbatim — never the friend's "returned"
+      const badge = screen.getByText('failed');
+      expect(badge).toBeInTheDocument();
+      expect(badge).toHaveClass('bg-rose-950', 'text-rose-200');
+      expect(screen.queryByText('returned')).not.toBeInTheDocument();
     });
   });
 

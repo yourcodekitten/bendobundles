@@ -682,6 +682,7 @@ async fn handle_post_claim(
     match &gift_result {
         Ok(FulfillResponse::GiftUrl { .. }) => tracing::info!("claim: gifted"),
         Ok(FulfillResponse::AlreadyRedeemed) => tracing::info!("claim: already-redeemed (410)"),
+        Ok(FulfillResponse::KeyDead) => tracing::info!("claim: dead-key (410)"),
         Ok(other) => tracing::warn!(outcome = ?other, "claim: parked"),
         Err(e) => tracing::warn!(error = %e, "claim: fulfillment invoke failed → parked"),
     }
@@ -693,6 +694,13 @@ async fn handle_post_claim(
             StatusCode::GONE,
             Json(serde_json::json!({
                 "error": "that key was already redeemed on humble — pick another"
+            })),
+        )
+            .into_response(),
+        Ok(FulfillResponse::KeyDead) => (
+            StatusCode::GONE,
+            Json(serde_json::json!({
+                "error": "that key can't be redeemed anymore — pick another"
             })),
         )
             .into_response(),

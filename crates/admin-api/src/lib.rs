@@ -790,6 +790,13 @@ async fn handle_self_claim(State(s): State<AppState>, Path(id): Path<String>) ->
             })),
         )
             .into_response(),
+        Ok(FulfillResponse::KeyDead) => (
+            StatusCode::GONE,
+            Json(serde_json::json!({
+                "error": "key is dead on humble's side — claim failed terminally, reason recorded on the claim"
+            })),
+        )
+            .into_response(),
         Ok(_) | Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "fulfillment failed — check self-claims later; the claim is recorded"})),

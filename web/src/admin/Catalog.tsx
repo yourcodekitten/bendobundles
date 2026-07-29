@@ -337,7 +337,9 @@ export function Catalog() {
                       ? 'bg-green-700 text-green-100'
                       : sc.state === 'compensated'
                         ? 'bg-slate-600 text-slate-100'
-                        : 'bg-amber-700 text-amber-100'
+                        : sc.state === 'failed'
+                          ? 'bg-rose-950 text-rose-200'
+                          : 'bg-amber-700 text-amber-100'
                   }`}
                 >
                   {sc.state}

@@ -128,6 +128,7 @@ async fn link_and_claim_roundtrip() {
         created_at: datetime!(2026-07-02 01:00 UTC),
         choice_pre_tpks: None,
         revealed_key: None,
+        failure_reason: None,
     };
     store.put_claim(&claim).await.unwrap();
     assert_eq!(store.get_claim("tok1", "c1").await.unwrap().unwrap(), claim);
@@ -1536,6 +1537,204 @@ async fn compensate_self_claim_succeeds_with_no_link_meta_item() {
     let game = store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Available);
     assert_eq!(game.claim_id, None);
+}
+
+// =================================================================================================
+// dead-key-truth TASK 3: fail_claim_dead_key / fail_self_claim_dead_key — terminal failure txns.
+// =================================================================================================
+
+#[tokio::test]
+async fn fail_claim_dead_key_flips_all_three_items() {
+    let Some(store) = store_or_skip("fail-deadkey").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+
+    store
+        .fail_claim_dead_key(
+            "tok1",
+            "c1",
+            &gid,
+            "This key has expired and can no longer be redeemed.",
+        )
+        .await
+        .unwrap();
+
+    let c = store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Failed);
+    assert_eq!(
+        c.failure_reason.as_deref(),
+        Some("This key has expired and can no longer be redeemed.")
+    );
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::Expired);
+    assert_eq!(g.claim_id, None);
+    assert!(!g.is_listable(), "a dead-key game must never re-list");
+    assert_eq!(store.list_listable_games().await.unwrap().len(), 0);
+    assert_eq!(
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        0,
+        "the friend's slot returns"
+    );
+    assert!(
+        store
+            .list_pending_claims()
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.id != "c1"),
+        "pending marker consumed -- claim leaves the GSI"
+    );
+}
+
+#[tokio::test]
+async fn fail_claim_dead_key_is_idempotent() {
+    // Mirror of compensate_is_idempotent: 2-slot link so single-vs-double decrement is
+    // visible in the counter; retry must not double-decrement NOR overwrite the reason.
+    let Some(store) = store_or_skip("fail-deadkey-idem").await else {
+        return;
+    };
+    let mut lnk = link("tok1");
+    lnk.claims_allowed = 2;
+    store.create_link(&lnk).await.unwrap();
+    store.put_game(&game(1, true)).await.unwrap();
+    store.put_game(&game(2, true)).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let a = game_id("gk1", "mn");
+    let b = game_id("gk2", "mn");
+    store.claim_game("tok1", &a, "cA", now).await.unwrap();
+    store.claim_game("tok1", &b, "cB", now).await.unwrap();
+
+    store
+        .fail_claim_dead_key("tok1", "cA", &a, "first words")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        1
+    );
+
+    store
+        .fail_claim_dead_key("tok1", "cA", &a, "second words")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        1,
+        "retry must not double-decrement"
+    );
+    let c = store.get_claim("tok1", "cA").await.unwrap().unwrap();
+    assert_eq!(
+        c.failure_reason.as_deref(),
+        Some("first words"),
+        "retry is a no-op, not an overwrite -- the FIRST reason is the durable truth"
+    );
+}
+
+#[tokio::test]
+async fn fail_self_claim_dead_key_skips_link_decrement() {
+    let Some(store) = store_or_skip("fail-self-deadkey").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game_self(&gid, "c-f1", now).await.unwrap();
+
+    store
+        .fail_self_claim_dead_key(
+            "c-f1",
+            &gid,
+            "Keys are temporarily exhausted for this product",
+        )
+        .await
+        .unwrap();
+
+    let c = store
+        .get_claim(SELF_LINK_TOKEN, "c-f1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.state, ClaimState::Failed);
+    // lilith's rider is "reason ON the claim item" -- BOTH variants persist it.
+    assert_eq!(
+        c.failure_reason.as_deref(),
+        Some("Keys are temporarily exhausted for this product")
+    );
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::Expired);
+}
+
+#[tokio::test]
+async fn stale_fulfill_after_dead_key_fail_stays_loud() {
+    // Mirror of the stale-fulfill-after-compensate guard (~:743-754) -- and Task 2
+    // EDITS that error text, so the modified guard gets its own pin here.
+    let Some(store) = store_or_skip("fail-deadkey-stalefulfill").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+    store
+        .fail_claim_dead_key("tok1", "c1", &gid, "dead")
+        .await
+        .unwrap();
+
+    let res = store
+        .fulfill_claim(
+            "tok1",
+            "c1",
+            &gid,
+            "https://www.humblebundle.com/gift?key=x",
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "stale fulfill after dead-key fail must take the loud path, not silently flip: {res:?}"
+    );
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        g.status,
+        GameStatus::Expired,
+        "the retired game must stay retired"
+    );
+}
+
+#[tokio::test]
+async fn fail_dead_key_gift_variant_cancels_on_self_partition() {
+    // Mirror of the compensate pin at ~:1521-1525: WHY the self variant exists.
+    let Some(store) = store_or_skip("fail-deadkey-selfpin").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game_self(&gid, "c-f2", now).await.unwrap();
+
+    let wrong = store
+        .fail_claim_dead_key(SELF_LINK_TOKEN, "c-f2", &gid, "dead")
+        .await;
+    assert!(
+        wrong.is_err(),
+        "gift fail variant must cancel on the absent LINK META"
+    );
+
+    store
+        .fail_self_claim_dead_key("c-f2", &gid, "dead")
+        .await
+        .unwrap();
+    let c = store
+        .get_claim(SELF_LINK_TOKEN, "c-f2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.state, ClaimState::Failed);
 }
 
 // =================================================================================================

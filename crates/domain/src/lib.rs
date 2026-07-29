@@ -32,6 +32,12 @@ pub enum ClaimState {
     Pending,
     Fulfilled,
     Compensated,
+    /// Terminal failure: the claim can never complete (today's one producer: a DEAD
+    /// humble key — expired server-side). Generic on purpose: states are lifecycle,
+    /// reasons are evidence — the *why* lives in [`Claim::failure_reason`], written in
+    /// the same transaction (spec §2, family review 2026-07-29). The friend's slot is
+    /// returned by that transaction; the game is retired, never re-listed.
+    Failed,
 }
 
 /// Source that produced a [`Game::steam_app_id`], used to decide which value wins in
@@ -230,6 +236,14 @@ pub struct Claim {
     /// as `None`, which is correct — none of them ever recorded a choose intent.
     #[serde(default)]
     pub choice_pre_tpks: Option<Vec<String>>,
+
+    /// Why this claim terminally failed (humble's refusal text or matched code), written
+    /// by the fail transaction in the same write that flips `state` to
+    /// [`ClaimState::Failed`]. Durable on purpose: pings scroll away and log groups
+    /// have retention; the claim record is the truth a future admin surface reads.
+    /// `default` keeps every pre-existing CLAIM item wire-valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -722,6 +736,7 @@ mod tests {
             created_at: datetime!(2026-07-02 00:00 UTC),
             choice_pre_tpks: None,
             revealed_key: None,
+            failure_reason: None,
         };
         let mut json = serde_json::to_value(&claim).unwrap();
         json.as_object_mut().unwrap().remove("choice_pre_tpks");
@@ -742,6 +757,7 @@ mod tests {
             created_at: datetime!(2026-07-02 00:00 UTC),
             choice_pre_tpks: Some(vec!["already_owned_choice_steam".into()]),
             revealed_key: None,
+            failure_reason: None,
         };
         let json = serde_json::to_string(&claim).unwrap();
         let back: Claim = serde_json::from_str(&json).unwrap();
@@ -794,6 +810,31 @@ mod tests {
     #[test]
     fn self_link_token_is_self() {
         assert_eq!(SELF_LINK_TOKEN, "SELF");
+    }
+
+    #[test]
+    fn claim_state_failed_wire_value_and_reason_roundtrip() {
+        // Wire value is load-bearing for web + admin rendering: exactly "failed".
+        assert_eq!(
+            serde_json::to_string(&ClaimState::Failed).unwrap(),
+            "\"failed\""
+        );
+        // failure_reason must be absent-tolerant (every pre-existing claim item) and
+        // round-trip when present.
+        let json = r#"{"id":"c1","link_token":"t","game_id":"g:m","state":"failed",
+            "gift_url":null,"created_at":"2026-07-09T21:38:28Z",
+            "failure_reason":"This key has expired and can no longer be redeemed."}"#;
+        let c: Claim = serde_json::from_str(json).unwrap();
+        assert_eq!(c.state, ClaimState::Failed);
+        assert_eq!(
+            c.failure_reason.as_deref(),
+            Some("This key has expired and can no longer be redeemed.")
+        );
+        // Absent field ⇒ None (pre-existing items stay wire-valid).
+        let json_old = r#"{"id":"c1","link_token":"t","game_id":"g:m","state":"pending",
+            "gift_url":null,"created_at":"2026-07-09T21:38:28Z"}"#;
+        let c_old: Claim = serde_json::from_str(json_old).unwrap();
+        assert_eq!(c_old.failure_reason, None);
     }
 
     // ── steam_app_id / appid_source / owned_by_ben field tests ────────────────

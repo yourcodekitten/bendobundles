@@ -82,6 +82,9 @@ needs — no part of this waits on Ben.**
      add the var, re-plan. (Nearly shipped 2026-07-10.)
    - `humble_username` / `discord_webhook_url` from **`~/.secrets/bendobundles-deploy.env`** (600, outside
      git — the saved deploy secrets; see `code-kitten` `state/decisions.md` 2026-07-06 pointer)
+   - `ops_alarm_email` — **MANDATORY, no default.** Ben's alert email address (the ops-alarm SNS
+     topic subscription target — he confirms it once by mail). Value supplied at deploy time only,
+     never committed. Omitting it hard-fails the apply.
 3. **`admin_password_hash` — pull the LIVE value and pass it back verbatim (a no-op). NEVER re-hash the
    password.** The `admin_hash` SSM param (`aws-ssm.tf`) is `value = var.admin_password_hash` with **no
    `ignore_changes`**, so terraform sets it to whatever you pass on every apply. Argon2 with a fresh salt
@@ -111,6 +114,15 @@ AWS_PROFILE=kitten-deploy terraform apply tf.plan
 **Escalate to Ben** only for genuinely ambiguous blast radius — an unexpected `destroy`, an `admin_hash`
 change you didn't intend, a breaking infra change, or unrecognised providers (a wrong-workspace /
 foreign-state slip — see [bootstrap step 3](#one-time-bootstrap)). Routine web + code deploys don't need it.
+
+> **⚠️ Rollback caveat (dead-key-truth, 2026-07-29): once a claim lands `failed`, this deploy is
+> forward-only.** `domain::ClaimState` has no `#[serde(other)]` fallback, so the first post-deploy
+> sync writing a claim with `state: "failed"` (expected — the stuck doom claim resolves that way)
+> means a pre-branch lambda binary can no longer deserialize that item. Rolling the lambda zips back
+> to a pre-dead-key-truth build after that point breaks `claims_for_link` parsing for that link:
+> **the friend history endpoint and the admin link-audit view both 500 on it.** Symptom → cause: if
+> either 500s right after a rollback, this is why. Fix forward (redeploy dead-key-truth or later),
+> don't roll the binaries back.
 
 Authoritative outputs (`s3_bucket_id`, `cloudfront_distribution_id`, `site_url`) always come from
 `terraform output`; the values inlined in this doc are 2026-07-08 conveniences, not the source of truth.
@@ -274,6 +286,11 @@ domain_zone_id = "Z1ABCDEF123456"  # Route53 hosted zone ID for bendobundles.com
 # plans a `permissions_boundary -> null` strip on all three lambda execution roles —
 # see the full-deploy recipe above.
 lambda_permissions_boundary_arn = "arn:aws:iam::123456789012:policy/your-app-boundary"
+
+# Required — no default, apply hard-fails without it. Ben's alert email address; the
+# ops-alarm SNS topic subscription target (he confirms it once by mail). Not a secret,
+# but still supplied at deploy time only, never committed.
+ops_alarm_email = "ben@example.com"
 ```
 
 Keep `admin_password_hash` and `discord_webhook_url` out of the tfvars file. Pass them via

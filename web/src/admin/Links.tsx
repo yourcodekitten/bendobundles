@@ -35,6 +35,8 @@ function stateBadgeClass(state: string): string {
       return 'bg-amber-700 text-amber-100';
     case 'compensated':
       return 'bg-give text-give-ink';
+    case 'failed':
+      return 'bg-rose-950 text-rose-200';
     default:
       return 'bg-control text-ink';
   }

@@ -49,7 +49,10 @@ fn gift_decision_ladder_is_exhaustive_and_safe() {
         Decision::Park
     ));
     assert!(matches!(
-        gift_decision(&Err(E::RedeemRefused("x".into()))),
+        gift_decision(&Err(E::RedeemRefused {
+            msg: "x".into(),
+            code: None,
+        })),
         Decision::Park
     ));
     assert!(matches!(
@@ -60,6 +63,16 @@ fn gift_decision_ladder_is_exhaustive_and_safe() {
     // Network/Parse are constructed only inside humble-client (from reqwest/serde) — the compiler's
     // exhaustiveness check on the no-`_` match in gift_decision is the real guard that they, and any
     // future variant, get a decision. The map above pins every nameable outcome.
+
+    // TERMINAL: a dead key never parks — it fails the claim, returns the slot, retires
+    // the game. The ladder's one new arm (spec §2).
+    assert!(matches!(
+        gift_decision(&Err(E::KeyExpired {
+            msg: "This key has expired and can no longer be redeemed.".into(),
+            code: None
+        })),
+        Decision::DeadKey
+    ));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -804,6 +817,63 @@ async fn redeem_auth_rejection_never_triggers_selfheal() {
     assert!(!body.contains("self-login") && !body.contains("DEAD"));
 }
 
+// ---------------------------------------------------------------------------------------------
+// Task 4: a dead key (humble: expired) terminally fails the claim — never parks, never
+// compensates. The claim is Failed with its reason, the game retires Expired, the slot returns.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn gift_claim_on_expired_refusal_fails_terminally() {
+    let Some(store) = store_or_skip("gift-deadkey").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+
+    let humble = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "errormsg": "This key has expired and can no longer be redeemed."
+        })))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    let resp = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+    assert_eq!(resp, FulfillResponse::KeyDead);
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Failed);
+    assert_eq!(
+        claim.failure_reason.as_deref(),
+        Some("This key has expired and can no longer be redeemed.")
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Expired);
+    assert_eq!(
+        deps.store.list_listable_games().await.unwrap().len(),
+        0,
+        "a dead-key game must not re-list"
+    );
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        0,
+        "slot returned"
+    );
+
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "exactly one transition ping");
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("DEAD key") && body.contains("c1"));
+    assert!(!body.contains("AAAA"), "never a key value in a ping");
+}
+
 // =============================================================================================
 // RECONCILE + SYNC-WALK MATRIX
 // ---------------------------------------------------------------------------------------------
@@ -1167,19 +1237,33 @@ async fn reconcile_unreconcilable_over_threshold_pings_once() {
     // skip UNCHANGED: claim still pending (reconcile decided nothing) …
     let claim = deps.store.get_claim("tokS2", "cS2").await.unwrap().unwrap();
     assert_eq!(claim.state, ClaimState::Pending);
-    // … but now it's LOUD: exactly one ping, carrying claim id + game_id, no secret.
+    // … but now it's LOUD: the structural stuck-alert AND the pending-age sweep BOTH fire
+    // (B-3: the sweep is deliberately not deduplicated against reconcile's own alert).
     let reqs = discord.received_requests().await.unwrap();
     assert_eq!(
         reqs.len(),
-        1,
-        "past the threshold, the stuck claim must ping exactly once"
+        2,
+        "past the threshold, both the stuck-alert and the sweep must ping"
     );
-    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
-    assert!(body.contains("cS2"), "ping carries the claim id");
-    assert!(body.contains(&gid), "ping carries the game_id");
+    let bodies: Vec<String> = reqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
     assert!(
-        body.to_lowercase().contains("stuck"),
-        "ping names the stuck condition"
+        bodies
+            .iter()
+            .any(|b| b.contains("cS2") && b.contains("cannot act on")),
+        "the structural stuck-alert ping carries the claim id: {bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("cS2") && b.contains("STILL PENDING")),
+        "the sweep ping carries the claim id: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|b| b.contains(&gid)),
+        "at least one ping carries the game_id"
     );
 }
 
@@ -1205,14 +1289,83 @@ async fn reconcile_unsplittable_game_id_over_threshold_pings() {
 
     let claim = deps.store.get_claim("tokX", "cX").await.unwrap().unwrap();
     assert_eq!(claim.state, ClaimState::Pending);
+    // Both the structural stuck-alert AND the pending-age sweep fire (B-3, not deduplicated).
     let reqs = discord.received_requests().await.unwrap();
     assert_eq!(
         reqs.len(),
-        1,
-        "an unsplittable game_id must ping once past the threshold"
+        2,
+        "an unsplittable game_id past the threshold pings twice: stuck-alert + sweep"
     );
-    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
-    assert!(body.contains("cX") && body.contains("game_id"));
+    let bodies: Vec<String> = reqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("cX") && b.contains("game_id") && b.contains("cannot act on")),
+        "the structural stuck-alert ping: {bodies:?}"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("cX") && b.contains("STILL PENDING")),
+        "the sweep ping: {bodies:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// PLACEMENT PIN (gate review B-4): the pending-age sweep is the FIRST statement in run_sync, before
+// even the listing acquisition — so a dead humble session (which makes run_sync ping COOKIE_DEAD and
+// return before reconcile ever runs) must NOT starve the watchdog. If a future refactor adds an
+// early return above the sweep call, this test fails.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn stale_pending_claim_pings_even_when_listing_is_dead() {
+    // B-4 placement pin (lilith's rider on the gate): "the sweep ran even though
+    // everything after it died." A dead-cookie LISTING -- run_sync's :2766 early
+    // return, where reconcile is NEVER called -- must not starve the sweep. If a
+    // future refactor adds an early return above the sweep call, THIS test fails.
+    let Some(store) = store_or_skip("stale-sweep-deadlisting").await else {
+        return;
+    };
+    seed_aged_pending(
+        &store,
+        &game_id("gkS9", "mnSTALE"),
+        "tokS9",
+        "cS9",
+        hours_ago(26),
+    )
+    .await;
+
+    let humble = MockServer::start().await;
+    // Listing 302 -> /login = Unauthorized; deps() has no session_store, so no heal:
+    // run_sync pings COOKIE_DEAD and returns before reconcile ever runs.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(302).append_header("location", "/login"))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let reqs = discord.received_requests().await.unwrap();
+    let bodies: Vec<String> = reqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("STILL PENDING") && b.contains("cS9")),
+        "sweep must ping the stale claim even though the listing died: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|b| b.contains("session")),
+        "the cookie-dead ping also fires on this lane"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3215,7 +3368,10 @@ fn reveal_decision_ladder_matches_gift_decision() {
     );
     assert_eq!(reveal_decision(&Err(E::AmbiguousRedeem)), Decision::Park);
     assert_eq!(
-        reveal_decision(&Err(E::RedeemRefused("x".into()))),
+        reveal_decision(&Err(E::RedeemRefused {
+            msg: "x".into(),
+            code: None,
+        })),
         Decision::Park
     );
     assert_eq!(reveal_decision(&Err(E::RateLimited)), Decision::Park);
@@ -3254,7 +3410,10 @@ fn reveal_decision_ladder_matches_gift_decision() {
     check_agree!(E::AmbiguousRedeem);
     check_agree!(E::RateLimited);
     check_agree!(E::Api(500));
-    check_agree!(E::RedeemRefused("y".into()));
+    check_agree!(E::RedeemRefused {
+        msg: "y".into(),
+        code: None,
+    });
     check_agree!(E::RedeemAuthRejected {
         status: 403,
         csrf_minted: true
@@ -3262,6 +3421,10 @@ fn reveal_decision_ladder_matches_gift_decision() {
     check_agree!(E::SecureAreaStepUpFailed { reason: "y".into() });
     check_agree!(E::LoginFailed { reason: "y".into() });
     check_agree!(E::ChooseFailed { reason: "y".into() });
+    check_agree!(E::KeyExpired {
+        msg: "y".into(),
+        code: None,
+    });
 }
 
 // =================================================================================================
@@ -3586,6 +3749,84 @@ async fn reconcile_self_choice_b2_reveals_never_chooses() {
         count_path(&reqs, "/humbler/choosecontent"),
         0,
         "reconcile must never call choosecontent"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Task 4: structural pre-check — a tpk humble already marks `is_expired` fails terminally without
+// ever spending a redeem/reveal call. Drive path mirrors reconcile_self_choice_b2_reveals_never_chooses
+// above: choice claim + pre=[] snapshot + order carrying the tpk -> reconcile branch B2 ->
+// claimed_tpk_terminal, where the structural pre-check must fire FIRST.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn structural_expired_tpk_fails_without_a_redeem_call() {
+    let Some(store) = store_or_skip("deadkey-structural").await else {
+        return;
+    };
+    seed_choice_game(&store, "gkH:off_h", "Dead On Arrival").await;
+    store
+        .claim_game_self("gkH:off_h", "sc-dk", old_enough())
+        .await
+        .unwrap();
+    store
+        .record_choice_intent(SELF_LINK_TOKEN, "sc-dk", vec![])
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    // Order mounted INLINE with is_expired: true -- do NOT modify tpk_json or
+    // mount_order_with_unredeemed_tpk (M-4: those are SHARED fixtures; editing them
+    // silently reshapes the fixture under the whole file).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkH"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "gkH",
+            "product": { "human_name": "Choice Month" },
+            "tpkd_dict": { "all_tpks": [{
+                "machine_name": "off_h_choice_steam",
+                "human_name": "Dead On Arrival",
+                "key_type": "steam",
+                "is_expired": true,
+                "keyindex": 0,
+            }]},
+            "subproducts": [],
+        })))
+        .mount(&humble)
+        .await;
+    // Deliberately NO reveal/redeem mock: a structurally dead key must spend no humble write.
+    let discord = discord_ok().await;
+
+    let deps_val = deps(store.clone(), &humble.uri(), Some(discord.uri()));
+    run_reconcile(&deps_val).await;
+
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-dk")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.state, ClaimState::Failed);
+    assert!(
+        claim
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("expired"),
+        "the structural reason names the is_expired flag: {:?}",
+        claim.failure_reason
+    );
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/humbler/redeemkey"),
+        0,
+        "no redeem/reveal call may be spent on a structurally dead key"
+    );
+    let pings = discord.received_requests().await.unwrap();
+    assert!(
+        pings.iter().any(|r| String::from_utf8(r.body.clone())
+            .unwrap()
+            .contains("expired")),
+        "the transition ping fires"
     );
 }
 
