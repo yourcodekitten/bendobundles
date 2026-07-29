@@ -1467,6 +1467,219 @@ impl Store {
         }
     }
 
+    /// Dead-key terminal — [`compensate_claim`]'s sibling for a key humble can NEVER
+    /// redeem again (spec §2). Same one-transaction/all-or-nothing shape and the same
+    /// guards, with three deltas: the CLAIM lands `Failed` carrying `failure_reason`
+    /// (durable evidence, written in the same txn — pings scroll, dynamo doesn't); the
+    /// GAME retires as `Expired` (never re-lists — `is_listable` excludes it); the LINK
+    /// decrement is identical (the friend did nothing wrong; the slot returns).
+    /// Idempotency rechecks mirror compensate: any already-terminal state → Ok(()).
+    pub async fn fail_claim_dead_key(
+        &self,
+        link_token: &str,
+        claim_id: &str,
+        game_id: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let mut claim = self
+            .get_claim(link_token, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("fail_dead_key: claim missing"))?;
+        claim.state = ClaimState::Failed;
+        claim.failure_reason = Some(reason.to_string());
+
+        let mut game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(StoreError::Corrupt("fail_dead_key: game missing"))?;
+        game.status = GameStatus::Expired;
+        game.claim_id = None; // game_item omits top-level claim_id → the retired game is unowned
+
+        // item 0: CLAIM put — consume the pending marker (dedup / mutual-exclusion gate).
+        let claim_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(&claim)))
+            .condition_expression("attribute_exists(gsi2pk)")
+            .build()
+            .expect("claim_put");
+        // item 1: GAME put — retire (game_item omits the listable GSI attrs for Expired); never
+        // resurrect a game fulfill already flipped to gifted.
+        let game_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .condition_expression("#st = :pending")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()))
+            .build()
+            .expect("game_put");
+        // item 2: LINK decrement — atomic ADD, guarded ≥ 1 so it can't go negative.
+        let link_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", schema::s(link_pk(link_token)))
+            .key("sk", schema::s("META"))
+            .update_expression("ADD claims_used :neg_one")
+            .condition_expression("claims_used >= :one")
+            .expression_attribute_values(
+                ":neg_one",
+                aws_sdk_dynamodb::types::AttributeValue::N("-1".into()),
+            )
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .build()
+            .expect("link_update");
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(claim_put)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(game_put)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(link_update)
+                    .build(),
+            )
+            .send()
+            .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                let err_str = format!("{sdk_err:?}");
+                if let Some(
+                    aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(tce),
+                ) = sdk_err.as_service_error()
+                {
+                    let item0_ccf = tce
+                        .cancellation_reasons()
+                        .first()
+                        .and_then(|r| r.code())
+                        .is_some_and(|c| c == "ConditionalCheckFailed");
+                    if item0_ccf {
+                        // Marker already consumed — someone else finished this claim's fate.
+                        let current = self
+                            .get_claim(link_token, claim_id)
+                            .await?
+                            .ok_or(StoreError::Corrupt("fail_dead_key: claim missing on recheck"))?;
+                        match current.state {
+                            // idempotent retry after a prior full success.
+                            ClaimState::Failed => return Ok(()),
+                            // another terminal owner won the marker race; their fate stands.
+                            ClaimState::Fulfilled | ClaimState::Compensated => return Ok(()),
+                            // marker gone but still Pending is impossible-by-construction →
+                            // fall through to the loud error below.
+                            ClaimState::Pending => {}
+                        }
+                    }
+                }
+                Err(StoreError::Aws(err_str))
+            }
+        }
+    }
+
+    /// Self-claim dead-key terminal — [`fail_claim_dead_key`]'s two-item sibling, mirroring
+    /// [`compensate_self_claim`]'s relationship to [`compensate_claim`]: CLAIM → failed (carrying
+    /// `failure_reason`, conditioned on the pending marker), GAME retired as `Expired`
+    /// (conditioned `#st = :pending`), and NO link decrement — LINK#SELF has no META item; the
+    /// gift variant's `claims_used >= 1` guard against it would cancel the whole transaction,
+    /// wedging every self-claim dead-key failure permanently (same reasoning as compensate's
+    /// self variant).
+    pub async fn fail_self_claim_dead_key(
+        &self,
+        claim_id: &str,
+        game_id: &str,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        let mut claim = self
+            .get_claim(domain::SELF_LINK_TOKEN, claim_id)
+            .await?
+            .ok_or(StoreError::Corrupt("fail_self_dead_key: claim missing"))?;
+        claim.state = ClaimState::Failed;
+        claim.failure_reason = Some(reason.to_string());
+
+        let mut game = self
+            .get_game(game_id)
+            .await?
+            .ok_or(StoreError::Corrupt("fail_self_dead_key: game missing"))?;
+        game.status = GameStatus::Expired;
+        game.claim_id = None;
+
+        let claim_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(claim_item(&claim)))
+            .condition_expression("attribute_exists(gsi2pk)")
+            .build()
+            .expect("claim_put");
+        let game_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(game_item(&game)))
+            .condition_expression("#st = :pending")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()))
+            .build()
+            .expect("game_put");
+
+        let result = self
+            .client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(claim_put)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(game_put)
+                    .build(),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                let err_str = format!("{sdk_err:?}");
+                if let Some(
+                    aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError::TransactionCanceledException(tce),
+                ) = sdk_err.as_service_error()
+                {
+                    let item0_ccf = tce
+                        .cancellation_reasons()
+                        .first()
+                        .and_then(|r| r.code())
+                        .is_some_and(|c| c == "ConditionalCheckFailed");
+                    if item0_ccf {
+                        // Marker already consumed — someone else finished this claim's fate.
+                        let current = self
+                            .get_claim(domain::SELF_LINK_TOKEN, claim_id)
+                            .await?
+                            .ok_or(StoreError::Corrupt(
+                                "fail_self_dead_key: claim missing on recheck",
+                            ))?;
+                        match current.state {
+                            // idempotent retry after a prior full success.
+                            ClaimState::Failed => return Ok(()),
+                            // another terminal owner won the marker race; their fate stands.
+                            ClaimState::Fulfilled | ClaimState::Compensated => return Ok(()),
+                            // marker gone but still Pending is impossible-by-construction →
+                            // fall through to the loud error below.
+                            ClaimState::Pending => {}
+                        }
+                    }
+                }
+                Err(StoreError::Aws(err_str))
+            }
+        }
+    }
+
     /// Toggle a game's `hidden` flag with a guarded conditional write.
     ///
     /// Race handling:
