@@ -421,6 +421,62 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["*"]
   }
 
+  # ── SNS + CloudWatch alarms (dead-key-truth ops-alarm layer, 2026-07-29) ────
+  # The main stack grew an ops-alarm SNS topic (+ ben's email subscription) and
+  # two CloudWatch metric alarms; the first apply 403'd on SNS:CreateTopic
+  # (this policy predates the feature — caught live 2026-07-29, four resources
+  # stranded after the lambda updates applied). Everything here is scoped to
+  # the app prefix. Subscription ARNs live UNDER the topic ARN
+  # (…:topic-name:uuid), so the same glob covers Subscribe/GetSubscription-
+  # Attributes/Unsubscribe. ListSubscriptionsByTopic rides along because the
+  # provider may resolve a pending email confirmation through it on refresh —
+  # read-only, topic-scoped.
+  statement {
+    sid    = "SnsOpsAlarms"
+    effect = "Allow"
+    actions = [
+      "sns:CreateTopic",
+      "sns:DeleteTopic",
+      "sns:GetTopicAttributes",
+      "sns:SetTopicAttributes",
+      "sns:TagResource",
+      "sns:UntagResource",
+      "sns:ListTagsForResource",
+      "sns:Subscribe",
+      "sns:Unsubscribe",
+      "sns:GetSubscriptionAttributes",
+      "sns:ListSubscriptionsByTopic",
+    ]
+    resources = ["arn:aws:sns:${local.region}:${local.account}:${local.app_prefix}*"]
+  }
+  statement {
+    sid    = "CloudWatchAlarms"
+    effect = "Allow"
+    actions = [
+      "cloudwatch:PutMetricAlarm",
+      "cloudwatch:DeleteAlarms",
+      "cloudwatch:TagResource",
+      "cloudwatch:UntagResource",
+      "cloudwatch:ListTagsForResource",
+    ]
+    resources = ["arn:aws:cloudwatch:${local.region}:${local.account}:alarm:${local.app_prefix}*"]
+  }
+  # DescribeAlarms follows this file's unscopeable-list-action pattern (see
+  # SsmDescribeUnscopeable): folding it into the alarm-ARN statement above
+  # risks the silent no-grant this file has been burned by twice — metadata
+  # only, region-fenced like its SSM sibling.
+  statement {
+    sid       = "CloudWatchDescribeAlarmsUnscopeable"
+    effect    = "Allow"
+    actions   = ["cloudwatch:DescribeAlarms"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [local.region]
+    }
+  }
+
   # ── deploy-web.sh: publish the SPA to the site bucket ───────────────────────
   statement {
     sid    = "SiteBucket"
