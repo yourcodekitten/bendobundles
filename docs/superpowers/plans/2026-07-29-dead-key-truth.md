@@ -32,13 +32,13 @@
 **Interfaces:**
 - Produces: `HumbleError::KeyExpired { msg: String, code: Option<String> }` AND `HumbleError::RedeemRefused(String)` **changes shape** to `RedeemRefused { msg: String, code: Option<String> }` (OMBB claw #1: parse the code ONCE at the edge, carry it on the variant — it is the exact value `failure_reason` persists). `pub(crate) fn classify_refusal(code: Option<String>, msg: String) -> HumbleError`. `RedeemResponse`/`RevealResponse` gain the optional `error` field. Task 4 consumes both shapes; every existing `RedeemRefused(_)` pattern in fulfillment becomes `RedeemRefused { .. }` (compiler enumerates the sites).
 
-- [ ] **Step 1: Write the failing tests** (append to `client_test.rs`). Scaffolding pointers, verified: the REDEEM-path pattern to copy is `redeems_as_gift` (:122) / `already_redeemed_is_typed` (:146) -- client construction `client(&server).await`, invocation `.redeem_as_gift("KEY", "machine", 0)`. Do NOT copy the test at :1361 (`reveal_key_refused_reads_error_msg_field`) for the redeem tests -- that one exercises the REVEAL path (`.reveal_key(...)`); copying it would produce four `redeem_*`-named tests that never touch `redeem_once`. In the snippets below, `client_against_mock()`/`redeem_via()` are stand-ins for exactly that :122/:146 scaffolding:
+- [ ] **Step 1: Write the failing tests** (append to `client_test.rs`). Scaffolding pointers, verified: the REDEEM-path pattern to copy is `redeems_as_gift` (:122) / `already_redeemed_is_typed` (:146) -- client construction `client(&server).await`, invocation `.redeem_as_gift("KEY", "machine", 0)`. Do NOT copy the test at :1361 (`reveal_key_refused_reads_error_msg_field`) for the redeem tests -- that one exercises the REVEAL path (`.reveal_key(...)`); copying it would produce four `redeem_*`-named tests that never touch `redeem_once`. The snippets below are written against that real scaffolding directly:
 
 ```rust
 #[tokio::test]
 async fn redeem_expired_key_maps_to_key_expired() {
     // The live 2026-07-09 doom_eternal refusal, byte-exact (cloudwatch receipt).
-    let (client, server) = client_against_mock().await; // reuse the file's existing helper for a client pointed at a MockServer; if the helper has a different name, grep the exhausted-keys test at ~:1370 and reuse ITS scaffolding verbatim
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/humbler/redeemkey"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -47,53 +47,65 @@ async fn redeem_expired_key_maps_to_key_expired() {
         })))
         .mount(&server)
         .await;
-    let err = redeem_via(&client).await.unwrap_err(); // same call shape the ~:1370 test uses
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "doom_eternal_choice_steam", 0)
+        .await
+        .unwrap_err();
     match err {
         humble_client::HumbleError::KeyExpired { msg, code } => {
             assert_eq!(msg, "This key has expired and can no longer be redeemed.");
-            assert_eq!(code, None); // no code captured live for the expired class yet
+            assert_eq!(code, None); // no machine code captured live for the expired class yet
         }
         other => panic!("expected KeyExpired, got {other:?}"),
     }
 }
 
 #[tokio::test]
-async fn expired_phrase_survives_humble_punctuation_drift() {
+async fn expired_phrase_survives_humble_text_drift() {
     // contains-match on the long phrase (OMBB claw #2, mirroring the already-redeemed
-    // precedent): a tweaked period or prefix must not silently degrade terminal
-    // detection back to park-forever.
-    let (client, server) = client_against_mock().await;
+    // precedent): prefix/suffix/CASE drift must not silently degrade terminal detection
+    // back to park-forever. The mock varies case ON the phrase itself so the
+    // .to_lowercase() in classify_refusal is load-bearing, not decorative.
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/humbler/redeemkey"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": false,
-            "errormsg": "Sorry! This key has expired and can no longer be redeemed"
+            "errormsg": "Sorry! This key HAS EXPIRED and can NO LONGER be redeemed"
         })))
         .mount(&server)
         .await;
-    let err = redeem_via(&client).await.unwrap_err();
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "doom_eternal_choice_steam", 0)
+        .await
+        .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::KeyExpired { .. }));
 }
 
 #[tokio::test]
 async fn redeem_refusal_with_error_code_still_maps_to_redeem_refused() {
-    // The keys_depleted_email shape (fixture precedent at ~:1370) must be UNCHANGED
-    // by the new code parse: unknown/untyped codes fall through byte-for-byte.
-    let (client, server) = client_against_mock().await;
+    // The keys_depleted_email shape (fixture precedent: reveal test at :1361) must be
+    // UNCHANGED in classification by the new code parse: unknown/untyped codes fall
+    // through byte-for-byte -- but the code now RIDES the error.
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/humbler/redeemkey"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "error": "keys_depleted_email",
-            "error_msg": "Keys are temporarily exhausted for this product",
-            "success": false
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"error":"keys_depleted_email","error_msg":"Keys are temporarily exhausted for this product","success":false}"#,
+        ))
         .mount(&server)
         .await;
-    let err = redeem_via(&client).await.unwrap_err();
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "soulcalibur6_monthly_steam", 0)
+        .await
+        .unwrap_err();
     match err {
         humble_client::HumbleError::RedeemRefused { msg, code } => {
             assert_eq!(msg, "Keys are temporarily exhausted for this product");
-            assert_eq!(code.as_deref(), Some("keys_depleted_email")); // the code now RIDES the error
+            assert_eq!(code.as_deref(), Some("keys_depleted_email"));
         }
         other => panic!("expected RedeemRefused, got {other:?}"),
     }
@@ -103,7 +115,7 @@ async fn redeem_refusal_with_error_code_still_maps_to_redeem_refused() {
 async fn short_expired_text_without_the_long_phrase_stays_redeem_refused() {
     // The contains-match keys on the LONG phrase; a short fragment lacking
     // "can no longer be redeemed" must NOT be buried as terminal.
-    let (client, server) = client_against_mock().await;
+    let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/humbler/redeemkey"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -112,22 +124,36 @@ async fn short_expired_text_without_the_long_phrase_stays_redeem_refused() {
         })))
         .mount(&server)
         .await;
-    let err = redeem_via(&client).await.unwrap_err();
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "some_steam", 0)
+        .await
+        .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::RedeemRefused { .. }));
 }
 
 #[tokio::test]
 async fn reveal_expired_key_maps_to_key_expired() {
-    // The REVEAL path routes through the same classify_refusal (step 3e) -- one test
-    // pins that the shared classifier really is wired there. Scaffolding: copy
-    // reveal_key_refused_reads_error_msg_field (:1361), which calls
-    // client(&server).await.reveal_key("GK", "mn_steam", 0).
-    // Mock: 200 {"success": false, "errormsg": "This key has expired and can no longer be redeemed."}
-    // Assert: matches!(err, HumbleError::KeyExpired { .. })
+    // The REVEAL path routes through the same classify_refusal (step 3e) -- this is the
+    // ONLY pin that the classifier got wired into reveal_once at all. Scaffolding
+    // mirrors reveal_key_refused_reads_error_msg_field (:1361).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"success":false,"errormsg":"This key has expired and can no longer be redeemed."}"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::KeyExpired { .. })
+    ));
 }
 ```
 
-Note for the implementer: write the reveal test fully against the :1361 scaffolding -- the comment lines are its required mock + assertion, not optional prose. The redeem tests use the :122/:146 scaffolding named above. The assertions are the contract; the scaffolding is the file's.
+All five are written against the file's REAL scaffolding (`client(&server).await` + `.redeem_as_gift(...)` / `.reveal_key(...)` -- the patterns at :122/:146/:1361); no fictional helpers.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -226,6 +252,24 @@ pub(crate) fn classify_refusal(code: Option<String>, msg: String) -> HumbleError
 
 3e. The `RevealResponse` refusal arm lives in `reveal_once` (~:1332-1345) — the same `(false, _)`-shaped construction with its own inline already-redeemed contains-check: replace that whole `if lower…else` block with `Err(classify_refusal(body.error, msg))` (delete the now-local `lower` binding), exactly as in 3d. The two methods must classify identically — the file says so itself at the non-200 arms.
 
+3f. **Task-1-interim classification arms (B-1).** The new variant makes two deliberately `_`-free exhaustive matches in FULFILLMENT non-exhaustive (E0004) the moment this task compiles the workspace: `gift_error_decision` (fulfillment `lib.rs:192`) and `choose_decision` (`:264`). The correct `DeadKey` classification is Task 4's product and must NOT be invented here. Add exactly these arms:
+
+In `gift_error_decision`:
+
+```rust
+        // interim -- Task 4 reclassifies this arm to Decision::DeadKey. Park is the
+        // safe holding value (today's behavior for every refusal).
+        HumbleError::KeyExpired { .. } => Decision::Park,
+```
+
+In `choose_decision` (this arm is PERMANENT, not interim):
+
+```rust
+        // choose_content never yields KeyExpired (it spends picks, it doesn't redeem
+        // keys) -- classified conservatively as Park; reconcile's order diff decides.
+        HumbleError::KeyExpired { .. } => Decision::Park,
+```
+
 - [ ] **Step 4: Run the humble-client suite AND the cross-crate compile gates**
 
 Run: `flock /tmp/claude-cargo.lock cargo test -p humble-client && flock /tmp/claude-cargo.lock cargo check -p fulfillment --all-targets`
@@ -244,7 +288,8 @@ git commit -S -m "feat(humble-client): typed KeyExpired refusal + machine-code p
 
 **Files:**
 - Modify: `crates/domain/src/lib.rs` (~:29-35 `ClaimState`, ~:207-233 `Claim`)
-- Modify (compile ripples, enumerated by `cargo check --workspace`): `crates/dynamo/src/lib.rs` idempotency-recheck matches (~:1356-1361 in `compensate_claim`, ~:1446-1451 in `compensate_self_claim`, plus any recheck match in `fulfill_claim`/`fulfill_self_claim` — the compiler lists them; there is no `_` arm anywhere on `ClaimState`)
+- Modify (compile ripples): `crates/dynamo/src/lib.rs` recheck matches (~:1356-1361 `compensate_claim`, ~:1446-1451 `compensate_self_claim`) + fulfill recheck error strings (`:1086-1090`, `:1138-1142`); there is no `_` arm anywhere on `ClaimState`
+- Modify (test-literal ripples -- every `Claim { .. }` struct literal gains `failure_reason: None`): `crates/public-api/tests/api_test.rs` (`:1962`, `:2023`), `crates/admin-api/tests/api_test.rs` (`:1075`, `:1496`), plus any further literals the `--all-targets` check flags in dynamo/fulfillment test files
 - Test: `crates/domain/src/lib.rs` (inline `#[cfg(test)]` module, following the file's existing test placement)
 
 **Interfaces:**
@@ -316,7 +361,11 @@ pub enum ClaimState {
     pub failure_reason: Option<String>,
 ```
 
-3c. Run `flock /tmp/claude-cargo.lock cargo check --workspace --all-targets 2>&1 | grep -B2 -A6 "non-exhaustive\|missing field"` -- the compiler enumerates every `ClaimState` match missing `Failed` and every `Claim` literal missing `failure_reason`. The recheck-after-cancellation MATCHES are ONLY in `compensate_claim` (~:1356) and `compensate_self_claim` (~:1446) -- the `fulfill_claim`/`fulfill_self_claim` rechecks are `!=` COMPARISONS (`:1086`, `:1138`), which the compiler will NOT flag. Conscious decision for those two: a stale fulfill retry that finds `Failed` errors loudly (correct -- fulfill must never override a terminal fail), but its error text says "fulfill lost to compensate", which is now a lie. Update BOTH sites' error text to `"fulfill lost -- claim already terminal (compensated or failed)"` so the loud path tells the truth. At the two compensate match sites, add the arm:
+3c. Run `flock /tmp/claude-cargo.lock cargo check --workspace --all-targets 2>&1 | grep -B2 -A6 "non-exhaustive\|missing field"` -- the compiler enumerates every `ClaimState` match missing `Failed` and every `Claim` literal missing `failure_reason`. The recheck-after-cancellation MATCHES are ONLY in `compensate_claim` (~:1356) and `compensate_self_claim` (~:1446) -- the `fulfill_claim`/`fulfill_self_claim` rechecks are `!=` COMPARISONS (`:1086`, `:1138`), which the compiler will NOT flag. Conscious decision for those two: a stale fulfill retry that finds `Failed` errors loudly (correct -- fulfill must never override a terminal fail), but its error text says "fulfill lost to compensate", which is now a lie. Update BOTH sites' error text, PRESERVING each site's operational recovery tail verbatim:
+- `:1087-1089`: `"fulfill lost to compensate — gift URL needs manual/reconcile recovery"` becomes `"fulfill lost — claim already terminal (compensated or failed); gift URL needs manual/reconcile recovery"`
+- `:1139-1141`: `"fulfill_self lost to compensate — revealed key needs manual/reconcile recovery"` becomes `"fulfill_self lost — claim already terminal (compensated or failed); revealed key needs manual/reconcile recovery"`
+
+At the two compensate match sites, add the arm:
 
 ```rust
                             // Failed is terminal and owned by the dead-key transaction —
@@ -329,13 +378,13 @@ Also fix the struct-literal compile errors: every place a `Claim` is constructed
 
 - [ ] **Step 4: Run tests**
 
-Run: `flock /tmp/claude-cargo.lock cargo test -p domain && flock /tmp/claude-cargo.lock cargo check --workspace`
-Expected: domain PASS; workspace compiles clean.
+Run: `flock /tmp/claude-cargo.lock cargo test -p domain && flock /tmp/claude-cargo.lock cargo check --workspace --all-targets`
+Expected: domain PASS; the WHOLE workspace including every test target compiles clean (the `Claim` literal ripple reaches public-api and admin-api TEST files -- plain `cargo check` misses them and would hand Task 3 a dirty tree).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/domain crates/dynamo
+git add crates/domain crates/dynamo crates/public-api crates/admin-api
 git commit -S -m "feat(domain): ClaimState::Failed + durable failure_reason on Claim"
 ```
 
@@ -356,59 +405,148 @@ git commit -S -m "feat(domain): ClaimState::Failed + durable failure_reason on C
 ```rust
 #[tokio::test]
 async fn fail_claim_dead_key_flips_all_three_items() {
-    let Some(store) = store_or_skip("fail_dead_key").await else { return };
-    // Seed exactly as the compensate tests do: link (claims_allowed 2), available game,
-    // then claim_game → Pending + claims_used 1.
-    // ... (reuse the compensate test's seeding lines verbatim)
+    let Some(store) = store_or_skip("fail-deadkey").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+
     store
-        .fail_claim_dead_key(&token, &claim_id, &game_id, "This key has expired and can no longer be redeemed.")
+        .fail_claim_dead_key("tok1", "c1", &gid, "This key has expired and can no longer be redeemed.")
         .await
         .unwrap();
-    let claim = store.get_claim(&token, &claim_id).await.unwrap().unwrap();
-    assert_eq!(claim.state, domain::ClaimState::Failed);
+
+    let c = store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Failed);
     assert_eq!(
-        claim.failure_reason.as_deref(),
+        c.failure_reason.as_deref(),
         Some("This key has expired and can no longer be redeemed.")
     );
-    let game = store.get_game(&game_id).await.unwrap().unwrap();
-    assert_eq!(game.status, domain::GameStatus::Expired);
-    assert_eq!(game.claim_id, None);
-    assert!(!game.is_listable(), "a dead-key game must never re-list");
-    let link = store.get_link(&token).await.unwrap().unwrap();
-    assert_eq!(link.claims_used, 0, "the friend's slot returns");
-    // The pending marker is consumed: the claim no longer appears in the GSI.
-    assert!(store.list_pending_claims().await.unwrap().iter().all(|c| c.id != claim_id));
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::Expired);
+    assert_eq!(g.claim_id, None);
+    assert!(!g.is_listable(), "a dead-key game must never re-list");
+    assert_eq!(store.list_listable_games().await.unwrap().len(), 0);
+    assert_eq!(
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        0,
+        "the friend's slot returns"
+    );
+    assert!(
+        store.list_pending_claims().await.unwrap().iter().all(|p| p.id != "c1"),
+        "pending marker consumed -- claim leaves the GSI"
+    );
 }
 
 #[tokio::test]
-async fn fail_claim_dead_key_is_idempotent_and_loses_races_gracefully() {
-    let Some(store) = store_or_skip("fail_dead_key_idem").await else { return };
-    // ... seed as above, fail once ...
-    // Idempotent retry after full success:
-    store.fail_claim_dead_key(&token, &claim_id, &game_id, "again").await.unwrap();
-    // claims_used must NOT double-decrement:
-    let link = store.get_link(&token).await.unwrap().unwrap();
-    assert_eq!(link.claims_used, 0);
-    // And the durable reason is the FIRST write's (retry is a no-op, not an overwrite):
-    let claim = store.get_claim(&token, &claim_id).await.unwrap().unwrap();
+async fn fail_claim_dead_key_is_idempotent() {
+    // Mirror of compensate_is_idempotent: 2-slot link so single-vs-double decrement is
+    // visible in the counter; retry must not double-decrement NOR overwrite the reason.
+    let Some(store) = store_or_skip("fail-deadkey-idem").await else {
+        return;
+    };
+    let mut lnk = link("tok1");
+    lnk.claims_allowed = 2;
+    store.create_link(&lnk).await.unwrap();
+    store.put_game(&game(1, true)).await.unwrap();
+    store.put_game(&game(2, true)).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let a = game_id("gk1", "mn");
+    let b = game_id("gk2", "mn");
+    store.claim_game("tok1", &a, "cA", now).await.unwrap();
+    store.claim_game("tok1", &b, "cB", now).await.unwrap();
+
+    store.fail_claim_dead_key("tok1", "cA", &a, "first words").await.unwrap();
+    assert_eq!(store.get_link("tok1").await.unwrap().unwrap().claims_used, 1);
+
+    store.fail_claim_dead_key("tok1", "cA", &a, "second words").await.unwrap();
     assert_eq!(
-        claim.failure_reason.as_deref(),
-        Some("This key has expired and can no longer be redeemed.")
+        store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        1,
+        "retry must not double-decrement"
+    );
+    let c = store.get_claim("tok1", "cA").await.unwrap().unwrap();
+    assert_eq!(
+        c.failure_reason.as_deref(),
+        Some("first words"),
+        "retry is a no-op, not an overwrite -- the FIRST reason is the durable truth"
     );
 }
 
 #[tokio::test]
 async fn fail_self_claim_dead_key_skips_link_decrement() {
-    let Some(store) = store_or_skip("fail_self_dead_key").await else { return };
-    // Seed a SELF claim exactly as the compensate_self tests do.
+    let Some(store) = store_or_skip("fail-self-deadkey").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game_self(&gid, "c-f1", now).await.unwrap();
+
     store
-        .fail_self_claim_dead_key(&claim_id, &game_id, "Keys are temporarily exhausted for this product")
+        .fail_self_claim_dead_key("c-f1", &gid, "Keys are temporarily exhausted for this product")
         .await
         .unwrap();
-    let claim = store.get_claim(domain::SELF_LINK_TOKEN, &claim_id).await.unwrap().unwrap();
-    assert_eq!(claim.state, domain::ClaimState::Failed);
-    let game = store.get_game(&game_id).await.unwrap().unwrap();
-    assert_eq!(game.status, domain::GameStatus::Expired);
+
+    let c = store.get_claim(SELF_LINK_TOKEN, "c-f1").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Failed);
+    // lilith's rider is "reason ON the claim item" -- BOTH variants persist it.
+    assert_eq!(
+        c.failure_reason.as_deref(),
+        Some("Keys are temporarily exhausted for this product")
+    );
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::Expired);
+}
+
+#[tokio::test]
+async fn stale_fulfill_after_dead_key_fail_stays_loud() {
+    // Mirror of the stale-fulfill-after-compensate guard (~:743-754) -- and Task 2
+    // EDITS that error text, so the modified guard gets its own pin here.
+    let Some(store) = store_or_skip("fail-deadkey-stalefulfill").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_link(&link("tok1")).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game("tok1", &gid, "c1", now).await.unwrap();
+    store.fail_claim_dead_key("tok1", "c1", &gid, "dead").await.unwrap();
+
+    let res = store
+        .fulfill_claim("tok1", "c1", &gid, "https://www.humblebundle.com/gift?key=x")
+        .await;
+    assert!(
+        res.is_err(),
+        "stale fulfill after dead-key fail must take the loud path, not silently flip: {res:?}"
+    );
+    let g = store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(g.status, GameStatus::Expired, "the retired game must stay retired");
+}
+
+#[tokio::test]
+async fn fail_dead_key_gift_variant_cancels_on_self_partition() {
+    // Mirror of the compensate pin at ~:1521-1525: WHY the self variant exists.
+    let Some(store) = store_or_skip("fail-deadkey-selfpin").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let now = datetime!(2026-07-02 12:00 UTC);
+    let gid = game_id("gk1", "mn");
+    store.claim_game_self(&gid, "c-f2", now).await.unwrap();
+
+    let wrong = store.fail_claim_dead_key(SELF_LINK_TOKEN, "c-f2", &gid, "dead").await;
+    assert!(
+        wrong.is_err(),
+        "gift fail variant must cancel on the absent LINK META"
+    );
+
+    store.fail_self_claim_dead_key("c-f2", &gid, "dead").await.unwrap();
+    let c = store.get_claim(SELF_LINK_TOKEN, "c-f2").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Failed);
 }
 ```
 
@@ -511,17 +649,19 @@ git commit -S -m "feat(dynamo): fail_claim_dead_key txns — Failed claim + dura
     ));
 ```
 
-And in the choose-ladder pinning test -- which lives at `crates/fulfillment/src/lib.rs:3496` (`choose_decision_ladder_never_compensates`, an INLINE cfg(test) module; `choose_decision` appears nowhere in handler_test.rs): append `E::KeyExpired { msg: "x".into(), code: None }` to its `park_variants` array -- the array-driven assertion then mechanically covers both the Park classification and the whole-map never-compensate property. Comment on the new entry:
+The choose-ladder pinning test lives at `crates/fulfillment/src/lib.rs:3496` (`choose_decision_ladder_never_compensates`, an INLINE cfg(test) module; `choose_decision` appears nowhere in handler_test.rs): append `E::KeyExpired { msg: "x".into(), code: None }` to its `park_variants` array with the comment below. NOTE (B-1): this is a PIN, not a red -- Task 1's 3f already added the permanent Park arm, so this test passes immediately; the array entry keeps the every-variant convention honest.
 
 ```rust
         // choose_content never yields KeyExpired (it spends picks, it doesn't redeem
         // keys) -- classified conservatively as Park; reconcile's order diff decides.
 ```
 
+ALSO append a `KeyExpired { msg: "x".into(), code: None }` entry to `reveal_decision_ladder_matches_gift_decision` (handler_test.rs:3202), following that test's existing per-variant agreement convention -- one line keeps the file's every-variant discipline honest for the new variant.
+
 - [ ] **Step 2: Run to verify failure**
 
 Run: `flock /tmp/claude-cargo.lock cargo test -p fulfillment --test handler_test ladder && flock /tmp/claude-cargo.lock cargo test -p fulfillment --lib choose_decision_ladder`
-Expected: FAIL -- no `KeyExpired` arm / no `DeadKey` variant (compile errors are the failure). Both commands must be re-run green at Step 5 (the `--lib` target is where the choose ladder actually runs).
+Expected (B-1 shape): the gift/reveal ladder tests FAIL as ASSERTIONS -- `gift_decision(KeyExpired)` returns Task 1's interim `Park`, the test demands `DeadKey`; that assertion mismatch is the true red. The `--lib` choose ladder already PASSES (its Park arm is permanent from Task 1) -- a 0-test or compile-error outcome on either command means the census or Task 1 was incomplete. Both commands re-run green at Step 5.
 
 - [ ] **Step 3: Implement the enum + classifications**
 
@@ -535,7 +675,7 @@ Expected: FAIL -- no `KeyExpired` arm / no `DeadKey` variant (compile errors are
     DeadKey,
 ```
 
-3b. `gift_error_decision`: add the arm (keep the no-`_` discipline):
+3b. `gift_error_decision`: REPLACE Task 1's interim `Park` arm (delete its interim comment) with:
 
 ```rust
         // Definitively dead server-side — terminal, not park: retrying a key humble
@@ -543,7 +683,7 @@ Expected: FAIL -- no `KeyExpired` arm / no `DeadKey` variant (compile errors are
         HumbleError::KeyExpired { .. } => Decision::DeadKey,
 ```
 
-3c. `choose_decision`: add `HumbleError::KeyExpired { .. } => Decision::Park,` with the comment from Step 1's test.
+3c. `choose_decision`: NO change -- confirm the permanent `KeyExpired { .. } => Decision::Park` arm from Task 1 step 3f is present with its comment.
 
 3d. `FulfillResponse` — add after `AlreadyRedeemed`:
 
@@ -622,6 +762,7 @@ Site-specific deltas (scope facts verified -- two of the flagged sites have NO `
 - `reveal_claimed_tpk` (executor ~:1217): NO `link_token` param -- always a SELF claim; call `fail_dead_key_any(deps, domain::SELF_LINK_TOKEN, claim_id, game_id, &reason)`. It serves BOTH choice terminals and bundle-B1 reconcile (:3214), so its ping uses the hedged line -- append: `" If this was a choice claim, its spent pick is stranded."`
 - `handle_self_claim` (executor ~:1364): NO `link_token` in scope -- same `domain::SELF_LINK_TOKEN` call, same hedged ping line as `reveal_claimed_tpk`.
 - Choose executor sites (matching `Decision` on a choose outcome, e.g. ~:912): `DeadKey` is unreachable from `choose_decision` (it maps KeyExpired -> Park) -- implement as a never-panic fallback: `tracing::error!` + return the site's Park response with reason `"dead key decision on a choose outcome -- classified conservatively"`.
+- Reconcile B2's response match (`reconcile_choice_claim` ~:1595-1603): the `other =>` arm logs "claim stays pending" -- FALSE for `KeyDead` (the doom acceptance path lands here). Add an explicit arm BEFORE `other =>`: `FulfillResponse::KeyDead => tracing::info!(claim_id = %claim.id, "reconcile(choice): dead key -- claim terminally failed from reconcile"),`
 
 3g. Structural pre-check in `claimed_tpk_terminal` (~:1018), FIRST thing in the fn body before the flavor dispatch:
 
@@ -670,39 +811,117 @@ Note: `claimed_tpk_terminal` currently has params `(deps, flavor, claim_id, link
 ```rust
 #[tokio::test]
 async fn gift_claim_on_expired_refusal_fails_terminally() {
-    let Some(store) = store_or_skip("dead_key_gift").await else { return };
-    // Seed link + available game + pending claim exactly like the existing
-    // wiremock gift tests, then mock the redeem endpoint with the doom refusal:
-    // 200 {"success": false, "errormsg": "This key has expired and can no longer be redeemed."}
-    // Also mount a webhook mock (Mock::given(method("POST")).and(path("/hook")))
-    // and set deps.webhook_url to the mock's /hook URL.
-    // Invoke the gift handler as the existing tests do.
-    // Assertions:
-    // 1. response is FulfillResponse::KeyDead
-    // 2. claim state == Failed, failure_reason == the doom string
-    // 3. game status == Expired, not listable
-    // 4. link claims_used decremented back
-    // 5. the webhook mock received EXACTLY ONE ping containing "DEAD key"
+    let Some(store) = store_or_skip("gift-deadkey").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+
+    let humble = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "errormsg": "This key has expired and can no longer be redeemed."
+        })))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    let resp = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+    assert_eq!(resp, FulfillResponse::KeyDead);
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Failed);
+    assert_eq!(
+        claim.failure_reason.as_deref(),
+        Some("This key has expired and can no longer be redeemed.")
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Expired);
+    assert_eq!(
+        deps.store.list_listable_games().await.unwrap().len(),
+        0,
+        "a dead-key game must not re-list"
+    );
+    assert_eq!(
+        deps.store.get_link("tok1").await.unwrap().unwrap().claims_used,
+        0,
+        "slot returned"
+    );
+
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "exactly one transition ping");
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("DEAD key") && body.contains("c1"));
+    assert!(!body.contains("AAAA"), "never a key value in a ping");
 }
 
 #[tokio::test]
 async fn structural_expired_tpk_fails_without_a_redeem_call() {
-    let Some(store) = store_or_skip("dead_key_structural").await else { return };
-    // DRIVE PATH: copy `reconcile_self_choice_b2_reveals_never_chooses`
-    // (handler_test.rs:3548) wholesale -- it already seeds a choice-shaped pending
-    // claim with a choice_pre_tpks snapshot, builds the choice-order mock
-    // (is_expired: false in its fixtures), and invokes reconcile through sync so
-    // execution reaches claimed_tpk_terminal via branch B2. Deltas from that test:
-    // 1. flip the new tpk's fixture field to "is_expired": true
-    // 2. replace its reveal-endpoint mock with .expect(0) -- the assertion that NO
-    //    reveal/redeem call is spent on a structurally dead key
-    // 3. webhook mock (Task 4 Step 4 /hook pattern) -- one ping containing "expired"
-    // Assertions: claim Failed with the structural reason (contains "is_expired");
-    // game Expired; the .expect(0) verifies on MockServer drop.
+    // Drive path mirrors reconcile_self_choice_b2_reveals_never_chooses (:3548):
+    // choice claim + pre=[] snapshot + order carrying the tpk -> reconcile branch B2
+    // -> claimed_tpk_terminal, where the structural pre-check must fire FIRST.
+    let Some(store) = store_or_skip("deadkey-structural").await else {
+        return;
+    };
+    seed_choice_game(&store, "gkH:off_h", "Dead On Arrival").await;
+    store
+        .claim_game_self("gkH:off_h", "sc-dk", old_enough())
+        .await
+        .unwrap();
+    store
+        .record_choice_intent(SELF_LINK_TOKEN, "sc-dk", vec![])
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    // Order mounted INLINE with is_expired: true -- do NOT modify tpk_json or
+    // mount_order_with_unredeemed_tpk (M-4: those are SHARED fixtures; editing them
+    // silently reshapes the fixture under the whole file).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkH"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "gkH",
+            "product": { "human_name": "Choice Month" },
+            "tpkd_dict": { "all_tpks": [{
+                "machine_name": "off_h_choice_steam",
+                "human_name": "Dead On Arrival",
+                "key_type": "steam",
+                "is_expired": true,
+                "keyindex": 0,
+            }]},
+            "subproducts": [],
+        })))
+        .mount(&humble)
+        .await;
+    // Deliberately NO reveal/redeem mock: a structurally dead key must spend no humble write.
+    let discord = discord_ok().await;
+
+    let deps_val = deps(store.clone(), &humble.uri(), Some(discord.uri()));
+    run_reconcile(&deps_val).await;
+
+    let claim = store.get_claim(SELF_LINK_TOKEN, "sc-dk").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Failed);
+    assert!(
+        claim.failure_reason.as_deref().unwrap_or_default().contains("expired"),
+        "the structural reason names the is_expired flag: {:?}",
+        claim.failure_reason
+    );
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/humbler/redeemkey"),
+        0,
+        "no redeem/reveal call may be spent on a structurally dead key"
+    );
+    let pings = discord.received_requests().await.unwrap();
+    assert!(
+        pings.iter().any(|r| String::from_utf8(r.body.clone()).unwrap().contains("expired")),
+        "the transition ping fires"
+    );
 }
 ```
-
-(Write these fully against the actual helper names found in the file — the comment lines above are the required assertions, not skippable prose.)
 
 - [ ] **Step 5: Run the fulfillment suite**
 
@@ -718,54 +937,85 @@ git commit -S -m "feat(fulfillment): Decision::DeadKey — terminal dead-key pat
 
 ---
 
-### Task 5: fulfillment — pending-age escalation sweep (set-driven)
+### Task 5: fulfillment — pending-age escalation sweep (set-driven, at the TOP of run_sync)
 
 **Files:**
-- Modify: `crates/fulfillment/src/lib.rs` — `reconcile` (~:3111, immediately after `list_pending_claims` succeeds and `now` is computed, BEFORE the per-claim loop)
-- Test: `crates/fulfillment/tests/handler_test.rs`
+- Modify: `crates/fulfillment/src/lib.rs` — new fn `pending_age_sweep` (place it directly above `reconcile` ~:3110) + ONE call at the very top of `run_sync` (~:2743, before the listing acquisition). `reconcile` itself is UNCHANGED.
+- Modify: `crates/fulfillment/tests/handler_test.rs` — new placement-pin test + two existing exactly-once ping tests updated (B-3, Step 4)
 
 **Interfaces:**
 - Consumes: `list_pending_claims()` (existing), `RECONCILE_STUCK_ALERT_AGE` (existing, 24h), `ping()` (existing).
-- Produces: no new public surface — an invariant: every pending claim older than 24h produces one ping per sync.
+- Produces: no new public surface — an invariant: every pending claim older than 24h produces one ping per sync, from the top of `run_sync`, before ANY humble acquisition (gate review B-4: the sweep needs only dynamo + discord; placement above every early return is the whole point, and it is PINNED by this task's test).
 
 - [ ] **Step 1: Write the failing test:**
 
 ```rust
 #[tokio::test]
-async fn stale_pending_claim_pings_every_sync_before_reconcile_acts() {
-    let Some(store) = store_or_skip("stale_sweep").await else { return };
-    // Seed via seed_pending_claim(&store, "GK26H", "stalegame") (~:134), then age the
-    // claim: re-write its item with created_at = now - 26h (grep the existing
-    // stuck-alert/RECONCILE_MIN_AGE tests for the file's aging seam — they already
-    // rewrite created_at; reuse that exact technique, do NOT invent a new seam).
-    // humble MockServer: mount the order-read path returning 401 for EVERY request so
-    // the reconcile PASS aborts on its first order read — the sweep must ping ANYWAY:
-    // that ordering (sweep before pass) is the invariant lilith named; a dead session
-    // must not starve the watchdog.
-    // webhook MockServer: the /hook pattern from Task 4 Step 4, NO .expect() count
-    // (cookie-dead pings may also fire on this lane) — assert on received_requests():
-    // at least one body contains the claim id AND "STILL PENDING".
-    // Invoke reconcile through the same entry the existing reconcile tests use
-    // (grep "reconcile" in handler_test.rs for the established invocation).
+async fn stale_pending_claim_pings_even_when_listing_is_dead() {
+    // B-4 placement pin (lilith's rider on the gate): "the sweep ran even though
+    // everything after it died." A dead-cookie LISTING -- run_sync's :2766 early
+    // return, where reconcile is NEVER called -- must not starve the sweep. If a
+    // future refactor adds an early return above the sweep call, THIS test fails.
+    let Some(store) = store_or_skip("stale-sweep-deadlisting").await else {
+        return;
+    };
+    seed_aged_pending(&store, &game_id("gkS9", "mnSTALE"), "tokS9", "cS9", hours_ago(26)).await;
+
+    let humble = MockServer::start().await;
+    // Listing 302 -> /login = Unauthorized; deps() has no session_store, so no heal:
+    // run_sync pings COOKIE_DEAD and returns before reconcile ever runs.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(302).append_header("location", "/login"))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let reqs = discord.received_requests().await.unwrap();
+    let bodies: Vec<String> = reqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies.iter().any(|b| b.contains("STILL PENDING") && b.contains("cS9")),
+        "sweep must ping the stale claim even though the listing died: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|b| b.contains("session")),
+        "the cookie-dead ping also fires on this lane"
+    );
 }
 ```
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `flock /tmp/claude-cargo.lock cargo test -p fulfillment --test handler_test stale_sweep`
-Expected: FAIL — no ping is sent.
+Run: `flock /tmp/claude-cargo.lock cargo test -p fulfillment --test handler_test stale_pending_claim`
+Expected: **1 test run, 1 failed** — the STILL PENDING assertion. The filter is the test FN name (`stale_pending_claim…`), NOT the `store_or_skip` label; a "0 tests run; ok" outcome means the filter missed and the red was never observed — that is NOT a red.
 
-- [ ] **Step 3: Implement.** In `reconcile`, after `let now = OffsetDateTime::now_utc();` and before the existing `for claim in claims` loop. The sweep iterates `for claim in &claims`; its borrow ends before the existing by-value loop, so NO change to the later loop is needed -- do not refactor it:
+- [ ] **Step 3: Implement.** TWO edits:
+
+3a. New fn, placed directly above `reconcile` (~:3110):
 
 ```rust
-    // ── Pending-age sweep (spec §3, set-driven) ──────────────────────────────────
-    // Runs over the GSI list BEFORE the reconcile pass, so nothing can starve it:
-    // not a dead session aborting the pass, not a claim shape reconcile can't touch,
-    // not reconcile itself regressing. The invariant is on the SET: every claim both
-    // pending and older than RECONCILE_STUCK_ALERT_AGE pings, every sync, until a
-    // terminal transition removes it from the GSI. Daily-by-cadence (sync schedule),
-    // deliberately not deduplicated: a once-ever alert that scrolls away IS the
-    // silent-loop bug this exists to kill (family review 2026-07-29).
+/// ── Pending-age sweep (spec §3, set-driven; placement per gate review B-4) ──────
+/// The FIRST thing run_sync does, before any humble acquisition: the sweep needs
+/// only dynamo + the discord webhook, so no session death, listing failure, or
+/// reconcile regression can starve it. The invariant is on the SET: every claim
+/// both pending and older than RECONCILE_STUCK_ALERT_AGE pings, every sync, until
+/// a terminal transition removes it from the GSI. Daily-by-cadence (sync schedule),
+/// deliberately NOT deduplicated: a once-ever alert that scrolls away IS the
+/// silent-loop bug this exists to kill (family review 2026-07-29). Placement is
+/// PINNED by stale_pending_claim_pings_even_when_listing_is_dead — an early return
+/// added above this call fails that test.
+async fn pending_age_sweep(deps: &Deps) {
+    let claims = match deps.store.list_pending_claims().await {
+        Ok(c) => c,
+        Err(_) => return, // can't read this pass — the next sync retries.
+    };
+    let now = OffsetDateTime::now_utc();
     for claim in &claims {
         let age = now - claim.created_at;
         if age > RECONCILE_STUCK_ALERT_AGE {
@@ -779,21 +1029,36 @@ Expected: FAIL — no ping is sent.
             ping(
                 deps,
                 &format!(
-                    "claim {} ({}) is STILL PENDING after ~{days}d. Reconcile retries \
-                     it every sync (or cannot reach it — see logs for this run). It \
-                     will nag daily until it completes, compensates, or fails.",
+                    "claim {} ({}) is STILL PENDING after ~{days}d. Reconcile retries                      it every sync (or cannot reach it — see logs for this run). It                      will nag daily until it completes, compensates, or fails.",
                     claim.id, claim.game_id
                 ),
             )
             .await;
         }
     }
+}
 ```
 
-- [ ] **Step 4: Run the suite**
+3b. The call — the FIRST statement in `run_sync` (~:2743), immediately after its opening `tracing::info!` line and BEFORE the listing acquisition:
+
+```rust
+    // Watchdog first (gate review B-4): needs no humble session — must run before
+    // anything that can die. Do not add early returns above this line.
+    pending_age_sweep(deps).await;
+```
+
+`reconcile` itself is UNCHANGED — no sweep code inside it.
+
+- [ ] **Step 4: Update the two exactly-once ping tests (B-3), then run the suite.**
+
+The sweep double-pings two EXISTING tests whose 30h-old seeds now correctly (spec §3 accepts the double ping) receive BOTH the structural stuck-alert AND the sweep ping:
+- `reconcile_unreconcilable_over_threshold_pings_once` (handler_test.rs:1148)
+- `reconcile_unsplittable_game_id_over_threshold_pings` (handler_test.rs:1192)
+
+Update BOTH: keep the 30h seeds EXACTLY as they are (aged seeds are the tests' point), change `assert_eq!(reqs.len(), 1)` to `assert_eq!(reqs.len(), 2)`, and assert one body contains the stuck-alert copy (`"cannot act on"`) and one contains `"STILL PENDING"`. Do NOT add dedup to the sweep to make them pass — the double ping is the specified behavior for structurally-stuck claims. Any OTHER test that newly fails on an unexpected extra ping seeded its claim older than 24h without meaning to; those seeds may be brought under 24h (but ≥ RECONCILE_MIN_AGE) — the two tests named above may NOT.
 
 Run: `flock /tmp/claude-cargo.lock cargo test -p fulfillment`
-Expected: PASS, including Task 4's tests (a fresh <24h claim in those tests must NOT trip the sweep — if one does, its seeded `created_at` is stale-aged; fix the seed, not the sweep).
+Expected: PASS, with the two updated tests asserting 2 pings and Task 4's fresh-claim tests unaffected (their seeds are younger than 24h).
 
 - [ ] **Step 5: Commit**
 
@@ -804,45 +1069,57 @@ git commit -S -m "feat(fulfillment): set-driven pending-age sweep — no claim i
 
 ---
 
-### Task 6: public-api — `KeyDead` → HTTP 410
+### Task 6: public-api + admin-api — `KeyDead` → HTTP 410 everywhere it surfaces
 
 **Files:**
 - Modify: `crates/public-api/src/lib.rs` (~:680-703, the claim outcome match + its log match)
-- Modify: `crates/admin-api/src/lib.rs` (~:793, the self-claim endpoint's response mapping -- KeyDead must not surface as 500)
-- Test: whatever claim-endpoint test exists (`grep -rn "GONE\|already redeemed" crates/public-api` locates the AlreadyRedeemed mapping test to mirror; if none exists, the two match arms below are covered by Task 4's response-variant tests plus compile — add the arm, note the gap in the PR body)
+- Modify: `crates/admin-api/src/lib.rs` — BOTH self-claim response matches: the invoke arm (~:793 region) AND the reveal-path match (~:774-798); each currently folds `KeyDead` into a 500 whose copy ("the claim is recorded") is wrong twice for a terminally failed claim
+- Test: `crates/public-api/tests/api_test.rs` (MockInvoker rig at :100-135) + `crates/admin-api/tests/api_test.rs` (MockAdminInvoker/MockCallInvoker rigs at :86-135)
 
 **Interfaces:**
 - Consumes: `FulfillResponse::KeyDead` (Task 4).
-- Produces: HTTP 410 `{"error": "that key can't be redeemed anymore — choose another"}` — the friend-facing copy of record (spec-aligned, no choice-pick jargon for bundle friends; web renders the server's message verbatim through the existing `refused` lane).
+- Produces: friend HTTP 410 `{"error": "that key can't be redeemed anymore — pick another"}` (verb matches the NEIGHBORING AlreadyRedeemed 410 at public-api :692 — two adjacent 410s must not disagree; this supersedes the spec's copy discussion, "pick" here is the neighbor's plain English, not choice jargon); admin HTTP 410 `{"error": "key is dead on humble's side — claim failed terminally, reason recorded on the claim"}` on both admin matches. Task 7 renders the friend message through the existing `refused` lane.
 
-- [ ] **Step 1: Add the log-match arm** (in the outcome-logging match ~:682):
+- [ ] **Step 1: public-api log arm** (in the outcome-logging match ~:682):
 
 ```rust
         Ok(FulfillResponse::KeyDead) => tracing::info!("claim: dead-key (410)"),
 ```
 
-- [ ] **Step 2: Add the response arm** (before the `_ => park_response()` arm):
+- [ ] **Step 2: public-api response arm** (before the `_ => park_response()` arm):
 
 ```rust
         Ok(FulfillResponse::KeyDead) => (
             StatusCode::GONE,
             Json(serde_json::json!({
-                "error": "that key can't be redeemed anymore — choose another"
+                "error": "that key can't be redeemed anymore — pick another"
             })),
         )
             .into_response(),
 ```
 
-- [ ] **Step 3: admin-api sibling arm.** The admin self-claim endpoint (`crates/admin-api/src/lib.rs:793` region) currently folds `FulfillResponse::KeyDead` into its catch-all -> HTTP 500 "fulfillment failed" -- a designed terminal outcome reported as an error. Read the handler's existing non-500 outcome arms (mirror their exact response construction and error-envelope JSON shape) and add an explicit arm: `FulfillResponse::KeyDead` -> status 410 with message `"key is dead on humble's side — claim failed terminally, reason recorded on the claim"`.
+- [ ] **Step 3: admin-api arms — BOTH matches.** In the invoke-arm match (~:793 region) AND the reveal-path match (~:774-798), add before each catch-all, mirroring the neighboring `AlreadyRedeemed => GONE` construction each match already has:
 
-- [ ] **Step 4: Mirror the AlreadyRedeemed test** (if the grep in Files found one) asserting 410 + the exact message for a `KeyDead` fulfillment result.
+```rust
+        Ok(FulfillResponse::KeyDead) => (
+            StatusCode::GONE,
+            Json(serde_json::json!({
+                "error": "key is dead on humble's side — claim failed terminally, reason recorded on the claim"
+            })),
+        )
+            .into_response(),
+```
 
-- [ ] **Step 4: Run**
+- [ ] **Step 4: mirror tests, UNCONDITIONAL** (the rigs exist — `MockInvoker::new(FulfillResponse::…)` public-api api_test.rs:100-135; the admin mock invokers at admin-api api_test.rs:86-135; there is no "no harness" escape):
+  - public-api: `grep -n "MockInvoker::new" crates/public-api/tests/api_test.rs`, copy the claim-endpoint test that drives a non-200 FulfillResponse through the POST claim route, swap the mock to `MockInvoker::new(FulfillResponse::KeyDead)`, assert status 410 and the byte-exact body from Step 2.
+  - admin-api: same recipe twice — one test through the invoke arm, one through the reveal path (copy the nearest AlreadyRedeemed/GONE-shaped test for each; `grep -n "GONE\|already redeemed" crates/admin-api/tests/api_test.rs`), each asserting 410 + the byte-exact Step 3 body.
+
+- [ ] **Step 5: Run**
 
 Run: `flock /tmp/claude-cargo.lock cargo test -p public-api -p admin-api && flock /tmp/claude-cargo.lock cargo clippy --all-targets -p public-api -p admin-api`
-Expected: PASS / clean.
+Expected: PASS / clean, including the three new mirror tests.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/public-api crates/admin-api
@@ -886,7 +1163,7 @@ And in the row (the ternary at ~:40-52), add a `failed` branch between the fulfi
               ) : claim.state === 'pending' ? (
 ```
 
-- [ ] **Step 3: Admin badges.** In `Links.tsx` `stateBadgeClass`, add a `case 'failed':` returning a rose-toned class consistent with the function's existing entries (read the function; mirror its class-string style, e.g. `'bg-rose-950 text-rose-200'`). ALSO: `web/src/admin/Catalog.tsx:338` branches on `sc.state === 'compensated'` for self-claims -- read that conditional and add a sibling `'failed'` branch mirroring the compensated branch's structure with the same rose tone and the literal label `key dead` (without this, a failed self-claim silently renders through the fallback styling).
+- [ ] **Step 3: Admin badges.** In `Links.tsx` `stateBadgeClass`, add a `case 'failed':` returning a rose-toned class consistent with the function's existing entries (read the function; mirror its class-string style, e.g. `'bg-rose-950 text-rose-200'`). ALSO: `web/src/admin/Catalog.tsx:338` branches on `sc.state === 'compensated'` for self-claims — the rendered LABEL there is the raw `{sc.state}` expression, so no label edit is possible or wanted: extend only the CLASS ternary with a `sc.state === 'failed'` case using the same rose tone (read the existing ternary and mirror its structure). Naming stays two-names-total across the product: the friend chip says `returned` (brand-warm), every admin surface shows the raw wire state `failed`.
 
 - [ ] **Step 4: Verify**
 
@@ -906,7 +1183,7 @@ git commit -S -m "feat(web): failed claims render warm — 'returned' chip, hone
 
 **Files:**
 - Create: `terraform/aws-cloudwatch-alarms.tf`
-- Modify: `terraform/tf-variables.tf` (the `ops_alarm_email` variable)
+- Modify: `terraform/tf-variables.tf` (ADD the `ops_alarm_email` variable — it does not exist yet)
 
 **Interfaces:**
 - Consumes: the fulfillment lambda's function name -- `module.lambda_fulfillment.lambda_function_name` (lambdas in this repo are MODULE instantiations, `bendoerr-terraform-modules/lambda/aws`; there is no `resource "aws_lambda_function"` anywhere. Precedent for exactly this reference: `aws-eventbridge.tf:26`).
@@ -924,8 +1201,9 @@ git commit -S -m "feat(web): failed claims render warm — 'returned' chip, hone
 # never touches; these catch the reconcile that never runs.
 
 resource "aws_sns_topic" "ops_alarms" {
-  name = "${module.label.id}-ops-alarms"
-  tags = module.label.tags
+  # label name is "ops" -> id already ends "-ops"; suffix once, not twice.
+  name = "${module.label_alarms.id}-alarms"
+  tags = module.label_alarms.tags
 }
 
 resource "aws_sns_topic_subscription" "ops_alarms_email" {
@@ -935,7 +1213,7 @@ resource "aws_sns_topic_subscription" "ops_alarms_email" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "fulfillment_errors" {
-  alarm_name          = "${module.label.id}-fulfillment-errors"
+  alarm_name          = "${module.label_alarms.id}-fulfillment-errors"
   alarm_description   = "bendobundles fulfillment lambda reported errors — sync/reconcile may be silently down"
   namespace           = "AWS/Lambda"
   metric_name         = "Errors"
@@ -947,35 +1225,38 @@ resource "aws_cloudwatch_metric_alarm" "fulfillment_errors" {
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
   alarm_actions       = [aws_sns_topic.ops_alarms.arn]
-  tags                = module.label.tags
+  tags                = module.label_alarms.tags
 }
 
 resource "aws_cloudwatch_metric_alarm" "fulfillment_silent" {
-  alarm_name          = "${module.label.id}-fulfillment-silent"
+  alarm_name        = "${module.label_alarms.id}-fulfillment-silent"
   alarm_description   = "bendobundles fulfillment lambda has not been invoked in 25h — the daily sync (and its pending-age sweep) is not running"
   namespace           = "AWS/Lambda"
   metric_name = "Invocations"
   dimensions  = { FunctionName = module.lambda_fulfillment.lambda_function_name }
   statistic   = "Sum"
-  # 25 consecutive silent hours = the 24h schedule + 1h grace. Expressed as 25
-  # one-hour periods because CloudWatch caps a single period at 86400s -- a bare
-  # period=90000 is rejected at the API (apply-time), invisible to validate.
+  # 24 consecutive silent hours. CloudWatch enforces TWO limits invisible to
+  # `terraform validate`: period <= 86400 AND period * evaluation_periods <= 86400
+  # TOTAL -- so 3600x24 is the maximum expressible window (gate review B-2; both
+  # 90000x1 and 3600x25 are rejected at the API, at apply time). Residual: with the
+  # daily cron at a fixed minute, minute-level jitter can graze one false nag per
+  # miss -- accepted; a false silent-alarm nag is the cheap direction.
   period              = 3600
-  evaluation_periods  = 25
+  evaluation_periods  = 24
   threshold           = 1
   comparison_operator = "LessThanThreshold"
   treat_missing_data  = "breaching" # NO data in an hour = not invoked = counts toward the alarm
   alarm_actions       = [aws_sns_topic.ops_alarms.arn]
-  tags                = module.label.tags
+  tags                = module.label_alarms.tags
 }
 ```
 
-Adjust the one reference the plan leaves file-local: the label module instance (`module.label` above) -- create a file-local `module "label_alarms"` following `aws-dynamodb.tf`'s `module "label_table"` pattern (label/null 1.0.1, `context = module.context.shared`, `name = "alarms"`), and use `module.label_alarms.id`/`.tags`. Add `variable "ops_alarm_email"` to `terraform/tf-variables.tf` with `description = "Email endpoint for the ops-alarm SNS topic."` and NO default (the deploy tfvars provides it -- ben's contact email, never committed).
+Adjust the one reference the plan leaves file-local: the label module instance (`module.label` above) -- create a file-local `module "label_alarms"` following `aws-dynamodb.tf`'s `module "label_table"` pattern (label/null 1.0.1, `context = module.context.shared`, `name = "ops"`), and use `module.label_alarms.id`/`.tags` as already written in the HCL above. Add `variable "ops_alarm_email"` to `terraform/tf-variables.tf` with `description = "Email endpoint for the ops-alarm SNS topic."` and NO default (the deploy tfvars provides it -- ben's contact email, never committed).
 
 - [ ] **Step 2: Validate**
 
-Run: `cd terraform && terraform fmt -check aws-cloudwatch-alarms.tf && terraform validate` (validate needs init; if the backend isn't initialized in this clone, `terraform init -backend=false` first — read-only, no state touched).
-Expected: fmt clean, validate passes.
+Run: `cd terraform && terraform fmt -check aws-cloudwatch-alarms.tf && terraform validate` (validate needs init; if the backend isn't initialized in this clone, `terraform init -backend=false` first — read-only, no state touched, but it DOES need network for provider/module downloads).
+Expected: fmt clean, validate passes. Remember validate CANNOT see the CloudWatch API limits — the 3600×24 arithmetic above is load-bearing, do not "round it up".
 
 - [ ] **Step 3: Commit**
 
@@ -994,7 +1275,7 @@ git commit -S -m "feat(terraform): out-of-process alarms -- fulfillment errors +
 - [ ] **Step 1: Full trust-nothing verify** (stale-binary lesson: clean the crates whose results matter):
 
 ```bash
-flock /tmp/claude-cargo.lock cargo clean -p humble-client -p domain -p dynamo -p fulfillment -p public-api
+flock /tmp/claude-cargo.lock cargo clean -p humble-client -p domain -p dynamo -p fulfillment -p public-api -p admin-api
 flock /tmp/claude-cargo.lock cargo fmt --all -- --check
 flock /tmp/claude-cargo.lock cargo clippy --all-targets
 flock /tmp/claude-cargo.lock cargo test --workspace
@@ -1012,6 +1293,20 @@ git commit -S -m "docs: dead-key-truth spec → implemented status"
 
 ---
 
+### Task 10: live acceptance (deploy-phase — run by the DEPLOYING OPERATOR after the terraform apply + admin sync-now, NOT by a coding subagent)
+
+The spec's §4 acceptance criteria, as commands with expected outputs. Run all five after the first post-deploy sync completes (~5 min after the admin `POST /admin/api/sync` 202):
+
+- [ ] **A1 — doom transitioned autonomously.** `AWS_PROFILE=kitten-debug aws dynamodb query --table-name brd-prod-ue1-bendobundles-table --index-name pending-claims --key-condition-expression "gsi2pk = :p" --expression-attribute-values '{":p":{"S":"PENDINGCLAIM"}}' --output json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Count']); [print(json.loads(i['body']['S'])['id']) for i in d['Items']]"` → Expected: count **2**, and `87b9a4d8-…` is NOT in the list (was 3, with doom).
+- [ ] **A2 — the failed claim carries its reason.** Read the doom claim item (pk `LINK#14e9ec4b0b984019975fa88d499bde2be5f8fae5c7494bb4a4ad8cef9416a7f4`, sk `CLAIM#87b9a4d8-9855-47fb-bc3b-aa0be42ed4a2` via `aws dynamodb get-item`) → Expected: body has `"state":"failed"` and `failure_reason` containing "expired".
+- [ ] **A3 — exactly one transition ping fired for doom** (not a daily loop): `AWS_PROFILE=kitten-debug aws logs filter-log-events --log-group-name /aws/lambda/brd-prod-ue1-bendobundles-fulfillment --start-time <deploy-epoch-ms> --filter-pattern '"87b9a4d8"'` → Expected: the dead-key transition log line ONCE; NO new `reconcile(choice): terminal did not complete` lines after the transition.
+- [ ] **A4 — the exhausted pair nags.** Same log filter for `"STILL PENDING"` → Expected: exactly two entries per sync (claims `3f46c058` + `3da0c011`), and the corresponding discord pings arrived in ben's ops feed.
+- [ ] **A5 — the loop-pair is gone going forward.** Next scheduled sync (09:00 UTC): re-run A3's filter over the new window → Expected: zero `terminal did not complete` for `87b9a4d8`; A4's two nags recur (daily-by-design until ben acts). The two CloudWatch alarms exist in `OK` state (`aws cloudwatch describe-alarms --alarm-name-prefix brd-prod-ue1-bendobundles`).
+
+Failure of any A-item = pounce step 13 (address fallout) before the reveal.
+
+---
+
 ## Post-plan arc (NOT plan tasks — pounce steps 7-14, for the record)
 
-PR → two /review passes (findings posted on-thread per the 2026-07-06 rule) → OMBB sign-off (discord) → merge (my own PR, hard rule 1) → full deploy as kitten-deploy (lambdas + the new alarms ⇒ terraform apply per terraform/README "Deploying as kitten"; `ops_alarm_email` rides the deploy tfvars, ben confirms the SNS email once) → admin sync-now → live acceptance: doom `87b9a4d8` transitions to `failed` autonomously with one ping; exhausted pair starts daily nags; pending GSI 3→2; friend page shows `returned`; the two alarms exist in `OK` state; reveal to ben.
+PR → two /review passes (findings posted on-thread per the 2026-07-06 rule) → OMBB sign-off (discord) → merge (my own PR, hard rule 1) → full deploy as kitten-deploy (lambdas + the new alarms ⇒ terraform apply per terraform/README "Deploying as kitten"; `ops_alarm_email` rides the deploy tfvars, ben confirms the SNS email once) → admin sync-now → **Task 10's acceptance checklist** (the concrete commands live there) → reveal to ben.

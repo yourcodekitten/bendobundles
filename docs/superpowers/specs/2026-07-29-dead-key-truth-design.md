@@ -143,11 +143,13 @@ New invariant, enforced on the SET, not on pass outcomes:
 **every claim in the pending-claims GSI older than `RECONCILE_STUCK_ALERT_AGE`
 (24h) pings, every sync, full stop.**
 
-- The sweep runs over `list_pending_claims()` output BEFORE the reconcile pass
-  (so a dead-session early-return, a future claim shape reconcile can't touch,
-  or reconcile itself breaking can never starve the invariant — the original
-  per-pass-touched-claim framing was alert_unreconcilable's classification
-  blind spot reborn one layer up, as coverage).
+- The sweep runs at the TOP of `run_sync`, before ANY humble acquisition — it
+  needs only dynamo + the discord webhook (gate review B-4: inside `reconcile`
+  it still starved on the dead-cookie LISTING return at run_sync:2766; that hole
+  had moved three times, so the PLACEMENT itself is pinned by a fixture that
+  drives run_sync through the dead-listing early return and asserts the
+  escalation pinged anyway — "the sweep ran even though everything after it
+  died").
 - Ping names game, claim id, age in days. When the same run's reconcile pass
   produces an outcome class for that claim, logs carry it; when reconcile never
   reaches the claim at all, that absence is itself the loudest line.
@@ -163,7 +165,10 @@ New invariant, enforced on the SET, not on pass outcomes:
 - **The watchdog's watchdog is out-of-process** (OMBB's claw #3): the sweep dies
   with the lambda if the cron misfires, a deploy bricks it, or IAM rots. Two
   CloudWatch alarms on the fulfillment lambda close the LAST silence layer —
-  `Errors > 0` and `Invocations == 0 over 25h` — wired to an SNS topic with
+  `Errors > 0` and `Invocations == 0 over 24h` (3600s × 24 evaluation periods —
+  CloudWatch caps both the single period AND the period×evaluations product at
+  86400s, so 24h is the maximum expressible window; minute-jitter may graze a
+  rare false nag, accepted as the cheap direction) — wired to an SNS topic with
   ben's email subscribed (one confirm click). Terraform, applied at deploy.
   Layer map: sweep catches the claim reconcile never touches; the alarm catches
   the reconcile that never runs.
