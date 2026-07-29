@@ -1611,8 +1611,7 @@ async fn handle_self_claim(
                             "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
                              \"{reason}\". The claim is failed (reason recorded on the \
                              claim), the game is retired as expired and will not re-list, \
-                             and the slot was returned. Nothing retries this. If this was a \
-                             choice claim, its spent pick is stranded.",
+                             and the slot was returned. Nothing retries this.",
                         ),
                     )
                     .await;
@@ -3319,7 +3318,7 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
 /// The FIRST thing run_sync does, before any humble acquisition: the sweep needs
 /// only dynamo + the discord webhook, so no session death, listing failure, or
 /// reconcile regression can starve it. The invariant is on the SET: every claim
-/// both pending and older than RECONCILE_STUCK_ALERT_AGE pings, every sync, until
+/// both pending and at least RECONCILE_STUCK_ALERT_AGE old pings, every sync, until
 /// a terminal transition removes it from the GSI. Daily-by-cadence (sync schedule),
 /// deliberately NOT deduplicated: a once-ever alert that scrolls away IS the
 /// silent-loop bug this exists to kill (family review 2026-07-29). Placement is
@@ -3333,7 +3332,7 @@ async fn pending_age_sweep(deps: &Deps) {
     let now = OffsetDateTime::now_utc();
     for claim in &claims {
         let age = now - claim.created_at;
-        if age > RECONCILE_STUCK_ALERT_AGE {
+        if age >= RECONCILE_STUCK_ALERT_AGE {
             let days = age.whole_days();
             tracing::warn!(
                 claim_id = %claim.id,
