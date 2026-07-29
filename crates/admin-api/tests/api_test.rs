@@ -1434,6 +1434,25 @@ async fn self_claim_endpoint_202_on_parked() {
     assert_eq!(resp.status(), 202);
 }
 
+/// POST /admin/api/games/:id/self-claim when mock returns KeyDead → 410 with the
+/// admin-facing copy (byte-exact — mirrors the neighboring AlreadyRedeemed GONE arm).
+#[tokio::test]
+async fn self_claim_endpoint_410_on_dead_key() {
+    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::KeyDead).await;
+    seed_available_game(&store, "gkN:mnN", "Dead Key Game").await;
+
+    let resp = authed_post(&app, "/admin/api/games/gkN:mnN/self-claim", "{}").await;
+    assert_eq!(resp.status(), 410);
+    let body: serde_json::Value = body_json(resp).await;
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": "key is dead on humble's side — claim failed terminally, reason recorded on the claim"
+        }),
+        "byte-exact admin-facing dead-key copy"
+    );
+}
+
 /// GET /admin/api/claims/self returns fulfilled self-claims including their revealed_key.
 /// Crucially: does NOT 404 even though LINK#SELF has no META item (handle_link_claims would 404).
 #[tokio::test]

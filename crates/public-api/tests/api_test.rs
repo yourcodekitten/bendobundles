@@ -970,6 +970,38 @@ async fn parked_claim_returns_202_and_appears_pending() {
     );
 }
 
+/// Dead key: MockInvoker returns KeyDead → 410 with the friend-facing copy
+/// (byte-exact — this is the neighboring AlreadyRedeemed 410's sibling, same verb).
+#[tokio::test]
+async fn dead_key_claim_returns_410() {
+    let Some(store) = store_or_skip("dead-key-claim").await else {
+        return;
+    };
+    let g = test_game(4);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store.create_link(&test_link("dead-tok")).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::KeyDead);
+
+    let claim_body = serde_json::json!({"game_id": gid});
+    let post_req = Request::post("/api/l/dead-tok/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+        .unwrap();
+    let post_resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(post_req)
+        .await
+        .unwrap();
+    assert_eq!(post_resp.status(), StatusCode::GONE, "dead key → 410");
+    let post_j = body_json(post_resp).await;
+    assert_eq!(
+        post_j,
+        serde_json::json!({"error": "that key can't be redeemed anymore — pick another"}),
+        "byte-exact friend-facing dead-key copy"
+    );
+}
+
 /// Fallback route returns 404 for any unmatched path.
 #[tokio::test]
 async fn unknown_route_is_404() {
