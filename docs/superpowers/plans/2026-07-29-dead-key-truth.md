@@ -1018,7 +1018,7 @@ async fn pending_age_sweep(deps: &Deps) {
     let now = OffsetDateTime::now_utc();
     for claim in &claims {
         let age = now - claim.created_at;
-        if age > RECONCILE_STUCK_ALERT_AGE {
+        if age >= RECONCILE_STUCK_ALERT_AGE {
             let days = age.whole_days();
             tracing::warn!(
                 claim_id = %claim.id,
