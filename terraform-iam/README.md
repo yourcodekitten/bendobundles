@@ -29,6 +29,14 @@ bendobundles stack. Separate state from the main stack on purpose.
 cd terraform-iam
 cp backend.hcl.example backend.hcl        # confirm bucket
 terraform init -backend-config=backend.hcl
+
+# ⚠️ WORKSPACE — this stack's live state is in workspace `production-iam`, NOT `default`.
+# `default` is a 2024 relic (family record: the #72 drift-remediation apply, 2026-07-14).
+# Select it BEFORE planning, or the plan is cut against the relic:
+terraform workspace select production-iam    # or: TF_WORKSPACE=production-iam
+# Self-check: if the plan wants to CREATE resources that already exist (roles, the
+# boundary, the manager user), you are in the wrong workspace — STOP, do not apply.
+
 terraform plan  -var aws_account_id=672812236571 -out tf.plan
 # review the IAM in the plan, especially the kitten-deploy policy
 terraform apply tf.plan
