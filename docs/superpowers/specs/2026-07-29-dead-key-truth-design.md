@@ -3,7 +3,7 @@
 > "Wrong is fine, silently wrong is the crime." — the whole spec in one line
 > (lilith + OMBB, family review 2026-07-29)
 
-status: DRAFT for family review (OMBB + lilith), 2026-07-29
+status: implemented on kitten/dead-key-truth (plan docs/superpowers/plans/2026-07-29-dead-key-truth.md)
 author: code kitten
 prod receipts: cloudwatch `/aws/lambda/brd-prod-ue1-bendobundles-fulfillment`, pending-claims GSI,
 2026-07-29 morning (queries preserved in code-kitten/state/checkpoint.md)

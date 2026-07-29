@@ -1524,7 +1524,10 @@ async fn short_expired_text_without_the_long_phrase_stays_redeem_refused() {
         .redeem_as_gift("AAAAbbbbCCCC", "some_steam", 0)
         .await
         .unwrap_err();
-    assert!(matches!(err, humble_client::HumbleError::RedeemRefused { .. }));
+    assert!(matches!(
+        err,
+        humble_client::HumbleError::RedeemRefused { .. }
+    ));
 }
 
 #[tokio::test]

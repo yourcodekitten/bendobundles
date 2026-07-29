@@ -82,6 +82,9 @@ needs — no part of this waits on Ben.**
      add the var, re-plan. (Nearly shipped 2026-07-10.)
    - `humble_username` / `discord_webhook_url` from **`~/.secrets/bendobundles-deploy.env`** (600, outside
      git — the saved deploy secrets; see `code-kitten` `state/decisions.md` 2026-07-06 pointer)
+   - `ops_alarm_email` — **MANDATORY, no default.** Ben's alert email address (the ops-alarm SNS
+     topic subscription target — he confirms it once by mail). Value supplied at deploy time only,
+     never committed. Omitting it hard-fails the apply.
 3. **`admin_password_hash` — pull the LIVE value and pass it back verbatim (a no-op). NEVER re-hash the
    password.** The `admin_hash` SSM param (`aws-ssm.tf`) is `value = var.admin_password_hash` with **no
    `ignore_changes`**, so terraform sets it to whatever you pass on every apply. Argon2 with a fresh salt
@@ -274,6 +277,11 @@ domain_zone_id = "Z1ABCDEF123456"  # Route53 hosted zone ID for bendobundles.com
 # plans a `permissions_boundary -> null` strip on all three lambda execution roles —
 # see the full-deploy recipe above.
 lambda_permissions_boundary_arn = "arn:aws:iam::123456789012:policy/your-app-boundary"
+
+# Required — no default, apply hard-fails without it. Ben's alert email address; the
+# ops-alarm SNS topic subscription target (he confirms it once by mail). Not a secret,
+# but still supplied at deploy time only, never committed.
+ops_alarm_email = "ben@example.com"
 ```
 
 Keep `admin_password_hash` and `discord_webhook_url` out of the tfvars file. Pass them via
