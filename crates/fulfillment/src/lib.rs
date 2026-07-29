@@ -154,6 +154,10 @@ pub enum FulfillResponse {
     },
     /// definitive: key was already redeemed; claim compensated; friend should pick another
     AlreadyRedeemed,
+    /// Terminal dead key: the claim was failed (reason persisted), the friend's slot
+    /// returned, the game retired as expired. public-api maps this to 410 with its own
+    /// friend-honest message — the AlreadyRedeemed pattern, different words.
+    KeyDead,
     /// ambiguous or refused: claim stays PENDING for reconcile; friend told "processing"
     Parked {
         reason: String,
@@ -183,6 +187,11 @@ pub enum Decision {
     ParkCookieDead,
     /// Ambiguous or refused — park pending for reconcile; NEVER compensate blind.
     Park,
+    /// The key is definitively DEAD (humble: expired, unredeemable forever). Terminal:
+    /// fail the claim with its reason, return the slot, retire the game as Expired.
+    /// NEVER park (retry cannot succeed) and NEVER compensate (re-listing would hand
+    /// the next friend the same dead key).
+    DeadKey,
 }
 
 /// The Err-arm classification shared by [`gift_decision`] and [`reveal_decision`]. Extracted so
@@ -218,9 +227,9 @@ fn gift_error_decision(err: &HumbleError) -> Decision {
         // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
         // only reconcile against humble truth can tell. Park — never compensate blind.
         HumbleError::RedeemRefused { .. } => Decision::Park,
-        // interim -- Task 4 reclassifies this arm to Decision::DeadKey. Park is the
-        // safe holding value (today's behavior for every refusal).
-        HumbleError::KeyExpired { .. } => Decision::Park,
+        // Definitively dead server-side — terminal, not park: retrying a key humble
+        // has expired loops forever (live receipt: claim 87b9a4d8, 21 silent days).
+        HumbleError::KeyExpired { .. } => Decision::DeadKey,
         HumbleError::AmbiguousRedeem => Decision::Park,
         HumbleError::RateLimited => Decision::Park,
         HumbleError::Api(_) => Decision::Park,
@@ -745,6 +754,43 @@ async fn handle_gift(
                 reason: format!("humble call inconclusive: park for reconcile ({detail})"),
             }
         }
+        Decision::DeadKey => {
+            let reason = match &outcome {
+                // The persisted failure_reason is the same value the wire carried:
+                // "msg" or "msg [code: c]" — one truth from wire to dynamo.
+                Err(HumbleError::KeyExpired { msg, code }) => match code {
+                    Some(c) => format!("{msg} [code: {c}]"),
+                    None => msg.clone(),
+                },
+                // DeadKey is only produced from KeyExpired today; a future producer
+                // must carry its own words. Never leaves this arm blank.
+                _ => "dead key (unclassified producer)".to_string(),
+            };
+            match fail_dead_key_any(deps, link_token, claim_id, game_id, &reason).await {
+                Ok(()) => {
+                    tracing::warn!(claim_id, game_id, %reason, "dead key: claim terminally failed, slot returned, game retired");
+                    ping(
+                        deps,
+                        &format!(
+                            "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
+                             \"{reason}\". The claim is failed (reason recorded on the \
+                             claim), the game is retired as expired and will not re-list, \
+                             and the slot was returned. Nothing retries this.",
+                        ),
+                    )
+                    .await;
+                    FulfillResponse::KeyDead
+                }
+                Err(e) => {
+                    // The store write failed — the claim is STILL pending; reconcile
+                    // will re-detect the dead key next pass and retry this transition.
+                    ping(deps, &format!("dead-key fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                    FulfillResponse::Parked {
+                        reason: "dead key detected but recording failed — will retry".into(),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -924,6 +970,17 @@ async fn handle_choice_claim(
         Decision::Park | Decision::Compensate => {
             return choose_park(deps, claim_id, &title, &choose_outcome).await;
         }
+        // Unreachable: choose_decision maps KeyExpired -> Park, never DeadKey (Task 1 3f) — a
+        // choosecontent call never redeems a key. Never-panic fallback, exhaustiveness only.
+        Decision::DeadKey => {
+            tracing::error!(
+                claim_id,
+                "unreachable: choose decision matched DeadKey — classified conservatively as park"
+            );
+            return FulfillResponse::Parked {
+                reason: "dead key decision on a choose outcome -- classified conservatively".into(),
+            };
+        }
     }
 
     // ── Step 5: re-read the order and find the newly-minted tpk. ────────────────────────────────
@@ -1031,6 +1088,39 @@ async fn claimed_tpk_terminal(
     tpk: &KeyEntry,
     allow_heal: bool,
 ) -> FulfillResponse {
+    // Structural truth beats string-matching (spec §1 ladder rung 1): a tpk humble
+    // already marks expired is dead — don't spend a redeem/reveal call to learn it.
+    // Same trust sync already grants tpk.expired at listing time.
+    if tpk.expired {
+        let reason = format!(
+            "tpk {} is marked expired on the order (structural is_expired)",
+            tpk.machine_name
+        );
+        // Executor parity with the DeadKey arm: fail, ping, KeyDead.
+        return match fail_dead_key_any(deps, link_token, claim_id, game_id, &reason).await {
+            Ok(()) => {
+                tracing::warn!(claim_id, game_id, %reason, "dead key (structural): claim terminally failed");
+                ping(
+                    deps,
+                    &format!(
+                        "claim {claim_id} ({game_id}) sits on a key humble marks expired \
+                         ({}) — failed terminally without a redeem attempt. Reason recorded, \
+                         slot returned, game retired. If this was a choice claim, its spent \
+                         pick is stranded.",
+                        tpk.machine_name
+                    ),
+                )
+                .await;
+                FulfillResponse::KeyDead
+            }
+            Err(e) => {
+                ping(deps, &format!("dead-key (structural) fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                FulfillResponse::Parked {
+                    reason: "dead key detected but recording failed — will retry".into(),
+                }
+            }
+        };
+    }
     match flavor {
         ClaimFlavor::Gift => {
             redeem_claimed_tpk(
@@ -1184,6 +1274,39 @@ async fn redeem_claimed_tpk(
                 reason: format!("humble call inconclusive: park for reconcile ({detail})"),
             }
         }
+        Decision::DeadKey => {
+            let reason = match &outcome {
+                Err(HumbleError::KeyExpired { msg, code }) => match code {
+                    Some(c) => format!("{msg} [code: {c}]"),
+                    None => msg.clone(),
+                },
+                _ => "dead key (unclassified producer)".to_string(),
+            };
+            match fail_dead_key_any(deps, link_token, claim_id, game_id, &reason).await {
+                Ok(()) => {
+                    tracing::warn!(claim_id, game_id, %reason, "dead key: claim terminally failed, slot returned, game retired");
+                    ping(
+                        deps,
+                        &format!(
+                            "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
+                             \"{reason}\". The claim is failed (reason recorded on the \
+                             claim), the game is retired as expired and will not re-list, \
+                             and the slot was returned. Nothing retries this. The monthly \
+                             pick was already spent and is stranded -- the dead key was the \
+                             pick's product.",
+                        ),
+                    )
+                    .await;
+                    FulfillResponse::KeyDead
+                }
+                Err(e) => {
+                    ping(deps, &format!("dead-key fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                    FulfillResponse::Parked {
+                        reason: "dead key detected but recording failed — will retry".into(),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1287,6 +1410,39 @@ async fn reveal_claimed_tpk(
             }
             FulfillResponse::Parked {
                 reason: format!("humble call inconclusive: park for reconcile ({detail})"),
+            }
+        }
+        Decision::DeadKey => {
+            let reason = match &outcome {
+                Err(HumbleError::KeyExpired { msg, code }) => match code {
+                    Some(c) => format!("{msg} [code: {c}]"),
+                    None => msg.clone(),
+                },
+                _ => "dead key (unclassified producer)".to_string(),
+            };
+            match fail_dead_key_any(deps, domain::SELF_LINK_TOKEN, claim_id, game_id, &reason).await
+            {
+                Ok(()) => {
+                    tracing::warn!(claim_id, game_id, %reason, "dead key: claim terminally failed, slot returned, game retired");
+                    ping(
+                        deps,
+                        &format!(
+                            "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
+                             \"{reason}\". The claim is failed (reason recorded on the \
+                             claim), the game is retired as expired and will not re-list, \
+                             and the slot was returned. Nothing retries this. If this was a \
+                             choice claim, its spent pick is stranded.",
+                        ),
+                    )
+                    .await;
+                    FulfillResponse::KeyDead
+                }
+                Err(e) => {
+                    ping(deps, &format!("dead-key fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                    FulfillResponse::Parked {
+                        reason: "dead key detected but recording failed — will retry".into(),
+                    }
+                }
             }
         }
     }
@@ -1437,6 +1593,39 @@ async fn handle_self_claim(
                 reason: format!("self-claim reveal inconclusive: park for reconcile ({detail})"),
             }
         }
+        Decision::DeadKey => {
+            let reason = match &outcome {
+                Err(HumbleError::KeyExpired { msg, code }) => match code {
+                    Some(c) => format!("{msg} [code: {c}]"),
+                    None => msg.clone(),
+                },
+                _ => "dead key (unclassified producer)".to_string(),
+            };
+            match fail_dead_key_any(deps, domain::SELF_LINK_TOKEN, claim_id, game_id, &reason).await
+            {
+                Ok(()) => {
+                    tracing::warn!(claim_id, game_id, %reason, "dead key: claim terminally failed, slot returned, game retired");
+                    ping(
+                        deps,
+                        &format!(
+                            "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
+                             \"{reason}\". The claim is failed (reason recorded on the \
+                             claim), the game is retired as expired and will not re-list, \
+                             and the slot was returned. Nothing retries this. If this was a \
+                             choice claim, its spent pick is stranded.",
+                        ),
+                    )
+                    .await;
+                    FulfillResponse::KeyDead
+                }
+                Err(e) => {
+                    ping(deps, &format!("dead-key fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                    FulfillResponse::Parked {
+                        reason: "dead key detected but recording failed — will retry".into(),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1526,6 +1715,26 @@ async fn compensate_any(deps: &Deps, claim: &domain::Claim) -> Result<(), StoreE
     }
 }
 
+/// Dead-key dispatch — [`compensate_any`]'s sibling: SELF claims use the self variant
+/// (no link decrement), everything else the gift variant.
+async fn fail_dead_key_any(
+    deps: &Deps,
+    link_token: &str,
+    claim_id: &str,
+    game_id: &str,
+    reason: &str,
+) -> Result<(), StoreError> {
+    if link_token == domain::SELF_LINK_TOKEN {
+        deps.store
+            .fail_self_claim_dead_key(claim_id, game_id, reason)
+            .await
+    } else {
+        deps.store
+            .fail_claim_dead_key(link_token, claim_id, game_id, reason)
+            .await
+    }
+}
+
 /// The choice branch of [`reconcile`]. Called for an aged `Pending` claim whose game
 /// `requires_choice`, with a fresh `order`. Decides PURELY from the intent snapshot + the order
 /// diff — it must NEVER call `choose_content` on any branch, and must not even take the offered id
@@ -1600,6 +1809,9 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                 match resp {
                     FulfillResponse::GiftUrl { .. } | FulfillResponse::RevealedKey { .. } => {
                         tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
+                    }
+                    FulfillResponse::KeyDead => {
+                        tracing::info!(claim_id = %claim.id, "reconcile(choice): dead key -- claim terminally failed from reconcile")
                     }
                     other => {
                         // Any non-success just leaves the claim Pending for the next pass (the
@@ -3525,6 +3737,12 @@ mod tests {
                 code: None,
             },
             E::AmbiguousRedeem,
+            // choose_content never yields KeyExpired (it spends picks, it doesn't redeem
+            // keys) -- classified conservatively as Park; reconcile's order diff decides.
+            E::KeyExpired {
+                msg: "x".into(),
+                code: None,
+            },
         ];
         for v in park_variants {
             let d = choose_decision(&Err(v));
