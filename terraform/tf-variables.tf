@@ -68,3 +68,8 @@ variable "sync_schedule_expression" {
   default     = "cron(0 9 * * ? *)" # 09:00 UTC daily = pre-dawn US-East
   description = "EventBridge schedule for the daily humble sync."
 }
+
+variable "ops_alarm_email" {
+  type        = string
+  description = "Email endpoint for the ops-alarm SNS topic."
+}
