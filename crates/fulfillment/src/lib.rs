@@ -217,7 +217,10 @@ fn gift_error_decision(err: &HumbleError) -> Decision {
         HumbleError::ChooseFailed { .. } => Decision::Park,
         // Everything else is ambiguous-or-refused. The key MAY have burned (or may not have);
         // only reconcile against humble truth can tell. Park — never compensate blind.
-        HumbleError::RedeemRefused(_) => Decision::Park,
+        HumbleError::RedeemRefused { .. } => Decision::Park,
+        // interim -- Task 4 reclassifies this arm to Decision::DeadKey. Park is the
+        // safe holding value (today's behavior for every refusal).
+        HumbleError::KeyExpired { .. } => Decision::Park,
         HumbleError::AmbiguousRedeem => Decision::Park,
         HumbleError::RateLimited => Decision::Park,
         HumbleError::Api(_) => Decision::Park,
@@ -289,7 +292,10 @@ pub fn choose_decision(outcome: &Result<(), HumbleError>) -> Decision {
             // classified for exhaustiveness. None of them may compensate a choice claim.
             HumbleError::AlreadyRedeemed => Decision::Park,
             HumbleError::RedeemAuthRejected { .. } => Decision::Park,
-            HumbleError::RedeemRefused(_) => Decision::Park,
+            HumbleError::RedeemRefused { .. } => Decision::Park,
+            // choose_content never yields KeyExpired (it spends picks, it doesn't redeem
+            // keys) -- classified conservatively as Park; reconcile's order diff decides.
+            HumbleError::KeyExpired { .. } => Decision::Park,
             HumbleError::AmbiguousRedeem => Decision::Park,
         },
     }
@@ -687,7 +693,7 @@ async fn handle_gift(
         // re-checks against humble truth (see `reconcile`).
         Decision::Park => {
             let detail = match &outcome {
-                Err(HumbleError::RedeemRefused(_)) => "refused",
+                Err(HumbleError::RedeemRefused { .. }) => "refused",
                 Err(HumbleError::AmbiguousRedeem) => "ambiguous",
                 Err(HumbleError::RateLimited) => "rate-limited",
                 Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
@@ -1133,7 +1139,7 @@ async fn redeem_claimed_tpk(
         // classes, mirroring handle_gift.
         Decision::Park => {
             let detail = match &outcome {
-                Err(HumbleError::RedeemRefused(_)) => "refused",
+                Err(HumbleError::RedeemRefused { .. }) => "refused",
                 Err(HumbleError::AmbiguousRedeem) => "ambiguous",
                 Err(HumbleError::RateLimited) => "rate-limited",
                 Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
@@ -1238,7 +1244,7 @@ async fn reveal_claimed_tpk(
         // classes, mirroring redeem_claimed_tpk.
         Decision::Park => {
             let detail = match &outcome {
-                Err(HumbleError::RedeemRefused(_)) => "refused",
+                Err(HumbleError::RedeemRefused { .. }) => "refused",
                 Err(HumbleError::AmbiguousRedeem) => "ambiguous",
                 Err(HumbleError::RateLimited) => "rate-limited",
                 Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
@@ -1409,7 +1415,7 @@ async fn handle_self_claim(
         }
         Decision::Park => {
             let detail = match &outcome {
-                Err(HumbleError::RedeemRefused(_)) => "refused",
+                Err(HumbleError::RedeemRefused { .. }) => "refused",
                 Err(HumbleError::AmbiguousRedeem) => "ambiguous",
                 Err(HumbleError::RateLimited) => "rate-limited",
                 Err(HumbleError::RedeemAuthRejected { .. }) => "redeem-auth-rejected",
@@ -3514,7 +3520,10 @@ mod tests {
                 status: 403,
                 csrf_minted: false,
             },
-            E::RedeemRefused("x".into()),
+            E::RedeemRefused {
+                msg: "x".into(),
+                code: None,
+            },
             E::AmbiguousRedeem,
         ];
         for v in park_variants {

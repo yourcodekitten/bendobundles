@@ -49,7 +49,10 @@ fn gift_decision_ladder_is_exhaustive_and_safe() {
         Decision::Park
     ));
     assert!(matches!(
-        gift_decision(&Err(E::RedeemRefused("x".into()))),
+        gift_decision(&Err(E::RedeemRefused {
+            msg: "x".into(),
+            code: None,
+        })),
         Decision::Park
     ));
     assert!(matches!(
@@ -3215,7 +3218,10 @@ fn reveal_decision_ladder_matches_gift_decision() {
     );
     assert_eq!(reveal_decision(&Err(E::AmbiguousRedeem)), Decision::Park);
     assert_eq!(
-        reveal_decision(&Err(E::RedeemRefused("x".into()))),
+        reveal_decision(&Err(E::RedeemRefused {
+            msg: "x".into(),
+            code: None,
+        })),
         Decision::Park
     );
     assert_eq!(reveal_decision(&Err(E::RateLimited)), Decision::Park);
@@ -3254,7 +3260,10 @@ fn reveal_decision_ladder_matches_gift_decision() {
     check_agree!(E::AmbiguousRedeem);
     check_agree!(E::RateLimited);
     check_agree!(E::Api(500));
-    check_agree!(E::RedeemRefused("y".into()));
+    check_agree!(E::RedeemRefused {
+        msg: "y".into(),
+        code: None,
+    });
     check_agree!(E::RedeemAuthRejected {
         status: 403,
         csrf_minted: true

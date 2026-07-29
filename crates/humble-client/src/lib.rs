@@ -235,13 +235,24 @@ pub enum HumbleError {
     RateLimited,
     #[error("key already redeemed on humble")]
     AlreadyRedeemed,
-    /// Humble returned success=false with a reason that is not "already redeemed".
-    /// Refusal reasons vary (non-giftable, gifting disabled, transient) — the exact
-    /// already-redeemed phrasing is community-documented, unverified against the live API until
-    /// the first real gifting; callers must treat RedeemRefused conservatively (park, don't
-    /// assume the key survives or burned).
-    #[error("humble refused the redeem: {0}")]
-    RedeemRefused(String),
+    /// Humble refused because the key itself is DEAD — expired server-side, unredeemable
+    /// forever. TERMINAL: no retry can succeed and reconcile must not loop on it. Carries
+    /// humble's exact refusal text (+ machine code when sent) for the operator ping and
+    /// the durable claim record. Constructed ONLY by `classify_refusal` on the long
+    /// phrase (lowercase-contains, mirroring the already-redeemed routing); anything
+    /// without the phrase falls through to `RedeemRefused` (park-and-retry, the safe
+    /// direction). Misclassification is recoverable in BOTH directions by design:
+    /// missed terminal → park + daily sweep nag; false terminal → one transition ping
+    /// carrying these exact words for ben to contradict.
+    #[error("humble key expired: {msg}")]
+    KeyExpired { msg: String, code: Option<String> },
+    /// Humble returned success=false with a reason that is neither already-redeemed nor
+    /// the expired phrase. `code` is humble's machine-readable refusal code when sent
+    /// (e.g. "keys_depleted_email") — parsed ONCE here at the client edge and carried so
+    /// downstream never re-parses (it feeds escalation copy and the durable
+    /// failure_reason).
+    #[error("humble redeem refused: {msg}")]
+    RedeemRefused { msg: String, code: Option<String> },
     #[error(
         "humble reported success but returned no gift key — outcome ambiguous, do not retry blindly"
     )]
@@ -374,6 +385,12 @@ struct RedeemResponse {
     giftkey: Option<String>,
     #[serde(default, alias = "error_msg")]
     errormsg: Option<String>,
+    /// Humble's machine-readable refusal code (e.g. "keys_depleted_email"), when present.
+    /// Parsed for logging/registry-growth from day one — you can't grow a code registry
+    /// from codes you drop. Classification still keys off the message text until a
+    /// terminal code is captured live.
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -387,6 +404,36 @@ struct RevealResponse {
     key: Option<serde_json::Value>,
     #[serde(default, alias = "error_msg")]
     errormsg: Option<String>,
+    /// Humble's machine-readable refusal code (e.g. "keys_depleted_email"), when present.
+    /// Parsed for logging/registry-growth from day one — you can't grow a code registry
+    /// from codes you drop. Classification still keys off the message text until a
+    /// terminal code is captured live.
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Classify a `success=false` redeem/reveal refusal. Ladder (spec §1): already-redeemed
+/// phrase → AlreadyRedeemed (pre-existing routing, precedence preserved); the expired
+/// long phrase → KeyExpired; everything else → RedeemRefused, message byte-for-byte as
+/// before, now carrying the machine `code` when humble sent one (parsed ONCE here at
+/// the edge — downstream never re-parses).
+pub(crate) fn classify_refusal(code: Option<String>, msg: String) -> HumbleError {
+    if let Some(c) = &code {
+        tracing::info!(code = %c, errormsg = %msg, "humble refusal carried a machine code");
+    }
+    let lower = msg.to_lowercase();
+    if lower.contains("already been redeemed") || lower.contains("already redeemed") {
+        return HumbleError::AlreadyRedeemed;
+    }
+    // Lowercase-CONTAINS on the long phrase, mirroring the already-redeemed precedent
+    // above (belt-and-suspenders on purpose): an exact match would silently degrade
+    // terminal detection back to park-forever the day humble tweaks a period. The
+    // phrase is long enough that a live key's refusal can't plausibly contain it.
+    // Live capture: cloudwatch, claim 87b9a4d8, 2026-07-09.
+    if lower.contains("has expired and can no longer be redeemed") {
+        return HumbleError::KeyExpired { msg, code };
+    }
+    HumbleError::RedeemRefused { msg, code }
 }
 
 #[derive(serde::Deserialize)]
@@ -1182,20 +1229,10 @@ impl HumbleClient {
                         let msg = body
                             .errormsg
                             .unwrap_or_else(|| "no error message".to_string());
-                        // Community-documented phrase: "This key has already been redeemed."
-                        // Belt-and-suspenders: also catch if humble ever shortens it to
-                        // "already redeemed" without "been".
                         // The refusal text is humble's own — safe to log and the
                         // single most useful clue for a redeem that won't complete.
                         tracing::warn!(errormsg = %msg, "humble redeem refused (success=false)");
-                        let lower = msg.to_lowercase();
-                        if lower.contains("already been redeemed")
-                            || lower.contains("already redeemed")
-                        {
-                            Err(HumbleError::AlreadyRedeemed)
-                        } else {
-                            Err(HumbleError::RedeemRefused(msg))
-                        }
+                        Err(classify_refusal(body.error, msg))
                     }
                 }
             }
@@ -1334,14 +1371,7 @@ impl HumbleClient {
                             .errormsg
                             .unwrap_or_else(|| "no error message".to_string());
                         tracing::warn!(errormsg = %msg, "humble reveal refused (success=false)");
-                        let lower = msg.to_lowercase();
-                        if lower.contains("already been redeemed")
-                            || lower.contains("already redeemed")
-                        {
-                            Err(HumbleError::AlreadyRedeemed)
-                        } else {
-                            Err(HumbleError::RedeemRefused(msg))
-                        }
+                        Err(classify_refusal(body.error, msg))
                     }
                 }
             }

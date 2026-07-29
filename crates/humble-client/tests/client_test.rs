@@ -181,7 +181,7 @@ async fn refused_redeem_is_typed() {
         .unwrap_err();
     assert!(matches!(
         err,
-        humble_client::HumbleError::RedeemRefused(ref msg) if msg == "Gifting is disabled for this product."
+        humble_client::HumbleError::RedeemRefused { ref msg, .. } if msg == "Gifting is disabled for this product."
     ));
 }
 
@@ -1374,7 +1374,7 @@ async fn reveal_key_refused_reads_error_msg_field() {
     let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
     assert!(matches!(
         out,
-        Err(humble_client::HumbleError::RedeemRefused(ref msg))
+        Err(humble_client::HumbleError::RedeemRefused { ref msg, .. })
             if msg == "Keys are temporarily exhausted for this product"
     ));
 }
@@ -1427,5 +1427,122 @@ async fn reveal_key_step_up_gate_without_creds_is_step_up_failed() {
     assert!(matches!(
         out,
         Err(humble_client::HumbleError::SecureAreaStepUpFailed { .. })
+    ));
+}
+
+#[tokio::test]
+async fn redeem_expired_key_maps_to_key_expired() {
+    // The live 2026-07-09 doom_eternal refusal, byte-exact (cloudwatch receipt).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "errormsg": "This key has expired and can no longer be redeemed."
+        })))
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "doom_eternal_choice_steam", 0)
+        .await
+        .unwrap_err();
+    match err {
+        humble_client::HumbleError::KeyExpired { msg, code } => {
+            assert_eq!(msg, "This key has expired and can no longer be redeemed.");
+            assert_eq!(code, None); // no machine code captured live for the expired class yet
+        }
+        other => panic!("expected KeyExpired, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn expired_phrase_survives_humble_text_drift() {
+    // contains-match on the long phrase (OMBB claw #2, mirroring the already-redeemed
+    // precedent): prefix/suffix/CASE drift must not silently degrade terminal detection
+    // back to park-forever. The mock varies case ON the phrase itself so the
+    // .to_lowercase() in classify_refusal is load-bearing, not decorative.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "errormsg": "Sorry! This key HAS EXPIRED and can NO LONGER be redeemed"
+        })))
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "doom_eternal_choice_steam", 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::KeyExpired { .. }));
+}
+
+#[tokio::test]
+async fn redeem_refusal_with_error_code_still_maps_to_redeem_refused() {
+    // The keys_depleted_email shape (fixture precedent: reveal test at :1361) must be
+    // UNCHANGED in classification by the new code parse: unknown/untyped codes fall
+    // through byte-for-byte -- but the code now RIDES the error.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"error":"keys_depleted_email","error_msg":"Keys are temporarily exhausted for this product","success":false}"#,
+        ))
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "soulcalibur6_monthly_steam", 0)
+        .await
+        .unwrap_err();
+    match err {
+        humble_client::HumbleError::RedeemRefused { msg, code } => {
+            assert_eq!(msg, "Keys are temporarily exhausted for this product");
+            assert_eq!(code.as_deref(), Some("keys_depleted_email"));
+        }
+        other => panic!("expected RedeemRefused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn short_expired_text_without_the_long_phrase_stays_redeem_refused() {
+    // The contains-match keys on the LONG phrase; a short fragment lacking
+    // "can no longer be redeemed" must NOT be buried as terminal.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false,
+            "errormsg": "This key has expired."
+        })))
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .await
+        .redeem_as_gift("AAAAbbbbCCCC", "some_steam", 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, humble_client::HumbleError::RedeemRefused { .. }));
+}
+
+#[tokio::test]
+async fn reveal_expired_key_maps_to_key_expired() {
+    // The REVEAL path routes through the same classify_refusal (step 3e) -- this is the
+    // ONLY pin that the classifier got wired into reveal_once at all. Scaffolding
+    // mirrors reveal_key_refused_reads_error_msg_field (:1361).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"success":false,"errormsg":"This key has expired and can no longer be redeemed."}"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = client(&server).await.reveal_key("GK", "mn_steam", 0).await;
+    assert!(matches!(
+        out,
+        Err(humble_client::HumbleError::KeyExpired { .. })
     ));
 }
