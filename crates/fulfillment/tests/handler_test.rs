@@ -1250,11 +1250,15 @@ async fn reconcile_unreconcilable_over_threshold_pings_once() {
         .map(|r| String::from_utf8(r.body.clone()).unwrap())
         .collect();
     assert!(
-        bodies.iter().any(|b| b.contains("cS2") && b.contains("cannot act on")),
+        bodies
+            .iter()
+            .any(|b| b.contains("cS2") && b.contains("cannot act on")),
         "the structural stuck-alert ping carries the claim id: {bodies:?}"
     );
     assert!(
-        bodies.iter().any(|b| b.contains("cS2") && b.contains("STILL PENDING")),
+        bodies
+            .iter()
+            .any(|b| b.contains("cS2") && b.contains("STILL PENDING")),
         "the sweep ping carries the claim id: {bodies:?}"
     );
     assert!(
@@ -1303,7 +1307,9 @@ async fn reconcile_unsplittable_game_id_over_threshold_pings() {
         "the structural stuck-alert ping: {bodies:?}"
     );
     assert!(
-        bodies.iter().any(|b| b.contains("cX") && b.contains("STILL PENDING")),
+        bodies
+            .iter()
+            .any(|b| b.contains("cX") && b.contains("STILL PENDING")),
         "the sweep ping: {bodies:?}"
     );
 }
@@ -1323,7 +1329,14 @@ async fn stale_pending_claim_pings_even_when_listing_is_dead() {
     let Some(store) = store_or_skip("stale-sweep-deadlisting").await else {
         return;
     };
-    seed_aged_pending(&store, &game_id("gkS9", "mnSTALE"), "tokS9", "cS9", hours_ago(26)).await;
+    seed_aged_pending(
+        &store,
+        &game_id("gkS9", "mnSTALE"),
+        "tokS9",
+        "cS9",
+        hours_ago(26),
+    )
+    .await;
 
     let humble = MockServer::start().await;
     // Listing 302 -> /login = Unauthorized; deps() has no session_store, so no heal:
@@ -1344,7 +1357,9 @@ async fn stale_pending_claim_pings_even_when_listing_is_dead() {
         .map(|r| String::from_utf8(r.body.clone()).unwrap())
         .collect();
     assert!(
-        bodies.iter().any(|b| b.contains("STILL PENDING") && b.contains("cS9")),
+        bodies
+            .iter()
+            .any(|b| b.contains("STILL PENDING") && b.contains("cS9")),
         "sweep must ping the stale claim even though the listing died: {bodies:?}"
     );
     assert!(
