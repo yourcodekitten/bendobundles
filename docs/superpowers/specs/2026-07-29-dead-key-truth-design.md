@@ -1,5 +1,8 @@
 # dead-key truth — refusal taxonomy, terminal claim state, and the end of silent retry loops
 
+> "Wrong is fine, silently wrong is the crime." — the whole spec in one line
+> (lilith + OMBB, family review 2026-07-29)
+
 status: DRAFT for family review (OMBB + lilith), 2026-07-29
 author: code kitten
 prod receipts: cloudwatch `/aws/lambda/brd-prod-ue1-bendobundles-fulfillment`, pending-claims GSI,
@@ -75,11 +78,22 @@ Detection ladder, most-reliable first:
    Reconcile B2 / `claimed_tpk_terminal` checks `tpk.expired` BEFORE attempting
    the redeem. (Bundle sync already honors this flag at listing time; the redeem
    paths currently ignore it.)
-2. **Coded:** parse the refusal body's `error` field (today dropped). A known
-   terminal code → typed variant. Known codes registry starts with what we have
-   receipts for; unknown codes fall through.
-3. **String:** exact-match "This key has expired and can no longer be redeemed."
-   → `HumbleError::KeyExpired`. Mirrors the existing already-redeemed routing.
+2. **Coded:** parse the refusal body's `error` field (today dropped) ONCE at the
+   client edge, and **carry it on the error variant** — `RedeemRefused { msg,
+   code: Option<String> }` / `KeyExpired { msg, code: Option<String> }` — so the
+   code rides the error everywhere downstream: escalation copy names it without
+   re-parsing, and it is the exact value `failure_reason` persists (OMBB's claw
+   #1; one truth from wire to dynamo). A known terminal code → typed variant;
+   registry starts empty of terminal codes (none captured yet), grows from logs.
+3. **String:** lowercase-CONTAINS on the long phrase
+   "has expired and can no longer be redeemed" → `KeyExpired`. This mirrors the
+   already-redeemed routing precedent FOR REAL (that routing is deliberately
+   contains, belt-and-suspenders — an exact match would silently degrade back to
+   park-forever the day humble tweaks a period: this bug's ghost haunting its own
+   fix; OMBB's claw #2). Loosening is safe NOW because §3 gives classification
+   drift a signal in both directions: a missed terminal degrades to park + daily
+   nag; a false terminal fires one transition ping carrying humble's exact words
+   for ben to contradict. Wrong is recoverable; silently wrong was the crime.
 
 Everything unrecognized stays `RedeemRefused(String)` — byte-for-byte today's
 behavior. Conservative by construction: an unknown refusal parks and retries,
@@ -146,6 +160,13 @@ New invariant, enforced on the SET, not on pass outcomes:
 - `alert_unreconcilable` remains for structural specifics (its "fix by hand"
   guidance is more precise); a structurally-stuck claim thus pings twice per
   sync — accepted at this scale, noted for a later dedup fold.
+- **The watchdog's watchdog is out-of-process** (OMBB's claw #3): the sweep dies
+  with the lambda if the cron misfires, a deploy bricks it, or IAM rots. Two
+  CloudWatch alarms on the fulfillment lambda close the LAST silence layer —
+  `Errors > 0` and `Invocations == 0 over 25h` — wired to an SNS topic with
+  ben's email subscribed (one confirm click). Terraform, applied at deploy.
+  Layer map: sweep catches the claim reconcile never touches; the alarm catches
+  the reconcile that never runs.
 
 ### 4. The three stuck claims are the acceptance test
 
@@ -186,8 +207,13 @@ Post-deploy, the next sync should — with NO hand-surgery:
 
 lilith (msgs 1531984906660479039/1531984907386224810): all five positions
 endorsed; two riders folded above — failure-reason persisted on the claim item
-(§2) and escalation as a GSI age sweep, set-driven (§3, rewritten). OMBB review
-in flight; plan gate his as always.
+(§2) and escalation as a GSI age sweep, set-driven (§3, rewritten).
+OMBB (msgs 1531985144280518656/1531985231819575397): five-for-five with the
+votes, citations independently re-measured on the branch; three claws all
+folded — code carried on the variant (§1.2), contains-match on the long phrase
+(§1.3), CloudWatch alarms as the out-of-process last layer (§3). His gate-time
+test debts: expired-refusal fixture, fail-txn idempotency tests, `failed` serde
+pin, and a reconcile-never-reached-it escalation fixture — all owed by the plan.
 
 ## Open questions (family review)
 
