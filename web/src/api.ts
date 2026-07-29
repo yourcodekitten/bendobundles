@@ -15,7 +15,7 @@ export type GameView = {
 export type ClaimView = {
   game_id: string;
   title?: string;
-  state: 'pending' | 'fulfilled' | 'compensated';
+  state: 'pending' | 'fulfilled' | 'compensated' | 'failed';
   gift_url: string | null;
 };
 
@@ -95,7 +95,7 @@ export type SelfClaimResult =
 
 export type SelfClaimView = {
   game_id: string;
-  state: 'pending' | 'fulfilled' | 'compensated';
+  state: 'pending' | 'fulfilled' | 'compensated' | 'failed';
   revealed_key: string | null;
   created_at: string;
 };
@@ -104,7 +104,7 @@ export type SelfClaimView = {
 // secret and NEVER crosses to the admin surface; only the fact it was issued.
 export type AdminClaimView = {
   game_id: string;
-  state: 'pending' | 'fulfilled' | 'compensated';
+  state: 'pending' | 'fulfilled' | 'compensated' | 'failed';
   issued: boolean;
 };
 

@@ -589,6 +589,12 @@ describe('Links', () => {
       issued: false,
     };
 
+    const claimFailed: AdminClaimView = {
+      game_id: 'game-dome-keeper',
+      state: 'failed',
+      issued: false,
+    };
+
     it('expand audit button loads claims and renders game_id + state chips', async () => {
       const user = userEvent.setup();
       vi.mocked(adminLinks).mockResolvedValue([link1]);
@@ -638,6 +644,25 @@ describe('Links', () => {
       // even carry the secret. Keep a canary: no href-bearing anchor may render
       // inside the audit panel.
       expect(document.body.innerHTML).not.toContain('humble.gift');
+    });
+
+    it('renders the raw "failed" state with a rose-toned badge (admin surface, not the friend chip)', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([link1]);
+      vi.mocked(adminLinkClaims).mockResolvedValue([claimFailed]);
+
+      renderLinks();
+      await waitFor(() => screen.getByText('Alice'));
+
+      await user.click(screen.getByRole('button', { name: 'expand audit for Alice' }));
+
+      await waitFor(() => {
+        expect(screen.getByText('game-dome-keeper')).toBeInTheDocument();
+        // Admin surfaces show the raw wire state, never the friend's "returned"
+        expect(screen.getByText('failed')).toBeInTheDocument();
+        expect(screen.queryByText('returned')).not.toBeInTheDocument();
+      });
+      expect(screen.getByText('failed')).toHaveClass('bg-rose-950', 'text-rose-200');
     });
 
     it('collapse button hides the audit panel', async () => {

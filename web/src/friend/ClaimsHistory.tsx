@@ -5,6 +5,7 @@ const STATE_CHIP: Record<ClaimView['state'], { label: string; className: string 
   fulfilled: { label: 'gifted', className: 'bg-give text-give-ink' },
   pending: { label: 'processing', className: 'bg-amber-900 text-amber-200' },
   compensated: { label: 'compensated', className: 'bg-slate-800 text-slate-300' },
+  failed: { label: 'returned', className: 'bg-rose-950 text-rose-200' },
 };
 
 interface ClaimsHistoryProps {
@@ -46,6 +47,10 @@ function ClaimsHistoryImpl({ claims }: ClaimsHistoryProps) {
                 >
                   lost the tab? it&apos;s right here
                 </a>
+              ) : claim.state === 'failed' ? (
+                <span className="shrink-0 text-xs text-dust-faint">
+                  that key expired on humble&apos;s side — your pick came back
+                </span>
               ) : claim.state === 'pending' ? (
                 <span className="shrink-0 text-xs text-dust-faint">processing</span>
               ) : null}
