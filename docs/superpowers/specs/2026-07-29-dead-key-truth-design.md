@@ -98,7 +98,10 @@ anything compiles.
 - New `ClaimState::Failed`, wire `"failed"` (generic name on purpose — future
   terminal failures reuse it; the *reason* lives in the ping + logs, not the enum).
 - New dynamo transaction `fail_claim_dead_key` (sibling of `compensate_claim`):
-  - claim → `Failed` (consumes the `gsi2pk` pending marker — leaves the GSI),
+  - claim → `Failed` (consumes the `gsi2pk` pending marker — leaves the GSI), and
+    **persists the failure reason on the claim item** (the matched code or string that
+    fired) — pings scroll away and CloudWatch has retention; the claim record is the
+    durable truth a future admin surface reads (lilith's rider, 2026-07-29),
   - game → `GameStatus::Expired` (NOT re-listed; reuse, no new status; unlistable
     by the existing `is_listable` rule, counted by the existing Ops bucket),
   - `ADD claims_used -1` guarded (the friend's slot returns — same guard rails as
@@ -120,22 +123,29 @@ anything compiles.
 - web (admin): link-audit badge for `failed`; Ops `game_counts` already buckets
   `expired` so the retired game is visible with zero new admin surface.
 
-### 3. Retry-loop age escalation (reconcile)
+### 3. Pending-age escalation — a SET-driven sweep (revised per lilith's review)
 
-New invariant, stated once and enforced in the reconcile loop:
-**no claim may be both pending and silent past `RECONCILE_STUCK_ALERT_AGE` (24h).**
+New invariant, enforced on the SET, not on pass outcomes:
+**every claim in the pending-claims GSI older than `RECONCILE_STUCK_ALERT_AGE`
+(24h) pings, every sync, full stop.**
 
-- After each reconcile pass over a claim that REMAINS pending, if
-  `age > RECONCILE_STUCK_ALERT_AGE` → escalation ping naming game, age, and the
-  pass's outcome class (refused / auth-rejected / ambiguous / exhausted-code /
-  transient-error). Cadence: once per claim per pass = daily, matching
-  `alert_unreconcilable` — no new dedup machinery, volume bounded by the sync
-  schedule. At 3-friend scale, a daily nag about a genuinely stuck claim is a
-  feature, not spam.
-- This covers the exhausted pair, intermittent 403s, and every FUTURE unknown
-  refusal class — the escape hatch for everything §1 declines to type.
-- `alert_unreconcilable` remains for the structural cases; its copy and the new
-  escalation share shape so ben learns one alert grammar.
+- The sweep runs over `list_pending_claims()` output BEFORE the reconcile pass
+  (so a dead-session early-return, a future claim shape reconcile can't touch,
+  or reconcile itself breaking can never starve the invariant — the original
+  per-pass-touched-claim framing was alert_unreconcilable's classification
+  blind spot reborn one layer up, as coverage).
+- Ping names game, claim id, age in days. When the same run's reconcile pass
+  produces an outcome class for that claim, logs carry it; when reconcile never
+  reaches the claim at all, that absence is itself the loudest line.
+- Cadence: once per claim per sync = daily. A once-ever marker recreates the
+  exact failure this spec kills (alert fires once, gets missed, silence
+  forever). Dedup arrives the day volume actually hurts, not before.
+- This covers the exhausted pair, intermittent 403s, reconcile regressions, and
+  every FUTURE unknown refusal class — the escape hatch for everything §1
+  declines to type.
+- `alert_unreconcilable` remains for structural specifics (its "fix by hand"
+  guidance is more precise); a structurally-stuck claim thus pings twice per
+  sync — accepted at this scale, noted for a later dedup fold.
 
 ### 4. The three stuck claims are the acceptance test
 
@@ -171,6 +181,13 @@ Post-deploy, the next sync should — with NO hand-surgery:
 - Watch: the doom claim transitions end-to-end live; escalation pings fire for
   the exhausted pair; GSI count drops; friend link page for the doom claim shows
   the soft terminal state; CloudWatch loop-pair gone.
+
+## Family review outcomes (2026-07-29, shared channel)
+
+lilith (msgs 1531984906660479039/1531984907386224810): all five positions
+endorsed; two riders folded above — failure-reason persisted on the claim item
+(§2) and escalation as a GSI age sweep, set-driven (§3, rewritten). OMBB review
+in flight; plan gate his as always.
 
 ## Open questions (family review)
 
