@@ -661,7 +661,7 @@ ALSO append a `KeyExpired { msg: "x".into(), code: None }` entry to `reveal_deci
 - [ ] **Step 2: Run to verify failure**
 
 Run: `flock /tmp/claude-cargo.lock cargo test -p fulfillment --test handler_test ladder && flock /tmp/claude-cargo.lock cargo test -p fulfillment --lib choose_decision_ladder`
-Expected (B-1 shape): the gift/reveal ladder tests FAIL as ASSERTIONS -- `gift_decision(KeyExpired)` returns Task 1's interim `Park`, the test demands `DeadKey`; that assertion mismatch is the true red. The `--lib` choose ladder already PASSES (its Park arm is permanent from Task 1) -- a 0-test or compile-error outcome on either command means the census or Task 1 was incomplete. Both commands re-run green at Step 5.
+Expected (B-1 shape): the GIFT ladder test FAILS as an ASSERTION -- `gift_decision(KeyExpired)` returns Task 1's interim `Park`, the test demands `DeadKey`; that mismatch is the true red. (The reveal-side `check_agree!` line is agreement-only -- delegation makes it pass even at red time.) The `--lib` choose ladder already PASSES (its Park arm is permanent from Task 1) -- a 0-test or compile-error outcome on either command means the census or Task 1 was incomplete. Both commands re-run green at Step 5.
 
 - [ ] **Step 3: Implement the enum + classifications**
 
@@ -1029,7 +1029,9 @@ async fn pending_age_sweep(deps: &Deps) {
             ping(
                 deps,
                 &format!(
-                    "claim {} ({}) is STILL PENDING after ~{days}d. Reconcile retries                      it every sync (or cannot reach it — see logs for this run). It                      will nag daily until it completes, compensates, or fails.",
+                    "claim {} ({}) is STILL PENDING after ~{days}d. Reconcile retries \
+                     it every sync (or cannot reach it — see logs for this run). It \
+                     will nag daily until it completes, compensates, or fails.",
                     claim.id, claim.game_id
                 ),
             )
@@ -1073,7 +1075,7 @@ git commit -S -m "feat(fulfillment): set-driven pending-age sweep — no claim i
 
 **Files:**
 - Modify: `crates/public-api/src/lib.rs` (~:680-703, the claim outcome match + its log match)
-- Modify: `crates/admin-api/src/lib.rs` — BOTH self-claim response matches: the invoke arm (~:793 region) AND the reveal-path match (~:774-798); each currently folds `KeyDead` into a 500 whose copy ("the claim is recorded") is wrong twice for a terminally failed claim
+- Modify: `crates/admin-api/src/lib.rs` — the ONE `FulfillResponse` match in the crate, `handle_self_claim`'s `match s.invoker.call(req).await` at :774-798 (the `Ok(_) | Err(_)` catch-all at ~:793 is INSIDE this match, not a second site; :852 is sync's `fire`, no FulfillResponse arms); it currently folds `KeyDead` into a 500 whose copy ("the claim is recorded") is wrong twice for a terminally failed claim
 - Test: `crates/public-api/tests/api_test.rs` (MockInvoker rig at :100-135) + `crates/admin-api/tests/api_test.rs` (MockAdminInvoker/MockCallInvoker rigs at :86-135)
 
 **Interfaces:**
@@ -1098,7 +1100,7 @@ git commit -S -m "feat(fulfillment): set-driven pending-age sweep — no claim i
             .into_response(),
 ```
 
-- [ ] **Step 3: admin-api arms — BOTH matches.** In the invoke-arm match (~:793 region) AND the reveal-path match (~:774-798), add before each catch-all, mirroring the neighboring `AlreadyRedeemed => GONE` construction each match already has:
+- [ ] **Step 3: admin-api arm — ONE match site.** In `handle_self_claim`'s match (:774-798), add before the `Ok(_) | Err(_)` catch-all, mirroring the neighboring `AlreadyRedeemed => GONE` construction:
 
 ```rust
         Ok(FulfillResponse::KeyDead) => (
@@ -1112,12 +1114,12 @@ git commit -S -m "feat(fulfillment): set-driven pending-age sweep — no claim i
 
 - [ ] **Step 4: mirror tests, UNCONDITIONAL** (the rigs exist — `MockInvoker::new(FulfillResponse::…)` public-api api_test.rs:100-135; the admin mock invokers at admin-api api_test.rs:86-135; there is no "no harness" escape):
   - public-api: `grep -n "MockInvoker::new" crates/public-api/tests/api_test.rs`, copy the claim-endpoint test that drives a non-200 FulfillResponse through the POST claim route, swap the mock to `MockInvoker::new(FulfillResponse::KeyDead)`, assert status 410 and the byte-exact body from Step 2.
-  - admin-api: same recipe twice — one test through the invoke arm, one through the reveal path (copy the nearest AlreadyRedeemed/GONE-shaped test for each; `grep -n "GONE\|already redeemed" crates/admin-api/tests/api_test.rs`), each asserting 410 + the byte-exact Step 3 body.
+  - admin-api: same recipe once — copy the nearest AlreadyRedeemed/GONE-shaped self-claim test (`grep -n "GONE\|already redeemed" crates/admin-api/tests/api_test.rs`), swap the mock's response to `FulfillResponse::KeyDead`, assert 410 + the byte-exact Step 3 body.
 
 - [ ] **Step 5: Run**
 
 Run: `flock /tmp/claude-cargo.lock cargo test -p public-api -p admin-api && flock /tmp/claude-cargo.lock cargo clippy --all-targets -p public-api -p admin-api`
-Expected: PASS / clean, including the three new mirror tests.
+Expected: PASS / clean, including the TWO new mirror tests (one public-api, one admin-api).
 
 - [ ] **Step 6: Commit**
 
@@ -1196,8 +1198,9 @@ git commit -S -m "feat(web): failed claims render warm — 'returned' chip, hone
 # INSIDE the fulfillment lambda — if the cron misfires, a deploy bricks the
 # function, or IAM rots, the sweep dies with it and every in-process alarm dies
 # too. These two alarms are the out-of-process layer: they fire when the sync
-# lambda errors, or when it hasn't been invoked for a full day (25h > the 24h
-# schedule, one hour of grace). Layer map: the sweep catches the claim reconcile
+# lambda errors, or when it goes silent for 24h -- the maximum window CloudWatch
+# can express (see the silent alarm's limits comment) against the daily schedule.
+# Layer map: the sweep catches the claim reconcile
 # never touches; these catch the reconcile that never runs.
 
 resource "aws_sns_topic" "ops_alarms" {
@@ -1230,7 +1233,7 @@ resource "aws_cloudwatch_metric_alarm" "fulfillment_errors" {
 
 resource "aws_cloudwatch_metric_alarm" "fulfillment_silent" {
   alarm_name        = "${module.label_alarms.id}-fulfillment-silent"
-  alarm_description   = "bendobundles fulfillment lambda has not been invoked in 25h — the daily sync (and its pending-age sweep) is not running"
+  alarm_description   = "bendobundles fulfillment lambda has not been invoked in 24h — the daily sync (and its pending-age sweep) is not running"
   namespace           = "AWS/Lambda"
   metric_name = "Invocations"
   dimensions  = { FunctionName = module.lambda_fulfillment.lambda_function_name }
@@ -1262,7 +1265,7 @@ Expected: fmt clean, validate passes. Remember validate CANNOT see the CloudWatc
 
 ```bash
 git add terraform
-git commit -S -m "feat(terraform): out-of-process alarms -- fulfillment errors + 25h-silent, sns to ben"
+git commit -S -m "feat(terraform): out-of-process alarms -- fulfillment errors + 24h-silent, sns to ben"
 ```
 
 ---
