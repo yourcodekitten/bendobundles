@@ -2185,6 +2185,22 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a GAME row by id. Feature-gated to `heal` — compiled ONLY for the heal_choice_pairs
+    /// operator bin, NEVER the lambda build, so "the sync path never deletes" is a compiler
+    /// guarantee, not a discipline (spec Q5). A stray `delete_game` in sync code fails to compile.
+    #[cfg(feature = "heal")]
+    pub async fn delete_game(&self, id: &str) -> Result<(), StoreError> {
+        let (pk, sk) = schema::key_pair(schema::game_pk(id), "META");
+        self.client
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await?;
+        Ok(())
+    }
+
     /// Persist the Steam identity (SteamID string) under CONFIG#STEAM. Idempotent — overwrites any
     /// existing record. Use this as the single source of truth for Ben's Steam account ID.
     pub async fn put_steam_identity(&self, steamid: &str) -> Result<(), StoreError> {
