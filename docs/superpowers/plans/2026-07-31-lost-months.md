@@ -889,6 +889,8 @@ the same month identity; the ladder relies on it:
 
 Safe because discovery is additive (a month not reached this pass surfaces next sync). Arithmetic against A5: list 12s + detail-fan-out bounded 180s + D7 reads 2s ≈ 194s worst-bounded, inside the 393s headroom (900−507 baseline); nominal added ≈ +40s. NO new order reads (OrderIndex is built by the existing order walk, not re-fetched here).
 
+**Fires-anyway for the deadline (OMBB execution rider — a guard with no test can be silently no-op'd).** Mirror Task-5's `walk_deadline_bounds_a_slow_server`: a fulfillment test where the membership reads are delayed (`ResponseTemplate::set_delay`) past a test-injected short `CHOICE_DISCOVERY_DEADLINE` so the pass breaks early with the deadline warn and processes fewer months than mounted. To make the deadline test-injectable, take it as a field on `Deps` (like `steam_enrich_deadline: far_deadline()` already is — add `choice_discovery_deadline: Duration`, defaulting to 180s in `main.rs`, overridable to e.g. 50ms in the test). Assert: not all mounted months got written, and a subsequent full-deadline sync writes the rest (additive recovery).
+
 - [ ] **Step 4: Verify green** — the Task-4 transitional-skip warn text is gone from the codebase (grep for `"ladder lands in a later task"` → zero hits).
 - [ ] **Step 5: Commit** — `git commit -S -m "feat(fulfillment): gamekey resolution ladder blob→list→order + whole-pass deadline + structured shape logging (spec D2/D5, A5)"`
 
