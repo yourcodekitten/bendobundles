@@ -77,7 +77,12 @@ const STEAM_REVIEWS_TTL_SECS: i64 = 14 * 24 * 60 * 60;
 /// enough to catch an *old* month whose pick is still unspent (Humble keeps a choice redeemable
 /// until it's spent), so it covers the whole history; the expensive per-month reads are still gated
 /// to the handful of live months (`uses_choices && can_redeem_games`).
-const CHOICE_DISCOVERY_MAX_PAGES: usize = 26;
+// Runaway guard only (era-stop is the normal terminal): ~120 months covers the full Choice era
+// plus years of margin. Hitting it means era-stop never fired — itself a signal (it warns).
+const CHOICE_DISCOVERY_MAX_PAGES: usize = 40;
+// Whole-list-walk deadline: bounds the paginated GETs even if the server hands back cursors
+// forever slowly. The per-month detail fan-out has its own deadline (Task 7).
+const CHOICE_WALK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How many of the newest months discovery probes DIRECTLY by constructed slug (current month + the
 /// preceding N-1), independent of the subscription list. The `subscription_products_with_gamekeys`
@@ -3185,7 +3190,8 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
     // a prefix of months this pass — safe, because discovery only ADDS entries and never deletes on
     // absence, so a missed month just waits for the next run.
     let (heal, read) = selfheal_once(deps, !*healed, || {
-        deps.humble.choice_months(CHOICE_DISCOVERY_MAX_PAGES)
+        deps.humble
+            .choice_months(CHOICE_DISCOVERY_MAX_PAGES, SYNC_PACE, CHOICE_WALK_DEADLINE)
     })
     .await;
     if let Some(h) = heal {
@@ -3206,7 +3212,7 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
             return 0;
         }
     };
-    if !walk.complete {
+    if !walk.complete_for_choice() {
         tracing::warn!(
             max_pages = CHOICE_DISCOVERY_MAX_PAGES,
             "choice discovery: month walk truncated — discovered a prefix (additive; nothing deleted on absence)"

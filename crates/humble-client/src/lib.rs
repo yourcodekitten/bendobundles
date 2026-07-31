@@ -369,14 +369,37 @@ pub struct OfferedGame {
     pub title: String,
 }
 
-/// The result of a [`choice_months`](HumbleClient::choice_months) walk. `complete` distinguishes a
-/// full history (`true`) from a prefix truncated at `max_pages` (`false`) — a caller must never
-/// treat a truncated walk as the whole picture (a cycling server would otherwise look like a
-/// complete-but-shrinking sync every run).
+/// Why a [`choice_months`](HumbleClient::choice_months) walk stopped. The first two are
+/// COMPLETE-for-Choice (the whole Choice era was enumerated); the last two are TRUNCATED (a
+/// partial prefix — a caller must never treat it as the whole picture, or a cycling server looks
+/// like a complete-but-shrinking sync every run).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkStop {
+    /// The server returned a page with no cursor (or an empty page) — natural end of the list.
+    CursorEnd,
+    /// A full page of pre-Choice (Humble Monthly era) products — the Choice era is exhausted.
+    EraStop,
+    /// Hit `max_pages` with a cursor still pending — runaway guard tripped (truncated).
+    Cap,
+    /// The whole-walk `deadline` elapsed mid-walk (truncated).
+    Deadline,
+}
+
+/// The result of a [`choice_months`](HumbleClient::choice_months) walk. `stop` records WHY it
+/// ended; [`complete_for_choice`](Self::complete_for_choice) is the caller's "did I see the whole
+/// Choice era?" check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChoiceMonthsWalk {
     pub months: Vec<ChoiceMonth>,
-    pub complete: bool,
+    pub stop: WalkStop,
+}
+
+impl ChoiceMonthsWalk {
+    /// True when the walk reached the end of the Choice era (`CursorEnd` or `EraStop`), false when
+    /// it was truncated by the cap or the deadline.
+    pub fn complete_for_choice(&self) -> bool {
+        matches!(self.stop, WalkStop::CursorEnd | WalkStop::EraStop)
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -731,19 +754,34 @@ impl HumbleClient {
     /// `max_pages` bounds it defensively so a server that never stops handing back a cursor can't
     /// spin forever.
     ///
-    /// Returns a [`ChoiceMonthsWalk`] whose `complete` flag tells the caller whether it reached the
-    /// end (`true`) or stopped at `max_pages` with a cursor still pending (`false` ⇒ `months` is a
-    /// PARTIAL prefix, not the full history). A truncated walk is NOT an error (the prefix is real
-    /// and useful), but the caller must not treat a partial as complete — a cycling server would
-    /// otherwise report duplicated/truncated data as a full sync, silently, forever. A `warn!` also
-    /// fires on truncation.
-    pub async fn choice_months(&self, max_pages: usize) -> Result<ChoiceMonthsWalk, HumbleError> {
+    /// Returns a [`ChoiceMonthsWalk`] whose `stop` records why it ended — `CursorEnd`/`EraStop`
+    /// are complete-for-Choice, `Cap`/`Deadline` are truncated prefixes. A truncated walk is NOT
+    /// an error (the prefix is real and useful), but the caller must check
+    /// [`complete_for_choice`](ChoiceMonthsWalk::complete_for_choice) — a cycling server would
+    /// otherwise report duplicated/truncated data as a full sync, silently, forever. `pace` sleeps
+    /// between pages (bot-profile avoidance); `deadline` bounds the whole walk. A `warn!` fires on
+    /// a truncating stop.
+    pub async fn choice_months(
+        &self,
+        max_pages: usize,
+        pace: std::time::Duration,
+        deadline: std::time::Duration,
+    ) -> Result<ChoiceMonthsWalk, HumbleError> {
         const BASE: &str =
             "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys";
+        let started = tokio::time::Instant::now();
         let mut months = Vec::new();
         let mut cursor: Option<String> = None;
-        let mut complete = false;
-        for _ in 0..max_pages {
+        let mut stop = WalkStop::Cap;
+        for page_no in 0..max_pages {
+            if page_no > 0 {
+                if started.elapsed() >= deadline {
+                    stop = WalkStop::Deadline;
+                    break;
+                }
+                // 26+ rapid GETs from a lambda IP is the exact bot profile SYNC_PACE exists to avoid.
+                tokio::time::sleep(pace).await;
+            }
             // Page 1 is the bare path with a trailing slash; later pages append the opaque cursor
             // VERBATIM, exactly as the browser sends it back: the captured tokens are base64URL
             // (`A-Za-z0-9-_` + `=` padding), all URL-path-safe — no `/`, `?`, or `#` to split the
@@ -755,15 +793,53 @@ impl HumbleClient {
             };
             let page: SubProductsPage = self.get_json(&path).await?;
             if page.products.is_empty() {
-                complete = true;
+                stop = WalkStop::CursorEnd; // an empty page is cursor-end, never era-stop (family review)
                 break;
             }
-            for p in page.products {
-                // A product may have no gamekey in the LIST (the two newest months — the current and
-                // just-billed one — show up gamekey-less here) even though its membership page carries
-                // a real gamekey and is fully claimable. So DON'T drop these: keep the slug
-                // (`product_url_path`), and let discovery resolve the real gamekey from the per-month
-                // read. Surface absence as None (never "") — the empty-string sentinel is abolished.
+            // Era discriminant (family review, final form): the SLUG decides — a product is
+            // pre-Choice iff product_machine_name is NON-EMPTY and does not end "_choice". An
+            // empty slug (a droppable field) is an anomaly-warn and DISQUALIFIES the page from
+            // era-stopping: a dropped field must never read as "pre-Choice era".
+            let mut page_all_pre_choice = true;
+            let mut page_had_anomaly = false;
+            for p in &page.products {
+                if p.product_machine_name.is_empty() {
+                    tracing::warn!(title = %p.title, "choice walk: product with empty machine_name — anomaly, page cannot era-stop");
+                    page_had_anomaly = true;
+                } else if p.product_machine_name.ends_with("_choice") {
+                    page_all_pre_choice = false;
+                } else if let Some(year) = p
+                    .product_url_path
+                    .rsplit('-')
+                    .next()
+                    .and_then(|y| y.parse::<i32>().ok())
+                {
+                    // Chronology sanity: a "pre-choice" slug dated inside the Choice era (the era
+                    // began Dec 2019, so year >= 2019) is drift, not history — don't era-stop on it.
+                    if year >= 2019 {
+                        tracing::warn!(machine_name = %p.product_machine_name, year, "choice walk: non-choice slug dated inside the Choice era — anomaly, page cannot era-stop");
+                        page_had_anomaly = true;
+                    }
+                }
+            }
+            if page_all_pre_choice && !page_had_anomaly {
+                tracing::info!(
+                    boundary = %page.products[0].product_machine_name,
+                    pages = page_no + 1,
+                    "choice walk: reached the pre-Choice era — complete for Choice"
+                );
+                stop = WalkStop::EraStop;
+                break;
+            }
+            // On a mixed boundary page (some `_choice`, some not) append ONLY choice products; an
+            // empty-slug product is an anomaly KEPT (Task 7's ladder may resolve it — dropping it
+            // silently is the exact bug class this PR kills). Monthly-era products are not months.
+            for p in page
+                .products
+                .into_iter()
+                .filter(|p| p.product_machine_name.is_empty() || p.product_machine_name.ends_with("_choice"))
+            {
+                // Surface a dropped list gamekey as None (never "") — the sentinel is abolished.
                 let gamekey = p.gamekey.filter(|g| !g.is_empty());
                 let mut offered_games: Vec<OfferedGame> = p
                     .content_choice_data
@@ -785,30 +861,31 @@ impl HumbleClient {
                     can_redeem_games: p.can_redeem_games,
                     // The list endpoint doesn't carry the pick budget — only the single-month read.
                     total_choices: None,
-                    offered_games,
                     // Nor the claimed set — None (unknown), NOT Some(empty): only the
                     // `choice_month` read knows what's chosen, and a caller must not mistake
                     // "this endpoint can't see the picks" for "no picks made".
                     claimed_machine_names: None,
+                    offered_games,
                 });
             }
             match page.cursor {
                 // trim() guards a whitespace-only cursor (won't come from JSON, but cheap + honest).
                 Some(c) if !c.trim().is_empty() => cursor = Some(c),
                 _ => {
-                    complete = true;
+                    stop = WalkStop::CursorEnd;
                     break;
                 }
             }
         }
-        if !complete {
+        if matches!(stop, WalkStop::Cap | WalkStop::Deadline) {
             tracing::warn!(
                 max_pages,
                 months = months.len(),
-                "choice_months hit the page cap with a cursor still pending — the month list is TRUNCATED, not the full history"
+                stop = ?stop,
+                "choice_months stopped before the era boundary — the month list is TRUNCATED, not the full history"
             );
         }
-        Ok(ChoiceMonthsWalk { months, complete })
+        Ok(ChoiceMonthsWalk { months, stop })
     }
 
     /// Fetch the value for humble's double-submit CSRF pair. A page GET (sent with the session
