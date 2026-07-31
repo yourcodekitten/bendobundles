@@ -3307,7 +3307,10 @@ async fn discover_choice_games(
         .filter_map(|m| Some((m.product_url_path.as_str(), m.gamekey.as_deref()?)))
         .collect();
     let started = tokio::time::Instant::now();
+    let months_walked = targets.len() as u32;
     let mut months_processed = 0u32;
+    let mut months_skipped = 0u32;
+    let mut canary_unmatched_tpks = 0u32;
     for (slug, is_probe) in &targets {
         // Bound the per-month detail fan-out in aggregate (spec A5 / M6): the per-request timeout
         // caps one read, not ~77 of them. A partial pass is safe — discovery is additive, so a
@@ -3343,6 +3346,7 @@ async fn discover_choice_games(
         // Gate on the membership PAGE's redeemability, not the list's — a month whose page can no
         // longer be redeemed carries no spendable pick, so skip it (no wasted writes on dead months).
         if !detail.can_redeem_games {
+            months_skipped += 1;
             continue;
         }
         // Spec D2: the gamekey ladder — blob → list → order-side → loud skip. Never "".
@@ -3364,6 +3368,7 @@ async fn discover_choice_games(
             (None, Some(g), _) => (g.to_string(), "list"),
             (None, None, Some(g)) => (g.to_string(), "order"),
             (None, None, None) => {
+                months_skipped += 1;
                 tracing::warn!(month = %slug, gamekey_source = "none",
                     choices_made_absent = detail.claimed_machine_names.is_none(),
                     "choice discovery: no gamekey from any rung — skipping (shape logged)");
@@ -3373,16 +3378,17 @@ async fn discover_choice_games(
         if gamekey_source != "blob" {
             tracing::warn!(month = %slug, gamekey_source, "choice discovery: blob dropped gamekey — resolved via ladder");
         }
-        months_processed += 1;
         // Spec D3: claimed is ORDER-authoritative; the blob's `contentChoicesMade` never alone marks
         // a game claimed. Order silent (its read failed this pass — the gamekey guarantees an order
         // exists) ⇒ skip the month LOUDLY and let the next sync retry: writing claimable rows on
         // missing evidence would mint ghosts that the additive/never-delete ingest keeps forever.
         let Some(order_tpks) = orders.tpks_by_gamekey.get(&month_gamekey) else {
+            months_skipped += 1;
             tracing::warn!(month = %detail.product_url_path, gamekey = %month_gamekey,
                 "choice discovery: order silent for month — skipping this pass (claimed-set unknowable, retried next sync)");
             continue;
         };
+        months_processed += 1;
         // claimable = offered − (offered games a matching claimed tpk exists for). The matcher is
         // the prod-enumerated grammar (domain::choice_tpk_matches), NOT blob equality.
         let claimable: Vec<&OfferedGame> = detail
@@ -3398,6 +3404,7 @@ async fn discover_choice_games(
             .filter(|t| !detail.offered_games.iter().any(|o| domain::choice_tpk_matches(t, &o.machine_name)))
             .count();
         if unmatched > 0 {
+            canary_unmatched_tpks += unmatched as u32;
             tracing::warn!(month = %detail.product_url_path, unmatched, "choice discovery: choice tpks matching no offered name (1:N grants or new grammar) — counted, not fatal");
         }
         // Per-month observability: which months surfaced how many claimable offered games. Turns
@@ -3443,6 +3450,16 @@ async fn discover_choice_games(
             }
         }
     }
+    // One summary per pass (spec D5): turns "did discovery do anything?" into a single line.
+    tracing::info!(
+        months_walked,
+        months_processed,
+        months_skipped,
+        stop_reason = ?walk.stop,
+        canary_unmatched_tpks,
+        written,
+        "choice discovery: pass summary"
+    );
     written
 }
 

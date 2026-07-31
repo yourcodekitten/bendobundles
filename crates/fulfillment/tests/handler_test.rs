@@ -2050,6 +2050,15 @@ async fn choice_choose_refused_parks_without_redeeming() {
     // cookie_ok untouched (no sync state written by a plain choose refusal).
     assert!(deps.store.get_sync_state().await.unwrap().is_none());
     // Exactly one distinct ping — the choose-refused notice, NOT a dead-cookie message.
+    //
+    // TRIPWIRE (lost-months spec D3): the order-authoritative claimed-set trade is sound only while
+    // THIS ping fires — an under-claimed game (matcher missed an exotic tpk) surfaces claimable,
+    // fails its choose loudly, and an operator sees it. Red-proof: this test asserts EXACTLY ONE
+    // ping whose body names the refusal AND the game; the sole ping on the choose-refused path is
+    // the ChooseFailed block in `choose_park` (lib.rs). Delete that ping → dreqs.len()==0 → this
+    // assertion reds (verified by construction; CI runs it against dynamodb-local). If this ever
+    // goes green with the ping gone, that trade has silently turned lossy — renegotiate the spec,
+    // do not delete this.
     let dreqs = discord.received_requests().await.unwrap();
     assert_eq!(dreqs.len(), 1);
     let body = String::from_utf8(dreqs[0].body.clone()).unwrap();
@@ -2057,6 +2066,7 @@ async fn choice_choose_refused_parks_without_redeeming() {
         body.contains("refused the pick"),
         "ping must name the refusal: {body}"
     );
+    assert!(body.contains(TITLE), "ping must name the game: {body}");
     assert!(!body.contains("DEAD"), "not a dead-cookie ping");
 }
 
