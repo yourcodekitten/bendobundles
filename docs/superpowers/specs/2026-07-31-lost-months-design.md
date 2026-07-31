@@ -34,6 +34,20 @@ vintage months get walked varies run to run, and any walked month can then die o
 strict field. Result: a permanently-shifting blind spot over exactly the months where
 ben's unclaimed value lives.
 
+3. **(found while grounding this spec, 2026-07-31 ~11:20Z)** — **the id-agreement
+   obligation is already violated in prod: 15 live duplicate pairs.** merge_sync's
+   trust contract warns that if discovery's `game_id(gamekey, offered.machine_name)`
+   diverges from key-sync's `game_id(gamekey, tpk.machine_name)`, "the stale `true`
+   record lingers as a duplicate instead of flipping." It does — table scan
+   (`brd-prod-ue1-bendobundles-table`, 1093 GAME rows) shows 15 offered/tpk sibling
+   pairs (`mylittleuniverse` + `mylittleuniverse_row_choice_steam`, `atomicheart`,
+   `wingspan`, `diabloiv`, …): choice tpk machine_names follow the grammar
+   `<offered>[_row|_ww]_choice_<steam|origin|gog|battlenet>` (enumerated from all 175
+   choice-suffixed rows), so the two paths *never* agree on an id for the same game.
+   Every claim ben makes through a surfaced month mints another pair. Any fix that
+   surfaces MORE claimable months without fixing this multiplies the duplicates —
+   which is why D3/D7 below are in scope, not riders.
+
 ## Goal / acceptance (all verified in prod, not on fixtures)
 
 - **A1** — july-2026's claimable games appear in the catalog (`requires_choice: true`
@@ -49,6 +63,9 @@ ben's unclaimed value lives.
   except additions, sync duration stays comfortably inside the lambda budget
   (current baseline to be measured in plan; walk adds ≈14 paced list GETs ≈ 4s and
   ≈3 month reads ≈ 1s).
+- **A6** — the duplicate-pair factory is closed: a claim on a discovered game flips
+  the offered row (one GAME row per game, before and after), proven by test; the 15
+  existing pairs are healed per the Q5 decision.
 
 ## Design
 
@@ -86,10 +103,24 @@ doesn't license writing `requires_choice: true`"). This PR pays that debt:
   there byte-for-byte as bundle-shaped tpks).
 - `claimable = offered − claimed`. A month whose claimed set is unknowable from BOTH
   sources skips loudly (contract preserved: never write `true` without a known set).
-- the tpk↔offered machine-name matching rule must be pinned to the same derivation
-  `merge_sync` / key-sync use (the #30 id-agreement obligation), with a unit test that
-  fails if the two derivations drift. (Family Q2: known counterexamples — non-steam
-  choice tpks, `_row` variants — welcome before this hardens.)
+- **the matcher** (one function, shared by D3 and D7, unit-tested against the prod-
+  enumerated grammar): a tpk machine_name matches an offered machine_name iff
+  stripping `_choice_<platform>` (platform ∈ steam|origin|gog|battlenet, extensible)
+  and then an optional region token (`_row` | `_ww`) yields the offered name exactly.
+  A `_choice_*` tpk whose base matches NO offered name in its month logs a structured
+  unknown-shape warn — never a silent guess. Without this matcher, surfacing vintage
+  months would re-list already-claimed games as claimable (→ `choosecontent` on a
+  spent pick → the exact choose-blind park loop the backlog flags as safety-critical).
+  (Family Q2: bless the grammar / name counterexamples.)
+
+### D7 — key-sync stops minting duplicate rows for choice tpks (the pair-factory fix)
+When the order walk meets a `_choice_*`-suffixed tpk, derive the offered-row id
+candidates deterministically (base, base+`_row`-stripped, base+`_ww`-stripped — no
+table scans, just `get_game` on ≤2 candidate ids) and, when an offered row exists,
+route the fresh key-sync record onto THAT id so `merge_sync` flips it (`requires_choice
+true→false`, key fields refreshed) instead of writing a sibling row. Non-choice tpks
+are untouched. Acceptance-tested: claiming a discovered game never creates a second
+GAME row (the 15th duplicate pair is the last).
 
 ### D4 — walk to completion, era-aware
 - **pace the list walk**: `SYNC_PACE` (300ms) between pages — the known backlog item;
@@ -138,3 +169,11 @@ doesn't license writing `requires_choice: true`"). This PR pays that debt:
 - **Q3 (sentinel)**: keep the walk-internal empty-string gamekey placeholder, or
   refactor to `Option<String>` end-to-end in this PR?
 - **Q4 (timeouts)**: fold backlog #5's `.timeout()` into this PR or keep it pure?
+- **Q5 (healing the 15)**: the existing duplicate pairs — one-time reconciliation in
+  this PR (key-sync's D7 path notices the sibling and absorbs it), a separate
+  maintenance script + runbook entry, or leave-and-let-D7-prevent-new-ones? my lean:
+  D7 absorbs naturally on the next sync per pair (the tpk row's data routes onto the
+  offered id; the orphan sibling then needs an explicit delete — that delete is the
+  part that wants family eyes, since discovery's own contract is "never delete on
+  absence"). note `mylittleuniverse`'s pair is live-entangled with a still-pending
+  claim — whatever heals must not yank a row a claim references.
