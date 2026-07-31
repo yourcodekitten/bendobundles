@@ -3098,11 +3098,17 @@ async fn discovery_pass_deadline_bounds_the_detail_fanout() {
 /// Re-mount a gamekey's order with fresh tpks — wiremock evaluates mocks last-mounted-first, so
 /// this new mount wins over the original.
 async fn remount_order(humble: &MockServer, gk: &str, product: &str, tpks: &[&str]) {
+    // wiremock resolves same-priority overlapping mocks first-mounted-wins, so a plain re-mount of
+    // this path would LOSE to the empty-keys order `sync_deps` mounted first — the walk would keep
+    // reading the pre-spend order forever (in prod the live endpoint just returns the current keys;
+    // this is purely a static-mock artifact). set_priority(1) (highest) makes the fresh order win so
+    // a "second sync" test actually exercises the spent-pick order.
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/order/{gk}")))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(order_with_product_json(gk, product, tpks)),
         )
+        .with_priority(1)
         .mount(humble)
         .await;
 }
