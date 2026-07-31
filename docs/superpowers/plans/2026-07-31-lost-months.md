@@ -18,7 +18,8 @@
 - The sync path NEVER deletes a row. The only delete in this plan lives in the operator heal script (Task 10), dry-run by default.
 - Discovery writes `requires_choice: true` only with an order-derived claimed set (spec D3). The blob NEVER alone marks a game claimed.
 - A `_choice_*` tpk the grammar can't parse still mints a row normally, loudly (spec D7 knot) — a lost key is worse than a loud pair.
-- Branch structure: Tasks 1–2 on `kitten/client-timeouts` (branched from `main`); Tasks 3–10 on `kitten/lost-months` rebased onto `kitten/client-timeouts`. Do not interleave.
+- Branch structure: Tasks 1–2 on `kitten/client-timeouts` (branched from `main`); Tasks 3–10 on `kitten/lost-months` rebased onto `kitten/client-timeouts`. Do not interleave. **NB the repo is already on `kitten/lost-months` with the spec+plan commits.** Execution order: (a) `git checkout main && git checkout -b kitten/client-timeouts`, do Tasks 1–2, push, PR; (b) `git checkout kitten/lost-months && git rebase kitten/client-timeouts` (the spec/plan commits ride on top), do Tasks 3–10.
+- **Fulfillment test precondition (Tasks 6–9):** these tests need dynamodb-local. Start it (`docker run -p 8000:8000 amazon/dynamodb-local` or the repo's existing script) AND export `DYNAMODB_LOCAL_URL=http://localhost:8000` before running them — the harness `store_or_skip` (handler_test.rs:81) *silently SKIPS* when no store is reachable and the URL is unset, which would forge a green "verify" step. With the URL set, an unreachable store PANICS instead. A skipped test is not a passing test: if you see `SKIP`, the store isn't up — fix that before trusting any RED or GREEN in Tasks 6–9.
 - Run `cargo test --workspace` (not just the touched crate) before every commit; `cargo clippy --workspace -- -D warnings` must stay clean.
 
 ---
@@ -250,18 +251,25 @@ pub fn choice_tpk_matches(tpk_machine_name: &str, offered_machine_name: &str) ->
 - Produces: `ChoiceMonth.gamekey: Option<String>` (was `String` with `""` sentinel from the list walk). `choice_month` populates it `None` when the blob omits it; `choice_months` `None` where it used `unwrap_or_default()`. NO caller may ever see `""`.
 - Consumes: nothing from earlier tasks.
 
-- [ ] **Step 1: Build two synthetic fixtures** (spec D5 forbids captured blobs — synthesize from the existing fixture for a valid month by deleting fields):
+**Test idiom (READ FIRST — the real one, verified against `client_test.rs`):** there are NO `mount_membership_page` / `mount_subscription_pages` helpers. The membership blob is loaded with `fixture_str(name)` (`:11` region — NOT `fixture()`, which does `serde_json::from_str().unwrap()` and PANICS on HTML) and mounted inline. The month read hits `GET /membership/<slug>`; the existing membership tests (~`:490`) and `choice_months_walks_the_cursor_pagination` (~`:865`) are the patterns to copy. The client constructor is `async`: `client(&server).await`. Add `HumbleError` to the file's imports (`:1` currently imports only `{HumbleClient, SessionCookie}`).
 
-Copy the existing membership-page fixture (the one `choice_month` tests load — see the fixture helper at `client_test.rs:11`) to `fixtures/membership_no_gamekey.html`, and in the copied `webpack-monthly-product-data` JSON delete the `"gamekey"` key from `contentChoiceOptions` (the may-2020 / july-2026 shape observed in prod logs: `missing field \`gamekey\``, requestIds `549e7e95`, `012814b8`). Everything else stays valid.
+- [ ] **Step 1: Build one synthetic fixture** (spec D5 forbids captured blobs): copy the existing membership fixture `choice_month` tests load to `crates/humble-client/tests/fixtures/membership_no_gamekey.html`, and in the copied `webpack-monthly-product-data` JSON delete the `"gamekey"` key from `contentChoiceOptions` (the may-2020 / july-2026 prod shape: `missing field \`gamekey\``, requestIds `549e7e95`, `012814b8`). Everything else stays valid.
 
-- [ ] **Step 2: Write the failing tests**
+- [ ] **Step 2: Write the failing tests** (inline mounts, real idiom)
 
 ```rust
 #[tokio::test]
 async fn month_without_blob_gamekey_parses_with_none() {
     let server = wiremock::MockServer::start().await;
-    mount_membership_page(&server, "may-2020", fixture("membership_no_gamekey.html")).await; // follow the file's existing membership-mount helper idiom
-    let c = client(&server);
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/membership/may-2020"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_string(fixture_str("membership_no_gamekey.html")),
+        )
+        .mount(&server)
+        .await;
+    let c = client(&server).await;
     let m = c.choice_month("may-2020").await.expect("must parse, not die on a dropped field");
     assert_eq!(m.gamekey, None);
     assert!(!m.offered_games.is_empty(), "offered games still extracted");
@@ -269,23 +277,24 @@ async fn month_without_blob_gamekey_parses_with_none() {
 }
 
 #[tokio::test]
-async fn list_walk_gamekey_is_none_never_empty_string() {
-    // Reuse the existing choice_months wiremock fixtures: the gamekey-less newest months
-    // must surface as None. Assert on the existing two-newest-months fixture that every
-    // month has gamekey None or non-empty Some — "" must be unrepresentable.
+async fn list_walk_gamekey_is_never_empty_string() {
+    // The gamekey-less newest months must surface as None, never "". Reuse the exact
+    // page mounts of the existing choice_months walk test (copy its inline Mock setup).
     let server = wiremock::MockServer::start().await;
-    mount_subscription_pages(&server).await; // existing helper/fixtures
-    let c = client(&server);
-    let walk = c.choice_months(26, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap();
+    mount_the_existing_walk_pages(&server).await; // inline copy from choice_months_walks_the_cursor_pagination (:865)
+    let c = client(&server).await;
+    let walk = c.choice_months(26).await.unwrap(); // 1-arg signature as it exists NOW; Task 5 rewrites it
     for m in &walk.months {
         assert_ne!(m.gamekey.as_deref(), Some(""), "empty-string gamekey is banned: {}", m.product_url_path);
     }
 }
 ```
 
-(The second test's `choice_months` signature is Task 5's — if executing this task before Task 5, write it against the current one-arg signature and let Task 5's step update it; both orders work, the assertion is the point.)
+(Write the second test against the CURRENT 1-arg `choice_months`; Task 5 updates the signature and this assertion rides along. `mount_the_existing_walk_pages` is a rename for "paste the inline `Mock::given` page mounts from the existing walk test" — there is no helper, inline them.)
 
 - [ ] **Step 3: Verify the first test FAILS** with the strict-parse error (`missing field gamekey`) — this reproduces prod. `cargo test -p humble-client month_without_blob_gamekey`
+
+- [ ] **Step 4a: Fix the `Default` bound FIRST (BLOCKER — the struct below won't compile otherwise).** `#[serde(default)]` on `content_choice_data` requires `ContentChoiceData` to impl `Default`. At `model.rs:100` change `#[derive(Deserialize)]` to `#[derive(Deserialize, Default)]` on `ContentChoiceData` (its fields — `initial: ContentChoiceInitial`, `game_data: HashMap` — are both `Default`-able, so the derive succeeds).
 
 - [ ] **Step 4: Implement**
 
@@ -366,16 +375,19 @@ and use `month_gamekey` in the three sites.
   ```
 - Consumes: Task 4's `Option<String>` gamekey.
 
-- [ ] **Step 1: Write the failing tests**
+**Test idiom:** same as Task 4 — inline `Mock::given(method("GET")).and(path(BASE_or_cursor)).respond_with(ResponseTemplate::new(200).set_body_json(json!({...})))`, one mount per page path (page 1 = `.../subscription_products_with_gamekeys/`, page 2 = `.../<cursor>`), built from the JSON shape in the existing `choice_months_walks_the_cursor_pagination` test. Define page JSON inline with `serde_json::json!`; a monthly-era product is `{ "productMachineName": "may_2019_monthly", "productUrlPath": "may-2019", "gamekey": "...", "contentChoiceData": {"game_data": {}} }`. `client(&server).await`. `ResponseTemplate::set_delay(...)` for the deadline test.
+
+- [ ] **Step 1: Write the failing tests** (inline page mounts; the five existing call sites to migrate are listed in Step 3)
 
 ```rust
 #[tokio::test]
 async fn walk_era_stops_on_a_full_page_of_pre_choice_slugs() {
+    // page 1: 3 choice months (productMachineName ends "_choice") + cursor "C2".
+    // page 2: 3 monthly-era products ("may_2019_monthly", non-empty, no _choice) + cursor "C3".
     let server = wiremock::MockServer::start().await;
-    // page 1: 3 choice months w/ cursor → page 2: 3 monthly-era products (machine_names
-    // like "may_2019_monthly", non-empty, no _choice suffix) w/ cursor still present.
-    mount_walk_pages(&server, &[CHOICE_PAGE_1, MONTHLY_PAGE]).await; // extend the file's existing page-mount helpers
-    let c = client(&server);
+    mount_page(&server, "/api/v1/subscriptions/humble_monthly/subscription_products_with_gamekeys/", choice_page(&["june_2019_choice","may_2019b_choice","apr_2019_choice"], Some("C2"))).await;
+    mount_page(&server, ".../C2", monthly_page(&["mar_2019_monthly","feb_2019_monthly","jan_2019_monthly"], Some("C3"))).await;
+    let c = client(&server).await;
     let walk = c.choice_months(40, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap();
     assert!(matches!(walk.stop, WalkStop::EraStop));
     assert!(walk.complete_for_choice());
@@ -384,29 +396,33 @@ async fn walk_era_stops_on_a_full_page_of_pre_choice_slugs() {
 
 #[tokio::test]
 async fn empty_slug_disqualifies_page_from_era_stop() {
-    // page 2 has 2 monthly products + 1 with EMPTY product_machine_name (dropped field)
-    // → NOT an era stop; the walk continues to page 3 (cursor end).
+    // page 2: 2 monthly + 1 EMPTY productMachineName (dropped field) → NOT era-stop;
+    // walk continues to page 3 which is empty (cursor end).
     let server = wiremock::MockServer::start().await;
-    mount_walk_pages(&server, &[CHOICE_PAGE_1, MONTHLY_PAGE_WITH_EMPTY_SLUG, FINAL_EMPTY_PAGE]).await;
-    let c = client(&server);
+    mount_page(&server, ".../", choice_page(&["june_2019_choice"], Some("C2"))).await;
+    mount_page(&server, ".../C2", page_with_empty_slug(Some("C3"))).await; // 2 monthly + 1 ""-slug
+    mount_page(&server, ".../C3", empty_products_page()).await;
+    let c = client(&server).await;
     let walk = c.choice_months(40, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap();
     assert!(matches!(walk.stop, WalkStop::CursorEnd));
 }
 
 #[tokio::test]
 async fn walk_deadline_bounds_a_slow_server() {
-    // Every page mounts with a 300ms delay and always hands back a cursor; a 500ms
-    // deadline must stop the walk as Deadline after ~1-2 pages, not spin to the cap.
+    // Every page delays 300ms and always hands back a cursor; a 500ms deadline stops
+    // the walk as Deadline after ~1-2 pages, not at the cap.
     let server = wiremock::MockServer::start().await;
-    mount_slow_cursor_pages(&server, std::time::Duration::from_millis(300)).await;
-    let c = client(&server);
+    mount_slow_always_cursor(&server, std::time::Duration::from_millis(300)).await; // path-regex catch-all, 200 + delay + cursor
+    let c = client(&server).await;
     let walk = c.choice_months(40, std::time::Duration::ZERO, std::time::Duration::from_millis(500)).await.unwrap();
     assert!(matches!(walk.stop, WalkStop::Deadline));
     assert!(!walk.complete_for_choice());
 }
 ```
 
-Also UPDATE the existing `choice_months_max_pages_bounds_a_nonstop_cursor` test (:1041) to assert `matches!(walk.stop, WalkStop::Cap)` instead of `complete == false`, and update every other walk-test assertion from `complete` to `stop`/`complete_for_choice()`.
+(`mount_page`, `choice_page`, `monthly_page`, `page_with_empty_slug`, `empty_products_page`, `mount_slow_always_cursor` are small inline test helpers YOU define at the top of this test module — each is 3–6 lines wrapping `serde_json::json!` + a `Mock::given` mount. They are NOT existing helpers.)
+
+- [ ] **Step 1b: Migrate the existing walk tests.** Five call sites use `choice_months(N)` and assert `walk.complete`: `client_test.rs:908, :959, :988, :1028, :1062`. Update each to the 3-arg signature `choice_months(N, Duration::ZERO, Duration::from_secs(60))` and replace `assert!(walk.complete)`/`assert!(!walk.complete)` with `assert!(walk.complete_for_choice())` / `matches!(walk.stop, WalkStop::Cap)`. Also update the `!walk.complete` reader at `fulfillment/src/lib.rs:3209` (handled in Step 3). The `choice_months_max_pages_bounds_a_nonstop_cursor` test (:1041) asserts `matches!(walk.stop, WalkStop::Cap)`.
 
 - [ ] **Step 2: Verify they fail** — `cargo test -p humble-client walk_` → FAIL (no `WalkStop`, wrong signature).
 
@@ -473,7 +489,14 @@ pub async fn choice_months(
             stop = WalkStop::EraStop;
             break;
         }
-        for p in page.products { /* … existing month-building body, gamekey per Task 4 … */ }
+        // On a mixed boundary page (some _choice, some not) append ONLY choice products;
+        // an empty-slug product is an anomaly kept (Task 7's ladder may resolve it — dropping
+        // it silently is the exact bug class this PR kills). Monthly-era products are not months.
+        for p in page
+            .products
+            .into_iter()
+            .filter(|p| p.product_machine_name.is_empty() || p.product_machine_name.ends_with("_choice"))
+        { /* … existing month-building body, gamekey per Task 4 … */ }
         match page.cursor {
             Some(c) if !c.trim().is_empty() => cursor = Some(c),
             _ => {
@@ -516,9 +539,50 @@ NOTE the era-check runs BEFORE appending the page's products (monthly-era produc
   }
   ```
   `discover_choice_games(deps, healed, cookie_ok, orders: &OrderIndex) -> u32`
+  - The sync test harness helpers (defined in Step 0, consumed by Tasks 6–9).
 - Consumes: Task 3's `choice_tpk_matches`.
 
-- [ ] **Step 1: Order wire test.** In `client_test.rs`, extend the existing `order()` test to assert `order.product_machine_name == "<the fixture's product.machine_name>"` (read the value from the existing order fixture JSON). Run → FAIL (field missing). Implement: add `pub product_machine_name: String` to `Order`, flow from `OrderWire.product.machine_name` (`#[serde(default)]` on the wire — an order without it yields `""`, which simply never matches a ladder lookup). Green. Commit `-S -m "feat(humble-client): Order carries product_machine_name"`.
+- [ ] **Step 0: Build the sync test harness (BLOCKER fix — these helpers do NOT exist yet; Tasks 6–9 all depend on them).** `handler_test.rs` has NO fluent harness — only `store_or_skip(test) -> Option<Store>` (:81), `humble_at(uri)` (:895), `order_json(gamekey, machine, redeemed)` (:899, single-tpk, product carries only `human_name`), and `membership_html(...)` (:2610). The sync driver is `handle(&deps, FulfillRequest::Sync).await`, and reads are `deps.store.get_game(&domain::game_id(gk, mn))`. Add these free helpers to the test module (each wraps the real idiom — no new abstraction, just named setup the four tasks share):
+
+```rust
+// --- lost-months sync-test helpers (Tasks 6–9) ---
+
+/// Full order JSON with N tpks AND a product machine_name (order_json only does one tpk,
+/// no machine_name — insufficient for choice claimed-set tests).
+fn choice_order_json(gamekey: &str, product_machine: &str, tpk_machines: &[&str]) -> serde_json::Value {
+    let tpks: Vec<_> = tpk_machines.iter().map(|m| serde_json::json!({
+        "machine_name": m, "human_name": "Test Game", "key_type": "steam",
+        "is_expired": false, "keyindex": 0,
+    })).collect();
+    serde_json::json!({
+        "gamekey": gamekey,
+        "product": { "human_name": "Test Choice Month", "machine_name": product_machine },
+        "tpkd_dict": { "all_tpks": tpks },
+        "subproducts": [],
+    })
+}
+
+/// Mount the humble endpoints a sync touches: the gamekeys listing (order walk input),
+/// each order, the subscription list (choice walk), each membership page. Pass what this
+/// test needs; unlisted endpoints simply aren't mounted (a sync tolerates their absence
+/// per its own error arms). `orders`: (gamekey, product_machine, &[tpk_machine]).
+/// `sub_list`: (slug, Option<gamekey>) newest-first, one cursor page then empty.
+/// `months`: (slug, membership-blob-json). Returns a wired `Deps`.
+async fn sync_deps(
+    store: Store, humble: &wiremock::MockServer,
+    orders: &[(&str, &str, &[&str])],
+    sub_list: &[(&str, Option<&str>)],
+    months: &[(&str, serde_json::Value)],
+) -> Deps { /* mount gamekeys=[orders' gamekeys]; each /api/v1/order/<gk>; the
+    subscription_products page(s); each /membership/<slug>; then deps(store, humble.uri(), webhook) */ }
+
+/// All GAME rows whose id starts with "<gamekey>:" — via list_all_games (dynamo:1985).
+async fn games_for_gamekey(store: &Store, gamekey: &str) -> Vec<domain::Game> { /* filter list_all_games */ }
+```
+
+Commit this alone: `git commit -S -m "test(fulfillment): sync-test harness for choice discovery (multi-tpk order json, sync_deps, games_for_gamekey)"`. Every Task 6–9 test below is written against THESE names; `h.mount_choice_month(...)` etc. in later snippets are shorthand for "mount via `sync_deps`'s `months`/`orders`/`sub_list` args" — translate each to a `sync_deps(...)` call + `handle(&deps, FulfillRequest::Sync).await` + `games_for_gamekey(...)` assertions. Guard every test with `let Some(store) = store_or_skip("name").await else { return };`.
+
+- [ ] **Step 1: Order wire test.** In `client_test.rs`, extend the existing `order()` test to assert `order.product_machine_name == "<the fixture's product.machine_name>"` (add a `"machine_name"` to the fixture's `product` block if absent — today `ProductWire` at model.rs:20 deserializes ONLY `human_name`, so `machine_name` is a NEW field on both the wire struct and `Order`). Run → FAIL (field missing). Implement: add `#[serde(default)] pub machine_name: String` to `ProductWire` (model.rs:20) and `pub product_machine_name: String` to `Order`, flow it through (an order without it yields `""`, which never matches a ladder lookup). Green. Commit `-S -m "feat(humble-client): Order carries product_machine_name"`.
 
 - [ ] **Step 2: Failing fulfillment test — claimed-set is order-authoritative.** In `handler_test.rs`, following the file's existing wiremock sync-test idiom (mock humble endpoints + moto/local store, run `run_sync`, assert on written rows):
 
@@ -567,7 +631,7 @@ async fn discovery_skips_month_loudly_when_order_is_silent() {
     }
 ```
 
-(A failed order read inserts nothing — absence from `tpks_by_gamekey` IS the "order silent" signal.) In `discover_choice_games`, replace the `claimable_games()` block (:3262-3269) with:
+(A failed order read inserts nothing — absence from `tpks_by_gamekey` IS the "order silent" signal.) **Thread the signature (MAJOR fix):** `discover_choice_games` gains a fourth param `orders: &OrderIndex`; declare `order_index` BEFORE the order loop (:3050 region) so it outlives the loop, populate it inside, and update the call at `lib.rs:3100` from `discover_choice_games(deps, &mut healed_this_run, &mut cookie_ok)` to `discover_choice_games(deps, &mut healed_this_run, &mut cookie_ok, &order_index)`. Then in `discover_choice_games`, replace the `claimable_games()` block (:3262-3269) with:
 
 ```rust
         // Spec D3: claimed is ORDER-authoritative; the blob never alone marks a game
@@ -664,8 +728,13 @@ and inside the per-month loop, after the detail read:
 ```rust
         // Spec D2: the gamekey ladder — blob → list → order-side → loud skip. Never "".
         // Rung 3 derives the order-product machine_name from the slug ("july-2026" →
-        // "july_2026_choice"), the same deterministic construction recent_month_slugs
-        // inverts; it also covers rung-2 misses for list-enumerated months.
+        // "july_2026_choice"). CONFIRMED against prod (2026-07-05 findings: the order
+        // endpoint's product.machine_name IS "<month>_<year>_choice", e.g.
+        // "april_2026_choice") — the same form the membership blob's productMachineName
+        // carries, so the two endpoints agree. This is the SOLE resolution for the active
+        // month (A1). A rung-3 MISS (slug_product not in the index) on a probe month is
+        // logged by the "gamekey_source = none" skip below — a shape drift surfaces as a
+        // visible skip, never a silently-dark month.
         let slug_product = format!("{}_choice", slug.replace('-', "_"));
         let (month_gamekey, gamekey_source) = match (
             detail.gamekey.as_deref(),
@@ -770,7 +839,9 @@ async fn unparseable_choice_tpk_still_mints_normally() {
             let game = Game { id, /* …existing fields unchanged… */ };
 ```
 
-(`merge_sync` already handles the flip: fresh `requires_choice: false` wins, key fields refresh, app-owned state is preserved — domain :325-345. The routed write changes ONLY which existing row `upsert_game_from_sync` merges onto. Note `merge_sync` keeps `existing.machine_name` — the offered name — which keeps the id stable on every later sync.)
+The per-key routing adds one `get_game` read per choice-shaped tpk (~175 catalog-wide, ≤2 candidate reads each) every sync — ~1-2s, inside the A5 budget headroom (507s/900s) but real; noted so it's counted, not a surprise.
+
+(`merge_sync` already handles the flip: fresh `requires_choice: false` wins, key fields refresh — domain :325-345. The routed write changes ONLY which existing row `upsert_game_from_sync` merges onto. **Id stability rests on THIS routing re-deriving `candidate_id` every sync — NOT on `merge_sync` preserving `machine_name`.** An offered row is written `status=Available`, which hits merge_sync's Available branch (`..fresh`) where fresh wins entirely, so `machine_name` becomes the tpk name post-flip; the id stays `GK:offered` only because the routing keeps targeting it. The A6a test asserts `id` + `requires_choice`, which is what actually matters — don't rely on the machine_name field staying the offered name.)
 
 - [ ] **Step 4: Verify green; workspace suite.**
 - [ ] **Step 5: Commit** — `git commit -S -m "feat(fulfillment): choice tpks route onto their offered row — the duplicate-pair factory closes (spec D7, A6a)"`
@@ -837,7 +908,26 @@ If no such test exists, write it following the file's park-and-ping idioms (mock
 //! (mylittleuniverse's sibling fails the gate today — expected; heal by hand post-claim.)
 ```
 
-main flow: list all GAME rows → group by gamekey → for each row whose machine_name is choice-shaped (`choice_tpk_bases(..).is_some()`), ladder its candidate ids; where a candidate row exists in the same gamekey → a PAIR. Print every pair with its gate verdict. With `--execute`: for gate-passing pairs, fetch the live order, re-verify evidence 1-3, then delete the sibling row (add a `Store::delete_game(&self, id: &str)` **to the bin via the raw dynamo client** — do NOT add a delete to the `Store` API surface; "sync never deletes" stays structurally true because the capability isn't exported where sync code could reach it). Print a final `healed=N skipped=M` line.
+main flow: list all GAME rows (`Store::list_all_games`, dynamo:1985) → group by gamekey → for each row whose machine_name is choice-shaped (`choice_tpk_bases(..).is_some()`), ladder its candidate ids; where a candidate row exists in the same gamekey → a PAIR. Print every pair with its gate verdict. With `--execute`: for gate-passing pairs, fetch the live order (`HumbleClient::order`), re-verify evidence 1-3, then delete the sibling row. Print a final `healed=N skipped=M` line.
+
+**The delete (BLOCKER fix — concrete, feature-gated so sync physically cannot call it):**
+1. In `crates/dynamo/Cargo.toml` add a feature: `[features]\nheal = []`.
+2. In `crates/dynamo/src/lib.rs`, next to `delete_session` (:2176), add a feature-gated method mirroring it exactly (`schema::game_pk` and `schema::key_pair` are already `pub`):
+
+```rust
+/// Delete a GAME row by id. Feature-gated to `heal` — compiled ONLY for the
+/// heal_choice_pairs operator bin, NEVER in the lambda build, so "the sync path
+/// never deletes" stays a structural guarantee, not a discipline. (spec Q5)
+#[cfg(feature = "heal")]
+pub async fn delete_game(&self, id: &str) -> Result<(), StoreError> {
+    let (pk, sk) = schema::key_pair(schema::game_pk(id), "META");
+    self.client.delete_item().table_name(&self.table)
+        .key("pk", pk).key("sk", sk).send().await?;
+    Ok(())
+}
+```
+
+3. The bin's own `Cargo.toml` target / the `cargo run` invocation enables it: `cargo run -p fulfillment --bin heal_choice_pairs --features dynamo/heal`. The lambda's build (no `--features`) never compiles `delete_game`, so a stray `deps.store.delete_game(..)` in sync code would fail to compile — the guarantee is enforced by the compiler, not by reviewer vigilance.
 
 - [ ] **Step 2: Test the pairing/gate logic.** Extract the pure decision (`fn pair_verdict(sibling: &Game, offered: Option<&Game>, live_order_tpks: &[String]) -> Verdict`) into the bin file and unit-test it in-file: gate-pass → `Heal`, claim_id present → `Skip("claim-entangled")`, offered row still `requires_choice=true` → `Skip("not flipped yet — run after a post-D7 sync")`, live order missing the matching tpk → `Skip("order does not corroborate")`.
 
@@ -869,8 +959,16 @@ Preconditions: the D7 sync change is DEPLOYED and at least one sync has run
 
 PR (layer 2) onto `kitten/client-timeouts` until layer 1 merges, then rebase onto `main`. Deploy = the existing terraform lambda path (`terraform/aws-lambda.tf`, `kitten-deploy` role) after both PRs merge. Prod acceptance = spec A1-A5 verified in CloudWatch (the queries from the spec header), then the Task-10 runbook for A6b. `#53` closes on the A1-A4 receipts.
 
-## Self-Review (done at write time)
+## Self-Review + cold-review fold-in (2026-07-31)
 
-- Spec coverage: D1→T4, D2→T7, D3→T3+T6, D4→T5, D5→T7+T9, D6→spread across every task's tests, D7→T8, Q3→T4, Q4→T1-2, Q5→T10, A6a→T8, A6b→T10, tripwire→T9. No gaps found.
-- Types: `choice_tpk_bases` returns `(String, Option<String>)` everywhere it's named (T3/T8/T10); `ChoiceMonthsWalk.stop`/`complete_for_choice()` consistent T5/T6; `OrderIndex` fields consistent T6/T7.
-- Placeholders: none — every step carries its code or an exact instruction. Harness helper names in fulfillment tests (`sync_harness`, `mount_choice_month`, …) are the plan's interface to the EXISTING handler_test idioms: the executor adapts names to the file's real helpers, keeping the asserted behavior verbatim.
+- Spec coverage: D1→T4, D2→T7, D3→T3+T6, D4→T5, D5→T7+T9, D6→spread across every task's tests, D7→T8, Q3→T4, Q4→T1-2, Q5→T10, A6a→T8, A6b→T10, tripwire→T9. No gaps.
+- Types: `choice_tpk_bases` returns `(String, Option<String>)` everywhere (T3/T8/T10); `ChoiceMonthsWalk.stop`/`complete_for_choice()` consistent T5/T6; `OrderIndex` fields consistent T6/T7.
+- **Adversarial cold-subagent review (implementation-plan-review, 3 blockers + 4 majors) folded in:**
+  - BLOCKER-1 (`ContentChoiceData: Default` compile break) → T4 Step 4a derives it explicitly.
+  - BLOCKER-2 (the harness fiction — `sync_harness` etc. don't exist; `store_or_skip` skips silently without dynamodb-local) → T6 Step 0 builds concrete named helpers (`choice_order_json`, `sync_deps`, `games_for_gamekey`) against the REAL idiom (`handle(Sync)`, `list_all_games`, `order_json` extended for multi-tpk+product-machine-name); Global Constraints state the dynamodb-local + `DYNAMODB_LOCAL_URL` precondition.
+  - BLOCKER-3 (Task 10 delete impossible-as-worded) → feature-gated `dynamo::Store::delete_game` under `heal`, concrete key-pair code, compiler-enforced sync-can't-delete.
+  - MAJOR-A (T4/T5 invented client-test helpers + `fixture()` HTML panic) → rewritten against inline `Mock` mounts + `fixture_str`.
+  - MAJOR-B (T5 append code/prose contradiction) → filter moved into the code block.
+  - MAJOR-C (rung-3 order product machine_name unverified) → CONFIRMED via 2026-07-05 findings (`april_2026_choice`), + a rung-3-miss surfaces as a visible skip.
+  - MAJOR-D (T6 signature not threaded to :3100 call site) → explicit call-site + `order_index` lifetime instruction.
+  - Minors (async `client().await`, `HumbleError` import, the five `choice_months`/`complete` call sites at :908/959/988/1028/1062, T8 rationale, T6 `ProductWire` wording, T8 dynamo-read budget) all folded at their sites.
