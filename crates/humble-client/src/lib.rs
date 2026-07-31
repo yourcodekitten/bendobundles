@@ -838,11 +838,9 @@ impl HumbleClient {
             // On a mixed boundary page (some `_choice`, some not) append ONLY choice products; an
             // empty-slug product is an anomaly KEPT (Task 7's ladder may resolve it — dropping it
             // silently is the exact bug class this PR kills). Monthly-era products are not months.
-            for p in page
-                .products
-                .into_iter()
-                .filter(|p| p.product_machine_name.is_empty() || p.product_machine_name.ends_with("_choice"))
-            {
+            for p in page.products.into_iter().filter(|p| {
+                p.product_machine_name.is_empty() || p.product_machine_name.ends_with("_choice")
+            }) {
                 // Surface a dropped list gamekey as None (never "") — the sentinel is abolished.
                 let gamekey = p.gamekey.filter(|g| !g.is_empty());
                 let mut offered_games: Vec<OfferedGame> = p

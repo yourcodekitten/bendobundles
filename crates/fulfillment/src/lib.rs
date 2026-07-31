@@ -11,7 +11,9 @@
 
 use domain::{AppidSource, Claim, Game, GameStatus};
 use dynamo::{OwnedWrite, Store, StoreError, SyncBegin, SyncState, SyncWrite};
-use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, OfferedGame, Order, RevealedKey};
+use humble_client::{
+    GiftUrl, HumbleClient, HumbleError, KeyEntry, OfferedGame, Order, RevealedKey,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -3316,7 +3318,10 @@ async fn discover_choice_games(
         // caps one read, not ~77 of them. A partial pass is safe — discovery is additive, so a
         // month not reached this sync surfaces next sync.
         if started.elapsed() >= deps.choice_discovery_deadline {
-            tracing::warn!(months_processed, "choice discovery: pass deadline — partial pass (additive, retried next sync)");
+            tracing::warn!(
+                months_processed,
+                "choice discovery: pass deadline — partial pass (additive, retried next sync)"
+            );
             break;
         }
         tokio::time::sleep(SYNC_PACE).await;
@@ -3362,7 +3367,10 @@ async fn discover_choice_games(
         let (month_gamekey, gamekey_source) = match (
             detail.gamekey.as_deref(),
             list_gamekey.get(slug.as_str()).copied(),
-            orders.gamekey_by_product.get(&slug_product).map(String::as_str),
+            orders
+                .gamekey_by_product
+                .get(&slug_product)
+                .map(String::as_str),
         ) {
             (Some(g), _, _) => (g.to_string(), "blob"),
             (None, Some(g), _) => (g.to_string(), "list"),
@@ -3394,14 +3402,23 @@ async fn discover_choice_games(
         let claimable: Vec<&OfferedGame> = detail
             .offered_games
             .iter()
-            .filter(|o| !order_tpks.iter().any(|t| domain::choice_tpk_matches(t, &o.machine_name)))
+            .filter(|o| {
+                !order_tpks
+                    .iter()
+                    .any(|t| domain::choice_tpk_matches(t, &o.machine_name))
+            })
             .collect();
         // Canary (spec D3): a `_choice_*` tpk matching NO offered name — expected for 1:N grants
         // (base + DLC tpks from one pick), so logged and counted, never month-fatal.
         let unmatched = order_tpks
             .iter()
             .filter(|t| domain::choice_tpk_bases(t).is_some())
-            .filter(|t| !detail.offered_games.iter().any(|o| domain::choice_tpk_matches(t, &o.machine_name)))
+            .filter(|t| {
+                !detail
+                    .offered_games
+                    .iter()
+                    .any(|o| domain::choice_tpk_matches(t, &o.machine_name))
+            })
             .count();
         if unmatched > 0 {
             canary_unmatched_tpks += unmatched as u32;

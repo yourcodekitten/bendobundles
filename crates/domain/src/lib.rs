@@ -298,7 +298,9 @@ pub fn choice_tpk_bases(tpk_machine_name: &str) -> Option<(String, Option<String
     let (base, platform) = tpk_machine_name.rsplit_once("_choice_")?;
     if base.is_empty()
         || platform.is_empty()
-        || !platform.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        || !platform
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
         return None;
     }
@@ -580,7 +582,10 @@ mod tests {
         // region token before _choice
         assert_eq!(
             choice_tpk_bases("mylittleuniverse_row_choice_steam"),
-            Some(("mylittleuniverse_row".into(), Some("mylittleuniverse".into())))
+            Some((
+                "mylittleuniverse_row".into(),
+                Some("mylittleuniverse".into())
+            ))
         );
         assert_eq!(
             choice_tpk_bases("beholder2_ww_choice_steam"),
@@ -601,7 +606,10 @@ mod tests {
             Some(("citizensleeper2_starwardvector".into(), None))
         );
         // NOT choice-shaped: monthly-era, bundle keys, bare names, empty platform
-        assert_eq!(choice_tpk_bases("holypotatoeswereinspace_monthly_steam"), None);
+        assert_eq!(
+            choice_tpk_bases("holypotatoeswereinspace_monthly_steam"),
+            None
+        );
         assert_eq!(choice_tpk_bases("wingspan"), None);
         assert_eq!(choice_tpk_bases("wingspan_choice_"), None);
         // fires-anyway for the platform CHARSET rung (M11 minor): uppercase must NOT parse.
@@ -611,16 +619,28 @@ mod tests {
     #[test]
     fn choice_tpk_matches_is_the_grammar_rung() {
         // strip-grammar equality (the _row pair that killed starts_with)
-        assert!(choice_tpk_matches("mylittleuniverse_row_choice_steam", "mylittleuniverse"));
+        assert!(choice_tpk_matches(
+            "mylittleuniverse_row_choice_steam",
+            "mylittleuniverse"
+        ));
         // exact-base match: an offered name that itself ends _row
-        assert!(choice_tpk_matches("mylittleuniverse_row_choice_steam", "mylittleuniverse_row"));
+        assert!(choice_tpk_matches(
+            "mylittleuniverse_row_choice_steam",
+            "mylittleuniverse_row"
+        ));
         assert!(choice_tpk_matches("wingspan_choice_steam", "wingspan"));
         // bare equality (defensive: claim-all mints may drop the suffix)
         assert!(choice_tpk_matches("wingspan", "wingspan"));
         // non-matches: different game, prefix-hazard neighbor, monthly key
         assert!(!choice_tpk_matches("wingspan_choice_steam", "wing"));
-        assert!(!choice_tpk_matches("atomicheart_row_choice_steam", "atomic"));
-        assert!(!choice_tpk_matches("holypotatoeswereinspace_monthly_steam", "holypotatoeswereinspace"));
+        assert!(!choice_tpk_matches(
+            "atomicheart_row_choice_steam",
+            "atomic"
+        ));
+        assert!(!choice_tpk_matches(
+            "holypotatoeswereinspace_monthly_steam",
+            "holypotatoeswereinspace"
+        ));
     }
 
     #[test]

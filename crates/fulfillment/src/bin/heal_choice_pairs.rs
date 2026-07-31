@@ -33,7 +33,10 @@ enum Verdict {
 fn pair_verdict(sibling: &Game, offered: Option<&Game>, live_order_tpks: &[String]) -> Verdict {
     // State-gate the SIBLING: only rows with zero app-owned state auto-heal.
     if sibling.status != GameStatus::Available {
-        return Verdict::Skip(format!("sibling status is {:?}, not Available", sibling.status));
+        return Verdict::Skip(format!(
+            "sibling status is {:?}, not Available",
+            sibling.status
+        ));
     }
     if sibling.claim_id.is_some() {
         return Verdict::Skip("claim-entangled (sibling has a claim_id)".into());
@@ -99,7 +102,8 @@ async fn main() {
     tracing_subscriber::fmt().init();
     let execute = std::env::args().any(|a| a == "--execute");
     let table = std::env::var("TABLE_NAME").expect("TABLE_NAME required");
-    let cookie = std::env::var("HUMBLE_COOKIE").expect("HUMBLE_COOKIE required (live-order re-verify)");
+    let cookie =
+        std::env::var("HUMBLE_COOKIE").expect("HUMBLE_COOKIE required (live-order re-verify)");
     let aws_cfg = aws_config::load_from_env().await;
     let store = Store::new(aws_sdk_dynamodb::Client::new(&aws_cfg), table);
     let humble = HumbleClient::new("https://www.humblebundle.com", SessionCookie::new(cookie))
@@ -116,13 +120,22 @@ async fn main() {
 
     // Fetch each involved gamekey's live order once (the order AUTHORIZES; the scan only scheduled).
     let mut order_tpks: HashMap<String, Vec<String>> = HashMap::new();
-    for gk in pairs.iter().map(|p| &p.gamekey).collect::<std::collections::HashSet<_>>() {
+    for gk in pairs
+        .iter()
+        .map(|p| &p.gamekey)
+        .collect::<std::collections::HashSet<_>>()
+    {
         match humble.order(gk).await {
             Ok(o) => {
-                order_tpks.insert(gk.clone(), o.keys.iter().map(|k| k.machine_name.clone()).collect());
+                order_tpks.insert(
+                    gk.clone(),
+                    o.keys.iter().map(|k| k.machine_name.clone()).collect(),
+                );
             }
             Err(e) => {
-                eprintln!("WARN: live order fetch for {gk} failed ({e}) — its pairs will not corroborate");
+                eprintln!(
+                    "WARN: live order fetch for {gk} failed ({e}) — its pairs will not corroborate"
+                );
             }
         }
     }
@@ -190,7 +203,9 @@ mod tests {
         sibling.claim_id = Some("c1".into());
         let offered = game("GK:omega", "omega");
         let live = vec!["omega_row_choice_steam".to_string()];
-        assert!(matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("claim-entangled")));
+        assert!(
+            matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("claim-entangled"))
+        );
     }
 
     #[test]
@@ -199,7 +214,9 @@ mod tests {
         let mut offered = game("GK:omega", "omega");
         offered.requires_choice = true; // not flipped yet
         let live = vec!["omega_row_choice_steam".to_string()];
-        assert!(matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("not flipped")));
+        assert!(
+            matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("not flipped"))
+        );
     }
 
     #[test]
@@ -207,7 +224,9 @@ mod tests {
         let sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
         let offered = game("GK:omega", "omega");
         let live: Vec<String> = vec![]; // live order carries no matching tpk
-        assert!(matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("corroborate")));
+        assert!(
+            matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("corroborate"))
+        );
     }
 
     #[test]
@@ -216,7 +235,9 @@ mod tests {
         sibling.appid_source = Some(AppidSource::Manual);
         let offered = game("GK:omega", "omega");
         let live = vec!["omega_row_choice_steam".to_string()];
-        assert!(matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("Manual")));
+        assert!(
+            matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("Manual"))
+        );
     }
 
     #[test]

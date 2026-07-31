@@ -2681,7 +2681,11 @@ fn membership_html_no_gamekey(slug: &str, title: &str, offered: &[(&str, &str)])
 // --- lost-months sync-test harness (Tasks 6–9) ─────────────────────────────────────────────────
 // Order JSON with N tpks AND a product machine_name (the file's `order_json` does one tpk, no
 // product machine_name — insufficient for order-authoritative claimed-set tests).
-fn order_with_product_json(gamekey: &str, product_machine: &str, tpk_machines: &[&str]) -> serde_json::Value {
+fn order_with_product_json(
+    gamekey: &str,
+    product_machine: &str,
+    tpk_machines: &[&str],
+) -> serde_json::Value {
     let tpks: Vec<_> = tpk_machines
         .iter()
         .map(|m| {
@@ -2717,8 +2721,10 @@ async fn sync_deps(
     months: &[(&str, String)],
     webhook: Option<String>,
 ) -> Deps {
-    let mut listing: Vec<serde_json::Value> =
-        orders.iter().map(|(gk, ..)| serde_json::json!({ "gamekey": gk })).collect();
+    let mut listing: Vec<serde_json::Value> = orders
+        .iter()
+        .map(|(gk, ..)| serde_json::json!({ "gamekey": gk }))
+        .collect();
     for gk in failed_orders {
         listing.push(serde_json::json!({ "gamekey": gk }));
     }
@@ -2730,7 +2736,10 @@ async fn sync_deps(
     for (gk, product, tpks) in orders {
         Mock::given(method("GET"))
             .and(path(format!("/api/v1/order/{gk}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(order_with_product_json(gk, product, tpks)))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(order_with_product_json(gk, product, tpks)),
+            )
             .mount(humble)
             .await;
     }
@@ -2754,7 +2763,9 @@ async fn sync_deps(
         .collect();
     Mock::given(method("GET"))
         .and(path(format!("{CHOICE_LIST_BASE}/")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "products": products })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "products": products })),
+        )
         .mount(humble)
         .await;
     for (slug, blob) in months {
@@ -2796,7 +2807,11 @@ async fn discovery_claimed_set_comes_from_the_order_not_the_blob() {
     let deps = sync_deps(
         store,
         &humble,
-        &[("GKDEC2020", "december_2020_choice", &["beta_row_choice_steam"])],
+        &[(
+            "GKDEC2020",
+            "december_2020_choice",
+            &["beta_row_choice_steam"],
+        )],
         &[],
         &[("december-2020", Some("GKDEC2020"))],
         &[(
@@ -2816,7 +2831,10 @@ async fn discovery_claimed_set_comes_from_the_order_not_the_blob() {
     let games = games_for_gamekey(&deps.store, "GKDEC2020").await;
     let names: Vec<_> = games.iter().map(|g| g.machine_name.as_str()).collect();
     assert!(names.contains(&"alpha") && names.contains(&"gamma"));
-    assert!(!names.contains(&"beta"), "order-claimed game must not be written claimable");
+    assert!(
+        !names.contains(&"beta"),
+        "order-claimed game must not be written claimable"
+    );
 }
 
 #[tokio::test]
@@ -2835,7 +2853,13 @@ async fn discovery_skips_month_loudly_when_order_is_silent() {
         &[("november-2020", Some("GKNOV2020"))],
         &[(
             "november-2020",
-            membership_html("november-2020", "GKNOV2020", "November 2020", &[("delta", "Delta")], &[]),
+            membership_html(
+                "november-2020",
+                "GKNOV2020",
+                "November 2020",
+                &[("delta", "Delta")],
+                &[],
+            ),
         )],
         None,
     )
@@ -2858,7 +2882,11 @@ async fn discovery_canary_counts_unmatched_choice_tpks() {
     let deps = sync_deps(
         store,
         &humble,
-        &[("GKMAY", "may_2021_choice", &["kappa_choice_steam", "kappa_dlc_choice_steam"])],
+        &[(
+            "GKMAY",
+            "may_2021_choice",
+            &["kappa_choice_steam", "kappa_dlc_choice_steam"],
+        )],
         &[],
         &[("may-2021b", Some("GKMAY"))],
         &[(
@@ -2870,7 +2898,10 @@ async fn discovery_canary_counts_unmatched_choice_tpks() {
     .await;
     handle(&deps, FulfillRequest::Sync).await;
     assert!(
-        games_for_gamekey(&deps.store, "GKMAY").await.iter().all(|g| g.machine_name != "kappa"),
+        games_for_gamekey(&deps.store, "GKMAY")
+            .await
+            .iter()
+            .all(|g| g.machine_name != "kappa"),
         "order-claimed kappa not re-listed; unmatched DLC tpk is canary-counted, not fatal"
     );
 }
@@ -2891,7 +2922,10 @@ async fn gamekey_ladder_blob_absent_list_hit() {
         &[("GKMAY2020", "may_2020_choice", &[])],
         &[],
         &[("may-2020", Some("GKMAY2020"))],
-        &[("may-2020", membership_html_no_gamekey("may-2020", "May 2020", &[("epsilon", "Epsilon")]))],
+        &[(
+            "may-2020",
+            membership_html_no_gamekey("may-2020", "May 2020", &[("epsilon", "Epsilon")]),
+        )],
         None,
     )
     .await;
@@ -2918,7 +2952,10 @@ async fn gamekey_ladder_resolves_via_order_when_blob_and_list_drop_it() {
         &[("GKAUG", "august_2026_choice", &[])],
         &[],
         &[("august-2026", None)],
-        &[("august-2026", membership_html_no_gamekey("august-2026", "August 2026", &[("zeta", "Zeta")]))],
+        &[(
+            "august-2026",
+            membership_html_no_gamekey("august-2026", "August 2026", &[("zeta", "Zeta")]),
+        )],
         None,
     )
     .await;
@@ -2945,19 +2982,33 @@ async fn gamekey_ladder_all_absent_skips_only_that_month() {
         &[],
         &[("march-2020", None), ("april-2020", Some("GKAPR"))],
         &[
-            ("march-2020", membership_html_no_gamekey("march-2020", "March 2020", &[("eta", "Eta")])),
-            ("april-2020", membership_html_no_gamekey("april-2020", "April 2020", &[("theta", "Theta")])),
+            (
+                "march-2020",
+                membership_html_no_gamekey("march-2020", "March 2020", &[("eta", "Eta")]),
+            ),
+            (
+                "april-2020",
+                membership_html_no_gamekey("april-2020", "April 2020", &[("theta", "Theta")]),
+            ),
         ],
         None,
     )
     .await;
     handle(&deps, FulfillRequest::Sync).await;
     assert!(
-        deps.store.list_all_games().await.unwrap().iter().all(|g| g.machine_name != "eta"),
+        deps.store
+            .list_all_games()
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.machine_name != "eta"),
         "no gamekey from any rung ⇒ march skipped"
     );
     assert!(
-        games_for_gamekey(&deps.store, "GKAPR").await.iter().any(|g| g.machine_name == "theta"),
+        games_for_gamekey(&deps.store, "GKAPR")
+            .await
+            .iter()
+            .any(|g| g.machine_name == "theta"),
         "april resolved via list ⇒ written"
     );
 }
@@ -2983,11 +3034,42 @@ async fn discovery_pass_deadline_bounds_the_detail_fanout() {
             ("GKO", "october_2020_choice", &[]),
         ],
         &[],
-        &[("december-2020", Some("GKD")), ("november-2020", Some("GKN")), ("october-2020", Some("GKO"))],
         &[
-            ("december-2020", membership_html("december-2020", "GKD", "December 2020", &[("g_dec", "Dec")], &[])),
-            ("november-2020", membership_html("november-2020", "GKN", "November 2020", &[("g_nov", "Nov")], &[])),
-            ("october-2020", membership_html("october-2020", "GKO", "October 2020", &[("g_oct", "Oct")], &[])),
+            ("december-2020", Some("GKD")),
+            ("november-2020", Some("GKN")),
+            ("october-2020", Some("GKO")),
+        ],
+        &[
+            (
+                "december-2020",
+                membership_html(
+                    "december-2020",
+                    "GKD",
+                    "December 2020",
+                    &[("g_dec", "Dec")],
+                    &[],
+                ),
+            ),
+            (
+                "november-2020",
+                membership_html(
+                    "november-2020",
+                    "GKN",
+                    "November 2020",
+                    &[("g_nov", "Nov")],
+                    &[],
+                ),
+            ),
+            (
+                "october-2020",
+                membership_html(
+                    "october-2020",
+                    "GKO",
+                    "October 2020",
+                    &[("g_oct", "Oct")],
+                    &[],
+                ),
+            ),
         ],
         None,
     )
@@ -3006,7 +3088,10 @@ async fn discovery_pass_deadline_bounds_the_detail_fanout() {
         after_short < after_full,
         "the short deadline bounded the fan-out: {after_short} written vs {after_full} with a full deadline"
     );
-    assert!(after_full >= 3, "the full-deadline sync wrote all three months");
+    assert!(
+        after_full >= 3,
+        "the full-deadline sync wrote all three months"
+    );
 }
 
 // --- D7 helpers (Task 8) ────────────────────────────────────────────────────────────────────────
@@ -3015,7 +3100,9 @@ async fn discovery_pass_deadline_bounds_the_detail_fanout() {
 async fn remount_order(humble: &MockServer, gk: &str, product: &str, tpks: &[&str]) {
     Mock::given(method("GET"))
         .and(path(format!("/api/v1/order/{gk}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_with_product_json(gk, product, tpks)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(order_with_product_json(gk, product, tpks)),
+        )
         .mount(humble)
         .await;
 }
@@ -3062,7 +3149,10 @@ async fn choice_tpk_flips_the_offered_row_and_stays_stable_across_a_second_sync(
         &[("GK1", "june_2021_choice", &[])],
         &[],
         &[("june-2021", Some("GK1"))],
-        &[("june-2021", membership_html("june-2021", "GK1", "June 2021", &[("omega", "Omega")], &[]))],
+        &[(
+            "june-2021",
+            membership_html("june-2021", "GK1", "June 2021", &[("omega", "Omega")], &[]),
+        )],
         None,
     )
     .await;
@@ -3071,7 +3161,13 @@ async fn choice_tpk_flips_the_offered_row_and_stays_stable_across_a_second_sync(
 
     // The pick is spent — the order now carries omega_row_choice_steam. Sync twice more: each pass
     // must FLIP GK1:omega and NOT mint a sibling (id stability via re-derivation, M10).
-    remount_order(&humble, "GK1", "june_2021_choice", &["omega_row_choice_steam"]).await;
+    remount_order(
+        &humble,
+        "GK1",
+        "june_2021_choice",
+        &["omega_row_choice_steam"],
+    )
+    .await;
     for pass in 2..=3 {
         handle(&deps, FulfillRequest::Sync).await;
         let games = games_for_gamekey(&deps.store, "GK1").await;
@@ -3081,7 +3177,10 @@ async fn choice_tpk_flips_the_offered_row_and_stays_stable_across_a_second_sync(
             "pass {pass}: no sibling minted: {:?}",
             games.iter().map(|g| &g.id).collect::<Vec<_>>()
         );
-        assert_eq!(games[0].id, "GK1:omega", "pass {pass}: routing re-derived the stable id");
+        assert_eq!(
+            games[0].id, "GK1:omega",
+            "pass {pass}: routing re-derived the stable id"
+        );
         assert!(!games[0].requires_choice, "pass {pass}: flipped");
     }
 }
@@ -3111,10 +3210,19 @@ async fn flip_preserves_app_owned_state() {
     )
     .await;
     handle(&deps, FulfillRequest::Sync).await;
-    let g = deps.store.get_game(&game_id("GK3", "sigma")).await.unwrap().unwrap();
+    let g = deps
+        .store
+        .get_game(&game_id("GK3", "sigma"))
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!g.requires_choice, "flipped");
     assert!(g.hidden, "hidden preserved across flip");
-    assert_eq!(g.appid_source, Some(AppidSource::Manual), "Manual appid wins");
+    assert_eq!(
+        g.appid_source,
+        Some(AppidSource::Manual),
+        "Manual appid wins"
+    );
     assert_eq!(g.steam_app_id, Some(12345), "Manual appid value preserved");
 }
 
@@ -3138,7 +3246,11 @@ async fn unparseable_choice_tpk_still_mints_normally() {
     .await;
     handle(&deps, FulfillRequest::Sync).await;
     assert!(
-        deps.store.get_game(&game_id("GK2", "weird_choice_")).await.unwrap().is_some(),
+        deps.store
+            .get_game(&game_id("GK2", "weird_choice_"))
+            .await
+            .unwrap()
+            .is_some(),
         "an unparseable choice tpk still mints its row"
     );
 }
@@ -3149,7 +3261,9 @@ async fn d7_candidate_read_error_fails_safe_to_tpk_id() {
     // dynamodb-local (no easy way to error a single read). The branch is verified by code review
     // at the D7 routing site (a read error `break`s and keeps the tpk id, warning) — a read error
     // must NEVER drop the key. Explicitly noted, not silently omitted.
-    eprintln!("d7_candidate_read_error_fails_safe_to_tpk_id: branch verified by code review (see D7 routing)");
+    eprintln!(
+        "d7_candidate_read_error_fails_safe_to_tpk_id: branch verified by code review (see D7 routing)"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -3168,16 +3282,20 @@ async fn sync_discovers_offered_choice_games_as_requires_choice_true() {
     // being removed from claimable PROVES the order did it, not the blob.
     Mock::given(method("GET"))
         .and(path("/api/v1/user/order"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkJun26" }])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkJun26" }])),
+        )
         .mount(&humble)
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gkJun26"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_with_product_json(
-            "gkJun26",
-            "june_2026_choice",
-            &["already_picked_choice_steam"],
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(order_with_product_json(
+                "gkJun26",
+                "june_2026_choice",
+                &["already_picked_choice_steam"],
+            )),
+        )
         .mount(&humble)
         .await;
     // choice_months walk: one live month (usesChoices + canRedeemGames), single page (no cursor).
@@ -3272,12 +3390,20 @@ async fn sync_choice_discovery_skips_page_non_redeemable_month() {
     // an order-silent skip (D3): the redeemability gate fires first, and now order-presence proves it.
     Mock::given(method("GET"))
         .and(path("/api/v1/user/order"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkOld" }])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkOld" }])),
+        )
         .mount(&humble)
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gkOld"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_with_product_json("gkOld", "old_spent_choice", &[])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(order_with_product_json(
+                "gkOld",
+                "old_spent_choice",
+                &[],
+            )),
+        )
         .mount(&humble)
         .await;
     Mock::given(method("GET"))
@@ -3344,16 +3470,20 @@ async fn sync_discovers_claim_all_tier_offers() {
     // Order-authoritative (D3): the ORDER claims octopathtravelerii (blob claims nothing below).
     Mock::given(method("GET"))
         .and(path("/api/v1/user/order"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkJun26" }])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkJun26" }])),
+        )
         .mount(&humble)
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gkJun26"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(order_with_product_json(
-            "gkJun26",
-            "june_2026_choice",
-            &["octopathtravelerii_choice_steam"],
-        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(order_with_product_json(
+                "gkJun26",
+                "june_2026_choice",
+                &["octopathtravelerii_choice_steam"],
+            )),
+        )
         .mount(&humble)
         .await;
     // List-walk: a claim-all month (usesChoices=false, canRedeemGames=true).

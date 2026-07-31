@@ -901,7 +901,10 @@ async fn month_without_blob_gamekey_parses_with_none() {
         .expect("must parse, not die on a dropped field");
     assert_eq!(m.gamekey, None);
     assert!(!m.offered_games.is_empty(), "offered games still extracted");
-    assert!(m.claimed_machine_names.is_some(), "claim-state still extracted");
+    assert!(
+        m.claimed_machine_names.is_some(),
+        "claim-state still extracted"
+    );
 }
 
 // ── Humble Choice: choice_months (paginated month enumeration via the cursor path segment) ───────
@@ -949,7 +952,15 @@ async fn choice_months_walks_the_cursor_pagination() {
         .mount(&server)
         .await;
 
-    let walk = client(&server).await.choice_months(10, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap();
+    let walk = client(&server)
+        .await
+        .choice_months(
+            10,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
     assert!(walk.complete_for_choice()); // reached the end (page 2 had no cursor)
     let months = walk.months;
     assert_eq!(months.len(), 3);
@@ -1000,7 +1011,15 @@ async fn choice_months_base64url_cursor_round_trips_through_the_path() {
         .mount(&server)
         .await;
 
-    let walk = client(&server).await.choice_months(10, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap();
+    let walk = client(&server)
+        .await
+        .choice_months(
+            10,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
     assert!(walk.complete_for_choice());
     let months = walk.months;
     // Reaching page 2 (gk2) proves the base64url cursor round-tripped through the path unmangled.
@@ -1029,7 +1048,15 @@ async fn choice_months_single_page_no_cursor_stops() {
         .mount(&server)
         .await;
 
-    let walk = client(&server).await.choice_months(10, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap();
+    let walk = client(&server)
+        .await
+        .choice_months(
+            10,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
     assert!(walk.complete_for_choice());
     let months = walk.months;
     assert_eq!(months.len(), 1);
@@ -1069,7 +1096,15 @@ async fn choice_months_keeps_gamekeyless_product_with_its_slug() {
 
     // The whole walk succeeds (not a Parse error) and keeps BOTH months — the gamekey-less one as
     // None (never an empty-string sentinel) with its real slug intact for the per-month read.
-    let walk = client(&server).await.choice_months(10, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap();
+    let walk = client(&server)
+        .await
+        .choice_months(
+            10,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
     assert!(walk.complete_for_choice());
     assert_eq!(
         walk.months.len(),
@@ -1078,7 +1113,10 @@ async fn choice_months_keeps_gamekeyless_product_with_its_slug() {
     );
     let june = &walk.months[0];
     assert_eq!(june.product_url_path, "june-2026");
-    assert_eq!(june.gamekey, None, "list gamekey is None, never an empty-string placeholder");
+    assert_eq!(
+        june.gamekey, None,
+        "list gamekey is None, never an empty-string placeholder"
+    );
     assert_eq!(walk.months[1].gamekey.as_deref(), Some("gkReal"));
 }
 
@@ -1101,7 +1139,15 @@ async fn choice_months_max_pages_bounds_a_nonstop_cursor() {
         .mount(&server)
         .await;
 
-    let walk = client(&server).await.choice_months(3, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap();
+    let walk = client(&server)
+        .await
+        .choice_months(
+            3,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
     assert_eq!(walk.months.len(), 3); // exactly max_pages products, not an infinite spin
     // The cap stopped the walk with a cursor still pending — the caller MUST know it's truncated.
     assert!(matches!(walk.stop, WalkStop::Cap));
@@ -1172,7 +1218,11 @@ fn mixed_page(
         products.push(sub_product("orphan-slug", "", &["orphan"]));
     }
     for s in monthly_slugs {
-        products.push(sub_product(s, &format!("{}_monthly", s.replace('-', "_")), &[]));
+        products.push(sub_product(
+            s,
+            &format!("{}_monthly", s.replace('-', "_")),
+            &[],
+        ));
     }
     sub_page(products, cursor)
 }
@@ -1201,7 +1251,10 @@ async fn mount_slow_always_cursor(server: &MockServer, delay: std::time::Duratio
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(delay)
-                .set_body_json(sub_page(vec![sub_product("x-choice", "x_choice", &[])], Some("SAME"))),
+                .set_body_json(sub_page(
+                    vec![sub_product("x-choice", "x_choice", &[])],
+                    Some("SAME"),
+                )),
         )
         .mount(server)
         .await;
@@ -1217,18 +1270,28 @@ async fn walk_era_stops_on_a_full_page_of_pre_choice_slugs() {
     mount_page(
         &server,
         &sub_path(None),
-        choice_page(&["dec_2019_choice", "nov_2019_choice", "oct_2019_choice"], Some("C2")),
+        choice_page(
+            &["dec_2019_choice", "nov_2019_choice", "oct_2019_choice"],
+            Some("C2"),
+        ),
     )
     .await;
     mount_page(
         &server,
         &sub_path(Some("C2")),
-        monthly_page(&["december-2018", "november-2018", "october-2018"], Some("C3")),
+        monthly_page(
+            &["december-2018", "november-2018", "october-2018"],
+            Some("C3"),
+        ),
     )
     .await;
     let walk = client(&server)
         .await
-        .choice_months(40, std::time::Duration::ZERO, std::time::Duration::from_secs(60))
+        .choice_months(
+            40,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
         .await
         .unwrap();
     assert!(matches!(walk.stop, WalkStop::EraStop));
@@ -1241,12 +1304,26 @@ async fn empty_slug_disqualifies_page_from_era_stop() {
     // page 2: 2 monthly (pre-2019) + 1 EMPTY machine_name → NOT era-stop; walk continues to the
     // empty page 3 (cursor end).
     let server = MockServer::start().await;
-    mount_page(&server, &sub_path(None), choice_page(&["dec_2019_choice"], Some("C2"))).await;
-    mount_page(&server, &sub_path(Some("C2")), page_with_empty_slug(Some("C3"))).await;
+    mount_page(
+        &server,
+        &sub_path(None),
+        choice_page(&["dec_2019_choice"], Some("C2")),
+    )
+    .await;
+    mount_page(
+        &server,
+        &sub_path(Some("C2")),
+        page_with_empty_slug(Some("C3")),
+    )
+    .await;
     mount_page(&server, &sub_path(Some("C3")), empty_products_page()).await;
     let walk = client(&server)
         .await
-        .choice_months(40, std::time::Duration::ZERO, std::time::Duration::from_secs(60))
+        .choice_months(
+            40,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
         .await
         .unwrap();
     assert!(matches!(walk.stop, WalkStop::CursorEnd));
@@ -1267,10 +1344,17 @@ async fn empty_slug_live_choice_product_is_kept_not_dropped() {
     mount_page(&server, &sub_path(Some("C2")), empty_products_page()).await;
     let walk = client(&server)
         .await
-        .choice_months(40, std::time::Duration::ZERO, std::time::Duration::from_secs(60))
+        .choice_months(
+            40,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
         .await
         .unwrap();
-    assert!(matches!(walk.stop, WalkStop::CursorEnd), "mixed page must not era-stop");
+    assert!(
+        matches!(walk.stop, WalkStop::CursorEnd),
+        "mixed page must not era-stop"
+    );
     assert!(
         walk.months
             .iter()
@@ -1287,7 +1371,11 @@ async fn walk_deadline_bounds_a_slow_server() {
     mount_slow_always_cursor(&server, std::time::Duration::from_millis(300)).await;
     let walk = client(&server)
         .await
-        .choice_months(40, std::time::Duration::ZERO, std::time::Duration::from_millis(500))
+        .choice_months(
+            40,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(500),
+        )
         .await
         .unwrap();
     assert!(matches!(walk.stop, WalkStop::Deadline));
@@ -1304,7 +1392,15 @@ async fn choice_months_dead_session_is_unauthorized() {
         .mount(&server)
         .await;
 
-    let err = client(&server).await.choice_months(10, std::time::Duration::ZERO, std::time::Duration::from_secs(60)).await.unwrap_err();
+    let err = client(&server)
+        .await
+        .choice_months(
+            10,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::Unauthorized));
 }
 
