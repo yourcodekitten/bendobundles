@@ -405,6 +405,32 @@ impl ChoiceMonthsWalk {
     }
 }
 
+/// Parse a subscription month slug (`<month-name>-<year>`, e.g. `"november-2019"`) into
+/// `(year, month)` for the era discriminant. The last `-` segment is the year; the segment before it
+/// the lowercase English month name. Returns `None` on any shape that doesn't match — the era check
+/// treats `None` as a fail-safe anomaly (a slug it can't date can never era-stop the page).
+fn month_year(slug: &str) -> Option<(i32, u32)> {
+    let (rest, year) = slug.rsplit_once('-')?;
+    let year: i32 = year.parse().ok()?;
+    let month_name = rest.rsplit_once('-').map_or(rest, |(_, m)| m);
+    let month = match month_name {
+        "january" => 1,
+        "february" => 2,
+        "march" => 3,
+        "april" => 4,
+        "may" => 5,
+        "june" => 6,
+        "july" => 7,
+        "august" => 8,
+        "september" => 9,
+        "october" => 10,
+        "november" => 11,
+        "december" => 12,
+        _ => return None,
+    };
+    Some((year, month))
+}
+
 #[derive(serde::Deserialize)]
 struct RedeemResponse {
     // No #[serde(default)] — a 200 body missing `success` must be a parse error, not silently
@@ -800,33 +826,43 @@ impl HumbleClient {
                 stop = WalkStop::CursorEnd; // an empty page is cursor-end, never era-stop (family review)
                 break;
             }
-            // Era discriminant (family review, final form): the SLUG decides — a product is
-            // pre-Choice iff product_machine_name is NON-EMPTY and does not end "_choice". An
-            // empty slug (a droppable field) is an anomaly-warn and DISQUALIFIES the page from
-            // era-stopping: a dropped field must never read as "pre-Choice era".
+            // Era discriminant (M11, family-ruled 2026-07-31): a page era-stops iff EVERY product
+            // resolves to a month STRICTLY BEFORE the Choice era's start (Dec 2019). The check is
+            // month-granular because the boundary is mid-year — Dec 2019 is Choice, Nov 2019 is the
+            // last Humble Monthly — so no year-int can split it. It fails SAFE in every ambiguous
+            // case: a `_choice` suffix, an empty machine_name, a non-choice slug dated Dec-2019+
+            // (drift), or an unparseable slug all DISQUALIFY the page. A false era-stop would HIDE a
+            // live month — the one sin this walk exists to prevent — so an unknown shape walks to the
+            // cap (non-corrupting), it never era-stops. (A positive `_monthly`-suffix marker was the
+            // preferred form, but the pre-Choice tail is unreachable to confirm real Monthly
+            // machine_names, and a hide-a-month guard is not built on an unconfirmable premise; this
+            // month-granular check needs no such assumption — parse-failure just fails safe.)
             let mut page_all_pre_choice = true;
-            let mut page_had_anomaly = false;
             for p in &page.products {
                 if p.product_machine_name.is_empty() {
                     tracing::warn!(title = %p.title, "choice walk: product with empty machine_name — anomaly, page cannot era-stop");
-                    page_had_anomaly = true;
+                    page_all_pre_choice = false;
                 } else if p.product_machine_name.ends_with("_choice") {
                     page_all_pre_choice = false;
-                } else if let Some(year) = p
-                    .product_url_path
-                    .rsplit('-')
-                    .next()
-                    .and_then(|y| y.parse::<i32>().ok())
-                {
-                    // Chronology sanity: a "pre-choice" slug dated inside the Choice era (the era
-                    // began Dec 2019, so year >= 2019) is drift, not history — don't era-stop on it.
-                    if year >= 2019 {
-                        tracing::warn!(machine_name = %p.product_machine_name, year, "choice walk: non-choice slug dated inside the Choice era — anomaly, page cannot era-stop");
-                        page_had_anomaly = true;
+                } else {
+                    // Non-choice, non-empty: a genuine pre-Choice Monthly ONLY if its slug parses to a
+                    // month strictly before Dec 2019. Dec-2019+ drift or an unparseable slug is an
+                    // anomaly that fails safe (page cannot era-stop) — closing the two fail-UNSAFE
+                    // holes of the old year-only check.
+                    match month_year(&p.product_url_path) {
+                        Some((y, m)) if (y, m) < (2019, 12) => {}
+                        Some((y, m)) => {
+                            tracing::warn!(machine_name = %p.product_machine_name, year = y, month = m, "choice walk: non-choice slug dated Dec-2019+ — drift anomaly, page cannot era-stop");
+                            page_all_pre_choice = false;
+                        }
+                        None => {
+                            tracing::warn!(machine_name = %p.product_machine_name, slug = %p.product_url_path, "choice walk: non-choice slug with unparseable month — anomaly, page cannot era-stop");
+                            page_all_pre_choice = false;
+                        }
                     }
                 }
             }
-            if page_all_pre_choice && !page_had_anomaly {
+            if page_all_pre_choice {
                 tracing::info!(
                     boundary = %page.products[0].product_machine_name,
                     pages = page_no + 1,

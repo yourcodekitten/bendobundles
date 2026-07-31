@@ -1260,12 +1260,15 @@ async fn mount_slow_always_cursor(server: &MockServer, delay: std::time::Duratio
         .await;
 }
 
-// NB fixture years: monthly-era products MUST carry pre-2019 url paths ("december-2018"), NOT 2019 —
-// the Choice era began Dec 2019, and the chronology guard warns+keeps-walking on a non-choice slug
-// dated >= that boundary. A "*_2019_monthly" fixture would red these on the CHRONOLOGY branch (M11).
+// M11 (family-ruled 2026-07-31): the era discriminant is month-granular `(year,month) < (2019,12)`,
+// so the REAL prod boundary — Jan–Nov 2019 Humble Monthly — era-stops correctly (the old year-only
+// `>= 2019` guard EATS these, walking to 2018 every sync; the 2018-fixture dodge that hid that gap is
+// gone). Two fail-SAFE holes are covered below: a drifted `december_2019` (Dec-2019+ non-choice) and
+// an unparseable slug both DISQUALIFY the page — a false era-stop would hide a live month.
 #[tokio::test]
-async fn walk_era_stops_on_a_full_page_of_pre_choice_slugs() {
-    // page 1: 3 choice months + cursor "C2"; page 2: 3 pre-2019 monthly products + cursor "C3".
+async fn walk_era_stops_on_a_full_page_of_real_2019_monthlies() {
+    // page 1: 3 choice months + cursor "C2"; page 2: 3 REAL Nov/Oct/Sep-2019 Humble Monthly products
+    // (the true prod boundary) + cursor "C3". Month-granular: (2019,11/10/9) < (2019,12) → era-stop.
     let server = MockServer::start().await;
     mount_page(
         &server,
@@ -1280,7 +1283,7 @@ async fn walk_era_stops_on_a_full_page_of_pre_choice_slugs() {
         &server,
         &sub_path(Some("C2")),
         monthly_page(
-            &["december-2018", "november-2018", "october-2018"],
+            &["november-2019", "october-2019", "september-2019"],
             Some("C3"),
         ),
     )
@@ -1297,6 +1300,83 @@ async fn walk_era_stops_on_a_full_page_of_pre_choice_slugs() {
     assert!(matches!(walk.stop, WalkStop::EraStop));
     assert!(walk.complete_for_choice());
     assert_eq!(walk.months.len(), 3, "monthly-era products are not months");
+}
+
+// Fail-safe hole (a): a drifted Dec-2019 that lost its `_choice` suffix ("december_2019") is dated
+// AT the boundary → `(2019,12)` is NOT `< (2019,12)` → drift anomaly → the page must NOT era-stop.
+// A false era-stop here would hide the whole tail of the Choice era — the exact sin this walk kills.
+#[tokio::test]
+async fn walk_does_not_era_stop_on_a_drifted_december_2019() {
+    let server = MockServer::start().await;
+    mount_page(
+        &server,
+        &sub_path(None),
+        choice_page(&["jan_2020_choice"], Some("C2")),
+    )
+    .await;
+    // page 2: a lone drifted december_2019 (non-`_choice`, offering a live "ghost") → NOT era-stop.
+    mount_page(
+        &server,
+        &sub_path(Some("C2")),
+        sub_page(
+            vec![sub_product("december-2019", "december_2019", &["ghost"])],
+            Some("C3"),
+        ),
+    )
+    .await;
+    mount_page(&server, &sub_path(Some("C3")), empty_products_page()).await;
+    let walk = client(&server)
+        .await
+        .choice_months(
+            40,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(walk.stop, WalkStop::CursorEnd),
+        "a Dec-2019+ drift must NOT era-stop (would hide the tail): {:?}",
+        walk.stop
+    );
+}
+
+// Fail-safe hole (b): a non-choice product whose slug carries no parseable month ("mystery-bundle")
+// → `month_year` returns None → anomaly → the page must NOT era-stop (the old code fell through and
+// treated it as pre-Choice, a fail-UNSAFE hide).
+#[tokio::test]
+async fn walk_does_not_era_stop_on_an_unparseable_slug() {
+    let server = MockServer::start().await;
+    mount_page(
+        &server,
+        &sub_path(None),
+        choice_page(&["jan_2020_choice"], Some("C2")),
+    )
+    .await;
+    mount_page(
+        &server,
+        &sub_path(Some("C2")),
+        sub_page(
+            vec![sub_product("mystery-bundle", "mystery_bundle", &[])],
+            Some("C3"),
+        ),
+    )
+    .await;
+    mount_page(&server, &sub_path(Some("C3")), empty_products_page()).await;
+    let walk = client(&server)
+        .await
+        .choice_months(
+            40,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(walk.stop, WalkStop::CursorEnd),
+        "an unparseable slug must fail safe (NOT era-stop): {:?}",
+        walk.stop
+    );
 }
 
 #[tokio::test]
