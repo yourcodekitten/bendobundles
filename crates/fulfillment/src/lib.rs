@@ -3267,12 +3267,19 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
             tracing::warn!(month = %detail.product_url_path, "choice discovery: single-month read had no claimed set — skipping (never writes true without one)");
             continue;
         };
+        // Transitional (until Task 7 installs the D2 gamekey ladder): the blob may now drop
+        // gamekey (Option). Skip loudly rather than fabricate one — a made-up gamekey poisons
+        // game_id() and both claim writes. The ladder (list → order-side) lands in a later task.
+        let Some(month_gamekey) = detail.gamekey.clone() else {
+            tracing::warn!(month = %detail.product_url_path, "choice discovery: month has no gamekey from any source yet — skipping (ladder lands in a later task)");
+            continue;
+        };
         // Per-month observability: which months surfaced how many claimable offered games, and the
         // offered/chosen split behind that number. Cheap, and it turns "why did this month write
         // nothing?" from a guessing game into a log line.
         tracing::info!(
             month = %detail.product_url_path,
-            gamekey = %detail.gamekey,
+            gamekey = %month_gamekey,
             offered = detail.offered_games.len(),
             chosen = detail.claimed_machine_names.as_ref().map_or(0, Vec::len),
             claimable = claimable.len(),
@@ -3280,10 +3287,10 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
         );
         for offered in claimable {
             let game = Game {
-                id: domain::game_id(&detail.gamekey, &offered.machine_name),
+                id: domain::game_id(&month_gamekey, &offered.machine_name),
                 title: offered.title.clone(),
                 bundle: detail.title.clone(),
-                gamekey: detail.gamekey.clone(),
+                gamekey: month_gamekey.clone(),
                 machine_name: offered.machine_name.clone(),
                 // No key exists until the pick is spent, so the offered wire carries no key platform.
                 // Placeholder; `merge_sync` refreshes `key_type` from the real key-sync `fresh` once a

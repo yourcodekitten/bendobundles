@@ -318,7 +318,10 @@ pub struct RevealedKey(pub String);
 /// neither).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChoiceMonth {
-    pub gamekey: String,
+    /// `Some` when any source supplied it; `None` when the wire dropped it (both the
+    /// gamekey-less newest months in the LIST and the blob-drop months in the DETAIL read).
+    /// Never `""` — resolution/skip is the caller's job (fulfillment's D2 ladder).
+    pub gamekey: Option<String>,
     pub title: String,
     pub product_url_path: String,
     pub product_machine_name: String,
@@ -701,7 +704,12 @@ impl HumbleClient {
         Ok(ChoiceMonth {
             gamekey: cco.gamekey,
             title: cco.title,
-            product_url_path: cco.product_url_path,
+            // Blob may drop productUrlPath (D1) — fall back to the slug we asked for.
+            product_url_path: if cco.product_url_path.is_empty() {
+                month_url.to_string()
+            } else {
+                cco.product_url_path
+            },
             product_machine_name: cco.product_machine_name,
             uses_choices: cco.uses_choices,
             is_active_content: cco.is_active_content,
@@ -755,8 +763,8 @@ impl HumbleClient {
                 // just-billed one — show up gamekey-less here) even though its membership page carries
                 // a real gamekey and is fully claimable. So DON'T drop these: keep the slug
                 // (`product_url_path`), and let discovery resolve the real gamekey from the per-month
-                // read. An empty gamekey here is just a placeholder the single-month read overrides.
-                let gamekey = p.gamekey.unwrap_or_default();
+                // read. Surface absence as None (never "") — the empty-string sentinel is abolished.
+                let gamekey = p.gamekey.filter(|g| !g.is_empty());
                 let mut offered_games: Vec<OfferedGame> = p
                     .content_choice_data
                     .game_data

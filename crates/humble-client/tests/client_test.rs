@@ -523,7 +523,7 @@ async fn choice_month_parses_offered_games_and_state() {
         .choice_month("may-2021")
         .await
         .unwrap();
-    assert_eq!(m.gamekey, "May21Gamekey00");
+    assert_eq!(m.gamekey.as_deref(), Some("May21Gamekey00"));
     assert_eq!(m.title, "May 2021");
     assert_eq!(m.product_url_path, "may-2021");
     assert_eq!(m.product_machine_name, "may_2021_choice");
@@ -777,7 +777,7 @@ fn claimable_games_subtraction_edges() {
             .collect()
     };
     let month = |claimed: Option<Vec<&str>>| ChoiceMonth {
-        gamekey: "gk".into(),
+        gamekey: Some("gk".into()),
         title: "May 2021".into(),
         product_url_path: "may-2021".into(),
         product_machine_name: "may_2021_choice".into(),
@@ -876,6 +876,31 @@ async fn choice_month_malformed_blob_is_parse_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::Parse(_)));
+}
+
+// A membership blob that DROPPED its `gamekey` (the may-2020 / july-2026 prod shape, requestIds
+// 012814b8 / 549e7e95) must parse — not die on the strict field — with gamekey None, and still
+// extract offered games + claim-state. Resolution is the caller's ladder (fulfillment D2).
+#[tokio::test]
+async fn month_without_blob_gamekey_parses_with_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/membership/may-2020"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(fixture_str("membership_no_gamekey.html"))
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&server)
+        .await;
+    let m = client(&server)
+        .await
+        .choice_month("may-2020")
+        .await
+        .expect("must parse, not die on a dropped field");
+    assert_eq!(m.gamekey, None);
+    assert!(!m.offered_games.is_empty(), "offered games still extracted");
+    assert!(m.claimed_machine_names.is_some(), "claim-state still extracted");
 }
 
 // ── Humble Choice: choice_months (paginated month enumeration via the cursor path segment) ───────
@@ -1041,8 +1066,8 @@ async fn choice_months_keeps_gamekeyless_product_with_its_slug() {
         .mount(&server)
         .await;
 
-    // The whole walk succeeds (not a Parse error) and keeps BOTH months — the gamekey-less one with
-    // an empty placeholder gamekey and its real slug intact for the per-month read.
+    // The whole walk succeeds (not a Parse error) and keeps BOTH months — the gamekey-less one as
+    // None (never an empty-string sentinel) with its real slug intact for the per-month read.
     let walk = client(&server).await.choice_months(10).await.unwrap();
     assert!(walk.complete);
     assert_eq!(
@@ -1052,8 +1077,8 @@ async fn choice_months_keeps_gamekeyless_product_with_its_slug() {
     );
     let june = &walk.months[0];
     assert_eq!(june.product_url_path, "june-2026");
-    assert_eq!(june.gamekey, "", "list gamekey is an empty placeholder");
-    assert_eq!(walk.months[1].gamekey, "gkReal");
+    assert_eq!(june.gamekey, None, "list gamekey is None, never an empty-string placeholder");
+    assert_eq!(walk.months[1].gamekey.as_deref(), Some("gkReal"));
 }
 
 #[tokio::test]
