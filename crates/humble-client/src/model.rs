@@ -19,6 +19,10 @@ pub(crate) struct OrderWire {
 #[derive(Deserialize)]
 pub(crate) struct ProductWire {
     pub human_name: String,
+    // The order-product identity ("july_2026_choice") — D2 ladder rung 3 (slug→gamekey) and D3.
+    // Defaulted: a non-choice order may omit it; an empty value simply never matches a lookup.
+    #[serde(default)]
+    pub machine_name: String,
 }
 
 #[derive(Deserialize, Default)]

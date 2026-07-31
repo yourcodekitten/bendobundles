@@ -46,6 +46,7 @@ async fn parses_order_key_states() {
     let order = client(&server).await.order("AAAAbbbbCCCC").await.unwrap();
     assert_eq!(order.bundle_name, "Humble Indie Bundle 99");
     assert_eq!(order.gamekey, "AAAAbbbbCCCC");
+    assert_eq!(order.product_machine_name, "hib99_bundle"); // Task 6: order-product identity (D2 rung 3 / D3)
     assert_eq!(order.keys.len(), 3);
 
     let fresh = &order.keys[0];

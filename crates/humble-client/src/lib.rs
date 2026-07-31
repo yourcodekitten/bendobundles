@@ -269,6 +269,9 @@ pub enum HumbleError {
 pub struct Order {
     pub gamekey: String,
     pub bundle_name: String,
+    /// The order-product machine_name ("july_2026_choice" for a Choice month). Empty for orders
+    /// whose wire omits it. Powers discovery's D2 ladder rung 3 (slug→gamekey) and the OrderIndex.
+    pub product_machine_name: String,
     pub keys: Vec<KeyEntry>,
     pub subproducts: Vec<Subproduct>,
 }
@@ -631,6 +634,7 @@ impl HumbleClient {
         Ok(Order {
             gamekey: wire.gamekey,
             bundle_name: wire.product.human_name,
+            product_machine_name: wire.product.machine_name,
             keys: wire
                 .tpkd_dict
                 .all_tpks
