@@ -68,7 +68,10 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     let aws_cfg = aws_config::load_from_env().await;
     let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_cfg);
     let ssm_client = aws_sdk_ssm::Client::new(&aws_cfg);
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5)) // ping is fire-and-forget; a hung webhook must not stall the run
+        .build()
+        .expect("reqwest client");
 
     let steam: Option<Arc<SteamClient>> = if let Some(ref param) = steam_key_param {
         match get_secret(&ssm_client, param).await {

@@ -537,6 +537,12 @@ impl HumbleClient {
         let http = wreq::Client::builder()
             .emulation(Emulation::Chrome137)
             .redirect(wreq::redirect::Policy::none()) // a 302-to-login must surface, not follow
+            // No timeout ⇒ one hung socket eats the whole lambda budget (backlog #5; lost-months
+            // A5 precondition). 30s total / 10s connect: generous for humble's slowest real
+            // responses (the membership blob), tight enough that even a worst-case serial walk
+            // stays bounded by the Task-5 walk deadline, not by 40 × hang.
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()?;
         Ok(Self {
             http,

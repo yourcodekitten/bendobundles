@@ -1,4 +1,4 @@
-use humble_client::{HumbleClient, SessionCookie};
+use humble_client::{HumbleClient, HumbleError, SessionCookie};
 use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -97,6 +97,25 @@ async fn forbidden_is_unauthorized() {
 
     let err = client(&server).await.gamekeys().await.unwrap_err();
     assert!(matches!(err, humble_client::HumbleError::Unauthorized));
+}
+
+#[tokio::test]
+async fn requests_time_out_instead_of_hanging_forever() {
+    let server = wiremock::MockServer::start().await;
+    // A response slower than the client timeout — the request must fail with
+    // HumbleError::Network, not hang. 35s delay > 30s timeout; the test completes
+    // in ~30s worst case, acceptable for one guard test.
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(35))
+                .set_body_string("{}"),
+        )
+        .mount(&server)
+        .await;
+    let c = client(&server).await; // the file's existing constructor helper
+    let err = c.gamekeys().await.unwrap_err();
+    assert!(matches!(err, HumbleError::Network(_)), "got {err:?}");
 }
 
 #[tokio::test]
