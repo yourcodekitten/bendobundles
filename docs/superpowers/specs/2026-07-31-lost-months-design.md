@@ -69,9 +69,13 @@ ben's unclaimed value lives.
   the sequenced pre-PR, AND a **total-walk deadline** on the list walk (≈120s; on
   breach the walk terminates as `cap`-style truncation — warn, partial prefix,
   never an error). Do the multiplication, then pick constants in plan.
-- **A6** — the duplicate-pair factory is closed: a claim on a discovered game flips
-  the offered row (one GAME row per game, before and after), proven by test; the 15
-  existing pairs are healed per the Q5 decision.
+- **A6a** — the duplicate-pair factory is closed: a claim on a discovered game flips
+  the offered row (one GAME row per game, before and after) — proven by TEST, the
+  one deliberate fixture carve-out from this header's "verified in prod" rule
+  (proving it in prod would require spending a real pick).
+- **A6b** — the 15 existing pairs are healed via the Q5 runbook path, proven by a
+  post-heal re-scan showing zero state-gate-eligible pairs — run once, eyes on it
+  (`mylittleuniverse` excluded until its claim resolves, then healed by hand).
 
 ## Design
 
