@@ -3074,8 +3074,36 @@ async fn run_sync(deps: &Deps) {
 
         let mut order_failed = false;
         for key in &order.keys {
+            // Spec D7: a choice-suffixed tpk may be the post-claim record of a game discovery
+            // already surfaced under the OFFERED name — route onto that row so merge_sync flips it
+            // (requires_choice true→false), instead of minting a sibling (15 live duplicate pairs
+            // in prod, 2026-07-31 scan). Ladder, not set: exact base first (an offered name may
+            // itself end _row), region-stripped second, FIRST hit wins. Id stability across syncs
+            // rests on THIS routing re-deriving the id every pass, not on merge_sync preserving
+            // machine_name (post-flip the row is Available → fresh wins → machine_name becomes the
+            // tpk name; the id stays GK:offered only because routing keeps targeting it).
+            let mut id = domain::game_id(&order.gamekey, &key.machine_name);
+            if let Some((exact, stripped)) = domain::choice_tpk_bases(&key.machine_name) {
+                for candidate in std::iter::once(exact).chain(stripped) {
+                    let candidate_id = domain::game_id(&order.gamekey, &candidate);
+                    match deps.store.get_game(&candidate_id).await {
+                        Ok(Some(_)) => {
+                            id = candidate_id; // offered row exists — route the fresh key onto it
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            // Fail SAFE: on a read error mint under the tpk id (pre-D7 behavior)
+                            // rather than dropping the key. A pair is loud and healable; a lost key
+                            // is not.
+                            tracing::warn!(error = ?e, candidate = %candidate_id, "D7 candidate lookup failed — minting under tpk id");
+                            break;
+                        }
+                    }
+                }
+            }
             let game = Game {
-                id: domain::game_id(&order.gamekey, &key.machine_name),
+                id,
                 title: key.human_name.clone(),
                 bundle: order.bundle_name.clone(),
                 gamekey: order.gamekey.clone(),
