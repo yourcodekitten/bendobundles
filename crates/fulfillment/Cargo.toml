@@ -32,7 +32,14 @@ wiremock = "0.6"
 # Build-gate for the run-once backfill bin (see src/bin/backfill_details.rs). Empty on
 # purpose: the bin's deps are all normal deps; the gate just keeps it out of default builds.
 backfill = []
+# Build-gate for the run-once heal_choice_pairs bin (spec Q5). Forwards to dynamo/heal so the
+# feature-gated Store::delete_game compiles only here — never in the default/lambda build.
+heal = ["dynamo/heal"]
 
 [[bin]]
 name = "backfill_details"
 required-features = ["backfill"]
+
+[[bin]]
+name = "heal_choice_pairs"
+required-features = ["heal"]

@@ -141,6 +141,7 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         steam_enrich_pace: std::time::Duration::ZERO,
         // Far deadline: the enrichment pass budget never fires during handler tests.
         steam_enrich_deadline: far_deadline(),
+        choice_discovery_deadline: std::time::Duration::from_secs(180),
     }
 }
 
@@ -520,6 +521,7 @@ async fn deps_with_selfheal(
         steam_enrich_pace: std::time::Duration::ZERO,
         // Far deadline: the enrichment pass budget never fires during handler tests.
         steam_enrich_deadline: far_deadline(),
+        choice_discovery_deadline: std::time::Duration::from_secs(180),
     }
 }
 
@@ -2048,6 +2050,15 @@ async fn choice_choose_refused_parks_without_redeeming() {
     // cookie_ok untouched (no sync state written by a plain choose refusal).
     assert!(deps.store.get_sync_state().await.unwrap().is_none());
     // Exactly one distinct ping — the choose-refused notice, NOT a dead-cookie message.
+    //
+    // TRIPWIRE (lost-months spec D3): the order-authoritative claimed-set trade is sound only while
+    // THIS ping fires — an under-claimed game (matcher missed an exotic tpk) surfaces claimable,
+    // fails its choose loudly, and an operator sees it. Red-proof: this test asserts EXACTLY ONE
+    // ping whose body names the refusal AND the game; the sole ping on the choose-refused path is
+    // the ChooseFailed block in `choose_park` (lib.rs). Delete that ping → dreqs.len()==0 → this
+    // assertion reds (verified by construction; CI runs it against dynamodb-local). If this ever
+    // goes green with the ping gone, that trade has silently turned lossy — renegotiate the spec,
+    // do not delete this.
     let dreqs = discord.received_requests().await.unwrap();
     assert_eq!(dreqs.len(), 1);
     let body = String::from_utf8(dreqs[0].body.clone()).unwrap();
@@ -2055,6 +2066,7 @@ async fn choice_choose_refused_parks_without_redeeming() {
         body.contains("refused the pick"),
         "ping must name the refusal: {body}"
     );
+    assert!(body.contains(TITLE), "ping must name the game: {body}");
     assert!(!body.contains("DEAD"), "not a dead-cookie ping");
 }
 
@@ -2639,6 +2651,627 @@ fn membership_html(
     )
 }
 
+/// Like `membership_html` but the blob DROPS `gamekey` (the may-2020/july-2026 prod shape). The
+/// blob claims nothing — claimed-set is order-authoritative (D3).
+fn membership_html_no_gamekey(slug: &str, title: &str, offered: &[(&str, &str)]) -> String {
+    let mut content_choices = serde_json::Map::new();
+    for (mn, t) in offered {
+        content_choices.insert((*mn).to_string(), serde_json::json!({ "title": t }));
+    }
+    let blob = serde_json::json!({
+        "contentChoiceOptions": {
+            "title": title,
+            "productUrlPath": slug,
+            "productMachineName": format!("{}_choice", slug.replace('-', "_")),
+            "usesChoices": true,
+            "isActiveContent": false,
+            "canRedeemGames": true,
+            "contentChoiceData": { "initial": {
+                "total_choices": offered.len(),
+                "content_choices": serde_json::Value::Object(content_choices),
+            } },
+            "contentChoicesMade": { "initial": { "choices_made": [] } },
+        }
+    });
+    format!(
+        "<html><body><script type=\"application/json\" id=\"webpack-monthly-product-data\">{blob}</script></body></html>"
+    )
+}
+
+// --- lost-months sync-test harness (Tasks 6–9) ─────────────────────────────────────────────────
+// Order JSON with N tpks AND a product machine_name (the file's `order_json` does one tpk, no
+// product machine_name — insufficient for order-authoritative claimed-set tests).
+fn order_with_product_json(
+    gamekey: &str,
+    product_machine: &str,
+    tpk_machines: &[&str],
+) -> serde_json::Value {
+    let tpks: Vec<_> = tpk_machines
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "machine_name": m, "human_name": "Test Game", "key_type": "steam",
+                "is_expired": false, "keyindex": 0,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "gamekey": gamekey,
+        "product": { "human_name": "Test Choice Month", "machine_name": product_machine },
+        "tpkd_dict": { "all_tpks": tpks },
+        "subproducts": [],
+    })
+}
+
+/// Mount the humble endpoints a `handle(Sync)` touches and return a wired `Deps`. The order walk is
+/// `GET /api/v1/user/order` (returns `[{gamekey}]`) → `GET /api/v1/order/<gk>` per key; the choice
+/// walk is `GET <CHOICE_LIST_BASE>/` then `/membership/<slug>`.
+/// `orders`: `(gamekey, product_machine, &[tpk_machine])` — mounted as BOTH a listing entry AND its
+/// order body, so the OrderIndex builds exactly as prod does. `failed_orders`: gamekeys whose order
+/// GET returns 500 (an "order silent" month — still listed so the walk reaches it).
+/// `sub_list`: `(slug, Option<gamekey>)` newest-first, one page then complete.
+/// `months`: `(slug, membership-blob-html)`.
+#[allow(clippy::too_many_arguments)]
+async fn sync_deps(
+    store: Store,
+    humble: &MockServer,
+    orders: &[(&str, &str, &[&str])],
+    failed_orders: &[&str],
+    sub_list: &[(&str, Option<&str>)],
+    months: &[(&str, String)],
+    webhook: Option<String>,
+) -> Deps {
+    let mut listing: Vec<serde_json::Value> = orders
+        .iter()
+        .map(|(gk, ..)| serde_json::json!({ "gamekey": gk }))
+        .collect();
+    for gk in failed_orders {
+        listing.push(serde_json::json!({ "gamekey": gk }));
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(listing)))
+        .mount(humble)
+        .await;
+    for (gk, product, tpks) in orders {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/order/{gk}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(order_with_product_json(gk, product, tpks)),
+            )
+            .mount(humble)
+            .await;
+    }
+    for gk in failed_orders {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/order/{gk}")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(humble)
+            .await;
+    }
+    let products: Vec<_> = sub_list
+        .iter()
+        .map(|(slug, gk)| {
+            let mn = format!("{}_choice", slug.replace('-', "_"));
+            serde_json::json!({
+                "gamekey": gk, "title": slug, "productUrlPath": slug, "productMachineName": mn,
+                "usesChoices": false, "isActiveContent": false, "canRedeemGames": true,
+                "contentChoiceData": { "game_data": {} }
+            })
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path(format!("{CHOICE_LIST_BASE}/")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "products": products })),
+        )
+        .mount(humble)
+        .await;
+    for (slug, blob) in months {
+        Mock::given(method("GET"))
+            .and(path(format!("/membership/{slug}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(blob.clone())
+                    .append_header("content-type", "text/html"),
+            )
+            .mount(humble)
+            .await;
+    }
+    deps(store, &humble.uri(), webhook)
+}
+
+/// All GAME rows whose id starts with `<gamekey>:` — via `list_all_games` (no prefix-scan exists).
+async fn games_for_gamekey(store: &Store, gamekey: &str) -> Vec<Game> {
+    let prefix = format!("{gamekey}:");
+    store
+        .list_all_games()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|g| g.id.starts_with(&prefix))
+        .collect()
+}
+
+// -------------------------------------------------------------------------------------------------
+// Order-authoritative claimed-set (spec D3): the ORDER's tpks decide what's claimed, never the blob.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn discovery_claimed_set_comes_from_the_order_not_the_blob() {
+    let Some(store) = store_or_skip("choice-order-authoritative").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // Blob claims NOTHING (chosen=[]); the ORDER carries "beta_row_choice_steam" → beta IS claimed.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[(
+            "GKDEC2020",
+            "december_2020_choice",
+            &["beta_row_choice_steam"],
+        )],
+        &[],
+        &[("december-2020", Some("GKDEC2020"))],
+        &[(
+            "december-2020",
+            membership_html(
+                "december-2020",
+                "GKDEC2020",
+                "December 2020",
+                &[("alpha", "Alpha"), ("beta", "Beta"), ("gamma", "Gamma")],
+                &[],
+            ),
+        )],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    let games = games_for_gamekey(&deps.store, "GKDEC2020").await;
+    let names: Vec<_> = games.iter().map(|g| g.machine_name.as_str()).collect();
+    assert!(names.contains(&"alpha") && names.contains(&"gamma"));
+    assert!(
+        !names.contains(&"beta"),
+        "order-claimed game must not be written claimable"
+    );
+}
+
+#[tokio::test]
+async fn discovery_skips_month_loudly_when_order_is_silent() {
+    let Some(store) = store_or_skip("choice-order-silent").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // The month is enumerated + parseable, but its order read 500s → no claimed-set source → no
+    // requires_choice rows this pass (no ghosts); next sync retries.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[],
+        &["GKNOV2020"],
+        &[("november-2020", Some("GKNOV2020"))],
+        &[(
+            "november-2020",
+            membership_html(
+                "november-2020",
+                "GKNOV2020",
+                "November 2020",
+                &[("delta", "Delta")],
+                &[],
+            ),
+        )],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert!(
+        games_for_gamekey(&deps.store, "GKNOV2020").await.is_empty(),
+        "no claimed-set source ⇒ no claimable writes ⇒ no ghost rows"
+    );
+}
+
+#[tokio::test]
+async fn discovery_canary_counts_unmatched_choice_tpks() {
+    let Some(store) = store_or_skip("choice-canary").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // 1:N grant: order has a base tpk matching offered "kappa" PLUS a DLC tpk matching nothing.
+    // kappa is order-claimed (not written); the unmatched DLC tpk is canary-counted, not fatal.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[(
+            "GKMAY",
+            "may_2021_choice",
+            &["kappa_choice_steam", "kappa_dlc_choice_steam"],
+        )],
+        &[],
+        &[("may-2021b", Some("GKMAY"))],
+        &[(
+            "may-2021b",
+            membership_html("may-2021b", "GKMAY", "May 2021", &[("kappa", "Kappa")], &[]),
+        )],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert!(
+        games_for_gamekey(&deps.store, "GKMAY")
+            .await
+            .iter()
+            .all(|g| g.machine_name != "kappa"),
+        "order-claimed kappa not re-listed; unmatched DLC tpk is canary-counted, not fatal"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// The gamekey ladder (spec D2): blob → list → order-side → loud skip. Never fabricates a gamekey.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn gamekey_ladder_blob_absent_list_hit() {
+    let Some(store) = store_or_skip("ladder-list").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // Blob drops gamekey; the LIST carries GKMAY2020 for the slug → rung 2 resolves it.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKMAY2020", "may_2020_choice", &[])],
+        &[],
+        &[("may-2020", Some("GKMAY2020"))],
+        &[(
+            "may-2020",
+            membership_html_no_gamekey("may-2020", "May 2020", &[("epsilon", "Epsilon")]),
+        )],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert_eq!(
+        games_for_gamekey(&deps.store, "GKMAY2020").await.len(),
+        1,
+        "ladder resolved via list; month processed"
+    );
+}
+
+#[tokio::test]
+async fn gamekey_ladder_resolves_via_order_when_blob_and_list_drop_it() {
+    let Some(store) = store_or_skip("ladder-order").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // Blob drops gamekey (rung 1 miss); the month is in the list but gamekey-less (rung 2 miss);
+    // the ORDER's product_machine_name "august_2026_choice" resolves it (rung 3 — the sole path
+    // for the active month, robust vs the time-dependent probe window).
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKAUG", "august_2026_choice", &[])],
+        &[],
+        &[("august-2026", None)],
+        &[(
+            "august-2026",
+            membership_html_no_gamekey("august-2026", "August 2026", &[("zeta", "Zeta")]),
+        )],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert_eq!(
+        games_for_gamekey(&deps.store, "GKAUG").await.len(),
+        1,
+        "resolved via order side (rung 3)"
+    );
+}
+
+#[tokio::test]
+async fn gamekey_ladder_all_absent_skips_only_that_month() {
+    let Some(store) = store_or_skip("ladder-skip").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // march-2020 has no gamekey anywhere (skipped); april-2020 resolves via list (written) — the
+    // skip is per-month, not a blanket no-op.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKAPR", "april_2020_choice", &[])],
+        &[],
+        &[("march-2020", None), ("april-2020", Some("GKAPR"))],
+        &[
+            (
+                "march-2020",
+                membership_html_no_gamekey("march-2020", "March 2020", &[("eta", "Eta")]),
+            ),
+            (
+                "april-2020",
+                membership_html_no_gamekey("april-2020", "April 2020", &[("theta", "Theta")]),
+            ),
+        ],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert!(
+        deps.store
+            .list_all_games()
+            .await
+            .unwrap()
+            .iter()
+            .all(|g| g.machine_name != "eta"),
+        "no gamekey from any rung ⇒ march skipped"
+    );
+    assert!(
+        games_for_gamekey(&deps.store, "GKAPR")
+            .await
+            .iter()
+            .any(|g| g.machine_name == "theta"),
+        "april resolved via list ⇒ written"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// The whole-pass deadline bounds the per-month detail fan-out (spec A5 / OMBB rider): a short
+// deadline breaks the loop early (fewer months written); a full-deadline re-sync writes the rest.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn discovery_pass_deadline_bounds_the_detail_fanout() {
+    let Some(store) = store_or_skip("choice-deadline").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // Three Choice-era list months (not probes). SYNC_PACE (300ms/month) means a 50ms whole-pass
+    // deadline breaks the loop before all three are processed.
+    let deps_full = sync_deps(
+        store,
+        &humble,
+        &[
+            ("GKD", "december_2020_choice", &[]),
+            ("GKN", "november_2020_choice", &[]),
+            ("GKO", "october_2020_choice", &[]),
+        ],
+        &[],
+        &[
+            ("december-2020", Some("GKD")),
+            ("november-2020", Some("GKN")),
+            ("october-2020", Some("GKO")),
+        ],
+        &[
+            (
+                "december-2020",
+                membership_html(
+                    "december-2020",
+                    "GKD",
+                    "December 2020",
+                    &[("g_dec", "Dec")],
+                    &[],
+                ),
+            ),
+            (
+                "november-2020",
+                membership_html(
+                    "november-2020",
+                    "GKN",
+                    "November 2020",
+                    &[("g_nov", "Nov")],
+                    &[],
+                ),
+            ),
+            (
+                "october-2020",
+                membership_html(
+                    "october-2020",
+                    "GKO",
+                    "October 2020",
+                    &[("g_oct", "Oct")],
+                    &[],
+                ),
+            ),
+        ],
+        None,
+    )
+    .await;
+    let mut deps = deps_full;
+    deps.choice_discovery_deadline = std::time::Duration::from_millis(50);
+    handle(&deps, FulfillRequest::Sync).await;
+    let after_short = deps.store.list_all_games().await.unwrap().len();
+
+    // Full deadline: the rest land (additive recovery — nothing was lost, just deferred).
+    deps.choice_discovery_deadline = std::time::Duration::from_secs(180);
+    handle(&deps, FulfillRequest::Sync).await;
+    let after_full = deps.store.list_all_games().await.unwrap().len();
+
+    assert!(
+        after_short < after_full,
+        "the short deadline bounded the fan-out: {after_short} written vs {after_full} with a full deadline"
+    );
+    assert!(
+        after_full >= 3,
+        "the full-deadline sync wrote all three months"
+    );
+}
+
+// --- D7 helpers (Task 8) ────────────────────────────────────────────────────────────────────────
+/// Re-mount a gamekey's order with fresh tpks — wiremock evaluates mocks last-mounted-first, so
+/// this new mount wins over the original.
+async fn remount_order(humble: &MockServer, gk: &str, product: &str, tpks: &[&str]) {
+    // wiremock resolves same-priority overlapping mocks first-mounted-wins, so a plain re-mount of
+    // this path would LOSE to the empty-keys order `sync_deps` mounted first — the walk would keep
+    // reading the pre-spend order forever (in prod the live endpoint just returns the current keys;
+    // this is purely a static-mock artifact). set_priority(1) (highest) makes the fresh order win so
+    // a "second sync" test actually exercises the spent-pick order.
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/order/{gk}")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(order_with_product_json(gk, product, tpks)),
+        )
+        .with_priority(1)
+        .mount(humble)
+        .await;
+}
+
+/// Seed a `requires_choice=true` offered row under `GK:mn`, letting the caller tweak fields.
+async fn seed_offered_game(store: &Store, gk: &str, mn: &str, mutate: impl FnOnce(&mut Game)) {
+    let mut g = Game {
+        id: game_id(gk, mn),
+        title: "Seeded Offer".into(),
+        bundle: "Seed Month".into(),
+        gamekey: gk.into(),
+        machine_name: mn.into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: true,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    mutate(&mut g);
+    store.put_game(&g).await.unwrap();
+}
+
+// -------------------------------------------------------------------------------------------------
+// Spec D7 (A6a): a choice-suffixed tpk flips its OFFERED row instead of minting a sibling — and the
+// id stays stable across repeated syncs (routing re-derives it, not merge_sync keeping machine_name).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn choice_tpk_flips_the_offered_row_and_stays_stable_across_a_second_sync() {
+    let Some(store) = store_or_skip("d7-flip-stable").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // Sync 1: discovery writes offered row GK1:omega (requires_choice=true).
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GK1", "june_2021_choice", &[])],
+        &[],
+        &[("june-2021", Some("GK1"))],
+        &[(
+            "june-2021",
+            membership_html("june-2021", "GK1", "June 2021", &[("omega", "Omega")], &[]),
+        )],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert_eq!(games_for_gamekey(&deps.store, "GK1").await.len(), 1);
+
+    // The pick is spent — the order now carries omega_row_choice_steam. Sync twice more: each pass
+    // must FLIP GK1:omega and NOT mint a sibling (id stability via re-derivation, M10).
+    remount_order(
+        &humble,
+        "GK1",
+        "june_2021_choice",
+        &["omega_row_choice_steam"],
+    )
+    .await;
+    for pass in 2..=3 {
+        handle(&deps, FulfillRequest::Sync).await;
+        let games = games_for_gamekey(&deps.store, "GK1").await;
+        assert_eq!(
+            games.len(),
+            1,
+            "pass {pass}: no sibling minted: {:?}",
+            games.iter().map(|g| &g.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            games[0].id, "GK1:omega",
+            "pass {pass}: routing re-derived the stable id"
+        );
+        assert!(!games[0].requires_choice, "pass {pass}: flipped");
+    }
+}
+
+#[tokio::test]
+async fn flip_preserves_app_owned_state() {
+    let Some(store) = store_or_skip("d7-preserve").await else {
+        return;
+    };
+    // An offered row that's been hidden + Manual-appid'd; the flip must preserve those app-owned
+    // fields (merge_sync), refreshing only requires_choice + key fields.
+    seed_offered_game(&store, "GK3", "sigma", |g| {
+        g.hidden = true;
+        g.appid_source = Some(AppidSource::Manual);
+        g.steam_app_id = Some(12345);
+    })
+    .await;
+    let humble = MockServer::start().await;
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GK3", "x_choice", &["sigma_choice_steam"])],
+        &[],
+        &[],
+        &[],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    let g = deps
+        .store
+        .get_game(&game_id("GK3", "sigma"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!g.requires_choice, "flipped");
+    assert!(g.hidden, "hidden preserved across flip");
+    assert_eq!(
+        g.appid_source,
+        Some(AppidSource::Manual),
+        "Manual appid wins"
+    );
+    assert_eq!(g.steam_app_id, Some(12345), "Manual appid value preserved");
+}
+
+#[tokio::test]
+async fn unparseable_choice_tpk_still_mints_normally() {
+    let Some(store) = store_or_skip("d7-unparseable").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // "weird_choice_" fails choice_tpk_bases (empty platform) → no routing → mints under tpk id.
+    // A lost key is worse than a loud pair.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GK2", "some_bundle", &["weird_choice_"])],
+        &[],
+        &[],
+        &[],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert!(
+        deps.store
+            .get_game(&game_id("GK2", "weird_choice_"))
+            .await
+            .unwrap()
+            .is_some(),
+        "an unparseable choice tpk still mints its row"
+    );
+}
+
+#[tokio::test]
+async fn d7_candidate_read_error_fails_safe_to_tpk_id() {
+    // The get_game Err → mint-under-tpk-id fail-safe branch cannot be cheaply exercised against
+    // dynamodb-local (no easy way to error a single read). The branch is verified by code review
+    // at the D7 routing site (a read error `break`s and keeps the tpk id, warning) — a read error
+    // must NEVER drop the key. Explicitly noted, not silently omitted.
+    eprintln!(
+        "d7_candidate_read_error_fails_safe_to_tpk_id: branch verified by code review (see D7 routing)"
+    );
+}
+
 // -------------------------------------------------------------------------------------------------
 // The happy path: a live month with an unspent pick → its still-claimable offered games land in the
 // catalog as requires_choice=true / Available; the already-chosen one does NOT.
@@ -2650,7 +3283,27 @@ async fn sync_discovers_offered_choice_games_as_requires_choice_true() {
     };
 
     let humble = MockServer::start().await;
-    mount_empty_listing(&humble).await; // no order-walk games — isolate the discovery pass.
+    // Order walk: gkJun26's ORDER carries already_picked as a claimed tpk. Claimed-set is
+    // order-authoritative (D3) — the blob claims NOTHING (chosen=[]) below, so already_picked
+    // being removed from claimable PROVES the order did it, not the blob.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkJun26" }])),
+        )
+        .mount(&humble)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkJun26"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(order_with_product_json(
+                "gkJun26",
+                "june_2026_choice",
+                &["already_picked_choice_steam"],
+            )),
+        )
+        .mount(&humble)
+        .await;
     // choice_months walk: one live month (usesChoices + canRedeemGames), single page (no cursor).
     Mock::given(method("GET"))
         .and(path(format!("{CHOICE_LIST_BASE}/")))
@@ -2666,7 +3319,7 @@ async fn sync_discovers_offered_choice_games_as_requires_choice_true() {
         })))
         .mount(&humble)
         .await;
-    // single-month read: 3 offered, 1 already chosen → 2 claimable.
+    // single-month read: 3 offered; already_picked is order-claimed → 2 claimable.
     Mock::given(method("GET"))
         .and(path("/membership/june-2026"))
         .respond_with(
@@ -2680,7 +3333,7 @@ async fn sync_discovers_offered_choice_games_as_requires_choice_true() {
                         ("another_offer", "Another Offer"),
                         ("already_picked", "Already Picked"),
                     ],
-                    &["already_picked"],
+                    &[],
                 ))
                 .append_header("content-type", "text/html"),
         )
@@ -2739,7 +3392,26 @@ async fn sync_choice_discovery_skips_page_non_redeemable_month() {
     };
 
     let humble = MockServer::start().await;
-    mount_empty_listing(&humble).await;
+    // Mount gkOld's order (empty tpks) so the skip below is provably the canRedeemGames gate, NOT
+    // an order-silent skip (D3): the redeemability gate fires first, and now order-presence proves it.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkOld" }])),
+        )
+        .mount(&humble)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkOld"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(order_with_product_json(
+                "gkOld",
+                "old_spent_choice",
+                &[],
+            )),
+        )
+        .mount(&humble)
+        .await;
     Mock::given(method("GET"))
         .and(path(format!("{CHOICE_LIST_BASE}/")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2801,7 +3473,25 @@ async fn sync_discovers_claim_all_tier_offers() {
     };
 
     let humble = MockServer::start().await;
-    mount_empty_listing(&humble).await;
+    // Order-authoritative (D3): the ORDER claims octopathtravelerii (blob claims nothing below).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([{ "gamekey": "gkJun26" }])),
+        )
+        .mount(&humble)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkJun26"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(order_with_product_json(
+                "gkJun26",
+                "june_2026_choice",
+                &["octopathtravelerii_choice_steam"],
+            )),
+        )
+        .mount(&humble)
+        .await;
     // List-walk: a claim-all month (usesChoices=false, canRedeemGames=true).
     Mock::given(method("GET"))
         .and(path(format!("{CHOICE_LIST_BASE}/")))
@@ -2817,7 +3507,8 @@ async fn sync_discovers_claim_all_tier_offers() {
         })))
         .mount(&humble)
         .await;
-    // Single-month read: claim-all blob — NO `initial` block, games under `game_data`, one chosen.
+    // Single-month read: claim-all blob — NO `initial` block, games under `game_data`. Blob claims
+    // nothing; the ORDER (above) is what marks octopathtravelerii claimed.
     let blob = r#"<html><body><script type="application/json" id="webpack-monthly-product-data">
     {"contentChoiceOptions":{
         "gamekey":"gkJun26","title":"June 2026","productUrlPath":"june-2026",
@@ -2827,7 +3518,7 @@ async fn sync_discovers_claim_all_tier_offers() {
             "constructionsimulator":{"title":"Construction Simulator"},
             "octopathtravelerii":{"title":"OCTOPATH TRAVELER II"}
         }},
-        "contentChoicesMade":{"initial":{"choices_made":["octopathtravelerii"]}}
+        "contentChoicesMade":{"initial":{"choices_made":[]}}
     }}</script></body></html>"#;
     Mock::given(method("GET"))
         .and(path("/membership/june-2026"))

@@ -9,9 +9,15 @@
 //! variant is a compile error until someone consciously picks its decision — the invariant can't
 //! silently rot.
 
+/// Pure gate logic for the `heal_choice_pairs` operator sweep (spec Q5). Non-gated so the normal
+/// test suite runs it; only the `delete_game` call in the bin is `heal`-feature-gated.
+pub mod heal_pairs;
+
 use domain::{AppidSource, Claim, Game, GameStatus};
 use dynamo::{OwnedWrite, Store, StoreError, SyncBegin, SyncState, SyncWrite};
-use humble_client::{GiftUrl, HumbleClient, HumbleError, KeyEntry, Order, RevealedKey};
+use humble_client::{
+    GiftUrl, HumbleClient, HumbleError, KeyEntry, OfferedGame, Order, RevealedKey,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,7 +83,12 @@ const STEAM_REVIEWS_TTL_SECS: i64 = 14 * 24 * 60 * 60;
 /// enough to catch an *old* month whose pick is still unspent (Humble keeps a choice redeemable
 /// until it's spent), so it covers the whole history; the expensive per-month reads are still gated
 /// to the handful of live months (`uses_choices && can_redeem_games`).
-const CHOICE_DISCOVERY_MAX_PAGES: usize = 26;
+// Runaway guard only (era-stop is the normal terminal): ~120 months covers the full Choice era
+// plus years of margin. Hitting it means era-stop never fired — itself a signal (it warns).
+const CHOICE_DISCOVERY_MAX_PAGES: usize = 40;
+// Whole-list-walk deadline: bounds the paginated GETs even if the server hands back cursors
+// forever slowly. The per-month detail fan-out has its own deadline (Task 7).
+const CHOICE_WALK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How many of the newest months discovery probes DIRECTLY by constructed slug (current month + the
 /// preceding N-1), independent of the subscription list. The `subscription_products_with_gamekeys`
@@ -384,6 +395,10 @@ pub struct Deps {
     /// context's `deadline` epoch-ms via [`compute_enrich_deadline`]. Tests inject `far_deadline()`
     /// so the deadline never fires during the run; prod sets it from the real lambda context.
     pub steam_enrich_deadline: tokio::time::Instant,
+    /// Whole-pass deadline for choice discovery's per-month detail fan-out (spec A5 / OMBB's
+    /// arithmetic rider). Bounds the ~77 membership reads in aggregate — the per-request timeout
+    /// alone does not. Tests inject a short value to exercise the early-break; prod is 180s.
+    pub choice_discovery_deadline: std::time::Duration,
 }
 
 /// Where a self-refreshed humble session is persisted, so the next cold start reads it back.
@@ -3011,6 +3026,9 @@ async fn run_sync(deps: &Deps) {
 
     let mut games_written = 0u32;
     let mut orders_failed = 0u32;
+    // Built as the order walk reads orders; handed to choice discovery for order-authoritative
+    // claimed-sets (spec D3) and the D2 gamekey ladder. Lives past the loop.
+    let mut order_index = OrderIndex::default();
 
     'orders: for gamekey in gamekeys {
         tokio::time::sleep(SYNC_PACE).await;
@@ -3040,6 +3058,19 @@ async fn run_sync(deps: &Deps) {
             }
         };
 
+        // Feed the choice-discovery index: this gamekey's claimed tpks (D3) + its product→gamekey
+        // mapping (D2 rung 3). A failed read above `continue`d without inserting — that absence is
+        // the "order silent" signal discovery keys off.
+        order_index.tpks_by_gamekey.insert(
+            order.gamekey.clone(),
+            order.keys.iter().map(|k| k.machine_name.clone()).collect(),
+        );
+        if !order.product_machine_name.is_empty() {
+            order_index
+                .gamekey_by_product
+                .insert(order.product_machine_name.clone(), order.gamekey.clone());
+        }
+
         // domain::match_artwork wants (human_name, icon) pairs.
         let subs: Vec<(String, Option<String>)> = order
             .subproducts
@@ -3049,8 +3080,36 @@ async fn run_sync(deps: &Deps) {
 
         let mut order_failed = false;
         for key in &order.keys {
+            // Spec D7: a choice-suffixed tpk may be the post-claim record of a game discovery
+            // already surfaced under the OFFERED name — route onto that row so merge_sync flips it
+            // (requires_choice true→false), instead of minting a sibling (15 live duplicate pairs
+            // in prod, 2026-07-31 scan). Ladder, not set: exact base first (an offered name may
+            // itself end _row), region-stripped second, FIRST hit wins. Id stability across syncs
+            // rests on THIS routing re-deriving the id every pass, not on merge_sync preserving
+            // machine_name (post-flip the row is Available → fresh wins → machine_name becomes the
+            // tpk name; the id stays GK:offered only because routing keeps targeting it).
+            let mut id = domain::game_id(&order.gamekey, &key.machine_name);
+            if let Some((exact, stripped)) = domain::choice_tpk_bases(&key.machine_name) {
+                for candidate in std::iter::once(exact).chain(stripped) {
+                    let candidate_id = domain::game_id(&order.gamekey, &candidate);
+                    match deps.store.get_game(&candidate_id).await {
+                        Ok(Some(_)) => {
+                            id = candidate_id; // offered row exists — route the fresh key onto it
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            // Fail SAFE: on a read error mint under the tpk id (pre-D7 behavior)
+                            // rather than dropping the key. A pair is loud and healable; a lost key
+                            // is not.
+                            tracing::warn!(error = ?e, candidate = %candidate_id, "D7 candidate lookup failed — minting under tpk id");
+                            break;
+                        }
+                    }
+                }
+            }
             let game = Game {
-                id: domain::game_id(&order.gamekey, &key.machine_name),
+                id,
                 title: key.human_name.clone(),
                 bundle: order.bundle_name.clone(),
                 gamekey: order.gamekey.clone(),
@@ -3097,7 +3156,8 @@ async fn run_sync(deps: &Deps) {
     // catalog entry, so the gift-choice orchestration has something to run on. Runs AFTER the order
     // walk so a heal it triggers can't starve the walk, and it shares the run's one-heal budget via
     // `healed_this_run` / `cookie_ok`.
-    games_written += discover_choice_games(deps, &mut healed_this_run, &mut cookie_ok).await;
+    games_written +=
+        discover_choice_games(deps, &mut healed_this_run, &mut cookie_ok, &order_index).await;
 
     // Steam enrichment pass — budgeted, politely-paced storefront reads (appdetails + reviews +
     // histogram) into the STEAMAPP cache. Runs LAST (after choice discovery) so the 180s
@@ -3180,12 +3240,29 @@ fn recent_month_slugs(now: OffsetDateTime, count: usize) -> Vec<String> {
     slugs
 }
 
-async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut bool) -> u32 {
+/// Everything choice-discovery needs from the order walk, built once as the walk reads orders.
+/// `tpks_by_gamekey` is the ORDER-authoritative claimed record (spec D3 — the blob never alone
+/// marks a game claimed); `gamekey_by_product` powers the D2 ladder rung 3 (order-product
+/// machine_name → gamekey). A gamekey ABSENT from `tpks_by_gamekey` = its order read failed this
+/// pass ("order silent") → discovery skips that month rather than guess.
+#[derive(Default)]
+pub(crate) struct OrderIndex {
+    tpks_by_gamekey: std::collections::HashMap<String, Vec<String>>,
+    gamekey_by_product: std::collections::HashMap<String, String>,
+}
+
+async fn discover_choice_games(
+    deps: &Deps,
+    healed: &mut bool,
+    cookie_ok: &mut bool,
+    orders: &OrderIndex,
+) -> u32 {
     // Step 1: enumerate month slugs. A truncated walk (`complete == false`) simply means we discover
     // a prefix of months this pass — safe, because discovery only ADDS entries and never deletes on
     // absence, so a missed month just waits for the next run.
     let (heal, read) = selfheal_once(deps, !*healed, || {
-        deps.humble.choice_months(CHOICE_DISCOVERY_MAX_PAGES)
+        deps.humble
+            .choice_months(CHOICE_DISCOVERY_MAX_PAGES, SYNC_PACE, CHOICE_WALK_DEADLINE)
     })
     .await;
     if let Some(h) = heal {
@@ -3206,7 +3283,7 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
             return 0;
         }
     };
-    if !walk.complete {
+    if !walk.complete_for_choice() {
         tracing::warn!(
             max_pages = CHOICE_DISCOVERY_MAX_PAGES,
             "choice discovery: month walk truncated — discovered a prefix (additive; nothing deleted on absence)"
@@ -3229,7 +3306,28 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
             targets.push((m.product_url_path.clone(), false));
         }
     }
+    // Ladder rung 2 (list): every enumerated month's slug → its list gamekey (Some entries only).
+    let list_gamekey: std::collections::HashMap<&str, &str> = walk
+        .months
+        .iter()
+        .filter_map(|m| Some((m.product_url_path.as_str(), m.gamekey.as_deref()?)))
+        .collect();
+    let started = tokio::time::Instant::now();
+    let months_walked = targets.len() as u32;
+    let mut months_processed = 0u32;
+    let mut months_skipped = 0u32;
+    let mut canary_unmatched_tpks = 0u32;
     for (slug, is_probe) in &targets {
+        // Bound the per-month detail fan-out in aggregate (spec A5 / M6): the per-request timeout
+        // caps one read, not ~77 of them. A partial pass is safe — discovery is additive, so a
+        // month not reached this sync surfaces next sync.
+        if started.elapsed() >= deps.choice_discovery_deadline {
+            tracing::warn!(
+                months_processed,
+                "choice discovery: pass deadline — partial pass (additive, retried next sync)"
+            );
+            break;
+        }
         tokio::time::sleep(SYNC_PACE).await;
         // A speculative probe NEVER spends the run's one heal: a not-yet-live month can 302 →
         // Unauthorized, which would both waste the heal and masquerade as a session death. Only a
@@ -3257,33 +3355,95 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
         // Gate on the membership PAGE's redeemability, not the list's — a month whose page can no
         // longer be redeemed carries no spendable pick, so skip it (no wasted writes on dead months).
         if !detail.can_redeem_games {
+            months_skipped += 1;
             continue;
         }
-        // `choice_month` always populates the claimed set, so `claimable_games` is `Some`. A `None`
-        // here would mean the claimed set is UNKNOWN (a `choice_months`-sourced month) — never true
-        // on this path, but we skip rather than guess: the contract forbids writing `true` without a
-        // known claimed set.
-        let Some(claimable) = detail.claimable_games() else {
-            tracing::warn!(month = %detail.product_url_path, "choice discovery: single-month read had no claimed set — skipping (never writes true without one)");
+        // Spec D2: the gamekey ladder — blob → list → order-side → loud skip. Never "".
+        // Rung 3 derives the order-product machine_name from the slug ("july-2026" →
+        // "july_2026_choice"). CONFIRMED against prod (2026-07-05 findings: the order endpoint's
+        // product.machine_name IS "<month>_<year>_choice", e.g. "april_2026_choice"), the same
+        // form the blob's productMachineName carries, so the two endpoints agree. Rung 3 is the
+        // SOLE resolution for the active month. A rung-3 miss surfaces as the "gamekey_source =
+        // none" skip below — a shape drift is a visible skip, never a silently-dark month.
+        // Invariant: `slug` == the list's product_url_path key == the order-product construction
+        // input — the same month identity across all three rungs.
+        let slug_product = format!("{}_choice", slug.replace('-', "_"));
+        let (month_gamekey, gamekey_source) = match (
+            detail.gamekey.as_deref(),
+            list_gamekey.get(slug.as_str()).copied(),
+            orders
+                .gamekey_by_product
+                .get(&slug_product)
+                .map(String::as_str),
+        ) {
+            (Some(g), _, _) => (g.to_string(), "blob"),
+            (None, Some(g), _) => (g.to_string(), "list"),
+            (None, None, Some(g)) => (g.to_string(), "order"),
+            (None, None, None) => {
+                months_skipped += 1;
+                tracing::warn!(month = %slug, gamekey_source = "none",
+                    choices_made_absent = detail.claimed_machine_names.is_none(),
+                    "choice discovery: no gamekey from any rung — skipping (shape logged)");
+                continue;
+            }
+        };
+        if gamekey_source != "blob" {
+            tracing::warn!(month = %slug, gamekey_source, "choice discovery: blob dropped gamekey — resolved via ladder");
+        }
+        // Spec D3: claimed is ORDER-authoritative; the blob's `contentChoicesMade` never alone marks
+        // a game claimed. Order silent (its read failed this pass — the gamekey guarantees an order
+        // exists) ⇒ skip the month LOUDLY and let the next sync retry: writing claimable rows on
+        // missing evidence would mint ghosts that the additive/never-delete ingest keeps forever.
+        let Some(order_tpks) = orders.tpks_by_gamekey.get(&month_gamekey) else {
+            months_skipped += 1;
+            tracing::warn!(month = %detail.product_url_path, gamekey = %month_gamekey,
+                "choice discovery: order silent for month — skipping this pass (claimed-set unknowable, retried next sync)");
             continue;
         };
-        // Per-month observability: which months surfaced how many claimable offered games, and the
-        // offered/chosen split behind that number. Cheap, and it turns "why did this month write
-        // nothing?" from a guessing game into a log line.
+        months_processed += 1;
+        // claimable = offered − (offered games a matching claimed tpk exists for). The matcher is
+        // the prod-enumerated grammar (domain::choice_tpk_matches), NOT blob equality.
+        let claimable: Vec<&OfferedGame> = detail
+            .offered_games
+            .iter()
+            .filter(|o| {
+                !order_tpks
+                    .iter()
+                    .any(|t| domain::choice_tpk_matches(t, &o.machine_name))
+            })
+            .collect();
+        // Canary (spec D3): a `_choice_*` tpk matching NO offered name — expected for 1:N grants
+        // (base + DLC tpks from one pick), so logged and counted, never month-fatal.
+        let unmatched = order_tpks
+            .iter()
+            .filter(|t| domain::choice_tpk_bases(t).is_some())
+            .filter(|t| {
+                !detail
+                    .offered_games
+                    .iter()
+                    .any(|o| domain::choice_tpk_matches(t, &o.machine_name))
+            })
+            .count();
+        if unmatched > 0 {
+            canary_unmatched_tpks += unmatched as u32;
+            tracing::warn!(month = %detail.product_url_path, unmatched, "choice discovery: choice tpks matching no offered name (1:N grants or new grammar) — counted, not fatal");
+        }
+        // Per-month observability: which months surfaced how many claimable offered games. Turns
+        // "why did this month write nothing?" from a guessing game into a log line.
         tracing::info!(
             month = %detail.product_url_path,
-            gamekey = %detail.gamekey,
+            gamekey = %month_gamekey,
             offered = detail.offered_games.len(),
-            chosen = detail.claimed_machine_names.as_ref().map_or(0, Vec::len),
+            claimed_tpks = order_tpks.len(),
             claimable = claimable.len(),
             "choice discovery: month processed"
         );
         for offered in claimable {
             let game = Game {
-                id: domain::game_id(&detail.gamekey, &offered.machine_name),
+                id: domain::game_id(&month_gamekey, &offered.machine_name),
                 title: offered.title.clone(),
                 bundle: detail.title.clone(),
-                gamekey: detail.gamekey.clone(),
+                gamekey: month_gamekey.clone(),
                 machine_name: offered.machine_name.clone(),
                 // No key exists until the pick is spent, so the offered wire carries no key platform.
                 // Placeholder; `merge_sync` refreshes `key_type` from the real key-sync `fresh` once a
@@ -3311,6 +3471,16 @@ async fn discover_choice_games(deps: &Deps, healed: &mut bool, cookie_ok: &mut b
             }
         }
     }
+    // One summary per pass (spec D5): turns "did discovery do anything?" into a single line.
+    tracing::info!(
+        months_walked,
+        months_processed,
+        months_skipped,
+        stop_reason = ?walk.stop,
+        canary_unmatched_tpks,
+        written,
+        "choice discovery: pass summary"
+    );
     written
 }
 
@@ -3818,6 +3988,7 @@ mod tests {
             Order {
                 gamekey: "gk".into(),
                 bundle_name: "May 2026 Humble Choice".into(),
+                product_machine_name: "may_2026_choice".into(),
                 keys,
                 subproducts: vec![],
             }

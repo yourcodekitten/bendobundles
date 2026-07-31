@@ -18,3 +18,8 @@ aws-config = { version = "1", features = ["behavior-version-latest", "test-util"
 steam-client = { path = "../steam-client" }
 tokio.workspace = true
 uuid.workspace = true
+
+[features]
+# Gates delete_game — compiled ONLY for the heal_choice_pairs operator bin, never the
+# lambda build, so "the sync path never deletes" is a compiler guarantee (spec Q5).
+heal = []

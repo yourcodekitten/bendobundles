@@ -288,6 +288,44 @@ pub fn game_id(gamekey: &str, machine_name: &str) -> String {
     format!("{gamekey}:{machine_name}")
 }
 
+/// Choice-tpk machine-name grammar, enumerated from prod 2026-07-31 (175 rows; spec D3):
+/// `<offered>[_row|_ww]_choice_<platform>` where platform is one-or-more `[a-z0-9]`.
+/// Returns `Some((exact_base, region_stripped))` for a choice-shaped name — `exact_base`
+/// keeps a `_row`/`_ww` region token (an offered name may itself end that way; D7's
+/// candidate ladder tries exact first), `region_stripped` is `Some` only when a region
+/// token existed. `None` = not choice-shaped (bundle/monthly keys; never guessed at).
+pub fn choice_tpk_bases(tpk_machine_name: &str) -> Option<(String, Option<String>)> {
+    let (base, platform) = tpk_machine_name.rsplit_once("_choice_")?;
+    if base.is_empty()
+        || platform.is_empty()
+        || !platform
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return None;
+    }
+    let region_stripped = ["_row", "_ww"]
+        .iter()
+        .find_map(|r| base.strip_suffix(r))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some((base.to_string(), region_stripped))
+}
+
+/// Spec D3's grammar rung: does this tpk record the claim of this offered game?
+/// Bare equality is defensive cover for a claim-all mint that drops the suffix.
+pub fn choice_tpk_matches(tpk_machine_name: &str, offered_machine_name: &str) -> bool {
+    if tpk_machine_name == offered_machine_name {
+        return true;
+    }
+    match choice_tpk_bases(tpk_machine_name) {
+        Some((exact, stripped)) => {
+            exact == offered_machine_name || stripped.as_deref() == Some(offered_machine_name)
+        }
+        None => false,
+    }
+}
+
 pub fn sync_status(redeemed: bool, expired: bool) -> GameStatus {
     if expired {
         GameStatus::Expired
@@ -532,6 +570,77 @@ mod tests {
     #[test]
     fn game_id_shape() {
         assert_eq!(game_id("abc", "def_tpk"), "abc:def_tpk");
+    }
+
+    #[test]
+    fn choice_tpk_bases_grammar() {
+        // plain platform suffix
+        assert_eq!(
+            choice_tpk_bases("wingspan_choice_steam"),
+            Some(("wingspan".into(), None))
+        );
+        // region token before _choice
+        assert_eq!(
+            choice_tpk_bases("mylittleuniverse_row_choice_steam"),
+            Some((
+                "mylittleuniverse_row".into(),
+                Some("mylittleuniverse".into())
+            ))
+        );
+        assert_eq!(
+            choice_tpk_bases("beholder2_ww_choice_steam"),
+            Some(("beholder2_ww".into(), Some("beholder2".into())))
+        );
+        // platform is open: gog / origin / battlenet / future
+        assert_eq!(
+            choice_tpk_bases("diabloiv_choice_battlenet"),
+            Some(("diabloiv".into(), None))
+        );
+        assert_eq!(
+            choice_tpk_bases("somegame_choice_gog"),
+            Some(("somegame".into(), None))
+        );
+        // multi-word machine names keep their own underscores
+        assert_eq!(
+            choice_tpk_bases("citizensleeper2_starwardvector_choice_steam"),
+            Some(("citizensleeper2_starwardvector".into(), None))
+        );
+        // NOT choice-shaped: monthly-era, bundle keys, bare names, empty platform
+        assert_eq!(
+            choice_tpk_bases("holypotatoeswereinspace_monthly_steam"),
+            None
+        );
+        assert_eq!(choice_tpk_bases("wingspan"), None);
+        assert_eq!(choice_tpk_bases("wingspan_choice_"), None);
+        // fires-anyway for the platform CHARSET rung (M11 minor): uppercase must NOT parse.
+        assert_eq!(choice_tpk_bases("wingspan_choice_Steam"), None);
+    }
+
+    #[test]
+    fn choice_tpk_matches_is_the_grammar_rung() {
+        // strip-grammar equality (the _row pair that killed starts_with)
+        assert!(choice_tpk_matches(
+            "mylittleuniverse_row_choice_steam",
+            "mylittleuniverse"
+        ));
+        // exact-base match: an offered name that itself ends _row
+        assert!(choice_tpk_matches(
+            "mylittleuniverse_row_choice_steam",
+            "mylittleuniverse_row"
+        ));
+        assert!(choice_tpk_matches("wingspan_choice_steam", "wingspan"));
+        // bare equality (defensive: claim-all mints may drop the suffix)
+        assert!(choice_tpk_matches("wingspan", "wingspan"));
+        // non-matches: different game, prefix-hazard neighbor, monthly key
+        assert!(!choice_tpk_matches("wingspan_choice_steam", "wing"));
+        assert!(!choice_tpk_matches(
+            "atomicheart_row_choice_steam",
+            "atomic"
+        ));
+        assert!(!choice_tpk_matches(
+            "holypotatoeswereinspace_monthly_steam",
+            "holypotatoeswereinspace"
+        ));
     }
 
     #[test]

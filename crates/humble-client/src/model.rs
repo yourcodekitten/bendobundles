@@ -19,6 +19,10 @@ pub(crate) struct OrderWire {
 #[derive(Deserialize)]
 pub(crate) struct ProductWire {
     pub human_name: String,
+    // The order-product identity ("july_2026_choice") — D2 ladder rung 3 (slug→gamekey) and D3.
+    // Defaulted: a non-choice order may omit it; an empty value simply never matches a lookup.
+    #[serde(default)]
+    pub machine_name: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -59,13 +63,22 @@ pub(crate) struct MembershipBlob {
     pub content_choice_options: ContentChoiceOptions,
 }
 
+// D1 general hardening (spec): humble drops membership-blob fields week to week (gamekey on
+// may-2020/july-2026; the `initial` cohort on 2026-06-30), so EVERY field defaults — one dropped
+// field can never kill a month's parse. Absence is resolved downstream (the D2 gamekey ladder) or
+// logged as a shape, never a fatal `missing field`.
 #[derive(Deserialize)]
 pub(crate) struct ContentChoiceOptions {
-    pub gamekey: String,
+    // Optional, never defaulted to "": a fabricated gamekey would poison `game_id()` and both
+    // claim writes. `None` ⇒ the ladder resolves it (list → order-side) or the month skips loudly.
+    #[serde(default)]
+    pub gamekey: Option<String>,
+    #[serde(default)]
     pub title: String,
-    #[serde(rename = "productUrlPath")]
+    // Absent ⇒ `choice_month` falls back to the request's own slug (the caller knows which it asked).
+    #[serde(default, rename = "productUrlPath")]
     pub product_url_path: String,
-    #[serde(rename = "productMachineName")]
+    #[serde(default, rename = "productMachineName")]
     pub product_machine_name: String,
     #[serde(default, rename = "usesChoices")]
     pub uses_choices: bool,
@@ -73,7 +86,8 @@ pub(crate) struct ContentChoiceOptions {
     pub is_active_content: bool,
     #[serde(default, rename = "canRedeemGames")]
     pub can_redeem_games: bool,
-    #[serde(rename = "contentChoiceData")]
+    // Absent ⇒ zero offered games; discovery logs the shape (months_skipped) instead of dying.
+    #[serde(default, rename = "contentChoiceData")]
     pub content_choice_data: ContentChoiceData,
     #[serde(default, rename = "contentChoicesMade")]
     pub content_choices_made: ContentChoicesMade,
@@ -97,7 +111,7 @@ pub(crate) struct ContentChoicesMadeInitial {
     pub choices_made: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(crate) struct ContentChoiceData {
     // pick-N tier (`usesChoices=true`) nests offered games under `initial.content_choices`. A
     // claim-all tier (`usesChoices=false`) month has NO `initial` block at all and lists its games

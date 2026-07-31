@@ -8,7 +8,9 @@ publish.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, optional = true }
+# Non-optional + `time`: choice_months paces its walk (tokio::time::sleep) and bounds it with a
+# deadline (tokio::time::Instant). The workspace default lacks `time`, so add it here.
+tokio = { workspace = true, features = ["time"] }
 tracing = "0.1"
 uuid.workspace = true
 wreq = { version = "5.3.0", features = ["json", "cookies", "gzip"] }
@@ -24,7 +26,8 @@ tokio.workspace = true
 wiremock = "0.6"
 
 [features]
-probe = ["dep:tokio"]
+# tokio is now always available; the feature only gates the probe bin below.
+probe = []
 
 [[bin]]
 name = "probe"
