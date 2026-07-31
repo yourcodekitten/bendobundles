@@ -9,6 +9,10 @@
 //! variant is a compile error until someone consciously picks its decision — the invariant can't
 //! silently rot.
 
+/// Pure gate logic for the `heal_choice_pairs` operator sweep (spec Q5). Non-gated so the normal
+/// test suite runs it; only the `delete_game` call in the bin is `heal`-feature-gated.
+pub mod heal_pairs;
+
 use domain::{AppidSource, Claim, Game, GameStatus};
 use dynamo::{OwnedWrite, Store, StoreError, SyncBegin, SyncState, SyncWrite};
 use humble_client::{
