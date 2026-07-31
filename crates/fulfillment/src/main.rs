@@ -241,6 +241,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     steam_enrich_disabled,
                     steam_enrich_pace: fulfillment::STEAM_ENRICH_PACE,
                     steam_enrich_deadline,
+                    choice_discovery_deadline: std::time::Duration::from_secs(180),
                 };
 
                 handle(&deps, req).await

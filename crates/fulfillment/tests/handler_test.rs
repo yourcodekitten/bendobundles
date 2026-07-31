@@ -141,6 +141,7 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         steam_enrich_pace: std::time::Duration::ZERO,
         // Far deadline: the enrichment pass budget never fires during handler tests.
         steam_enrich_deadline: far_deadline(),
+        choice_discovery_deadline: std::time::Duration::from_secs(180),
     }
 }
 
@@ -520,6 +521,7 @@ async fn deps_with_selfheal(
         steam_enrich_pace: std::time::Duration::ZERO,
         // Far deadline: the enrichment pass budget never fires during handler tests.
         steam_enrich_deadline: far_deadline(),
+        choice_discovery_deadline: std::time::Duration::from_secs(180),
     }
 }
 
@@ -2639,6 +2641,33 @@ fn membership_html(
     )
 }
 
+/// Like `membership_html` but the blob DROPS `gamekey` (the may-2020/july-2026 prod shape). The
+/// blob claims nothing — claimed-set is order-authoritative (D3).
+fn membership_html_no_gamekey(slug: &str, title: &str, offered: &[(&str, &str)]) -> String {
+    let mut content_choices = serde_json::Map::new();
+    for (mn, t) in offered {
+        content_choices.insert((*mn).to_string(), serde_json::json!({ "title": t }));
+    }
+    let blob = serde_json::json!({
+        "contentChoiceOptions": {
+            "title": title,
+            "productUrlPath": slug,
+            "productMachineName": format!("{}_choice", slug.replace('-', "_")),
+            "usesChoices": true,
+            "isActiveContent": false,
+            "canRedeemGames": true,
+            "contentChoiceData": { "initial": {
+                "total_choices": offered.len(),
+                "content_choices": serde_json::Value::Object(content_choices),
+            } },
+            "contentChoicesMade": { "initial": { "choices_made": [] } },
+        }
+    });
+    format!(
+        "<html><body><script type=\"application/json\" id=\"webpack-monthly-product-data\">{blob}</script></body></html>"
+    )
+}
+
 // --- lost-months sync-test harness (Tasks 6–9) ─────────────────────────────────────────────────
 // Order JSON with N tpks AND a product machine_name (the file's `order_json` does one tpk, no
 // product machine_name — insufficient for order-authoritative claimed-set tests).
@@ -2834,6 +2863,140 @@ async fn discovery_canary_counts_unmatched_choice_tpks() {
         games_for_gamekey(&deps.store, "GKMAY").await.iter().all(|g| g.machine_name != "kappa"),
         "order-claimed kappa not re-listed; unmatched DLC tpk is canary-counted, not fatal"
     );
+}
+
+// -------------------------------------------------------------------------------------------------
+// The gamekey ladder (spec D2): blob → list → order-side → loud skip. Never fabricates a gamekey.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn gamekey_ladder_blob_absent_list_hit() {
+    let Some(store) = store_or_skip("ladder-list").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // Blob drops gamekey; the LIST carries GKMAY2020 for the slug → rung 2 resolves it.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKMAY2020", "may_2020_choice", &[])],
+        &[],
+        &[("may-2020", Some("GKMAY2020"))],
+        &[("may-2020", membership_html_no_gamekey("may-2020", "May 2020", &[("epsilon", "Epsilon")]))],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert_eq!(
+        games_for_gamekey(&deps.store, "GKMAY2020").await.len(),
+        1,
+        "ladder resolved via list; month processed"
+    );
+}
+
+#[tokio::test]
+async fn gamekey_ladder_resolves_via_order_when_blob_and_list_drop_it() {
+    let Some(store) = store_or_skip("ladder-order").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // Blob drops gamekey (rung 1 miss); the month is in the list but gamekey-less (rung 2 miss);
+    // the ORDER's product_machine_name "august_2026_choice" resolves it (rung 3 — the sole path
+    // for the active month, robust vs the time-dependent probe window).
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKAUG", "august_2026_choice", &[])],
+        &[],
+        &[("august-2026", None)],
+        &[("august-2026", membership_html_no_gamekey("august-2026", "August 2026", &[("zeta", "Zeta")]))],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert_eq!(
+        games_for_gamekey(&deps.store, "GKAUG").await.len(),
+        1,
+        "resolved via order side (rung 3)"
+    );
+}
+
+#[tokio::test]
+async fn gamekey_ladder_all_absent_skips_only_that_month() {
+    let Some(store) = store_or_skip("ladder-skip").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // march-2020 has no gamekey anywhere (skipped); april-2020 resolves via list (written) — the
+    // skip is per-month, not a blanket no-op.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKAPR", "april_2020_choice", &[])],
+        &[],
+        &[("march-2020", None), ("april-2020", Some("GKAPR"))],
+        &[
+            ("march-2020", membership_html_no_gamekey("march-2020", "March 2020", &[("eta", "Eta")])),
+            ("april-2020", membership_html_no_gamekey("april-2020", "April 2020", &[("theta", "Theta")])),
+        ],
+        None,
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+    assert!(
+        deps.store.list_all_games().await.unwrap().iter().all(|g| g.machine_name != "eta"),
+        "no gamekey from any rung ⇒ march skipped"
+    );
+    assert!(
+        games_for_gamekey(&deps.store, "GKAPR").await.iter().any(|g| g.machine_name == "theta"),
+        "april resolved via list ⇒ written"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// The whole-pass deadline bounds the per-month detail fan-out (spec A5 / OMBB rider): a short
+// deadline breaks the loop early (fewer months written); a full-deadline re-sync writes the rest.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn discovery_pass_deadline_bounds_the_detail_fanout() {
+    let Some(store) = store_or_skip("choice-deadline").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    // Three Choice-era list months (not probes). SYNC_PACE (300ms/month) means a 50ms whole-pass
+    // deadline breaks the loop before all three are processed.
+    let deps_full = sync_deps(
+        store,
+        &humble,
+        &[
+            ("GKD", "december_2020_choice", &[]),
+            ("GKN", "november_2020_choice", &[]),
+            ("GKO", "october_2020_choice", &[]),
+        ],
+        &[],
+        &[("december-2020", Some("GKD")), ("november-2020", Some("GKN")), ("october-2020", Some("GKO"))],
+        &[
+            ("december-2020", membership_html("december-2020", "GKD", "December 2020", &[("g_dec", "Dec")], &[])),
+            ("november-2020", membership_html("november-2020", "GKN", "November 2020", &[("g_nov", "Nov")], &[])),
+            ("october-2020", membership_html("october-2020", "GKO", "October 2020", &[("g_oct", "Oct")], &[])),
+        ],
+        None,
+    )
+    .await;
+    let mut deps = deps_full;
+    deps.choice_discovery_deadline = std::time::Duration::from_millis(50);
+    handle(&deps, FulfillRequest::Sync).await;
+    let after_short = deps.store.list_all_games().await.unwrap().len();
+
+    // Full deadline: the rest land (additive recovery — nothing was lost, just deferred).
+    deps.choice_discovery_deadline = std::time::Duration::from_secs(180);
+    handle(&deps, FulfillRequest::Sync).await;
+    let after_full = deps.store.list_all_games().await.unwrap().len();
+
+    assert!(
+        after_short < after_full,
+        "the short deadline bounded the fan-out: {after_short} written vs {after_full} with a full deadline"
+    );
+    assert!(after_full >= 3, "the full-deadline sync wrote all three months");
 }
 
 // -------------------------------------------------------------------------------------------------

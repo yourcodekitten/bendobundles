@@ -389,6 +389,10 @@ pub struct Deps {
     /// context's `deadline` epoch-ms via [`compute_enrich_deadline`]. Tests inject `far_deadline()`
     /// so the deadline never fires during the run; prod sets it from the real lambda context.
     pub steam_enrich_deadline: tokio::time::Instant,
+    /// Whole-pass deadline for choice discovery's per-month detail fan-out (spec A5 / OMBB's
+    /// arithmetic rider). Bounds the ~77 membership reads in aggregate — the per-request timeout
+    /// alone does not. Tests inject a short value to exercise the early-break; prod is 180s.
+    pub choice_discovery_deadline: std::time::Duration,
 }
 
 /// Where a self-refreshed humble session is persisted, so the next cold start reads it back.
@@ -3268,7 +3272,22 @@ async fn discover_choice_games(
             targets.push((m.product_url_path.clone(), false));
         }
     }
+    // Ladder rung 2 (list): every enumerated month's slug → its list gamekey (Some entries only).
+    let list_gamekey: std::collections::HashMap<&str, &str> = walk
+        .months
+        .iter()
+        .filter_map(|m| Some((m.product_url_path.as_str(), m.gamekey.as_deref()?)))
+        .collect();
+    let started = tokio::time::Instant::now();
+    let mut months_processed = 0u32;
     for (slug, is_probe) in &targets {
+        // Bound the per-month detail fan-out in aggregate (spec A5 / M6): the per-request timeout
+        // caps one read, not ~77 of them. A partial pass is safe — discovery is additive, so a
+        // month not reached this sync surfaces next sync.
+        if started.elapsed() >= deps.choice_discovery_deadline {
+            tracing::warn!(months_processed, "choice discovery: pass deadline — partial pass (additive, retried next sync)");
+            break;
+        }
         tokio::time::sleep(SYNC_PACE).await;
         // A speculative probe NEVER spends the run's one heal: a not-yet-live month can 302 →
         // Unauthorized, which would both waste the heal and masquerade as a session death. Only a
@@ -3298,13 +3317,35 @@ async fn discover_choice_games(
         if !detail.can_redeem_games {
             continue;
         }
-        // Transitional (until Task 7 installs the D2 gamekey ladder): the blob may drop gamekey
-        // (Option). Skip loudly rather than fabricate one — a made-up gamekey poisons game_id() and
-        // both claim writes. The ladder (list → order-side) lands in a later task.
-        let Some(month_gamekey) = detail.gamekey.clone() else {
-            tracing::warn!(month = %detail.product_url_path, "choice discovery: month has no gamekey from any source yet — skipping (ladder lands in a later task)");
-            continue;
+        // Spec D2: the gamekey ladder — blob → list → order-side → loud skip. Never "".
+        // Rung 3 derives the order-product machine_name from the slug ("july-2026" →
+        // "july_2026_choice"). CONFIRMED against prod (2026-07-05 findings: the order endpoint's
+        // product.machine_name IS "<month>_<year>_choice", e.g. "april_2026_choice"), the same
+        // form the blob's productMachineName carries, so the two endpoints agree. Rung 3 is the
+        // SOLE resolution for the active month. A rung-3 miss surfaces as the "gamekey_source =
+        // none" skip below — a shape drift is a visible skip, never a silently-dark month.
+        // Invariant: `slug` == the list's product_url_path key == the order-product construction
+        // input — the same month identity across all three rungs.
+        let slug_product = format!("{}_choice", slug.replace('-', "_"));
+        let (month_gamekey, gamekey_source) = match (
+            detail.gamekey.as_deref(),
+            list_gamekey.get(slug.as_str()).copied(),
+            orders.gamekey_by_product.get(&slug_product).map(String::as_str),
+        ) {
+            (Some(g), _, _) => (g.to_string(), "blob"),
+            (None, Some(g), _) => (g.to_string(), "list"),
+            (None, None, Some(g)) => (g.to_string(), "order"),
+            (None, None, None) => {
+                tracing::warn!(month = %slug, gamekey_source = "none",
+                    choices_made_absent = detail.claimed_machine_names.is_none(),
+                    "choice discovery: no gamekey from any rung — skipping (shape logged)");
+                continue;
+            }
         };
+        if gamekey_source != "blob" {
+            tracing::warn!(month = %slug, gamekey_source, "choice discovery: blob dropped gamekey — resolved via ladder");
+        }
+        months_processed += 1;
         // Spec D3: claimed is ORDER-authoritative; the blob's `contentChoicesMade` never alone marks
         // a game claimed. Order silent (its read failed this pass — the gamekey guarantees an order
         // exists) ⇒ skip the month LOUDLY and let the next sync retry: writing claimable rows on
