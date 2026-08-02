@@ -2392,3 +2392,192 @@ async fn catalog_carries_tags_descriptors_and_hidden_source() {
         "provenance-less game serializes hidden_source: null"
     );
 }
+
+// ── Logout (POST /admin/api/logout) ────────────────────────────────────────────
+
+/// Pure-mock: logout with NO session cookie → 204 + a cookie-clearing Set-Cookie.
+/// Registered outside the session middleware, so it is reachable unauthenticated; with no
+/// cookie present the store is never touched (fake_store proves it — any call would fail).
+#[tokio::test]
+async fn logout_without_cookie_returns_204_and_clears_cookie() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash("pw");
+
+    let req = Request::post("/admin/api/logout")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router(store, invoker, admin_hash, None)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "logout with no cookie is idempotent — still 204"
+    );
+
+    let cookie = resp
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .expect("logout must clear the cookie")
+        .to_str()
+        .unwrap();
+    assert!(
+        cookie.starts_with("session=;"),
+        "cookie value is cleared: {cookie}"
+    );
+    assert!(
+        cookie.contains("Max-Age=0"),
+        "cookie is expired now: {cookie}"
+    );
+    assert!(
+        cookie.contains("Path=/admin"),
+        "same Path as login so the browser overwrites it: {cookie}"
+    );
+    assert!(
+        cookie.contains("HttpOnly"),
+        "clearing cookie keeps HttpOnly: {cookie}"
+    );
+    assert!(
+        cookie.contains("Secure"),
+        "clearing cookie keeps Secure: {cookie}"
+    );
+    assert!(
+        cookie.contains("SameSite=Strict"),
+        "clearing cookie keeps SameSite=Strict: {cookie}"
+    );
+}
+
+/// Store-backed: login → the cookie authenticates a protected route (200) → logout (204) →
+/// the SAME cookie is now rejected (401). Proves the session is revoked server-side, not merely
+/// cleared in the browser.
+#[tokio::test]
+async fn logout_revokes_session_server_side() {
+    let Some(store) = store_or_skip("logout-revoke").await else {
+        return;
+    };
+    let password = "logoutpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    // Cookie works before logout.
+    let before = Request::get("/admin/api/catalog")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(before)
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "session is live before logout"
+    );
+
+    // Logout with that cookie → 204.
+    let logout = Request::post("/admin/api/logout")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(logout)
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT, "logout succeeds");
+
+    // Server-side revocation: the token is gone from the store.
+    assert!(
+        store.get_session(&session).await.unwrap().is_none(),
+        "session row deleted from dynamo"
+    );
+
+    // Same cookie is now rejected on a protected route.
+    let after = Request::get("/admin/api/catalog")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
+        .oneshot(after)
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "revoked cookie no longer authenticates"
+    );
+}
+
+/// Store-backed: logging out an unknown/never-existed token → still 204 (delete_session is
+/// idempotent). This is the "already-expired or shared-device double-click" path.
+#[tokio::test]
+async fn logout_unknown_token_is_idempotent() {
+    let Some(store) = store_or_skip("logout-unknown").await else {
+        return;
+    };
+    let admin_hash = test_admin_hash("pw");
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+
+    // A token that was never issued.
+    let bogus = "0".repeat(64);
+    let req = Request::post("/admin/api/logout")
+        .header("cookie", format!("session={bogus}"))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router(store, invoker, admin_hash, None)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "unknown token logs out cleanly — no 404, no 500"
+    );
+}
+
+/// Pure-mock: logout WITH a cookie when the store delete fails → 500, and the cookie is NOT
+/// cleared. We refuse to clear-and-claim-success while the session is still live server-side.
+/// `fake_store`'s client points at a dead port, so `delete_session` errors — no dynamo needed.
+#[tokio::test]
+async fn logout_store_failure_returns_500_without_clearing_cookie() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash("pw");
+
+    let req = Request::post("/admin/api/logout")
+        .header("cookie", format!("session={}", "a".repeat(64)))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router(store, invoker, admin_hash, None)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed revocation is reported honestly, not masked as success"
+    );
+    assert!(
+        resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+        "cookie must NOT be cleared while the session is still live server-side"
+    );
+}

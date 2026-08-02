@@ -266,6 +266,16 @@ export async function adminLogin(password: string): Promise<boolean> {
   }
 }
 
+// Revoke the current admin session server-side and clear the cookie. Best-effort: the endpoint
+// is idempotent and always 204s, so there is no status to branch on — the caller redirects to
+// /admin/login regardless (see AdminApp's sign-out handler).
+export async function adminLogout(): Promise<void> {
+  await fetch('/admin/api/logout', {
+    method: 'POST',
+    credentials: 'same-origin',
+  });
+}
+
 async function checkUnauthorized(response: Response): Promise<void> {
   if (response.status === 401) {
     throw new Unauthorized();

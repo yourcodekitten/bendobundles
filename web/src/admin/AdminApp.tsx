@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { adminStatus, type StatusView } from '../api';
+import { adminStatus, adminLogout, type StatusView } from '../api';
 import { withAuth } from './withAuth';
 
 // Status + its refresh callback are threaded to child routes via Outlet context.
@@ -48,6 +48,14 @@ export function AdminApp() {
   // does not trigger the banner.
   const cookieAttentionNeeded = status?.sync?.cookie_ok === false;
 
+  // Sign out: revoke the session server-side, then land on the login page regardless of the
+  // round-trip's outcome — the user asked to leave, a failed request must not strand them here.
+  const signOut = () => {
+    void adminLogout()
+      .catch(() => {}) // best-effort — leaving is the intent even if the round-trip fails
+      .finally(() => navigate('/admin/login', { replace: true }));
+  };
+
   return (
     <div className="min-h-screen bg-room text-ink">
       <nav className="border-b border-line px-6 py-3 flex gap-6" aria-label="admin navigation">
@@ -60,6 +68,13 @@ export function AdminApp() {
         <NavLink to="/admin/ops" className={navLinkClass}>
           ops
         </NavLink>
+        <button
+          type="button"
+          onClick={signOut}
+          className="ml-auto text-dust hover:text-ink-soft"
+        >
+          sign out
+        </button>
       </nav>
 
       {cookieAttentionNeeded && (
