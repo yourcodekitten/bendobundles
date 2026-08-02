@@ -287,3 +287,81 @@ describe('ClaimDialog', () => {
     });
   });
 });
+
+// ── Focus trap (a11y #63) — ClaimDialog is the app's second role="dialog"
+// aria-modal surface; keyboard focus must not wander to the page behind the
+// backdrop (WCAG 2.4.3 / 2.1.2). One test per step shape: multi-focusable
+// (confirm, gifted), and the zero-focusable step (loading) that would otherwise
+// drop focus to <body>. ──────────────────────────────────────────────────────
+describe('focus trap', () => {
+  const onClose = vi.fn();
+  const onRefresh = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('confirm step: focus opens on the dialog, and Tab from the last control wraps to the first', async () => {
+    render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+    const dialog = screen.getByRole('dialog');
+    expect(document.activeElement).toBe(dialog); // focus-on-open pin
+
+    // Tab from the container lands on a focusable INSIDE the dialog.
+    await userEvent.tab();
+    const first = document.activeElement as HTMLElement;
+    expect(dialog.contains(first)).toBe(true);
+
+    // From the last control (confirm), Tab wraps back to the first (cancel).
+    const confirm = screen.getByRole('button', { name: /confirm/i });
+    confirm.focus();
+    await userEvent.tab();
+    expect(document.activeElement).toBe(first);
+  });
+
+  it('confirm step: Shift+Tab on the first control wraps to the last', async () => {
+    render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+    const cancel = screen.getByRole('button', { name: /cancel/i });
+    const confirm = screen.getByRole('button', { name: /confirm/i });
+
+    cancel.focus();
+    await userEvent.tab({ shift: true });
+    expect(document.activeElement).toBe(confirm);
+  });
+
+  it('loading step (zero focusables): Tab does not escape the dialog to the page behind it', async () => {
+    // Never-resolving claim keeps us on the loading step, which renders only a
+    // <p>claiming...</p> — no focusables. The confirm button unmounts here, so
+    // without a re-pin focus would fall to <body> and Tab would walk the page.
+    vi.mocked(claimGame).mockReturnValue(new Promise<never>(() => {}));
+    render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+
+    await userEvent.click(screen.getByRole('button', { name: /confirm/i }));
+    await screen.findByText(/claiming/i);
+
+    const dialog = screen.getByRole('dialog');
+    // Focus is pinned to the dialog, not lost to <body>.
+    expect(document.activeElement).toBe(dialog);
+
+    // Tab is swallowed — focus stays on the dialog, never reaches page content.
+    await userEvent.tab();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it('gifted step (multi-focusable, one-time URL): Tab wraps inside the dialog, never leaking', async () => {
+    vi.mocked(claimGame).mockResolvedValue({ kind: 'gifted', gift_url: GIFT_URL });
+    render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+
+    await userEvent.click(screen.getByRole('button', { name: /confirm/i }));
+    await waitFor(() => expect(screen.getByText(GIFT_URL)).toBeInTheDocument());
+
+    const dialog = screen.getByRole('dialog');
+    const close = screen.getByRole('button', { name: /close/i });
+
+    // From the last control, Tab wraps to the first focusable inside the dialog.
+    close.focus();
+    await userEvent.tab();
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).not.toBe(close);
+  });
+});

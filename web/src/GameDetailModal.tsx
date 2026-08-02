@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { makeTrapKeyDown } from "./focusTrap";
 import type {
   GameView,
   AdminGame,
@@ -20,24 +21,6 @@ const CLAIM_CHARGE_PER_MASH = 18;
 const CLAIM_DRAIN_PER_SEC = 15;
 const CLAIM_START_CHARGE = 30; // seed on open — a beat before the drain can cancel
 const CLAIM_BURST_MS = 750;
-
-// ── Focus trap (issue #61 acceptance) ─────────────────────────────────────────
-// Computed at keydown time: the focusable set is dynamic (carousel slides are
-// inert per-index, buttons appear/disappear), so a cached list would trap focus
-// into hidden slides.
-
-const FOCUSABLE_SELECTOR =
-  'button, [href], input, select, textarea, video, [tabindex]:not([tabindex="-1"])';
-
-function dialogFocusables(container: HTMLElement): HTMLElement[] {
-  return Array.from(
-    container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
-  ).filter(
-    (el) =>
-      el.closest('[inert], [aria-hidden="true"]') === null &&
-      !el.hasAttribute("disabled"),
-  );
-}
 
 // ── Status badge — mirrors Catalog's mapping ──────────────────────────────────
 
@@ -210,29 +193,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
   // (Escape stays the document listener above; the carousel's Arrow handling
   // lives on the carousel region — Tab is the only key this handler owns.)
 
-  const handleTrapKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key !== "Tab") return;
-    const container = containerRef.current;
-    if (container === null) return;
-    const els = dialogFocusables(container);
-    if (els.length === 0) {
-      e.preventDefault(); // nowhere to go — focus stays on the container
-      return;
-    }
-    const first = els[0];
-    const last = els[els.length - 1];
-    if (first === undefined || last === undefined) return;
-    const active = document.activeElement;
-    if (e.shiftKey) {
-      if (active === first || active === container) {
-        e.preventDefault();
-        last.focus();
-      }
-    } else if (active === last || active === container) {
-      e.preventDefault();
-      first.focus();
-    }
-  };
+  const handleTrapKeyDown = makeTrapKeyDown(containerRef);
 
   // ── Claim-chest: start / mash / cancel ────────────────────────────────────
 
