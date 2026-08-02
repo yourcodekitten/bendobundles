@@ -2551,3 +2551,33 @@ async fn logout_unknown_token_is_idempotent() {
         "unknown token logs out cleanly — no 404, no 500"
     );
 }
+
+/// Pure-mock: logout WITH a cookie when the store delete fails → 500, and the cookie is NOT
+/// cleared. We refuse to clear-and-claim-success while the session is still live server-side.
+/// `fake_store`'s client points at a dead port, so `delete_session` errors — no dynamo needed.
+#[tokio::test]
+async fn logout_store_failure_returns_500_without_clearing_cookie() {
+    let store = fake_store().await;
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let admin_hash = test_admin_hash("pw");
+
+    let req = Request::post("/admin/api/logout")
+        .header("cookie", format!("session={}", "a".repeat(64)))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = router(store, invoker, admin_hash, None)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a failed revocation is reported honestly, not masked as success"
+    );
+    assert!(
+        resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+        "cookie must NOT be cleared while the session is still live server-side"
+    );
+}
