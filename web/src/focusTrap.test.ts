@@ -59,6 +59,17 @@ describe("dialogFocusables", () => {
     expect(dialogFocusables(c).map((el) => el.textContent)).toEqual(["live"]);
   });
 
+  it("excludes hidden inputs so one can never become a dead focus boundary", () => {
+    // A hidden input eats .focus() as a no-op; at a wrap boundary (where preventDefault already
+    // fired) focus would stick there instead of advancing. It must not be in the set.
+    const c = mount(
+      `<button>a</button><input type="hidden" /><input type="text" /><button>b</button>`,
+    );
+    const els = dialogFocusables(c);
+    expect(els).toHaveLength(3); // two buttons + the text input; hidden input excluded
+    expect(els.some((el) => el.getAttribute("type") === "hidden")).toBe(false);
+  });
+
   it("returns an empty set when a step has no focusables (the loading-step shape)", () => {
     const c = mount(`<p>claiming...</p>`);
     expect(dialogFocusables(c)).toEqual([]);

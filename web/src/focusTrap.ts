@@ -9,8 +9,12 @@
 
 import type { KeyboardEvent, RefObject } from "react";
 
+// `input:not([type="hidden"])`: a hidden input matches `.focus()` as a no-op. Since this is now a
+// SHARED trap (a contract for callers not yet written), a hidden input at a wrap boundary would make
+// the wrap's `.focus()` a no-op while `preventDefault` already fired — focus would stick there
+// instead of advancing. Excluding it keeps that from ever biting a future consumer.
 const FOCUSABLE_SELECTOR =
-  'button, [href], input, select, textarea, video, [tabindex]:not([tabindex="-1"])';
+  'button, [href], input:not([type="hidden"]), select, textarea, video, [tabindex]:not([tabindex="-1"])';
 
 export function dialogFocusables(container: HTMLElement): HTMLElement[] {
   return Array.from(
