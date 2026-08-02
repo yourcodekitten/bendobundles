@@ -17,8 +17,8 @@ wreq = { version = "5.3.0", features = ["json", "cookies", "gzip"] }
 wreq-util = "2.2.6"
 # secure-area step-up: a humble app-TOTP (RFC 6238, SHA1/6/30s) over the base32 seed.
 # All pure-Rust (RustCrypto + data-encoding) — no C, so the boring-sys cross-build is untouched.
-hmac = "0.12"
-sha1 = "0.10"
+hmac = "0.13"
+sha1 = "0.11"
 data-encoding = "2"
 
 [dev-dependencies]
