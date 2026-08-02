@@ -2,6 +2,7 @@
 //!
 //! Routes under `/admin/api/`:
 //! - POST  /admin/api/login              — argon2 verify, 7-day session cookie
+//! - POST  /admin/api/logout             — revoke session server-side + clear cookie (idempotent)
 //! - GET   /admin/api/catalog            — full game catalog (all statuses)
 //! - POST  /admin/api/games/:id/hidden   — toggle hidden flag
 //! - POST  /admin/api/games/:id/self-claim — intake + synchronous reveal (RequestResponse)
@@ -18,7 +19,7 @@
 //! - GET   /admin/api/steam/identity     — read Ben's SteamID (null if unset)
 //! - GET   /admin/api/steam/owned/:steamid — session-guarded proxy: serve cache (≤24h) or fetch
 //!
-//! All routes except `/login` require a valid session cookie (`session=<token>`).
+//! All routes except `/login` and `/logout` require a valid session cookie (`session=<token>`).
 //! All `/admin/api/steam/*` routes additionally require a configured steam client; absent → 503.
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{Path, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -123,6 +124,11 @@ pub fn router(
 
     Router::new()
         .route("/admin/api/login", post(handle_login))
+        // Logout sits OUTSIDE the session middleware, a sibling of login. Revoking a session
+        // must not itself require a live session — an expired or already-deleted token still
+        // needs to clear the browser cookie and get a clean 204, which is impossible if the
+        // middleware 401s the request first.
+        .route("/admin/api/logout", post(handle_logout))
         .merge(protected)
         .with_state(state)
 }
@@ -130,8 +136,8 @@ pub fn router(
 // ── Session middleware ─────────────────────────────────────────────────────────
 
 /// Extract the `session=<token>` value from the Cookie header, if present.
-fn extract_session_cookie(req: &Request) -> Option<String> {
-    req.headers()
+fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|cookies| {
@@ -143,7 +149,7 @@ fn extract_session_cookie(req: &Request) -> Option<String> {
 }
 
 async fn session_middleware(State(s): State<AppState>, request: Request, next: Next) -> Response {
-    let Some(token) = extract_session_cookie(&request) else {
+    let Some(token) = extract_session_cookie(request.headers()) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -238,6 +244,30 @@ async fn handle_login(State(s): State<AppState>, Json(body): Json<LoginBody>) ->
         Json(serde_json::json!({"ok": true})),
     )
         .into_response()
+}
+
+// ── POST /admin/api/logout ────────────────────────────────────────────────────
+
+/// Revoke the current admin session and clear the browser cookie. Reads the token from the
+/// Cookie header and deletes it server-side (`delete_session` is idempotent), so an unknown or
+/// already-expired token is a clean no-op. The store is only touched when a cookie is actually
+/// present — an unauthenticated request with no session cookie clears nothing and writes nothing.
+/// Always 204 on success (there is nothing to return); the cookie is the credential, so `Path`
+/// and all attributes mirror login's cookie exactly or the browser won't overwrite it.
+async fn handle_logout(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    // Delete only when a cookie is actually present (short-circuits before touching the store).
+    // If the store delete genuinely fails, do NOT clear the cookie and claim success — the
+    // session is still live server-side, so report it honestly.
+    if let Some(token) = extract_session_cookie(&headers)
+        && s.store.delete_session(&token).await.is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let cookie = "session=; Max-Age=0; HttpOnly; Secure; SameSite=Strict; Path=/admin";
+    let cookie_val = axum::http::HeaderValue::from_static(cookie);
+
+    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie_val)]).into_response()
 }
 
 // ── GET /admin/api/catalog ────────────────────────────────────────────────────

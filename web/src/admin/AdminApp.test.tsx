@@ -14,9 +14,10 @@ vi.mock('../api', async (importOriginal) => {
   return {
     ...actual,
     adminStatus: vi.fn(),
+    adminLogout: vi.fn(),
   };
 });
-import { adminStatus } from '../api';
+import { adminStatus, adminLogout } from '../api';
 
 const noSyncStatus: StatusView = { sync: null, sync_run: null, game_counts: {} };
 
@@ -203,6 +204,40 @@ describe('AdminApp status polling while a sync runs', () => {
     await waitFor(() => expect(adminStatus).toHaveBeenCalledTimes(1));
 
     expect(intervalSpy.mock.calls.find((c) => c[1] === 5000)).toBeUndefined();
+  });
+});
+
+describe('AdminApp sign-out', () => {
+  beforeEach(() => {
+    vi.mocked(adminStatus).mockResolvedValue(noSyncStatus);
+    vi.mocked(adminLogout).mockResolvedValue(undefined);
+  });
+
+  it('renders a sign-out control in the nav', () => {
+    renderAdminWithChild(<div>content</div>);
+    expect(screen.getByRole('button', { name: /sign out/i })).toBeInTheDocument();
+  });
+
+  it('calls adminLogout and redirects to /admin/login on click', async () => {
+    const user = userEvent.setup();
+    renderAdminWithChild(<div>content</div>);
+
+    await user.click(screen.getByRole('button', { name: /sign out/i }));
+
+    await waitFor(() => expect(adminLogout).toHaveBeenCalledOnce());
+    await waitFor(() => expect(screen.getByText('login page')).toBeInTheDocument());
+  });
+
+  it('still redirects to login even if the logout call rejects', async () => {
+    // The user's intent is to leave — a failed server round-trip must not strand them
+    // on the admin surface.
+    const user = userEvent.setup();
+    vi.mocked(adminLogout).mockRejectedValue(new Error('network'));
+    renderAdminWithChild(<div>content</div>);
+
+    await user.click(screen.getByRole('button', { name: /sign out/i }));
+
+    await waitFor(() => expect(screen.getByText('login page')).toBeInTheDocument());
   });
 });
 
