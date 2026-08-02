@@ -6403,3 +6403,128 @@ async fn persist_fetched_halves_remerges_on_lost_race() {
         "Overwhelmingly Positive"
     );
 }
+
+// -------------------------------------------------------------------------------------------------
+// #35: a step-2 resume-redeem that PARKS must leave an intent snapshot EXCLUDING the resumed tpk —
+// never None. Otherwise reconcile reads None as branch A ("choose never ran ⇒ pick not spent") and
+// compensates, stranding a pick that materialized externally (hand-choose / title-collision).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn choice_resume_park_records_snapshot_excluding_the_tpk() {
+    let Some(store) = store_or_skip("choice-resume-snap").await else {
+        return;
+    };
+    let gid = seed_pending_choice_claim(
+        &store,
+        "gk",
+        OFFERED_ID,
+        TITLE,
+        OffsetDateTime::now_utc(),
+        None,
+    )
+    .await;
+
+    let humble = MockServer::start().await;
+    // Pre-read carries the game's key (title match, unredeemed) → step-2 resume path.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gk",
+            serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
+        )))
+        .mount(&humble)
+        .await;
+    // The resume redeem fails (403 on the WRITE) → the terminal parks; claim stays Pending.
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&humble)
+        .await;
+
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, choice_gift_req(&gid, "gk", OFFERED_ID)).await;
+    assert!(
+        matches!(resp, FulfillResponse::Parked { .. }),
+        "resume redeem failure parks, got {resp:?}"
+    );
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+    // The fix: a snapshot IS recorded (Some ⇒ NOT branch A), and it EXCLUDES the resumed tpk — the
+    // order's only key here, so the snapshot is empty. Reconcile's find_new_tpk then surfaces that
+    // tpk as the new pick ⇒ B2/B3, never A/compensate.
+    assert_eq!(
+        claim.choice_pre_tpks,
+        Some(vec![]),
+        "resume park must record a snapshot EXCLUDING the resumed tpk (only key here ⇒ empty), never None"
+    );
+    // A resume redeems an existing key — it must never choose.
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/humbler/choosecontent"),
+        0,
+        "resume must NOT choose"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// #35: the snapshot a resume-park leaves (present, EXCLUDING the existing tpk) must reconcile to B2 —
+// complete the externally-spent pick, NOT compensate it (which would re-list the game and strand the
+// pick). Seeds the exact snapshot shape the resume path records (empty ⇒ the present tpk reads new).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_choice_resume_snapshot_completes_never_strands() {
+    let Some(store) = store_or_skip("choice-resume-recon").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    // Snapshot EXCLUDES the tpk (empty) — exactly what the resume-park path records.
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, Some(vec![])).await;
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gk",
+            serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
+        )))
+        .mount(&humble)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "giftkey": "GIFTTOKEN"
+        })))
+        .mount(&humble)
+        .await;
+
+    let deps = deps(store, &humble.uri(), None);
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // B2: the pick is completed FROM reconcile — never compensated, the game stays claimed.
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "reconcile completes the spent pick (B2), never compensates it"
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        game.status,
+        GameStatus::Gifted,
+        "game stays claimed — the externally-spent pick is NOT stranded/returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/humbler/choosecontent"),
+        0,
+        "reconcile NEVER chooses"
+    );
+    assert_eq!(
+        count_path(&reqs, "/humbler/redeemkey"),
+        1,
+        "B2 redeems the present key exactly once"
+    );
+}

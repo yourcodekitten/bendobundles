@@ -890,6 +890,32 @@ async fn handle_choice_claim(
         .iter()
         .find(|k| k.human_name.eq_ignore_ascii_case(&title))
     {
+        // #35: the pick is already spent (this tpk exists). If it materialized EXTERNALLY (a
+        // hand-choose on humble, or a title-collision with a pre-existing key) and the resume
+        // terminal below then fails/parks, the claim is left `Pending` with no snapshot — which
+        // reconcile reads as branch A ("no intent ⇒ choose never ran ⇒ pick NOT spent") and
+        // COMPENSATES, stranding the already-spent pick + drifting the accounting. Record an intent
+        // snapshot that EXCLUDES this tpk, so reconcile's `find_new_tpk` surfaces it as the new key
+        // and routes to B2 (unredeemed ⇒ complete) / B3 (redeemed ⇒ recover), never A. Snapshotting
+        // the order VERBATIM would leave the tpk inside `pre` ⇒ find_new_tpk finds nothing ⇒ B1
+        // compensate: the identical misread — it MUST be excluded. Recording intent is NOT choosing;
+        // the resume still makes zero `choosecontent` calls (asserted in tests).
+        let pre_excluding: Vec<String> = pre_order
+            .keys
+            .iter()
+            .map(|k| k.machine_name.clone())
+            .filter(|mn| mn != &existing.machine_name)
+            .collect();
+        if let Err(e) = deps
+            .store
+            .record_choice_intent(link_token, claim_id, pre_excluding)
+            .await
+        {
+            // Snapshot didn't land — park rather than resume (mirrors the step-3 hinge). Safe: no
+            // pick is spent by us here, and the next sync re-reads the order and retries the resume.
+            tracing::warn!(claim_id, error = ?e, "choice pre-check: resume intent snapshot failed to persist — parking (will retry next sync)");
+            return parked_choice("resume-intent-write");
+        }
         if existing.redeemed {
             return match flavor {
                 ClaimFlavor::Gift => {
