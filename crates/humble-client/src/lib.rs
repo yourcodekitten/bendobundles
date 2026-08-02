@@ -2,6 +2,7 @@
 //! No test touches the real API — see the probe binary for live verification.
 mod model;
 
+use hmac::digest::KeyInit; // hmac 0.13 moved `new_from_slice` from `Mac` onto `KeyInit`
 use hmac::{Hmac, Mac};
 use model::{GamekeyEntry, MembershipBlob, OrderWire, SubProductsPage};
 use sha1::Sha1;
