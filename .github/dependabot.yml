@@ -7,6 +7,16 @@ updates:
       interval: "weekly"
     groups:
       cargo:
+        # Group routine bumps together, but split the framework majors out so
+        # they land as individual PRs and get real one-at-a-time runtime review
+        # rather than being rubber-stamped on green clippy inside the group.
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "lambda_runtime"
+          - "lambda_http"
+          - "axum"
+          - "tower"
         update-types:
           - "major"
           - "minor"
