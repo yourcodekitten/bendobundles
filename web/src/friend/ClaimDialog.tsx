@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { claimGame, type ClaimResult, type GameView } from "../api";
+import { makeTrapKeyDown } from "../focusTrap";
 import { motionOK } from "../motion";
 
 // ── The claim celebration — THE CHAIN (ben's pick, 2026-07-09) ───────────────
@@ -68,10 +69,19 @@ export function ClaimDialog({
   // final stage); it self-clears after its fall.
   const [confettiTail, setConfettiTail] = useState(false);
 
-  // Focus the dialog on open
+  // Focus the dialog on open, and re-pin to the container whenever a step change
+  // leaves focus outside it. Critical for the zero-focusable steps: the confirm
+  // button unmounts on 'loading', which would otherwise drop focus to <body>
+  // behind the backdrop — so Tab would never reach the trap below and would walk
+  // the page. Re-pinning only when focus has actually escaped keeps in-step
+  // focus (e.g. the copy button on 'gifted') untouched.
+  const trapKeyDown = makeTrapKeyDown(containerRef);
   useEffect(() => {
-    containerRef.current?.focus();
-  }, []);
+    const container = containerRef.current;
+    if (container && !container.contains(document.activeElement)) {
+      container.focus();
+    }
+  }, [step]);
 
   // Escape key — same policy as the backdrop, via dismissKindFor
   useEffect(() => {
@@ -130,6 +140,7 @@ export function ClaimDialog({
         aria-label={`claim ${game.title}`}
         tabIndex={-1}
         className="fixed inset-0 z-50 flex items-center justify-center p-4 outline-none"
+        onKeyDown={trapKeyDown}
         onClick={(e) => {
           if (e.target !== e.currentTarget) return;
           const kind = dismissKindFor(step);
