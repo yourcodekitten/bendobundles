@@ -1208,6 +1208,51 @@ async fn batch_get_steam_apps_found_and_missing() {
     assert!(empty.is_empty());
 }
 
+/// #64: batch_get_steam_genres_tags returns ONLY genres+tags per app — the slim read the friend
+/// list uses. A negative-cache stub (detail=None) degrades to empty chips; missing ids are absent;
+/// empty input short-circuits with no I/O.
+#[tokio::test]
+async fn batch_get_steam_genres_tags_slims_the_read() {
+    let Some(store) = store_or_skip("batch-genres-tags").await else {
+        return;
+    };
+    let mut full = steam_app_cache_full(570);
+    // The fixture leaves tags empty — populate them so both chip fields are proven end-to-end.
+    full.detail.as_mut().unwrap().tags =
+        vec!["Roguelike".to_string(), "Pixel Graphics".to_string()];
+    let stub = steam_app_cache_stub(571);
+    store
+        .put_steam_app(&full, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+    store
+        .put_steam_app(&stub, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+
+    let map = store
+        .batch_get_steam_genres_tags(&[570, 571, 99999])
+        .await
+        .unwrap();
+
+    assert_eq!(map.len(), 2, "two found, one missing");
+    let gt = map.get(&570).unwrap();
+    assert_eq!(gt.genres, vec!["Action".to_string(), "Indie".to_string()]);
+    assert_eq!(
+        gt.tags,
+        vec!["Roguelike".to_string(), "Pixel Graphics".to_string()]
+    );
+    assert_eq!(
+        map.get(&571).unwrap(),
+        &dynamo::SteamGenresTags::default(),
+        "negative-cache stub round-trips as empty chips"
+    );
+    assert!(!map.contains_key(&99999));
+
+    let empty = store.batch_get_steam_genres_tags(&[]).await.unwrap();
+    assert!(empty.is_empty());
+}
+
 /// `list_listable_games` must exhaust every page. Force a 1-item Query page via the test seam so
 /// three listable games span three pages: a single-page read would truncate to the first item.
 #[tokio::test]

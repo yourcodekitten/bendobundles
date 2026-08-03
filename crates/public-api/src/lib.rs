@@ -514,22 +514,21 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             let mut app_ids: Vec<u32> = gs.iter().filter_map(|g| g.steam_app_id).collect();
             app_ids.sort_unstable();
             app_ids.dedup();
+            // Slim read: only genres+tags per app, not the whole SteamAppCache blob (#64) — the
+            // list never touches detail's heavier fields (reviews, #62's screenshots).
             let caches = s
                 .store
-                .batch_get_steam_apps(&app_ids)
+                .batch_get_steam_genres_tags(&app_ids)
                 .await
                 .unwrap_or_default();
             gs.into_iter()
                 .map(|g| {
-                    let detail = g
-                        .steam_app_id
-                        .and_then(|id| caches.get(&id))
-                        .and_then(|c| c.detail.as_ref());
-                    let genres = detail
-                        .map(|d| d.genres.iter().take(5).cloned().collect())
+                    let gt = g.steam_app_id.and_then(|id| caches.get(&id));
+                    let genres = gt
+                        .map(|c| c.genres.iter().take(5).cloned().collect())
                         .unwrap_or_default();
                     // Stored tags are already capped at 10 — no take() here.
-                    let tags = detail.map(|d| d.tags.clone()).unwrap_or_default();
+                    let tags = gt.map(|c| c.tags.clone()).unwrap_or_default();
                     GameView::from_game(g, genres, tags)
                 })
                 .collect()
