@@ -270,7 +270,14 @@ async fn handle_steam_login(
     // the nonce in return_to. The invite token in `ctx` never crosses to Valve; the return endpoint
     // resolves the nonce back, single-use. A failed state write can't proceed (the return couldn't
     // resolve it) → bounce back with the same error fragment the SPA already handles.
-    let nonce = uuid::Uuid::new_v4().to_string();
+    // Two v4 UUIDs concatenated (64 hex, ≥128 bits of getrandom/CSPRNG entropy) — the same shape as
+    // the admin session token. A guessable state is a forgeable state, so this is unguessable by
+    // construction, not by hope; a single v4 (122 bits) sits below the codebase's security-token bar.
+    let nonce = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
     let expires = OffsetDateTime::now_utc().unix_timestamp() + dynamo::schema::OIDC_STATE_TTL_SECS;
     if s.store.put_oidc_state(&nonce, &ctx, expires).await.is_err() {
         return redirect_to(&format!("{ctx}#steam_error=steam_unreachable"));
