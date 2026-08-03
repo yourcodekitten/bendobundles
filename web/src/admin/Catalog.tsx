@@ -394,7 +394,7 @@ export function Catalog() {
                   type="button"
                   onClick={() => setDetailGame(game)}
                   aria-label={`view details for ${game.title}`}
-                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-give"
+                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded text-left focus-visible:outline-2 focus-visible:outline-pixel focus-visible:outline-offset-2"
                 >
                   {/* Artwork thumbnail — colored fallback when url absent */}
                   {game.artwork_url !== null ? (
