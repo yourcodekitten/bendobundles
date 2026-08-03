@@ -1752,7 +1752,8 @@ impl Store {
         }
     }
 
-    /// The ONE guarded full-item game write (#47) — the five field setters all delegate here;
+    /// The ONE guarded full-item game write (#47) — all six read-modify-write game writers
+    /// delegate here (the five field setters + `upsert_game_from_sync`'s existing-record arm);
     /// public only so integration tests can drive the stale-snapshot race deterministically
     /// (read → out-of-band write → stale put). Prefer the setters.
     ///
@@ -1948,61 +1949,41 @@ impl Store {
             return Ok(SyncWrite::Unchanged);
         };
 
-        // Condition: if no existing record, guard with attribute_not_exists(pk) so a concurrent
-        // first-insert doesn't clobber a claim that landed between our read and write.
-        // If an existing record was found, optimistic-lock on its status string — a CCF means a
-        // concurrent claim/compensate/fulfill changed status under us → SkippedInFlight.
-        // When the existing game is owned (claim_id is Some), add an ownership clause to close a
-        // TOCTOU where a compensate+reclaim lands inside sync's read→write window. Without it, the
-        // put would stamp the stale claim_id and strand the live claim (whose fulfill gate checks
-        // claim_id for ownership).
-        // hidden_source must also be unchanged since the read: an admin toggle landing inside
-        // this window would otherwise be silently reverted — INCLUDING the Admin stamp, which
-        // erases Ben's permanent auto-hide immunity (#71). Sync yields; next run re-merges.
-        let mut req = self
-            .client
-            .put_item()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&merged)));
-
-        let cond = match &existing {
-            None => "attribute_not_exists(pk)".to_string(),
-            Some(e) => {
-                // Clause list, not a format! branch matrix: every guarded field appends
-                // exactly one clause, so guard N+1 can't silently miss an arm.
-                let mut clauses = vec!["#st = :expected".to_string()];
-                req = req
-                    .expression_attribute_names("#st", "status")
-                    .expression_attribute_values(":expected", schema::s(e.status.as_wire()));
-                // If the existing game is owned, add the ownership clause to the condition.
-                if let Some(cid) = &e.claim_id {
-                    req = req.expression_attribute_values(":cid", schema::s(cid.clone()));
-                    clauses.push("claim_id = :cid".to_string());
-                }
-                // hidden_source must be unchanged since our read: an admin toggle landing
-                // inside this window owns the record — sync yields (#71).
-                req = req.expression_attribute_names("#hsrc", "hidden_source");
-                match e.hidden_source {
-                    None => clauses.push("attribute_not_exists(#hsrc)".to_string()),
-                    Some(src) => {
-                        req = req.expression_attribute_values(":hsrc", schema::s(src.as_wire()));
-                        clauses.push("#hsrc = :hsrc".to_string());
+        match &existing {
+            // No existing record: guard with attribute_not_exists(pk) so a concurrent
+            // first-insert doesn't clobber a claim that landed between our read and write.
+            None => {
+                let res = self
+                    .client
+                    .put_item()
+                    .table_name(&self.table)
+                    .set_item(Some(game_item(&merged)))
+                    .condition_expression("attribute_not_exists(pk)")
+                    .send()
+                    .await;
+                match res {
+                    Ok(_) => Ok(SyncWrite::Written),
+                    Err(sdk_err) => {
+                        if is_ccf_put(&sdk_err) {
+                            Ok(SyncWrite::SkippedInFlight)
+                        } else {
+                            Err(StoreError::Aws(format!("{sdk_err:?}")))
+                        }
                     }
                 }
-                clauses.join(" AND ")
             }
-        };
-
-        let res = req.condition_expression(cond).send().await;
-        match res {
-            Ok(_) => Ok(SyncWrite::Written),
-            Err(sdk_err) => {
-                if is_ccf_put(&sdk_err) {
-                    Ok(SyncWrite::SkippedInFlight)
-                } else {
-                    Err(StoreError::Aws(format!("{sdk_err:?}")))
-                }
-            }
+            // Existing record: the SIXTH delegator of put_game_if_unchanged (#47). The previous
+            // hand-rolled clause list guarded status + claim_id + hidden_source but MISSED
+            // appid_source — merge_sync carries the appid pair from this read, so a Manual
+            // override landing inside sync's read→write window was silently reverted (the exact
+            // #47 casualty, via the walk writer). The primitive's full coordination snapshot
+            // makes a missing arm impossible-by-construction: any mid-window change to status /
+            // appid_source / hidden_source / claim_id CCFs → SkippedInFlight; next run re-merges
+            // against fresh truth.
+            Some(e) => Ok(match self.put_game_if_unchanged(e, &merged).await? {
+                GuardedWrite::Written => SyncWrite::Written,
+                GuardedWrite::Contested => SyncWrite::SkippedInFlight,
+            }),
         }
     }
 
