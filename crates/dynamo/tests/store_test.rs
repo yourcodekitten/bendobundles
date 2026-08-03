@@ -908,6 +908,7 @@ async fn pending_claims_and_sync_state_and_sessions() {
         cookie_ok: true,
         games_written: 3,
         message: "ok".into(),
+        private_pinged: false,
     };
     store.put_sync_state(&st).await.unwrap();
     assert_eq!(store.get_sync_state().await.unwrap().unwrap(), st);

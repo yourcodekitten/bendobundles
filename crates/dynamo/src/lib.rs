@@ -123,6 +123,12 @@ pub struct SyncState {
     pub cookie_ok: bool,
     pub games_written: u32,
     pub message: String,
+    /// True while the current library-private episode has already been pinged (#47): the
+    /// ownership pass pings once when Steam first reports the library private, then holds
+    /// this marker until a successful (non-private) fetch ends the episode. `default` so
+    /// pre-marker items deserialize to false (episode not yet pinged).
+    #[serde(default)]
+    pub private_pinged: bool,
 }
 
 /// Cached result of a Steam-owned-games API fetch. Stored at STEAMOWN#<steamid>; TTL-evicted
@@ -131,6 +137,18 @@ pub struct SyncState {
 pub struct SteamOwnedCache {
     pub appids: Vec<u32>,
     pub fetched_at: i64,
+}
+
+/// Outcome of [`Store::cached_owned_or_fetch`] (#47) — the HTTP-agnostic result both owned
+/// proxies map to their own responses.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnedProxyOutcome {
+    /// A servable appid list: a fresh cache hit, or a fetch that refreshed the cache.
+    Games(Vec<u32>),
+    /// Steam says the library is private; any previous good cache is deliberately preserved.
+    Private,
+    /// Steam was unavailable and no fresh cache could cover for it.
+    Unavailable,
 }
 
 /// Cached enrichment data for a single Steam app, written at sync time.
@@ -2360,6 +2378,55 @@ impl Store {
         Ok(cache.map(|c| (c.appids, c.fetched_at)))
     }
 
+    /// The shared owned-games cache-or-fetch core (#47): serve the STEAMOWN cache when
+    /// fresh ([`schema::STEAM_OWNED_FRESH_SECS`]), else fetch from Steam with write-through.
+    /// Both owned proxies (admin + token-scoped public) had this block line-for-line — the
+    /// freshness rule, the write-through, and the do-NOT-overwrite-cache-on-Private rule
+    /// now live here, once. Callers keep their own preambles and map the outcome to HTTP.
+    pub async fn cached_owned_or_fetch(
+        &self,
+        steam: &steam_client::SteamClient,
+        steamid: &str,
+        now_epoch: i64,
+    ) -> OwnedProxyOutcome {
+        // Try the cache first.
+        match self.get_steam_owned(steamid).await {
+            Ok(Some((appids, fetched_at)))
+                if now_epoch - fetched_at <= schema::STEAM_OWNED_FRESH_SECS =>
+            {
+                // Cache is fresh — serve it without hitting Steam.
+                return OwnedProxyOutcome::Games(appids);
+            }
+            Ok(_) => {}  // absent or stale — fall through to fetch
+            Err(_) => {} // read error — fall through to fetch (degraded, not fatal)
+        }
+
+        // Cache miss or stale: call Steam.
+        match steam
+            .get_owned_games(&steam_client::SteamId64(steamid.to_string()))
+            .await
+        {
+            Ok(steam_client::OwnedGames::Games(appids)) => {
+                // Write-through cache — ignore write errors (degraded cache, not fatal).
+                let _ = self.put_steam_owned(steamid, &appids, now_epoch).await;
+                OwnedProxyOutcome::Games(appids)
+            }
+            Ok(steam_client::OwnedGames::Private) => {
+                // Do NOT overwrite a previous good cache — return the private signal only.
+                OwnedProxyOutcome::Private
+            }
+            Err(
+                steam_client::SteamError::Network(_)
+                | steam_client::SteamError::Api(_)
+                | steam_client::SteamError::RateLimited
+                | steam_client::SteamError::KeyRejected
+                | steam_client::SteamError::NotFound
+                | steam_client::SteamError::Parse(_)
+                | steam_client::SteamError::OpenIdRejected(_),
+            ) => OwnedProxyOutcome::Unavailable,
+        }
+    }
+
     /// Write (or refresh) a Steam app enrichment cache entry — guarded (#75).
     /// pk="STEAMAPP#<app_id>", sk="META", body=JSON of [`SteamAppCache`],
     /// version=N monotonic counter. Succeeds only if the item still matches the
@@ -2883,5 +2950,50 @@ mod tests {
         // No CCF, no conflict → caller falls through to the loud Store error.
         let reasons = vec![reason(None), reason(None), reason(None)];
         assert!(claim_cancellation_error(&reasons).is_none());
+    }
+
+    // self_claim_cancellation_error: the two-item (GAME, CLAIM — no LINK) sibling. Until #44
+    // item 5 it had zero coverage while the gift-side quartet above pinned every rule; a drift
+    // in its positional mapping or conflict precedence would surface as a wrong admin HTTP code.
+
+    #[test]
+    fn self_conflict_reason_maps_to_txconflict() {
+        // Pure timing race → the retryable variant (admin surfaces it as 409).
+        let reasons = vec![reason(Some("TransactionConflict")), reason(None)];
+        assert!(matches!(
+            self_claim_cancellation_error(&reasons),
+            Some(ClaimTxError::TxConflict)
+        ));
+    }
+
+    #[test]
+    fn self_conditional_check_beats_conflict() {
+        // Mixed cancel: the game's CCF is the business answer; never degrade to a retry.
+        let reasons = vec![
+            reason(Some("ConditionalCheckFailed")),
+            reason(Some("TransactionConflict")),
+        ];
+        assert!(matches!(
+            self_claim_cancellation_error(&reasons),
+            Some(ClaimTxError::GameUnavailable)
+        ));
+    }
+
+    #[test]
+    fn self_positional_ccf_mapping() {
+        assert!(matches!(
+            self_claim_cancellation_error(&[reason(Some("ConditionalCheckFailed")), reason(None)]),
+            Some(ClaimTxError::GameUnavailable)
+        ));
+        assert!(matches!(
+            self_claim_cancellation_error(&[reason(None), reason(Some("ConditionalCheckFailed"))]),
+            Some(ClaimTxError::DuplicateClaim)
+        ));
+    }
+
+    #[test]
+    fn self_unclassifiable_cancel_is_none() {
+        let reasons = vec![reason(None), reason(None)];
+        assert!(self_claim_cancellation_error(&reasons).is_none());
     }
 }

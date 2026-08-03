@@ -344,6 +344,7 @@ async fn redeem_auth_rejection_parks_and_pings_distinctly_without_flag() {
         cookie_ok: true,
         games_written: 5,
         message: "all good".into(),
+        private_pinged: false,
     };
     store.put_sync_state(&healthy).await.unwrap();
 
@@ -423,6 +424,7 @@ async fn validate_cookie_transient_error_does_not_touch_sync_state() {
         cookie_ok: true,
         games_written: 5,
         message: "all good".into(),
+        private_pinged: false,
     };
     store.put_sync_state(&initial_state).await.unwrap();
 
@@ -755,6 +757,7 @@ async fn redeem_auth_rejection_never_triggers_selfheal() {
         cookie_ok: true,
         games_written: 5,
         message: "all good".into(),
+        private_pinged: false,
     };
     store.put_sync_state(&healthy).await.unwrap();
 
@@ -4056,6 +4059,67 @@ async fn revealed_key_value_never_appears_in_logs_or_pings() {
     }
 }
 
+/// Store-failure sibling of the scrub test above (#44 item 1): the ping loop there iterates
+/// zero requests because neither exercised path pings — this drives record_revealed_key's
+/// store-failure ping (the ONLY self-claim ping that fires with a real key value in scope)
+/// and asserts it is non-empty, alerts the operator, and is scrubbed of the key.
+#[tokio::test]
+async fn self_claim_store_failure_ping_fires_and_is_scrubbed() {
+    let Some(store) = store_or_skip("sc-scrub-fail").await else {
+        return;
+    };
+    let key = "AAAA-BBBB-CCCC";
+
+    seed_available_game(&store, "gkSF:mnSF", "Scrub Game F").await;
+    store
+        .claim_game_self("gkSF:mnSF", "sc-sf", now())
+        .await
+        .unwrap();
+    // Force fulfill_self_claim to fail AFTER the reveal succeeds: a Compensated claim
+    // consumes the gsi2pk pending marker, so the conditional key-write CCFs and the
+    // recheck sees a terminal state (same seed as store_test's sc-fulfill-3).
+    let mut c = store
+        .get_claim(SELF_LINK_TOKEN, "sc-sf")
+        .await
+        .unwrap()
+        .unwrap();
+    c.state = ClaimState::Compensated;
+    store.put_claim(&c).await.unwrap();
+
+    let humble = MockServer::start().await;
+    mount_reveal_success(&humble, key).await;
+    let discord = discord_ok().await;
+    let deps = deps(store.clone(), &humble.uri(), Some(discord.uri()));
+    let resp = handle(
+        &deps,
+        FulfillRequest::SelfClaim {
+            claim_id: "sc-sf".into(),
+            game_id: "gkSF:mnSF".into(),
+            gamekey: "gkSF".into(),
+            machine_name: "mnSF".into(),
+            keyindex: 0,
+            requires_choice: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(resp, FulfillResponse::Error { .. }),
+        "revealed-but-unrecorded must surface as Error, got {resp:?}"
+    );
+
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(pings.len(), 1, "exactly one operator ping must fire");
+    let body = String::from_utf8_lossy(&pings[0].body).to_string();
+    assert!(
+        body.contains("not recorded"),
+        "ping must alert that the key was revealed but not recorded: {body}"
+    );
+    assert!(
+        !body.contains(key),
+        "key value leaked into the store-failure ping: {body}"
+    );
+}
+
 // -------------------------------------------------------------------------------------------------
 // Pure decision-ladder test: reveal_decision is identical to gift_decision (same Err classification).
 // -------------------------------------------------------------------------------------------------
@@ -5023,12 +5087,14 @@ async fn refresh_ben_ownership_private_keeps_stamps_and_pings() {
 
     store.put_steam_identity(STEAMID).await.unwrap();
 
-    // Seed STEAMOWN to simulate a prior successful fetch — the ping dedupe fires on its presence.
+    // Seed STEAMOWN to simulate a prior successful fetch — the ping dedupe fires on its
+    // presence. Seeded STALE (2 days old): a fresh entry would take the freshness-skip lane
+    // (#47) and never call Steam, which is its own test below.
     store
         .put_steam_owned(
             STEAMID,
             &[9999],
-            time::OffsetDateTime::now_utc().unix_timestamp(),
+            time::OffsetDateTime::now_utc().unix_timestamp() - 2 * 86400,
         )
         .await
         .unwrap();
@@ -5075,6 +5141,146 @@ async fn refresh_ben_ownership_private_keeps_stamps_and_pings() {
         body.contains("privacy") || body.contains("owned badges"),
         "ping body must mention privacy / owned badges"
     );
+
+    // The episode marker must be persisted so the NEXT sync doesn't re-ping (#47).
+    let st = d.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.private_pinged,
+        "private_pinged episode marker must persist after the ping"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Private-ping episode marker (#47): before the marker, the presence dedupe re-pinged EVERY sync
+// for the whole 7-day cache TTL (Private never overwrites the last good cache entry). Now the
+// ping fires once per episode; a successful non-private fetch ends the episode and re-arms it.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn private_ping_fires_once_per_episode_and_rearms_on_recovery() {
+    let Some(store) = store_or_skip("t8-private-episode").await else {
+        return;
+    };
+
+    const STEAMID: &str = "76561198000000003";
+    let stale = || time::OffsetDateTime::now_utc().unix_timestamp() - 2 * 86400;
+
+    seed_steam_game(&store, "gk-pe", "mn-pe", "Episode Game", Some(9999), None).await;
+    store.put_steam_identity(STEAMID).await.unwrap();
+    store
+        .put_steam_owned(STEAMID, &[9999], stale())
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let private_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": {}
+        })))
+        .mount(&private_mock)
+        .await;
+
+    let mut d = deps(store, &humble.uri(), Some(discord.uri()));
+    d.steam = Some(steam_client_at(&private_mock.uri()));
+
+    // Sync 1: private → exactly one ping, marker set.
+    handle(&d, FulfillRequest::Sync).await;
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1);
+
+    // Sync 2: still private (cache still the stale seed) → NO second ping.
+    handle(&d, FulfillRequest::Sync).await;
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        1,
+        "second private sync in the same episode must NOT re-ping"
+    );
+
+    // Recovery: a successful non-private fetch ends the episode (marker reset).
+    let games_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": { "game_count": 1, "games": [{ "appid": 9999 }] }
+        })))
+        .mount(&games_mock)
+        .await;
+    d.steam = Some(steam_client_at(&games_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+    let st = d.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        !st.private_pinged,
+        "successful fetch must end the episode and re-arm the ping"
+    );
+
+    // Privacy flips again: re-stale the cache (the recovery fetch refreshed it — a fresh
+    // cache takes the freshness-skip lane and learns nothing) and point back at private.
+    d.store
+        .put_steam_owned(STEAMID, &[9999], stale())
+        .await
+        .unwrap();
+    d.steam = Some(steam_client_at(&private_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        2,
+        "a NEW private episode after recovery must ping again"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Freshness skip (#47): a ≤24h STEAMOWN cache is stamped from directly — zero Steam calls —
+// and the episode marker carries through untouched.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn fresh_owned_cache_stamps_without_a_steam_call() {
+    let Some(store) = store_or_skip("t8-fresh-skip").await else {
+        return;
+    };
+
+    const STEAMID: &str = "76561198000000004";
+    let gid = seed_steam_game(&store, "gk-fs", "mn-fs", "Fresh Game", Some(4242), None).await;
+    store.put_steam_identity(STEAMID).await.unwrap();
+    // FRESH cache (1h old) containing the game's appid.
+    store
+        .put_steam_owned(
+            STEAMID,
+            &[4242],
+            time::OffsetDateTime::now_utc().unix_timestamp() - 3600,
+        )
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+
+    let steam_mock = MockServer::start().await;
+    // NO GetOwnedGames mock mounted: a Steam ownership call would 404 → transient-error lane
+    // → no stamp. The stamp below proves the cache lane ran instead.
+    let mut d = deps(store, &humble.uri(), None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let game = d.store.get_game(&gid).await.unwrap().unwrap();
+    assert!(
+        game.owned_by_ben,
+        "fresh cache must stamp owned_by_ben without a steam round-trip"
+    );
+    let owned_calls = steam_mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().contains("GetOwnedGames"))
+        .count();
+    assert_eq!(owned_calls, 0, "fresh cache must not hit GetOwnedGames");
 }
 
 // -------------------------------------------------------------------------------------------------

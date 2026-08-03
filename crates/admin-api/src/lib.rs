@@ -34,10 +34,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dynamo::{AppidWrite, ClaimTxError, HiddenWrite, Store};
+use dynamo::{AppidWrite, ClaimTxError, HiddenWrite, OwnedProxyOutcome, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::Deserialize;
-use steam_client::{OwnedGames, SteamClient, SteamId64};
+use steam_client::SteamClient;
 use time::OffsetDateTime;
 
 // ── Traits ────────────────────────────────────────────────────────────────────
@@ -190,12 +190,6 @@ async fn session_middleware(State(s): State<AppState>, request: Request, next: N
 }
 
 // ── Steam helper ──────────────────────────────────────────────────────────────
-
-/// Validate that `s` is exactly 17 ASCII digits — delegates to steam-client's canonical rule
-/// (`is_valid_steam_id64`), the single source shared with the OpenID `claimed_id` parse (#47).
-fn is_valid_steamid(s: &str) -> bool {
-    steam_client::is_valid_steam_id64(s)
-}
 
 /// Extract the steam client from state or return a 503 response.
 macro_rules! require_steam {
@@ -1017,10 +1011,10 @@ async fn handle_steam_identity_post(
 ) -> Response {
     let _steam = require_steam!(s);
 
-    if !is_valid_steamid(&body.steamid) {
+    if !steam_client::is_valid_steam_id64(&body.steamid) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "steamid must be exactly 17 ASCII digits"})),
+            Json(serde_json::json!({"error": steam_client::STEAM_ID64_ERROR_MSG})),
         )
             .into_response();
     }
@@ -1079,46 +1073,39 @@ async fn handle_steam_owned_proxy(
 ) -> Response {
     let steam = require_steam!(s);
 
-    if !is_valid_steamid(&steamid) {
+    if !steam_client::is_valid_steam_id64(&steamid) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "steamid must be exactly 17 ASCII digits"})),
+            Json(serde_json::json!({"error": steam_client::STEAM_ID64_ERROR_MSG})),
         )
             .into_response();
     }
 
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    const FRESH_SECS: i64 = 86400; // 24 hours
-
-    // Try the cache first.
-    match s.store.get_steam_owned(&steamid).await {
-        Ok(Some((appids, fetched_at))) if now - fetched_at <= FRESH_SECS => {
-            // Cache is fresh — serve it without hitting Steam.
-            return (StatusCode::OK, Json(serde_json::json!({"appids": appids}))).into_response();
-        }
-        Ok(_) => {}  // absent or stale — fall through to fetch
-        Err(_) => {} // read error — fall through to fetch (degraded, not fatal)
-    }
-
-    // Cache miss or stale: call Steam.
-    match steam.get_owned_games(&SteamId64(steamid.clone())).await {
-        Ok(OwnedGames::Games(appids)) => {
-            // Write-through cache — ignore write errors (degraded cache, not fatal).
-            let _ = s.store.put_steam_owned(&steamid, &appids, now).await;
-            (StatusCode::OK, Json(serde_json::json!({"appids": appids}))).into_response()
-        }
-        Ok(OwnedGames::Private) => {
-            // Do NOT overwrite a previous good cache — return private signal only.
+    // 24h cache-or-fetch — the shared core (#47); see Store::cached_owned_or_fetch.
+    match s
+        .store
+        .cached_owned_or_fetch(steam.as_ref(), &steamid, now)
+        .await
+    {
+        OwnedProxyOutcome::Games(appids) => (
+            StatusCode::OK,
+            // Browser-side mirror of the server's freshness rule (#47): the appid list is
+            // stable for the same 24h window the STEAMOWN cache serves. `private` — this
+            // is a session-guarded, per-admin response; never shared-cacheable.
+            [(
+                header::CACHE_CONTROL,
+                format!(
+                    "private, max-age={}",
+                    dynamo::schema::STEAM_OWNED_FRESH_SECS
+                ),
+            )],
+            Json(serde_json::json!({"appids": appids})),
+        )
+            .into_response(),
+        OwnedProxyOutcome::Private => {
             (StatusCode::OK, Json(serde_json::json!({"private": true}))).into_response()
         }
-        Err(
-            steam_client::SteamError::Network(_)
-            | steam_client::SteamError::Api(_)
-            | steam_client::SteamError::RateLimited
-            | steam_client::SteamError::KeyRejected
-            | steam_client::SteamError::NotFound
-            | steam_client::SteamError::Parse(_)
-            | steam_client::SteamError::OpenIdRejected(_),
-        ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        OwnedProxyOutcome::Unavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }

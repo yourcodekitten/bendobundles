@@ -2019,22 +2019,80 @@ where
 /// The alternative — an HTTP-path O(catalog) mass-clear in Task 9's handler — would require
 /// iterating and conditionally writing every game on delete. That's expensive, racey, and
 /// unnecessary given the UI hides the column anyway. Keeping it here keeps the logic in one place.
-async fn refresh_ben_ownership(deps: &Deps) {
+/// Diff-stamp `owned_by_ben` across `games` from an owned-appid list. Shared by the fetch
+/// and fresh-cache lanes of [`refresh_ben_ownership`] (#47).
+async fn stamp_owned(deps: &Deps, games: &[Game], appids: Vec<u32>) {
+    let appid_set: std::collections::HashSet<u32> = appids.into_iter().collect();
+    let mut stamped = 0usize;
+    let mut unstamped = 0usize;
+
+    for game in games {
+        let Some(steam_app_id) = game.steam_app_id else {
+            continue; // no appid — nothing to compare against
+        };
+        let owned = appid_set.contains(&steam_app_id);
+        if owned == game.owned_by_ben {
+            continue; // no change — skip the conditional write
+        }
+        match deps.store.set_game_owned_by_ben(&game.id, owned).await {
+            Ok(OwnedWrite::Written) => {
+                if owned {
+                    stamped += 1;
+                } else {
+                    unstamped += 1;
+                }
+            }
+            // A claim is in flight — the claim path owns this game's state for now.
+            // The next sync will re-diff and write once the claim lands.
+            Ok(OwnedWrite::Contested) => {
+                tracing::debug!(game_id = %game.id, "steam owned refresh: game in-flight claim — skipping stamp");
+            }
+            Ok(OwnedWrite::NotFound) => {} // game was deleted between list and stamp — safe no-op
+            Err(e) => {
+                tracing::warn!(game_id = %game.id, error = ?e, "steam owned refresh: set_game_owned_by_ben failed");
+            }
+        }
+    }
+
+    tracing::info!(stamped, unstamped, "steam owned refresh: stamps updated");
+}
+
+/// Returns the `private_pinged` episode marker to persist (#47): `already_pinged` carried
+/// through on every lane that learns nothing new about privacy (skips, fresh cache, transient
+/// errors), set true when a Private response is seen (pinging only if `!already_pinged` and a
+/// prior success exists), and reset to false by a successful non-private fetch — which is what
+/// ends an episode and re-arms the ping.
+async fn refresh_ben_ownership(deps: &Deps, games: &[Game], already_pinged: bool) -> bool {
     // No Steam client → skip. Configured by the app at startup; if absent the whole Steam
     // feature is disabled and no identity can be fetched.
     let Some(steam) = deps.steam.as_ref() else {
-        return;
+        return already_pinged;
     };
 
     // No identity → skip silently. Ben hasn't linked his Steam account yet.
     let steamid = match deps.store.get_steam_identity().await {
         Ok(Some(id)) => id,
-        Ok(None) => return,
+        Ok(None) => return already_pinged,
         Err(e) => {
             tracing::warn!(error = ?e, "steam owned refresh: get_steam_identity failed — skipping");
-            return;
+            return already_pinged;
         }
     };
+
+    // One cache read serves both the freshness skip and the Private-arm presence dedupe.
+    let cached = deps.store.get_steam_owned(&steamid).await.ok().flatten();
+
+    // Freshness skip (#47 perf): a ≤24h-old STEAMOWN entry (proxy- or sync-written) makes the
+    // Steam round-trip redundant — diff-stamp straight off the cached appids. Stated tradeoff:
+    // a privacy flip inside the freshness window is detected (and pinged) up to 24h late.
+    if let Some((appids, fetched_at)) = &cached {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if now - fetched_at <= dynamo::schema::STEAM_OWNED_FRESH_SECS {
+            tracing::info!("steam owned refresh: cache fresh — stamping without a steam call");
+            stamp_owned(deps, games, appids.clone()).await;
+            return already_pinged; // learned nothing about privacy — carry the marker
+        }
+    }
 
     match steam
         .get_owned_games(&steam_client::SteamId64(steamid.clone()))
@@ -2046,64 +2104,21 @@ async fn refresh_ben_ownership(deps: &Deps) {
             if let Err(e) = deps.store.put_steam_owned(&steamid, &appids, now).await {
                 tracing::warn!(error = ?e, "steam owned refresh: put_steam_owned failed — continuing with in-memory appids");
             }
-
-            // Read game list ONCE; diff-stamp only changed values.
-            let games = match deps.store.list_all_games().await {
-                Ok(g) => g,
-                Err(e) => {
-                    tracing::warn!(error = ?e, "steam owned refresh: list_all_games failed — skipping stamps");
-                    return;
-                }
-            };
-
-            let appid_set: std::collections::HashSet<u32> = appids.into_iter().collect();
-            let mut stamped = 0usize;
-            let mut unstamped = 0usize;
-
-            for game in &games {
-                let Some(steam_app_id) = game.steam_app_id else {
-                    continue; // no appid — nothing to compare against
-                };
-                let owned = appid_set.contains(&steam_app_id);
-                if owned == game.owned_by_ben {
-                    continue; // no change — skip the conditional write
-                }
-                match deps.store.set_game_owned_by_ben(&game.id, owned).await {
-                    Ok(OwnedWrite::Written) => {
-                        if owned {
-                            stamped += 1;
-                        } else {
-                            unstamped += 1;
-                        }
-                    }
-                    // A claim is in flight — the claim path owns this game's state for now.
-                    // The next sync will re-diff and write once the claim lands.
-                    Ok(OwnedWrite::Contested) => {
-                        tracing::debug!(game_id = %game.id, "steam owned refresh: game in-flight claim — skipping stamp");
-                    }
-                    Ok(OwnedWrite::NotFound) => {} // game was deleted between list and stamp — safe no-op
-                    Err(e) => {
-                        tracing::warn!(game_id = %game.id, error = ?e, "steam owned refresh: set_game_owned_by_ben failed");
-                    }
-                }
-            }
-
-            tracing::info!(stamped, unstamped, "steam owned refresh: stamps updated");
+            stamp_owned(deps, games, appids).await;
+            false // successful non-private fetch ends any private episode — re-arm the ping
         }
 
         Ok(steam_client::OwnedGames::Private) => {
             // Stamps remain frozen. Do NOT touch owned_by_ben.
             tracing::info!("steam owned refresh skipped: ben library reads private");
 
-            // Ping ONCE via the STEAMOWN-presence dedupe (see function-level doc).
-            let prev_success = deps
-                .store
-                .get_steam_owned(&steamid)
-                .await
-                .ok()
-                .and_then(|opt| opt)
-                .is_some();
-            if prev_success {
+            // Ping ONCE per episode: prior-success presence dedupe (as before) AND the
+            // persisted episode marker — presence alone re-pinged every sync for the whole
+            // 7-day cache TTL, because a Private response deliberately never overwrites the
+            // last good cache entry (#47).
+            let prev_success = cached.is_some();
+            let should_ping = prev_success && !already_pinged;
+            if should_ping {
                 ping(
                     deps,
                     "your steam 'game details' privacy or the key's account changed \
@@ -2111,11 +2126,13 @@ async fn refresh_ben_ownership(deps: &Deps) {
                 )
                 .await;
             }
+            already_pinged || should_ping
         }
 
         Err(e) => {
-            // Transient error — keep stamps, log, no ping.
+            // Transient error — keep stamps, log, no ping, carry the marker.
             tracing::warn!(error = ?e, "steam owned refresh: get_owned_games failed — keeping prior stamps");
+            already_pinged
         }
     }
 }
@@ -2459,15 +2476,21 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
     let mut adult_appids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
 
     // Decide the work list up front (cheap store reads only — no storefront calls yet).
+    // ONE BatchGetItem drain instead of N serial GetItems (#47). Degradation shape change,
+    // stated: a batch failure skips the whole pass (was: per-app skip) — enrichment is
+    // best-effort and self-heals next sync either way. The fetch loop's versioned re-read
+    // (#75 optimistic lock) is untouched.
+    let appid_vec: Vec<u32> = appids.iter().copied().collect();
+    let existing_caches = match deps.store.batch_get_steam_apps(&appid_vec).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = ?e, "steam enrichment: batch_get_steam_apps failed — skipping pass");
+            return;
+        }
+    };
     let mut worklist: Vec<Work> = Vec::new();
     for app_id in appids {
-        let existing = match deps.store.get_steam_app(app_id).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(app_id, error = ?e, "steam enrichment: get_steam_app failed — skipping app");
-                continue;
-            }
-        };
+        let existing = existing_caches.get(&app_id).cloned();
         // Adult appids are collected from the EXISTING cache too: a game newly mapped to
         // an already-fresh {3,4} cache (same adult game, second bundle) never enters the
         // worklist, and the sweep must still catch it. Cached descriptors don't need to
@@ -2880,18 +2903,13 @@ pub async fn backfill_steam_details(
 /// Lazy: if no unmapped games exist, returns WITHOUT fetching the app list.
 /// Resilient: 429 or any network/api failure from `get_app_list` logs a warning and skips the
 /// pass — the sync NEVER fails because Steam is unreachable.
-async fn map_missing_appids(deps: &Deps) {
+/// Returns the `(game_id, appid)` pairs actually WRITTEN, so the caller can apply them to its
+/// shared in-memory scan — the ownership pass runs next and must see this pass's mappings
+/// without a second full-catalog Scan (#47).
+async fn map_missing_appids(deps: &Deps, games: &[Game]) -> Vec<(String, u32)> {
     let Some(steam) = deps.steam.as_ref() else {
         // No Steam client configured — skip the title pass but keep tier-1 ids already written.
-        return;
-    };
-
-    let games = match deps.store.list_all_games().await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(error = ?e, "steam appid mapping: list_all_games failed — skipping pass");
-            return;
-        }
+        return Vec::new();
     };
 
     // Normalize: lowercase + trim + strip ™/® + collapse internal whitespace.
@@ -2929,7 +2947,7 @@ async fn map_missing_appids(deps: &Deps) {
             manual = manual_count,
             "steam appid mapping: no unmapped games — skipping app list fetch"
         );
-        return;
+        return Vec::new();
     }
 
     // Fetch the app list — keyless endpoint, so no API key is sent.
@@ -2937,7 +2955,7 @@ async fn map_missing_appids(deps: &Deps) {
         Ok(list) => list,
         Err(steam_client::SteamError::RateLimited) => {
             tracing::warn!("steam appid mapping: 429 rate limited — skipping title pass this run");
-            return;
+            return Vec::new();
         }
         Err(
             e @ (steam_client::SteamError::Network(_)
@@ -2951,7 +2969,7 @@ async fn map_missing_appids(deps: &Deps) {
                 error = ?e,
                 "steam appid mapping: network/api failure — skipping title pass this run"
             );
-            return;
+            return Vec::new();
         }
     };
 
@@ -2964,6 +2982,7 @@ async fn map_missing_appids(deps: &Deps) {
 
     let mut mapped = 0usize;
     let mut unmapped = 0usize;
+    let mut written: Vec<(String, u32)> = Vec::new();
 
     for game in &to_map {
         let normalized = normalize(&game.title);
@@ -2975,7 +2994,10 @@ async fn map_missing_appids(deps: &Deps) {
                     .set_game_steam_appid_if_unclaimed(&game.id, appid, AppidSource::Title)
                     .await
                 {
-                    Ok(dynamo::AppidWrite::Written) => mapped += 1,
+                    Ok(dynamo::AppidWrite::Written) => {
+                        mapped += 1;
+                        written.push((game.id.clone(), appid));
+                    }
                     Ok(_) => unmapped += 1, // NotFound / Skipped / Contested — leave unmapped
                     Err(e) => {
                         tracing::warn!(
@@ -2994,6 +3016,7 @@ async fn map_missing_appids(deps: &Deps) {
     tracing::info!(
         "steam appid mapping: mapped={mapped} unmapped={unmapped} manual={manual_count}"
     );
+    written
 }
 
 /// The sync walk. Runs [`pending_age_sweep`] first (the watchdog — see its doc for why it comes
@@ -3005,6 +3028,17 @@ async fn run_sync(deps: &Deps) {
     // Watchdog first (gate review B-4): needs no humble session — must run before
     // anything that can die. Do not add early returns above this line.
     pending_age_sweep(deps).await;
+    // The private-library ping's episode marker (#47). Read once; every persist_sync lane
+    // must carry it — a lane that never ran the ownership pass learned nothing and must not
+    // reset the marker (that would re-arm the ping mid-episode).
+    let prev_private_pinged = deps
+        .store
+        .get_sync_state()
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.private_pinged)
+        .unwrap_or(false);
     // Enrichment deadline is threaded from the caller via deps.steam_enrich_deadline. It was
     // computed from the lambda context's remaining time (minus the 180s margin) so `persist_sync`
     // + `end_sync_run` always have room to land — see compute_enrich_deadline.
@@ -3029,7 +3063,15 @@ async fn run_sync(deps: &Deps) {
         // Dead AND self-login couldn't fix it (or isn't configured) → genuine attention needed.
         Err(HumbleError::Unauthorized) => {
             ping(deps, COOKIE_DEAD_MSG).await;
-            persist_sync(deps, false, false, 0, "humble session cookie is dead").await;
+            persist_sync(
+                deps,
+                false,
+                false,
+                0,
+                "humble session cookie is dead",
+                prev_private_pinged,
+            )
+            .await;
             return;
         }
         Err(e) => {
@@ -3043,6 +3085,7 @@ async fn run_sync(deps: &Deps) {
                 cookie_ok,
                 0,
                 &format!("sync failed listing orders: {e}"),
+                prev_private_pinged,
             )
             .await;
             return;
@@ -3170,15 +3213,49 @@ async fn run_sync(deps: &Deps) {
         }
     }
 
+    // ONE full-catalog Scan shared by the title pass and the ownership pass (#47) — they
+    // previously each ran their own. Scanned AFTER the order walk (its upserts must be visible)
+    // and only when a steam client exists (both passes skip without one). The enrichment pass
+    // deliberately keeps its OWN scan: choice discovery writes new games between these passes
+    // and enrichment must see them.
+    let shared_scan: Option<Vec<Game>> = if deps.steam.is_some() {
+        match deps.store.list_all_games().await {
+            Ok(g) => Some(g),
+            Err(e) => {
+                tracing::warn!(error = ?e, "sync: list_all_games failed — skipping title + ownership passes");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Title-pass: map any still-unmapped steam games by unique exact name match against the Steam
     // app list. Lazy — skips the GetAppList fetch if no unmapped games exist. 429/network errors
     // are logged and swallowed; the pass is best-effort and never blocks sync.
-    map_missing_appids(deps).await;
+    let shared_scan = match shared_scan {
+        Some(mut games) => {
+            let written = map_missing_appids(deps, &games).await;
+            // Apply this pass's mappings to the shared scan so the ownership pass diffs
+            // against them without a re-Scan (it previously re-read the catalog).
+            for (id, appid) in &written {
+                if let Some(g) = games.iter_mut().find(|g| &g.id == id) {
+                    g.steam_app_id = Some(*appid);
+                    g.appid_source = Some(AppidSource::Title);
+                }
+            }
+            Some(games)
+        }
+        None => None,
+    };
 
     // Ownership pass: stamp owned_by_ben on every game with a steam_app_id. Runs AFTER the
     // mapper pass so appid coverage is as complete as possible before the diff. Failures are
     // logged and swallowed; the pass is best-effort and never blocks sync.
-    refresh_ben_ownership(deps).await;
+    let private_pinged = match &shared_scan {
+        Some(games) => refresh_ben_ownership(deps, games, prev_private_pinged).await,
+        None => prev_private_pinged, // pass skipped — carry the episode marker
+    };
 
     // Choice-discovery ingest — surface each still-claimable OFFERED game as a `requires_choice=true`
     // catalog entry, so the gift-choice orchestration has something to run on. Runs AFTER the order
@@ -3210,6 +3287,7 @@ async fn run_sync(deps: &Deps) {
         cookie_ok,
         games_written,
         &msg,
+        private_pinged,
     )
     .await;
     tracing::info!(games_written, orders_failed, cookie_ok, "sync finished");
@@ -3823,14 +3901,24 @@ async fn set_cookie_ok(deps: &Deps, cookie_ok: bool) {
     }
 }
 
-/// Persist a sync-run summary, preserving nothing from prior runs (a run fully describes itself).
-async fn persist_sync(deps: &Deps, ok: bool, cookie_ok: bool, games_written: u32, message: &str) {
+/// Persist a sync-run summary. A run fully describes itself EXCEPT `private_pinged`, which is
+/// episode state spanning runs — lanes where the ownership pass never ran must pass the carried
+/// previous value, or a dead-cookie run would silently re-arm the private-library ping (#47).
+async fn persist_sync(
+    deps: &Deps,
+    ok: bool,
+    cookie_ok: bool,
+    games_written: u32,
+    message: &str,
+    private_pinged: bool,
+) {
     let st = SyncState {
         last_run_epoch: OffsetDateTime::now_utc().unix_timestamp(),
         ok,
         cookie_ok,
         games_written,
         message: message.to_string(),
+        private_pinged,
     };
     let _ = deps.store.put_sync_state(&st).await;
 }

@@ -14,11 +14,11 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dynamo::{ClaimTxError, Store};
+use dynamo::{ClaimTxError, OwnedProxyOutcome, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use steam_client::{OwnedGames, SteamClient, SteamId64};
+use steam_client::SteamClient;
 use time::OffsetDateTime;
 
 // ── Invoker trait ─────────────────────────────────────────────────────────────
@@ -248,6 +248,33 @@ fn redirect_to(location: &str) -> Response {
 
 // ── GET /api/steam/login ──────────────────────────────────────────────────────
 
+/// Typed steam login-flow error, replacing the raw fragment string literals (#47). The web SPA
+/// string-matches the `Display` values EXACTLY (`consumeReturnFragment` in steamIdentity.ts;
+/// the `verify_failed` branches in LinkPage.tsx/Ops.tsx) — Display IS the wire contract, pinned
+/// byte-exact by `steam_login_error_fragments_are_the_wire_contract` below and end-to-end by the
+/// api_test fragment tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteamLoginError {
+    /// The OpenID assertion did not verify — the identity claim itself was rejected.
+    VerifyFailed,
+    /// Steam (or our state write) was unavailable — nothing wrong with the identity claim.
+    SteamUnreachable,
+}
+
+impl std::fmt::Display for SteamLoginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SteamLoginError::VerifyFailed => "verify_failed",
+            SteamLoginError::SteamUnreachable => "steam_unreachable",
+        })
+    }
+}
+
+/// Build the `ctx`-relative redirect target carrying a steam login error fragment.
+fn steam_error_fragment(ctx: &str, err: SteamLoginError) -> String {
+    format!("{ctx}#steam_error={err}")
+}
+
 async fn handle_steam_login(
     State(s): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
@@ -263,7 +290,10 @@ async fn handle_steam_login(
     // Guard: steam must be configured. If not, redirect back to ctx with an error fragment
     // so the SPA can show a polite message instead of a dead-end 503 on return.
     if s.steam.is_none() {
-        return redirect_to(&format!("{ctx}#steam_error=steam_unreachable"));
+        return redirect_to(&steam_error_fragment(
+            &ctx,
+            SteamLoginError::SteamUnreachable,
+        ));
     }
 
     // #86: mint an opaque single-use nonce, store OIDCSTATE#<nonce> → ctx (~5-min TTL), and put ONLY
@@ -280,7 +310,10 @@ async fn handle_steam_login(
     );
     let expires = OffsetDateTime::now_utc().unix_timestamp() + dynamo::schema::OIDC_STATE_TTL_SECS;
     if s.store.put_oidc_state(&nonce, &ctx, expires).await.is_err() {
-        return redirect_to(&format!("{ctx}#steam_error=steam_unreachable"));
+        return redirect_to(&steam_error_fragment(
+            &ctx,
+            SteamLoginError::SteamUnreachable,
+        ));
     }
 
     let return_to = build_return_to(&s.base_url, &nonce);
@@ -352,7 +385,7 @@ async fn handle_steam_return(
     {
         Ok(id) => id,
         Err(steam_client::SteamError::OpenIdRejected(_)) => {
-            return redirect_to(&format!("{ctx}#steam_error=verify_failed"));
+            return redirect_to(&steam_error_fragment(&ctx, SteamLoginError::VerifyFailed));
         }
         Err(
             steam_client::SteamError::Network(_)
@@ -363,7 +396,10 @@ async fn handle_steam_return(
             | steam_client::SteamError::Parse(_),
         ) => {
             // Network, API, or other Steam unreachability.
-            return redirect_to(&format!("{ctx}#steam_error=steam_unreachable"));
+            return redirect_to(&steam_error_fragment(
+                &ctx,
+                SteamLoginError::SteamUnreachable,
+            ));
         }
     };
 
@@ -451,40 +487,38 @@ async fn handle_steam_owned_proxy(
     if !steam_client::is_valid_steam_id64(&steamid) {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "steamid must be exactly 17 ASCII digits"})),
+            Json(serde_json::json!({"error": steam_client::STEAM_ID64_ERROR_MSG})),
         )
             .into_response();
     }
 
-    // 4. Cache-or-fetch exactly like the admin proxy (24h freshness rule).
+    // 4. Cache-or-fetch — the shared core with the admin proxy (24h freshness rule, #47);
+    //    see Store::cached_owned_or_fetch.
     let now_epoch = now.unix_timestamp();
-    const FRESH_SECS: i64 = 86400;
-
-    match s.store.get_steam_owned(&steamid).await {
-        Ok(Some((appids, fetched_at))) if now_epoch - fetched_at <= FRESH_SECS => {
-            return (StatusCode::OK, Json(serde_json::json!({"appids": appids}))).into_response();
-        }
-        Ok(_) => {}  // absent or stale
-        Err(_) => {} // read error — fall through
-    }
-
-    match steam.get_owned_games(&SteamId64(steamid.clone())).await {
-        Ok(OwnedGames::Games(appids)) => {
-            let _ = s.store.put_steam_owned(&steamid, &appids, now_epoch).await;
-            (StatusCode::OK, Json(serde_json::json!({"appids": appids}))).into_response()
-        }
-        Ok(OwnedGames::Private) => {
+    match s
+        .store
+        .cached_owned_or_fetch(steam.as_ref(), &steamid, now_epoch)
+        .await
+    {
+        OwnedProxyOutcome::Games(appids) => (
+            StatusCode::OK,
+            // Browser-side mirror of the server's freshness rule (#47): the appid list is
+            // stable for the same 24h window the STEAMOWN cache serves. `private` — this
+            // is a token-scoped, per-friend response; never shared-cacheable.
+            [(
+                header::CACHE_CONTROL,
+                format!(
+                    "private, max-age={}",
+                    dynamo::schema::STEAM_OWNED_FRESH_SECS
+                ),
+            )],
+            Json(serde_json::json!({"appids": appids})),
+        )
+            .into_response(),
+        OwnedProxyOutcome::Private => {
             (StatusCode::OK, Json(serde_json::json!({"private": true}))).into_response()
         }
-        Err(
-            steam_client::SteamError::Network(_)
-            | steam_client::SteamError::Api(_)
-            | steam_client::SteamError::RateLimited
-            | steam_client::SteamError::KeyRejected
-            | steam_client::SteamError::NotFound
-            | steam_client::SteamError::Parse(_)
-            | steam_client::SteamError::OpenIdRejected(_),
-        ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        OwnedProxyOutcome::Unavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
@@ -1081,4 +1115,24 @@ async fn handle_game_detail(
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod steam_login_error_tests {
+    use super::*;
+
+    /// Display IS the wire contract: the SPA string-matches these fragment values
+    /// (steamIdentity.ts / LinkPage.tsx / Ops.tsx). Byte-exact, forever.
+    #[test]
+    fn steam_login_error_fragments_are_the_wire_contract() {
+        assert_eq!(SteamLoginError::VerifyFailed.to_string(), "verify_failed");
+        assert_eq!(
+            SteamLoginError::SteamUnreachable.to_string(),
+            "steam_unreachable"
+        );
+        assert_eq!(
+            steam_error_fragment("/l/tok", SteamLoginError::VerifyFailed),
+            "/l/tok#steam_error=verify_failed"
+        );
+    }
 }

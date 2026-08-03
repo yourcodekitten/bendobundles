@@ -234,6 +234,12 @@ pub fn parse_body<T: serde::de::DeserializeOwned>(
 /// Seconds in seven days — the TTL window for STEAMOWN cache entries.
 pub const STEAM_OWNED_TTL_SECS: i64 = 7 * 24 * 3600;
 
+/// How long a cached owned-games list is considered FRESH (servable without a Steam
+/// round-trip) — distinct from [`STEAM_OWNED_TTL_SECS`], which is when DynamoDB deletes
+/// the item entirely. One const shared by both owned proxies and the sync ownership
+/// pass (#47) so the freshness rule can't drift per-surface.
+pub const STEAM_OWNED_FRESH_SECS: i64 = 86400;
+
 pub fn steam_app_pk(app_id: u32) -> String {
     format!("STEAMAPP#{app_id}")
 }
