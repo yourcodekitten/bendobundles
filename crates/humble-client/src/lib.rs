@@ -827,24 +827,37 @@ impl HumbleClient {
                 stop = WalkStop::CursorEnd; // an empty page is cursor-end, never era-stop (family review)
                 break;
             }
-            // Era discriminant (M11, family-ruled 2026-07-31): a page era-stops iff EVERY product
-            // resolves to a month STRICTLY BEFORE the Choice era's start (Dec 2019). The check is
-            // month-granular because the boundary is mid-year — Dec 2019 is Choice, Nov 2019 is the
-            // last Humble Monthly — so no year-int can split it. It fails SAFE in every ambiguous
-            // case: a `_choice` suffix, an empty machine_name, a non-choice slug dated Dec-2019+
-            // (drift), or an unparseable slug all DISQUALIFY the page. A false era-stop would HIDE a
-            // live month — the one sin this walk exists to prevent — so an unknown shape walks to the
-            // cap (non-corrupting), it never era-stops. (A positive `_monthly`-suffix marker was the
-            // preferred form, but the pre-Choice tail is unreachable to confirm real Monthly
-            // machine_names, and a hide-a-month guard is not built on an unconfirmable premise; this
-            // month-granular check needs no such assumption — parse-failure just fails safe.)
+            // Era discriminant (M11, family-ruled 2026-07-31; empty-name rung added #95): a page
+            // era-stops iff EVERY product resolves to a month STRICTLY BEFORE the Choice era's start
+            // (Dec 2019). The check is month-granular because the boundary is mid-year — Dec 2019 is
+            // Choice, Nov 2019 is the last Humble Monthly — so no year-int can split it. A `_choice`
+            // suffix or a slug dated Dec-2019+ keeps the page in the Choice era. It fails SAFE where
+            // it genuinely can't date a product — a non-choice slug that won't parse, or an EMPTY
+            // machine_name whose slug also won't parse — those DISQUALIFY the page. An empty
+            // machine_name is NOT itself disqualifying: prod's LIST omits the name for most products,
+            // so an empty name is dated by its slug like any other (#95); only an unparseable slug
+            // fails safe. A false era-stop would HIDE a live month — the one sin this walk exists to
+            // prevent — so an undatable shape walks to the cap (non-corrupting), it never era-stops.
             let mut page_all_pre_choice = true;
             for p in &page.products {
-                if p.product_machine_name.is_empty() {
-                    tracing::warn!(title = %p.title, "choice walk: product with empty machine_name — anomaly, page cannot era-stop");
+                if p.product_machine_name.ends_with("_choice") {
+                    // Positive Choice-era marker present — the page stays in the Choice era.
                     page_all_pre_choice = false;
-                } else if p.product_machine_name.ends_with("_choice") {
-                    page_all_pre_choice = false;
+                } else if p.product_machine_name.is_empty() {
+                    // #95: prod's LIST endpoint omits productMachineName for most products, so the
+                    // `_choice` marker is unavailable. Date the product by its SLUG instead — the
+                    // productUrlPath names the month regardless of machine_name. Pre-Choice iff
+                    // strictly before Dec 2019; a Dec-2019+ slug is a live Choice month whose name
+                    // prod simply omitted (normal, no warn); an unparseable slug is a genuine
+                    // anomaly that fails safe.
+                    match month_year(&p.product_url_path) {
+                        Some((y, m)) if (y, m) < (2019, 12) => {}
+                        Some((_, _)) => page_all_pre_choice = false,
+                        None => {
+                            tracing::warn!(title = %p.title, slug = %p.product_url_path, "choice walk: empty machine_name and unparseable slug — anomaly, page cannot era-stop");
+                            page_all_pre_choice = false;
+                        }
+                    }
                 } else {
                     // Non-choice, non-empty: a genuine pre-Choice Monthly ONLY if its slug parses to a
                     // month strictly before Dec 2019. Dec-2019+ drift or an unparseable slug is an
