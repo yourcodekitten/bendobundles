@@ -5690,6 +5690,71 @@ async fn enrich_stale_reviews_only_skips_appdetails() {
         "stale reviews must fetch the histogram"
     );
     assert_eq!(reqs.len(), 2, "exactly two storefront calls total");
+
+    // Store read-back (#51): call counts alone can't see a merge bug — assert the
+    // persisted item KEPT the fresh detail half untouched (content AND its clock)
+    // while the reviews half actually advanced.
+    let merged = d.store.get_steam_app(app_id).await.unwrap().unwrap();
+    let seeded = fresh_cache(app_id, now);
+    assert_eq!(
+        merged.detail, seeded.detail,
+        "the fresh detail half must survive a stale-reviews merge byte-for-byte"
+    );
+    assert_eq!(
+        merged.fetched_at, seeded.fetched_at,
+        "the detail clock must NOT be re-stamped by a reviews-only refresh"
+    );
+    assert!(
+        merged.reviews_fetched_at >= now,
+        "the reviews clock must advance past the stale seed"
+    );
+    assert_ne!(
+        merged.overall, seeded.overall,
+        "the fetched review summary must replace the stale seed"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Pacing floor (#51): the ≥pace gap before EVERY storefront call was inspection-only —
+// nothing failed if the sleeps were deleted. Inject a small real pace and measure: the
+// stale-reviews shape makes exactly 2 storefront calls (summary + histogram), each behind
+// one sleep, so wall-clock must be ≥ 2×pace. (Zero-pace runs of this shape finish in
+// single-digit milliseconds — the bound discriminates hard.)
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_pacing_floor_is_real() {
+    let Some(store) = store_or_skip("t3-pace-floor").await else {
+        return;
+    };
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let app_id = 413151;
+    seed_steam_game(&store, "gk-pf2", "mn-pf2", "Paced Game", Some(app_id), None).await;
+    let mut cache = fresh_cache(app_id, now);
+    cache.reviews_fetched_at = days_ago(15);
+    store
+        .put_steam_app(&cache, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+
+    let steam_mock = steam_mock_empty().await;
+    mount_steam_ok(&steam_mock, app_id).await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    let pace = std::time::Duration::from_millis(60);
+    d.steam_enrich_pace = pace;
+
+    let started = std::time::Instant::now();
+    enrich_steam_apps(&d, far_deadline()).await;
+    let elapsed = started.elapsed();
+
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 2, "shape check: exactly two paced calls");
+    assert!(
+        elapsed >= 2 * pace,
+        "two storefront calls must sit behind two pacing sleeps (elapsed {elapsed:?} < {:?})",
+        2 * pace
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
