@@ -166,6 +166,45 @@ impl SteamAppCache {
     }
 }
 
+/// Just the two enrichment fields the friend catalog list reads off a cached Steam app — the
+/// return type of [`Store::batch_get_steam_genres_tags`]. Extracting only these lets the hot list
+/// path skip deserializing the rest of a `SteamAppCache` (reviews, and the ~10 screenshot url pairs
+/// #62 added to `detail`) for every listable app on every request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SteamGenresTags {
+    pub genres: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+/// Slim deserialize target for the `body` blob: serde ignores every field it doesn't name, so this
+/// parses ONLY `app_id` + `detail.{genres,tags}` and never allocates the heavy detail fields.
+/// A `None` detail (delisted negative-cache stub) yields empty chips, matching the full-blob path.
+#[derive(serde::Deserialize)]
+struct SteamCacheSlim {
+    app_id: u32,
+    detail: Option<SteamDetailSlim>,
+}
+
+#[derive(serde::Deserialize)]
+struct SteamDetailSlim {
+    #[serde(default)]
+    genres: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+impl From<SteamCacheSlim> for SteamGenresTags {
+    fn from(s: SteamCacheSlim) -> Self {
+        match s.detail {
+            Some(d) => SteamGenresTags {
+                genres: d.genres,
+                tags: d.tags,
+            },
+            None => SteamGenresTags::default(),
+        }
+    }
+}
+
 /// Opaque optimistic-lock token for a STEAMAPP# item — obtainable ONLY from
 /// [`Store::get_steam_app_versioned`] (private field: a guard value cannot be
 /// fabricated, it must come from a read). `None` inside = legacy item written
@@ -2387,6 +2426,58 @@ impl Store {
         Ok(caches)
     }
 
+    /// Batch-fetch ONLY the `(genres, tags)` each cached Steam app carries — the friend catalog
+    /// list's enrichment. Same `BatchGetItem` drain shape as [`Store::batch_get_steam_apps`], but
+    /// each `body` is deserialized through the slim [`SteamCacheSlim`] target, so the hot list path
+    /// never allocates a full `SteamAppDetail` (reviews, #62's ~10 screenshot pairs, developers, …)
+    /// just to read a few chips. NOTE: the `body` is a single JSON string, so a `ProjectionExpression`
+    /// can't slim the READ itself (Dynamo can't project inside a string) — this trims the DESERIALIZE
+    /// cost, which is what grew with #62. Kept separate from `batch_get_steam_apps` (whose callers
+    /// want the whole blob) exactly as issue #64 asks. Missing appids are absent from the map.
+    pub async fn batch_get_steam_genres_tags(
+        &self,
+        app_ids: &[u32],
+    ) -> Result<HashMap<u32, SteamGenresTags>, StoreError> {
+        use aws_sdk_dynamodb::types::KeysAndAttributes;
+        let mut out_map = HashMap::with_capacity(app_ids.len());
+        for chunk in app_ids.chunks(100) {
+            let mut keys: Vec<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = chunk
+                .iter()
+                .map(|app_id| {
+                    let (pk, sk) = schema::key_pair(steam_app_pk(*app_id), "META");
+                    HashMap::from([("pk".to_string(), pk), ("sk".to_string(), sk)])
+                })
+                .collect();
+            while !keys.is_empty() {
+                let ka = KeysAndAttributes::builder()
+                    .set_keys(Some(keys))
+                    .build()
+                    .map_err(|e| StoreError::Aws(format!("{e:?}")))?;
+                let resp = self
+                    .client
+                    .batch_get_item()
+                    .request_items(&self.table, ka)
+                    .send()
+                    .await?;
+                for item in resp
+                    .responses()
+                    .and_then(|tables| tables.get(&self.table))
+                    .map(|items| items.as_slice())
+                    .unwrap_or_default()
+                {
+                    let slim: SteamCacheSlim = parse_body(item)?;
+                    out_map.insert(slim.app_id, slim.into());
+                }
+                keys = resp
+                    .unprocessed_keys()
+                    .and_then(|tables| tables.get(&self.table))
+                    .map(|ka| ka.keys().to_vec())
+                    .unwrap_or_default();
+            }
+        }
+        Ok(out_map)
+    }
+
     /// Return all cached Steam app_ids. Paged Scan filtered on `begins_with(pk, "STEAMAPP#")` —
     /// the same rationale as `list_all_games` (at ~700 items a Scan is fine). Does NOT include
     /// non-STEAMAPP items (games, links, etc.).
@@ -2590,6 +2681,66 @@ mod tests {
             b = b.code(c);
         }
         b.build()
+    }
+
+    // ── #64: the slim genres/tags deserialize target ────────────────────────────
+    // These parse a full-`SteamAppCache`-shaped body and prove the slim struct keeps ONLY
+    // genres+tags, dropping the heavy detail fields (screenshots, reviews, …) — the whole point.
+
+    #[test]
+    fn steam_slim_extracts_genres_tags_and_ignores_heavy_fields() {
+        let body = serde_json::json!({
+            "app_id": 42,
+            "detail": {
+                "app_id": 42,
+                "name": "Test",
+                "genres": ["Action", "Indie", "RPG"],
+                "tags": ["Roguelike", "Pixel Graphics"],
+                "developers": ["Dev"],
+                "publishers": ["Pub"],
+                "screenshots": [{"thumbnail": "t", "full": "f"}],
+                "content_descriptor_ids": [1, 2, 3]
+            },
+            "overall": {"desc": "Very Positive", "total_positive": 950, "total_negative": 50, "total_reviews": 1000},
+            "recent": null,
+            "fetched_at": 123,
+            "reviews_fetched_at": 456
+        });
+        let slim: SteamCacheSlim = serde_json::from_value(body).unwrap();
+        assert_eq!(slim.app_id, 42);
+        let gt: SteamGenresTags = slim.into();
+        assert_eq!(
+            gt.genres,
+            vec!["Action".to_string(), "Indie".to_string(), "RPG".to_string()]
+        );
+        assert_eq!(
+            gt.tags,
+            vec!["Roguelike".to_string(), "Pixel Graphics".to_string()]
+        );
+    }
+
+    #[test]
+    fn steam_slim_none_detail_is_empty_chips() {
+        let body = serde_json::json!({
+            "app_id": 7, "detail": null, "overall": null, "recent": null,
+            "fetched_at": 0, "reviews_fetched_at": 0
+        });
+        let slim: SteamCacheSlim = serde_json::from_value(body).unwrap();
+        assert_eq!(SteamGenresTags::from(slim), SteamGenresTags::default());
+    }
+
+    #[test]
+    fn steam_slim_detail_without_tags_defaults_empty() {
+        // An old blob whose detail predates `tags` (#71) — serde(default), never an error.
+        let body = serde_json::json!({
+            "app_id": 9, "detail": {"genres": ["Action"]},
+            "fetched_at": 0, "reviews_fetched_at": 0
+        });
+        let gt: SteamGenresTags = serde_json::from_value::<SteamCacheSlim>(body)
+            .unwrap()
+            .into();
+        assert_eq!(gt.genres, vec!["Action".to_string()]);
+        assert!(gt.tags.is_empty());
     }
 
     // dynamodb-local can't be coerced into producing a live TransactionConflict on demand, so
