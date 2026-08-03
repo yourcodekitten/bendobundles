@@ -122,7 +122,12 @@ export function Catalog() {
 
   const loadSelfClaims = useCallback(() => {
     withAuth(() => adminSelfClaims(), navigate)
-      .then((claims) => setSelfClaims(claims))
+      // Newest first — created_at is RFC3339, so a lexicographic desc sort is chronological (#44).
+      .then((claims) =>
+        setSelfClaims(
+          [...claims].sort((a, b) => b.created_at.localeCompare(a.created_at)),
+        ),
+      )
       .catch(() => {
         // non-critical — fail silently, list stays stale
       });
@@ -327,7 +332,7 @@ export function Catalog() {
           <div className="space-y-2">
             {selfClaims.map((sc) => (
               <div
-                key={sc.game_id}
+                key={sc.id}
                 className="flex flex-wrap items-center gap-3 rounded bg-floor px-4 py-3 text-sm"
               >
                 <span className="font-mono text-xs text-dust">{sc.game_id}</span>

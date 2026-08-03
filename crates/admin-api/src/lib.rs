@@ -776,6 +776,9 @@ async fn handle_link_claims(State(s): State<AppState>, Path(token): Path<String>
 /// Self-claim view of a claim — the ONE admin surface that serves a key value (Ben's own).
 #[derive(serde::Serialize)]
 struct SelfClaimView {
+    // The claim id — the stable React key. game_id repeats across a
+    // claim→compensate→re-claim cycle, so the web list must key on this, not game_id (#44).
+    id: String,
     game_id: String,
     state: domain::ClaimState,
     revealed_key: Option<String>,
@@ -868,6 +871,7 @@ async fn handle_self_claims(State(s): State<AppState>) -> Response {
             let views: Vec<SelfClaimView> = claims
                 .into_iter()
                 .map(|c| SelfClaimView {
+                    id: c.id,
                     game_id: c.game_id,
                     state: c.state,
                     revealed_key: c.revealed_key,

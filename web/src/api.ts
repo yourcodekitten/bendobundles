@@ -94,6 +94,7 @@ export type SelfClaimResult =
   | { kind: 'error' };
 
 export type SelfClaimView = {
+  id: string;
   game_id: string;
   state: 'pending' | 'fulfilled' | 'compensated' | 'failed';
   revealed_key: string | null;
