@@ -1325,9 +1325,10 @@ async fn reconcile_unsplittable_game_id_over_threshold_pings() {
 #[tokio::test]
 async fn stale_pending_claim_pings_even_when_listing_is_dead() {
     // B-4 placement pin (lilith's rider on the gate): "the sweep ran even though
-    // everything after it died." A dead-cookie LISTING -- run_sync's :2766 early
-    // return, where reconcile is NEVER called -- must not starve the sweep. If a
-    // future refactor adds an early return above the sweep call, THIS test fails.
+    // everything after it died." A dead-cookie LISTING -- run_sync's Unauthorized
+    // early-return lane, where reconcile is NEVER called -- must not starve the
+    // sweep. If a future refactor adds an early return above the sweep call, THIS
+    // test fails.
     let Some(store) = store_or_skip("stale-sweep-deadlisting").await else {
         return;
     };
