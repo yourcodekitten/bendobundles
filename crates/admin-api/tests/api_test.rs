@@ -47,7 +47,9 @@ async fn store_or_skip(test: &str) -> Option<Arc<Store>> {
         eprintln!("SKIP {test}: no dynamodb-local at {url}");
         return None;
     }
-    let store = Store::new(client, format!("t-adm-{test}"));
+    // PID-scoped like fulfillment's tables (#44 item 7): fixed-token creates (create_link is
+    // conditioned attribute_not_exists) would otherwise panic on a persistent local dynamo.
+    let store = Store::new(client, format!("t-adm-{}-{test}", std::process::id()));
     store.create_table_for_tests().await.unwrap();
     Some(Arc::new(store))
 }
@@ -1861,6 +1863,13 @@ async fn steam_owned_proxy_fresh_cache_served_without_hitting_steam() {
 
     let resp = authed_get(&app, &format!("/admin/api/steam/owned/{TEST_STEAMID}")).await;
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, max-age=86400"),
+        "Games responses must carry the browser-side freshness mirror (#47)"
+    );
     let j = body_json(resp).await;
     let appids = j["appids"].as_array().unwrap();
     assert_eq!(appids.len(), 2);

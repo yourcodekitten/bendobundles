@@ -33,6 +33,10 @@ pub fn is_valid_steam_id64(s: &str) -> bool {
     s.len() == 17 && s.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// The 400-response copy every `is_valid_steam_id64` enforcement site serves — one string,
+/// so the admin and public surfaces can never drift apart on the rule they share (#47).
+pub const STEAM_ID64_ERROR_MSG: &str = "steamid must be exactly 17 ASCII digits";
+
 // ── Domain types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

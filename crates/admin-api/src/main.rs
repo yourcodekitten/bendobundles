@@ -71,6 +71,12 @@ impl AdminInvoker for RealAdminInvoker {
             .send()
             .await
             .map_err(|e| format!("{e:?}"))?;
+        // An unhandled fulfillment error returns 200 with FunctionError set and an error-shaped
+        // payload. Today that payload can't parse as FulfillResponse (tagged enum), so parsing
+        // fails closed — but that's correct by accident; check the signal explicitly.
+        if let Some(fe) = resp.function_error() {
+            return Err(format!("lambda function error: {fe}"));
+        }
         let blob = resp
             .payload()
             .ok_or_else(|| "no payload in lambda response".to_string())?;

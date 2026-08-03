@@ -1057,6 +1057,54 @@ async fn self_reserved_token_is_a_plain_404() {
     );
 }
 
+/// POST sibling of the pin above: `/api/l/SELF/claim` must be byte-identical to an
+/// unknown-token claim — the write path must not become an enumeration oracle either
+/// (handle_post_claim resolves the link first, so SELF falls into the same None arm).
+#[tokio::test]
+async fn self_reserved_token_claim_post_is_a_plain_404() {
+    let Some(store) = store_or_skip("self-404-post").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let claim_body = serde_json::json!({"game_id": "gk:mn"});
+
+    let req_self = Request::post("/api/l/SELF/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+        .unwrap();
+    let resp_self = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req_self)
+        .await
+        .unwrap();
+
+    let req_other = Request::post(
+        "/api/l/nonexistent0000000000000000000000000000000000000000000000000000/claim",
+    )
+    .header("content-type", "application/json")
+    .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+    .unwrap();
+    let resp_other = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req_other)
+        .await
+        .unwrap();
+
+    assert_eq!(resp_self.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp_other.status(), StatusCode::NOT_FOUND);
+
+    let bytes_self = axum::body::to_bytes(resp_self.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let bytes_other = axum::body::to_bytes(resp_other.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        bytes_self, bytes_other,
+        "SELF and unknown token must return byte-identical 404 on the claim POST (no oracle)"
+    );
+}
+
 // ── Task 10: Steam tests ───────────────────────────────────────────────────────
 
 /// Build assertion params for a wiremock-backed OpenID check_authentication test.
@@ -1171,6 +1219,13 @@ async fn owned_proxy_serves_cache_then_fetches_on_stale() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, max-age=86400"),
+        "Games responses must carry the browser-side freshness mirror (#47)"
+    );
     let j = body_json(resp).await;
     assert!(
         j["appids"]

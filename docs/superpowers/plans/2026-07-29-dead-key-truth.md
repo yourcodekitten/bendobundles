@@ -1,5 +1,12 @@
 # Dead-Key Truth Implementation Plan
 
+> **STATUS: EXECUTED — shipped to `main` (verified 2026-08-03, closes #89).** Every task's product
+> exists in the codebase, including all fixes from the #89 plan-gate review (B-1 interim arms,
+> B-2 alarm arithmetic 3600×24, B-3 two-ping asserts, B-4 sweep-first placement, the Task-6
+> KeyDead→410 arms). This document is a **historical artifact**: its inline `file:line` anchors
+> describe the pre-execution tree and have drifted — treat the code as ground truth, not the
+> anchors. Do NOT execute this plan again.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Typed dead-key detection, a terminal `failed` claim state with durable reason, and a set-driven pending-age escalation sweep — so a humble-expired key terminally fails its claim (slot returned, game retired, ben pinged once) instead of looping silently forever.
@@ -1054,8 +1061,8 @@ async fn pending_age_sweep(deps: &Deps) {
 - [ ] **Step 4: Update the two exactly-once ping tests (B-3), then run the suite.**
 
 The sweep double-pings two EXISTING tests whose 30h-old seeds now correctly (spec §3 accepts the double ping) receive BOTH the structural stuck-alert AND the sweep ping:
-- `reconcile_unreconcilable_over_threshold_pings_once` (handler_test.rs:1148)
-- `reconcile_unsplittable_game_id_over_threshold_pings` (handler_test.rs:1192)
+- `reconcile_unreconcilable_over_threshold_pings_once` (find by name; done — already asserts 2)
+- `reconcile_unsplittable_game_id_over_threshold_pings` (find by name; done — already asserts 2)
 
 Update BOTH: keep the 30h seeds EXACTLY as they are (aged seeds are the tests' point), change `assert_eq!(reqs.len(), 1)` to `assert_eq!(reqs.len(), 2)`, and assert one body contains the stuck-alert copy (`"cannot act on"`) and one contains `"STILL PENDING"`. Do NOT add dedup to the sweep to make them pass — the double ping is the specified behavior for structurally-stuck claims. Any OTHER test that newly fails on an unexpected extra ping seeded its claim older than 24h without meaning to; those seeds may be brought under 24h (but ≥ RECONCILE_MIN_AGE) — the two tests named above may NOT.
 
@@ -1184,8 +1191,8 @@ git commit -S -m "feat(web): failed claims render warm — 'returned' chip, hone
 ### Task 8: terraform — the watchdog's watchdog (out-of-process alarms)
 
 **Files:**
-- Create: `terraform/aws-cloudwatch-alarms.tf`
-- Modify: `terraform/tf-variables.tf` (ADD the `ops_alarm_email` variable — it does not exist yet)
+- Create: `terraform/aws-cloudwatch-alarms.tf` (done — the file exists on main)
+- Modify: `terraform/tf-variables.tf` (ADD the `ops_alarm_email` variable — done, exists at tf-variables.tf:72)
 
 **Interfaces:**
 - Consumes: the fulfillment lambda's function name -- `module.lambda_fulfillment.lambda_function_name` (lambdas in this repo are MODULE instantiations, `bendoerr-terraform-modules/lambda/aws`; there is no `resource "aws_lambda_function"` anywhere. Precedent for exactly this reference: `aws-eventbridge.tf:26`).

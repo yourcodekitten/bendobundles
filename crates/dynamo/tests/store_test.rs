@@ -908,6 +908,7 @@ async fn pending_claims_and_sync_state_and_sessions() {
         cookie_ok: true,
         games_written: 3,
         message: "ok".into(),
+        private_pinged: false,
     };
     store.put_sync_state(&st).await.unwrap();
     assert_eq!(store.get_sync_state().await.unwrap().unwrap(), st);
@@ -1517,6 +1518,7 @@ async fn fulfill_self_claim_is_idempotent_on_retry() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(claim.state, ClaimState::Fulfilled);
     assert_eq!(claim.revealed_key.as_deref(), Some("K1"));
 }
 
@@ -1545,10 +1547,10 @@ async fn fulfill_self_claim_never_flips_when_claim_lost_to_compensate() {
     let res = store.fulfill_self_claim("c-f3", &gid, "LATE-KEY").await;
     assert!(res.is_err(), "fulfill must lose loudly to compensate");
     let g = store.get_game(&gid).await.unwrap().unwrap();
-    assert_ne!(
+    assert_eq!(
         g.status,
-        GameStatus::BenRedeemed,
-        "game must NOT flip when write-1 failed"
+        GameStatus::Pending,
+        "game must stay exactly where the claim left it when write-1 failed"
     );
 }
 
