@@ -5657,9 +5657,15 @@ async fn enrich_stale_reviews_only_skips_appdetails() {
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let app_id = 413150;
     seed_steam_game(&store, "gk-r", "mn-r", "Reviews Game", Some(app_id), None).await;
-    // Detail fresh (now), reviews stale (15 days old > 14d window).
+    // Detail fresh-but-NOT-now (1 day old, well inside the 30d TTL), reviews stale
+    // (15 days > 14d window). The detail clock is deliberately NOT `now`: a same-second
+    // seed would alias with the pass's own `now`, making the no-re-stamp assert below
+    // vacuous — a wrongful re-stamp would write the very value the assert expects
+    // (#132 review).
     let mut cache = fresh_cache(app_id, now);
+    cache.fetched_at = days_ago(1);
     cache.reviews_fetched_at = days_ago(15);
+    let seeded = cache.clone();
     store
         .put_steam_app(&cache, SteamAppPutGuard::Absent)
         .await
@@ -5693,9 +5699,8 @@ async fn enrich_stale_reviews_only_skips_appdetails() {
 
     // Store read-back (#51): call counts alone can't see a merge bug — assert the
     // persisted item KEPT the fresh detail half untouched (content AND its clock)
-    // while the reviews half actually advanced.
+    // while BOTH review halves actually advanced to the mock's known values.
     let merged = d.store.get_steam_app(app_id).await.unwrap().unwrap();
-    let seeded = fresh_cache(app_id, now);
     assert_eq!(
         merged.detail, seeded.detail,
         "the fresh detail half must survive a stale-reviews merge byte-for-byte"
@@ -5708,9 +5713,27 @@ async fn enrich_stale_reviews_only_skips_appdetails() {
         merged.reviews_fetched_at >= now,
         "the reviews clock must advance past the stale seed"
     );
+    // eq-to-mock, not ne-to-seed (#132 review): also catches a merge that nulls or
+    // garbles the field, not just one that keeps the seed.
+    assert_eq!(
+        merged.overall,
+        Some(steam_client::ReviewSummary {
+            desc: "Overwhelmingly Positive".into(),
+            total_positive: 455_578,
+            total_negative: 5303,
+            total_reviews: 460_881,
+        }),
+        "the fetched review summary must be the mock's, verbatim"
+    );
+    // The histogram half was counted at the wire but never read back (#132 review) —
+    // a merge dropping ours.reviews.1 must fail here.
+    assert!(
+        merged.recent.is_some(),
+        "the fetched recent-histogram half must persist"
+    );
     assert_ne!(
-        merged.overall, seeded.overall,
-        "the fetched review summary must replace the stale seed"
+        merged.recent, seeded.recent,
+        "the recent half must be the fetch's, not the stale seed's"
     );
 }
 
