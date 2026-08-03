@@ -1863,6 +1863,13 @@ async fn steam_owned_proxy_fresh_cache_served_without_hitting_steam() {
 
     let resp = authed_get(&app, &format!("/admin/api/steam/owned/{TEST_STEAMID}")).await;
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, max-age=86400"),
+        "Games responses must carry the browser-side freshness mirror (#47)"
+    );
     let j = body_json(resp).await;
     let appids = j["appids"].as_array().unwrap();
     assert_eq!(appids.len(), 2);

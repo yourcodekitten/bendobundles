@@ -1219,6 +1219,13 @@ async fn owned_proxy_serves_cache_then_fetches_on_stale() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("private, max-age=86400"),
+        "Games responses must carry the browser-side freshness mirror (#47)"
+    );
     let j = body_json(resp).await;
     assert!(
         j["appids"]
