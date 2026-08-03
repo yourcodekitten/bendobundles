@@ -57,7 +57,7 @@ module "lambda_fulfillment" {
   }
 }
 
-# ── public-api — friend surface; ZERO ssm access (trust boundary) ────────────
+# ── public-api — friend surface; steam key only, never the humble session (trust boundary) ──
 module "lambda_public_api" {
   source  = "bendoerr-terraform-modules/lambda/aws"
   version = "0.4.0"
