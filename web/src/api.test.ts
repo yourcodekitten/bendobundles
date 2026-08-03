@@ -13,6 +13,10 @@ import {
   adminSync,
   adminSelfClaim,
   adminSelfClaims,
+  adminSetLinkNote,
+  adminSetSteamIdentity,
+  adminClearSteamIdentity,
+  adminSetAppId,
   NotFound,
   FetchFailed,
   Unauthorized,
@@ -733,5 +737,51 @@ describe('adminSelfClaims', () => {
     const out = await adminSelfClaims();
     const [first] = out;
     expect(first?.revealed_key).toBe('K');
+  });
+});
+
+describe('CSRF header coverage — all mutating admin calls carry X-Admin-Request (#111 review)', () => {
+  const csrf = expect.objectContaining({
+    headers: expect.objectContaining({ 'X-Admin-Request': '1' }),
+  });
+  // A benign 200 that lets each call finish without throwing before the fetch assertion.
+  function ok() {
+    return { ok: true, status: 200, json: vi.fn().mockResolvedValue({}) };
+  }
+
+  it('adminSetLinkNote sends the header', async () => {
+    mockFetch.mockResolvedValueOnce(ok());
+    await adminSetLinkNote('tok', 'a note');
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/links/tok/note', csrf);
+  });
+
+  it('adminSetSteamIdentity sends the header', async () => {
+    mockFetch.mockResolvedValueOnce(ok());
+    await adminSetSteamIdentity('76561198000000001');
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/steam/identity', csrf);
+  });
+
+  it('adminClearSteamIdentity sends the header', async () => {
+    mockFetch.mockResolvedValueOnce(ok());
+    await adminClearSteamIdentity();
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/steam/identity', csrf);
+  });
+
+  it('adminSetAppId sends the header', async () => {
+    mockFetch.mockResolvedValueOnce(ok());
+    await adminSetAppId('gk:mn', 12345);
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/admin/api/games/gk%3Amn/steam-app-id',
+      csrf,
+    );
+  });
+
+  it('adminSelfClaim sends the header', async () => {
+    mockFetch.mockResolvedValueOnce(ok());
+    await adminSelfClaim('gk:mn');
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/admin/api/games/gk%3Amn/self-claim',
+      csrf,
+    );
   });
 });

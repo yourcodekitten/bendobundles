@@ -955,7 +955,9 @@ async fn handle_choice_claim(
             "choice pre-check: pick already spent (tpk present, unredeemed) — resuming to terminal WITHOUT choosing"
         );
         // Resume: the pick was already spent; skip the choose entirely and run the terminal on the
-        // key already sitting in the order. No intent snapshot needed — nothing new will be chosen.
+        // key already sitting in the order. The intent snapshot (EXCLUDING this tpk) was recorded
+        // above (#35) so a failed/parked resume reconciles to B2/B3, never branch-A compensate —
+        // nothing NEW is chosen here.
         return claimed_tpk_terminal(
             deps,
             flavor,
