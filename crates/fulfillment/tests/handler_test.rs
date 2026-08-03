@@ -2842,6 +2842,8 @@ async fn discovery_skips_month_loudly_when_order_is_silent() {
     let Some(store) = store_or_skip("choice-order-silent").await else {
         return;
     };
+    // Capture the "loudly" half: the order-silent skip must WARN, not swallow (see capture_logs).
+    let (log_buf, _capture) = capture_logs();
     let humble = MockServer::start().await;
     // The month is enumerated + parseable, but its order read 500s → no claimed-set source → no
     // requires_choice rows this pass (no ghosts); next sync retries.
@@ -2868,6 +2870,20 @@ async fn discovery_skips_month_loudly_when_order_is_silent() {
     assert!(
         games_for_gamekey(&deps.store, "GKNOV2020").await.is_empty(),
         "no claimed-set source ⇒ no claimable writes ⇒ no ghost rows"
+    );
+
+    // ...and it must have done so LOUDLY (the "loudly" in this test's name is a real invariant).
+    let captured = {
+        let buf = log_buf.lock().unwrap();
+        String::from_utf8_lossy(&buf).to_string()
+    };
+    assert!(
+        !captured.is_empty(),
+        "log capture must be non-empty — the test cannot pass vacuously on an empty capture"
+    );
+    assert!(
+        captured.contains("choice discovery: order silent for month"),
+        "order-silent month must warn LOUDLY: {captured:.500}"
     );
 }
 
