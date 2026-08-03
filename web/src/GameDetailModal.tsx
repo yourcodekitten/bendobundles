@@ -11,6 +11,8 @@ import { ClaimChest } from "./ClaimChest";
 import { DESCRIPTOR_LABELS, displayTags } from "./tags";
 import { titleColorClass, titleHueVar } from "./titleColor";
 import { gameDetailCache } from "./gameDetailCache";
+import { statusBadgeClass } from "./statusBadge";
+import { selfClaimLabel } from "./selfClaimLabel";
 
 // ── Claim-chest tuning (friend mount; overdrive 2026-07-09) ───────────────────
 // Generous fill so steady taps win without frantic mashing; the drain forces
@@ -21,25 +23,6 @@ const CLAIM_CHARGE_PER_MASH = 18;
 const CLAIM_DRAIN_PER_SEC = 15;
 const CLAIM_START_CHARGE = 30; // seed on open — a beat before the drain can cancel
 const CLAIM_BURST_MS = 750;
-
-// ── Status badge — mirrors Catalog's mapping ──────────────────────────────────
-
-function statusBadgeClass(status: string): string {
-  switch (status) {
-    case "available":
-      return "bg-green-700 text-green-100";
-    case "pending":
-      return "bg-amber-700 text-amber-100";
-    case "gifted":
-      return "bg-give text-give-ink";
-    case "ben_redeemed":
-      return "bg-slate-600 text-slate-100";
-    case "expired":
-      return "bg-red-700 text-red-100";
-    default:
-      return "bg-control text-ink";
-  }
-}
 
 // ── Review sentiment → color spectrum ─────────────────────────────────────────
 // Steam's review descriptor placed on a clearly-positive → clearly-negative
@@ -559,17 +542,12 @@ export function GameDetailModal(props: GameDetailModalProps) {
                             : "bg-control hover:bg-control-bright"
                         } disabled:opacity-50`}
                       >
-                        {isArmed
-                          ? g.owned_by_ben && ap.adminSteamId !== null
-                            ? g.requires_choice
-                              ? "you already own this on steam — spends 1 pick, sure?"
-                              : "you already own this on steam — sure?"
-                            : g.requires_choice
-                              ? "confirm? spends 1 pick"
-                              : "confirm?"
-                          : isClaiming
-                            ? "claiming…"
-                            : "claim for me"}
+                        {selfClaimLabel({
+                          armed: isArmed,
+                          ownedOnSteam: g.owned_by_ben && ap.adminSteamId !== null,
+                          requiresChoice: g.requires_choice,
+                          claiming: isClaiming,
+                        })}
                       </button>
                     )}
                     {r?.kind === "revealed" && (
