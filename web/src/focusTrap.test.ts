@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { dialogFocusables } from "./focusTrap";
+import type { KeyboardEvent as ReactKeyboardEvent, RefObject } from "react";
+import { dialogFocusables, makeTrapKeyDown } from "./focusTrap";
 
 // Direct unit tests for the shared primitive both dialogs rely on. The trap's
 // wrap behavior is exercised end-to-end in GameDetailModal.test / ClaimDialog.test;
@@ -73,5 +74,54 @@ describe("dialogFocusables", () => {
   it("returns an empty set when a step has no focusables (the loading-step shape)", () => {
     const c = mount(`<p>claiming...</p>`);
     expect(dialogFocusables(c)).toEqual([]);
+  });
+});
+
+describe("makeTrapKeyDown wraps past excluded boundary nodes (#110 review)", () => {
+  // Minimal synthetic React KeyboardEvent — makeTrapKeyDown only reads key/shiftKey and calls
+  // preventDefault. Returns whether preventDefault fired.
+  function pressTab(
+    onKeyDown: (e: ReactKeyboardEvent) => void,
+    shiftKey: boolean,
+  ): boolean {
+    let prevented = false;
+    onKeyDown({
+      key: "Tab",
+      shiftKey,
+      preventDefault: () => {
+        prevented = true;
+      },
+    } as unknown as ReactKeyboardEvent);
+    return prevented;
+  }
+
+  it("Tab from the last visible control wraps to first — a hidden input at the boundary is not a dead stop", () => {
+    // Hidden input sits LAST in the DOM. If it were counted, the wrap's `.focus()` would target it,
+    // no-op, and focus would STICK at the boundary. It must be skipped so Tab advances to `first`.
+    const c = mount(
+      `<button id="first">a</button><button id="last">b</button><input type="hidden" />`,
+    );
+    const ref = { current: c } as RefObject<HTMLElement>;
+    const onKeyDown = makeTrapKeyDown(ref);
+    const first = c.querySelector<HTMLElement>("#first")!;
+    const last = c.querySelector<HTMLElement>("#last")!;
+
+    last.focus();
+    expect(pressTab(onKeyDown, false)).toBe(true); // wrap intercepted
+    expect(document.activeElement).toBe(first); // advanced past the hidden input, not stuck on it
+  });
+
+  it("Shift+Tab from the first control wraps to the last visible control, past a boundary hidden input", () => {
+    const c = mount(
+      `<input type="hidden" /><button id="first">a</button><button id="last">b</button>`,
+    );
+    const ref = { current: c } as RefObject<HTMLElement>;
+    const onKeyDown = makeTrapKeyDown(ref);
+    const first = c.querySelector<HTMLElement>("#first")!;
+    const last = c.querySelector<HTMLElement>("#last")!;
+
+    first.focus();
+    expect(pressTab(onKeyDown, true)).toBe(true);
+    expect(document.activeElement).toBe(last);
   });
 });
