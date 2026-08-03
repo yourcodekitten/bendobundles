@@ -2033,8 +2033,9 @@ async fn stamp_owned(deps: &Deps, games: &[Game], appids: Vec<u32>) {
 ///
 /// - **Identity absent** → skip silently. Ben hasn't connected Steam yet.
 /// - **Fresh STEAMOWN cache (≤24h)** → diff-stamp from the cached appids, ZERO Steam calls
-///   (#47 perf). Stated tradeoff: a privacy flip inside the freshness window is detected (and
-///   pinged) up to 24h late.
+///   (#47 perf), and the episode marker RESETS — a fresh entry can only come from a successful
+///   post-episode-start fetch, so it is evidence the library reads again. Stated tradeoff: a
+///   privacy flip inside the freshness window is detected (and pinged) up to 24h late.
 /// - **`Ok(Games)`** → `put_steam_owned` (refresh the 7-day cache) + diff-stamp: write
 ///   `set_game_owned_by_ben` only for games whose `owned_by_ben` value CHANGED.
 ///   Games with no `steam_app_id` are skipped (nothing to compare against).
@@ -2065,10 +2066,11 @@ async fn stamp_owned(deps: &Deps, games: &[Game], appids: Vec<u32>) {
 /// unnecessary given the UI hides the column anyway. Keeping it here keeps the logic in one place.
 ///
 /// Returns the `private_pinged` episode marker to persist (#47): `already_pinged` carried
-/// through on every lane that learns nothing new about privacy (skips, fresh cache, transient
+/// through on every lane that learns nothing about privacy (client/identity skips, transient
 /// errors), set true when a Private response is seen (pinging only if `!already_pinged` and a
-/// prior success exists), and reset to false by a successful non-private fetch — which is what
-/// ends an episode and re-arms the ping.
+/// prior success exists), and reset to false by evidence of a successful non-private fetch —
+/// the Games arm directly, or a FRESH cache (which only a successful post-episode-start fetch
+/// can produce). That reset is what ends an episode and re-arms the ping.
 async fn refresh_ben_ownership(deps: &Deps, games: &[Game], already_pinged: bool) -> bool {
     // No Steam client → skip. Configured by the app at startup; if absent the whole Steam
     // feature is disabled and no identity can be fetched.
@@ -2097,7 +2099,14 @@ async fn refresh_ben_ownership(deps: &Deps, games: &[Game], already_pinged: bool
         if now - fetched_at <= dynamo::schema::STEAM_OWNED_FRESH_SECS {
             tracing::info!("steam owned refresh: cache fresh — stamping without a steam call");
             stamp_owned(deps, games, appids.clone()).await;
-            return already_pinged; // learned nothing about privacy — carry the marker
+            // A fresh cache IS privacy news (OMBB, #128 review): the Private arm is only
+            // reachable when the cache is stale/absent, so at episode start the cache was
+            // stale — any fresh entry seen later was written by a successful Games fetch
+            // AFTER the episode started (sync's Games arm resets the marker itself; the
+            // proxies' write-through is the path that can't). Fresh cache ⇒ episode over.
+            // Carrying the marker here would strand it true under steady friend traffic
+            // and silently swallow the NEXT private episode's ping.
+            return false;
         }
     }
 
@@ -3038,14 +3047,15 @@ async fn run_sync(deps: &Deps) {
     // The private-library ping's episode marker (#47). Read once; every persist_sync lane
     // must carry it — a lane that never ran the ownership pass learned nothing and must not
     // reset the marker (that would re-arm the ping mid-episode).
-    let prev_private_pinged = deps
-        .store
-        .get_sync_state()
-        .await
-        .ok()
-        .flatten()
-        .map(|s| s.private_pinged)
-        .unwrap_or(false);
+    let prev_private_pinged = match deps.store.get_sync_state().await {
+        Ok(Some(s)) => s.private_pinged,
+        Ok(None) => false, // first sync ever — no episode to carry
+        Err(e) => {
+            // Fails toward one duplicate ping (marker re-armed), never toward silence.
+            tracing::warn!(error = ?e, "sync: get_sync_state failed — private-ping marker read as false");
+            false
+        }
+    };
     // Enrichment deadline is threaded from the caller via deps.steam_enrich_deadline. It was
     // computed from the lambda context's remaining time (minus the 180s margin) so `persist_sync`
     // + `end_sync_run` always have room to land — see compute_enrich_deadline.

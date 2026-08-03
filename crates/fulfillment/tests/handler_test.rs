@@ -5236,8 +5236,145 @@ async fn private_ping_fires_once_per_episode_and_rearms_on_recovery() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// Freshness skip (#47): a ≤24h STEAMOWN cache is stamped from directly — zero Steam calls —
-// and the episode marker carries through untouched.
+// Fresh cache ENDS a private episode (#128 review fix): a fresh STEAMOWN entry can only be
+// written by a successful Games fetch, and the Private arm is only reachable from a stale/absent
+// cache — so a fresh entry seen with the marker set proves a post-episode-start success (the
+// proxies' write-through path, which can't reset the marker itself). Carrying instead of
+// resetting would strand the marker true under friend traffic and swallow the NEXT episode.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn fresh_cache_resets_private_episode_marker() {
+    let Some(store) = store_or_skip("t8-fresh-resets").await else {
+        return;
+    };
+    const STEAMID: &str = "76561198000000005";
+    seed_steam_game(&store, "gk-fr", "mn-fr", "Reset Game", Some(7777), None).await;
+    store.put_steam_identity(STEAMID).await.unwrap();
+    // Mid-episode marker...
+    store
+        .put_sync_state(&SyncState {
+            last_run_epoch: 1_800_000_000,
+            ok: true,
+            cookie_ok: true,
+            games_written: 0,
+            message: "ok".into(),
+            private_pinged: true,
+        })
+        .await
+        .unwrap();
+    // ...but a FRESH cache (a friend's proxy hit refreshed it after ben fixed privacy).
+    store
+        .put_steam_owned(
+            STEAMID,
+            &[7777],
+            time::OffsetDateTime::now_utc().unix_timestamp() - 3600,
+        )
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    let discord = discord_ok().await;
+    let steam_mock = MockServer::start().await; // no GetOwnedGames mock — must not be called
+    let mut d = deps(store, &humble.uri(), Some(discord.uri()));
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let st = d.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        !st.private_pinged,
+        "a fresh cache proves a post-episode success — the marker must reset so the NEXT episode pings"
+    );
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        0,
+        "resetting the marker is silent — no ping fires on the fresh lane"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Carry pin (#128 review fix): a lane that never runs the ownership pass (dead-cookie listing)
+// must CARRY the episode marker — resetting it would re-arm the ping mid-episode.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn dead_cookie_sync_carries_private_episode_marker() {
+    let Some(store) = store_or_skip("t8-carry-deadcookie").await else {
+        return;
+    };
+    store
+        .put_sync_state(&SyncState {
+            last_run_epoch: 1_800_000_000,
+            ok: true,
+            cookie_ok: true,
+            games_written: 0,
+            message: "ok".into(),
+            private_pinged: true,
+        })
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    // Listing 302 -> /login = Unauthorized; no session_store in deps, so no heal:
+    // run_sync pings COOKIE_DEAD and returns before the ownership pass exists.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/user/order"))
+        .respond_with(ResponseTemplate::new(302).append_header("location", "/login"))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+    let d = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    let st = d.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.private_pinged,
+        "the dead-cookie lane never ran the ownership pass — it must carry the marker, not reset it"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// prev_success pin (#128 review fix): first-ever sync seeing Private (no STEAMOWN entry has ever
+// been written) is NOT a change — no ping, marker stays false.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn private_without_prior_success_is_silent() {
+    let Some(store) = store_or_skip("t8-private-first").await else {
+        return;
+    };
+    const STEAMID: &str = "76561198000000006";
+    seed_steam_game(&store, "gk-pf", "mn-pf", "First Game", Some(8888), None).await;
+    store.put_steam_identity(STEAMID).await.unwrap();
+    // NO put_steam_owned — there has never been a successful fetch.
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    let discord = discord_ok().await;
+    let private_mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/IPlayerService/GetOwnedGames/v0001/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": {}
+        })))
+        .mount(&private_mock)
+        .await;
+    let mut d = deps(store, &humble.uri(), Some(discord.uri()));
+    d.steam = Some(steam_client_at(&private_mock.uri()));
+    handle(&d, FulfillRequest::Sync).await;
+
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        0,
+        "Private with no prior success is the initial state, not a change — no ping"
+    );
+    let st = d.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        !st.private_pinged,
+        "no ping fired, so the episode marker must stay false"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Freshness skip (#47): a ≤24h STEAMOWN cache is stamped from directly — zero Steam calls.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn fresh_owned_cache_stamps_without_a_steam_call() {

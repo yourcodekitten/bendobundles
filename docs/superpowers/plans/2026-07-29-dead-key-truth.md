@@ -1061,8 +1061,8 @@ async fn pending_age_sweep(deps: &Deps) {
 - [ ] **Step 4: Update the two exactly-once ping tests (B-3), then run the suite.**
 
 The sweep double-pings two EXISTING tests whose 30h-old seeds now correctly (spec §3 accepts the double ping) receive BOTH the structural stuck-alert AND the sweep ping:
-- `reconcile_unreconcilable_over_threshold_pings_once` (handler_test.rs:1220 as of 2026-08-03; done — asserts 2)
-- `reconcile_unsplittable_game_id_over_threshold_pings` (handler_test.rs:1278 as of 2026-08-03; done — asserts 2)
+- `reconcile_unreconcilable_over_threshold_pings_once` (find by name; done — already asserts 2)
+- `reconcile_unsplittable_game_id_over_threshold_pings` (find by name; done — already asserts 2)
 
 Update BOTH: keep the 30h seeds EXACTLY as they are (aged seeds are the tests' point), change `assert_eq!(reqs.len(), 1)` to `assert_eq!(reqs.len(), 2)`, and assert one body contains the stuck-alert copy (`"cannot act on"`) and one contains `"STILL PENDING"`. Do NOT add dedup to the sweep to make them pass — the double ping is the specified behavior for structurally-stuck claims. Any OTHER test that newly fails on an unexpected extra ping seeded its claim older than 24h without meaning to; those seeds may be brought under 24h (but ≥ RECONCILE_MIN_AGE) — the two tests named above may NOT.
 
