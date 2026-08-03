@@ -14,6 +14,8 @@ import {
 import { withAuth } from './withAuth';
 import { isMature } from '../tags';
 import { titleColorClass } from '../titleColor';
+import { statusBadgeClass } from '../statusBadge';
+import { selfClaimLabel } from '../selfClaimLabel';
 import { GameDetailModal } from '../GameDetailModal';
 import {
   type MatureFilter,
@@ -41,25 +43,6 @@ const MATURE_KEYS: readonly MatureFilter[] = ['all', 'hide', 'only'];
 
 function keyOf<T extends string>(raw: string | null, known: readonly T[], idle: T): T {
   return raw !== null && (known as readonly string[]).includes(raw) ? (raw as T) : idle;
-}
-
-// Status badge — exact color mapping from plan (snake_case serde values)
-//   available=green, pending=amber, gifted=violet, ben_redeemed=slate, expired=red
-function statusBadgeClass(status: string): string {
-  switch (status) {
-    case 'available':
-      return 'bg-green-700 text-green-100';
-    case 'pending':
-      return 'bg-amber-700 text-amber-100';
-    case 'gifted':
-      return 'bg-give text-give-ink';
-    case 'ben_redeemed':
-      return 'bg-slate-600 text-slate-100';
-    case 'expired':
-      return 'bg-red-700 text-red-100';
-    default:
-      return 'bg-control text-ink';
-  }
 }
 
 type PageState =
@@ -492,17 +475,12 @@ export function Catalog() {
                         : 'bg-control hover:bg-control-bright'
                     } disabled:opacity-50`}
                   >
-                    {isArmed
-                      ? game.owned_by_ben && adminSteamId !== null
-                        ? game.requires_choice
-                          ? 'you already own this on steam — spends 1 pick, sure?'
-                          : 'you already own this on steam — sure?'
-                        : game.requires_choice
-                          ? 'confirm? spends 1 pick'
-                          : 'confirm?'
-                      : isClaiming
-                        ? 'claiming…'
-                        : 'claim for me'}
+                    {selfClaimLabel({
+                      armed: isArmed,
+                      ownedOnSteam: game.owned_by_ben && adminSteamId !== null,
+                      requiresChoice: game.requires_choice,
+                      claiming: isClaiming,
+                    })}
                   </button>
                 )}
 
