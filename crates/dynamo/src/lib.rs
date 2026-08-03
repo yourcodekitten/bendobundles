@@ -2180,8 +2180,9 @@ impl Store {
     }
 
     /// Persist an admin session. pk="SESSION#<token>", sk="META". Both `expires_epoch` and `ttl`
-    /// are set to the same value; `ttl` is reserved for DynamoDB TTL (enabled in plan 4's
-    /// terraform). Until then, callers are responsible for checking expiry against wall clock.
+    /// are set to the same value; `ttl` drives DynamoDB TTL (enabled in `terraform/aws-dynamodb.tf`).
+    /// Because TTL deletion is lazy, callers still check expiry against wall clock — TTL is
+    /// reclamation + defense-in-depth, not the correctness gate.
     pub async fn create_session(&self, token: &str, expires_epoch: i64) -> Result<(), StoreError> {
         self.client
             .put_item()

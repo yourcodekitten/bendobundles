@@ -68,9 +68,9 @@ resource "aws_dynamodb_table" "this" {
     }
   }
 
-  # Sessions carry a numeric `ttl` epoch (schema.rs writes it; code also checks
-  # expiry itself, so TTL lag is harmless). This is the "terraform will enable
-  # it in plan 4" note in dynamo/src/schema.rs.
+  # Sessions (and the STEAMOWN cache) carry a numeric `ttl` epoch that schema.rs
+  # writes. DynamoDB TTL deletion is lazy, so the code also checks expiry itself
+  # — TTL lag is harmless; this attribute just reclaims storage after the fact.
   ttl {
     attribute_name = "ttl"
     enabled        = true

@@ -181,8 +181,9 @@ pub fn session_pk(token: &str) -> String {
 }
 
 /// Build the item for an admin session. pk="SESSION#<token>", sk="META", top-level
-/// `expires_epoch` N + `ttl` N (same value). `ttl` is the DynamoDB TTL attribute — terraform
-/// will enable it in plan 4. Until then, expiry enforcement is the caller's job (compare epoch).
+/// `expires_epoch` N + `ttl` N (same value). `ttl` is the DynamoDB TTL attribute (enabled in
+/// `terraform/aws-dynamodb.tf`). DynamoDB expiry is lazy (up to ~48h late), so callers still
+/// compare `expires_epoch` against wall-clock — TTL just reclaims storage afterward.
 pub fn session_item(token: &str, expires_epoch: i64) -> HashMap<String, AttributeValue> {
     let epoch_str = expires_epoch.to_string();
     HashMap::from([
@@ -277,8 +278,9 @@ pub fn steam_identity_item(steamid: &str) -> HashMap<String, AttributeValue> {
 
 /// Build the full item for a STEAMOWN cache entry.
 /// pk="STEAMOWN#<steamid>", sk="META", body=JSON of [`crate::SteamOwnedCache`],
-/// `ttl` N = now_epoch + [`STEAM_OWNED_TTL_SECS`] (DynamoDB TTL attribute; terraform enables it
-/// in plan 4 — until then, callers must check `fetched_at` manually).
+/// `ttl` N = now_epoch + [`STEAM_OWNED_TTL_SECS`] (DynamoDB TTL attribute, enabled in
+/// `terraform/aws-dynamodb.tf`; expiry is lazy so callers still check `fetched_at` for freshness
+/// — TTL only reclaims stale rows afterward).
 pub fn steam_owned_item(
     steamid: &str,
     appids: &[u32],
