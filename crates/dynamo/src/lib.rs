@@ -1827,13 +1827,13 @@ impl Store {
     /// Race handling:
     /// - If the game is already `Pending` at read time, return `Contested` immediately — the
     ///   claim is in flight and any hide attempt would race its fulfill/compensate.
-    /// - Otherwise use an optimistic lock on status (`#st = :expected`): a claim that lands
-    ///   between our read and the put flips the game to `Pending`, which CCFs the condition
-    ///   and safely returns `Contested`.
+    /// - Otherwise the full-coordination-snapshot lock ([`Store::put_game_if_unchanged`], #47):
+    ///   any coordinated field changing between our read and the put CCFs → `Contested`.
     ///
     /// The old `attribute_not_exists(claim_id)` guard permanently blocked gifted games (which
-    /// retain `claim_id` after `fulfill_claim`) from ever being hidden. The status-only lock
-    /// is the correct gate: `Gifted` games have a stable status string and no competing writer.
+    /// retain `claim_id` after `fulfill_claim`) from ever being hidden. The snapshot lock keeps
+    /// that fixed: a `Gifted` game's stable `claim_id` matches its own snapshot, so the write
+    /// still lands.
     pub async fn set_game_hidden(
         &self,
         game_id: &str,
@@ -1900,8 +1900,8 @@ impl Store {
     ///
     /// Returns `AppidWrite::Skipped` when the stored `appid_source` is `Manual` — the admin
     /// override is never overwritten by a mapper pass. Returns `AppidWrite::Contested` when the
-    /// game is `Pending` (a claim is in flight). Uses the same optimistic-lock-on-status pattern
-    /// as `set_game_hidden` to close the read→write race.
+    /// game is `Pending` (a claim is in flight). Delegates to the full-coordination-snapshot
+    /// lock ([`Store::put_game_if_unchanged`], #47) to close the read→write race.
     pub async fn set_game_steam_appid_if_unclaimed(
         &self,
         game_id: &str,
@@ -2655,8 +2655,8 @@ impl Store {
     /// - `appid = Some(id)` → sets `steam_app_id = id, appid_source = Manual`.
     /// - `appid = None`     → clears both fields to `None`; auto-resolution reruns next sync.
     ///
-    /// Uses the same optimistic-lock-on-status pattern as `set_game_hidden` — a concurrent
-    /// claim that lands between our read and the put CCFs the condition → `Contested`.
+    /// Delegates to the full-coordination-snapshot lock ([`Store::put_game_if_unchanged`], #47)
+    /// — any coordinated field changing between our read and the put CCFs → `Contested`.
     /// Returns `Contested` immediately if the game is already `Pending` at read time.
     pub async fn set_game_steam_appid_admin(
         &self,
@@ -2682,8 +2682,8 @@ impl Store {
     }
 
     /// Toggle a game's `owned_by_ben` flag with a guarded conditional write. Structural copy of
-    /// `set_game_hidden` — uses the same optimistic-lock-on-status pattern to close the
-    /// admin-toggle vs claim race.
+    /// `set_game_hidden` — delegates to the full-coordination-snapshot lock
+    /// ([`Store::put_game_if_unchanged`], #47) to close the admin-toggle vs claim race.
     ///
     /// Returns `Contested` immediately if the game is `Pending` (a claim is in flight). A claim
     /// landing AFTER the initial read flips status to `Pending`, which CCFs the condition → `Contested`.
