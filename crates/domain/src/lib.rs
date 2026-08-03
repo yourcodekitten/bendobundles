@@ -288,14 +288,23 @@ pub fn game_id(gamekey: &str, machine_name: &str) -> String {
     format!("{gamekey}:{machine_name}")
 }
 
-/// Choice-tpk machine-name grammar, enumerated from prod 2026-07-31 (175 rows; spec D3):
-/// `<offered>[_row|_ww]_choice_<platform>` where platform is one-or-more `[a-z0-9]`.
+/// Choice-tpk machine-name grammar (spec D3): `<offered>[_row|_ww]_(choice|monthly)_<platform>`
+/// where platform is one-or-more `[a-z0-9]`. Two era infixes carry the SAME claimed-tpk shape:
+/// modern Humble Choice uses `_choice_` (enumerated from prod 2026-07-31, 175 rows); the Dec-2019
+/// TRANSITION-era Choice — when the sub was mid-rebrand from "Humble Monthly" — uses `_monthly_`
+/// (e.g. `ancestorslegacy_monthly_steam` is the Dec-2019 Choice claim of offered `ancestorslegacy`,
+/// confirmed against real prod tpks 2026-08-03, #96). Excluding `_monthly_` was the #96 under-match.
 /// Returns `Some((exact_base, region_stripped))` for a choice-shaped name — `exact_base`
 /// keeps a `_row`/`_ww` region token (an offered name may itself end that way; D7's
 /// candidate ladder tries exact first), `region_stripped` is `Some` only when a region
-/// token existed. `None` = not choice-shaped (bundle/monthly keys; never guessed at).
+/// token existed. `None` = not choice-shaped (bundle keys, month-product slugs, bare names).
 pub fn choice_tpk_bases(tpk_machine_name: &str) -> Option<(String, Option<String>)> {
-    let (base, platform) = tpk_machine_name.rsplit_once("_choice_")?;
+    // Try the modern `_choice_` infix first, then the Dec-2019 transition-era `_monthly_` (#96).
+    // Note `_monthly_` requires a trailing platform, so a month-PRODUCT slug like
+    // `november_2019_monthly` (no `_<platform>` suffix) still returns None — only game tpks match.
+    let (base, platform) = tpk_machine_name
+        .rsplit_once("_choice_")
+        .or_else(|| tpk_machine_name.rsplit_once("_monthly_"))?;
     if base.is_empty()
         || platform.is_empty()
         || !platform
@@ -605,13 +614,26 @@ mod tests {
             choice_tpk_bases("citizensleeper2_starwardvector_choice_steam"),
             Some(("citizensleeper2_starwardvector".into(), None))
         );
-        // NOT choice-shaped: monthly-era, bundle keys, bare names, empty platform
+        // Dec-2019 transition-era Choice: `_monthly_` infix, SAME shape as `_choice_` (#96).
+        // Real prod tpks (2026-08-03): offered `ancestorslegacy` was claimed as
+        // `ancestorslegacy_monthly_steam`; `shadowofthetombraider` as `..._row_monthly_steam`.
         assert_eq!(
-            choice_tpk_bases("holypotatoeswereinspace_monthly_steam"),
-            None
+            choice_tpk_bases("ancestorslegacy_monthly_steam"),
+            Some(("ancestorslegacy".into(), None))
         );
+        assert_eq!(
+            choice_tpk_bases("shadowofthetombraider_row_monthly_steam"),
+            Some((
+                "shadowofthetombraider_row".into(),
+                Some("shadowofthetombraider".into())
+            ))
+        );
+        // NOT choice-shaped: bare names, empty platform, and a month-PRODUCT slug (trailing
+        // `_monthly` with NO `_<platform>` suffix — the era-stop's object, not a game tpk).
+        assert_eq!(choice_tpk_bases("november_2019_monthly"), None);
         assert_eq!(choice_tpk_bases("wingspan"), None);
         assert_eq!(choice_tpk_bases("wingspan_choice_"), None);
+        assert_eq!(choice_tpk_bases("wingspan_monthly_"), None);
         // fires-anyway for the platform CHARSET rung (M11 minor): uppercase must NOT parse.
         assert_eq!(choice_tpk_bases("wingspan_choice_Steam"), None);
     }
@@ -631,15 +653,25 @@ mod tests {
         assert!(choice_tpk_matches("wingspan_choice_steam", "wingspan"));
         // bare equality (defensive: claim-all mints may drop the suffix)
         assert!(choice_tpk_matches("wingspan", "wingspan"));
-        // non-matches: different game, prefix-hazard neighbor, monthly key
+        // Dec-2019 transition-era `_monthly_` tpk matches its offered game, same as `_choice_` (#96).
+        assert!(choice_tpk_matches(
+            "ancestorslegacy_monthly_steam",
+            "ancestorslegacy"
+        ));
+        // region-stripped monthly match: offered bare, claimed carries `_row`.
+        assert!(choice_tpk_matches(
+            "shadowofthetombraider_row_monthly_steam",
+            "shadowofthetombraider"
+        ));
+        // non-matches: different game, prefix-hazard neighbor (must still hold under the new infix)
         assert!(!choice_tpk_matches("wingspan_choice_steam", "wing"));
         assert!(!choice_tpk_matches(
             "atomicheart_row_choice_steam",
             "atomic"
         ));
         assert!(!choice_tpk_matches(
-            "holypotatoeswereinspace_monthly_steam",
-            "holypotatoeswereinspace"
+            "ancestorslegacy_monthly_steam",
+            "ancestors"
         ));
     }
 
