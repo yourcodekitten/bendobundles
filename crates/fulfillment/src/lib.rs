@@ -1983,42 +1983,6 @@ where
     }
 }
 
-/// Ownership pass: stamp `owned_by_ben` on every game that has a `steam_app_id`, using Ben's
-/// Steam library fetched via the Web API.
-///
-/// Called once per sync, AFTER `map_missing_appids` (which writes tier-1 and title-pass appids),
-/// so the appid coverage is as complete as possible before we diff ownership.
-///
-/// ## Behavior (spec §3, M1)
-///
-/// - **Identity absent** → skip silently. Ben hasn't connected Steam yet.
-/// - **`Ok(Games)`** → `put_steam_owned` (refresh the 7-day cache) + diff-stamp: read the game
-///   list ONCE, write `set_game_owned_by_ben` only for games whose `owned_by_ben` value CHANGED.
-///   Games with no `steam_app_id` are skipped (nothing to compare against).
-/// - **`Ok(Private)`** → keep stamps frozen (no writes). Log at INFO. Ping Ben ONCE with a clear
-///   message so he knows why badges stopped updating.
-///
-///   **Ping dedupe:** ping only when the STEAMOWN cache entry for Ben's steamid is already
-///   present — that entry is written only on a successful `Ok(Games)` response, so its presence
-///   means "the last successful fetch returned data" and its absence means "there's never been a
-///   good fetch, so Private is not a new condition". A `Private` response does NOT touch the
-///   STEAMOWN entry, so the dedupe naturally resets when a successful fetch next overwrites it.
-///
-/// - **`Err(_)`** → keep stamps frozen, log at WARN. No ping — a transient error is not
-///   actionable by Ben and should not noise the channel.
-///
-/// ## Disconnect / frozen stamps (deliberate design)
-///
-/// When Ben's Steam identity is removed (Task 9's handler deletes `CONFIG#STEAM`), this pass
-/// skips silently on the next sync (identity absent → early return). Prior `owned_by_ben` stamps
-/// are frozen in place — they are NOT mass-cleared here. The admin UI hides the owned-badge
-/// column entirely when no Steam identity is configured (Task 11 checks identity presence), so
-/// stale frozen stamps are invisible. A fresh re-connection and the next successful
-/// `Ok(Games)` fetch will recompute and correct every stamp via the normal diff path.
-///
-/// The alternative — an HTTP-path O(catalog) mass-clear in Task 9's handler — would require
-/// iterating and conditionally writing every game on delete. That's expensive, racey, and
-/// unnecessary given the UI hides the column anyway. Keeping it here keeps the logic in one place.
 /// Diff-stamp `owned_by_ben` across `games` from an owned-appid list. Shared by the fetch
 /// and fresh-cache lanes of [`refresh_ben_ownership`] (#47).
 async fn stamp_owned(deps: &Deps, games: &[Game], appids: Vec<u32>) {
@@ -2057,6 +2021,49 @@ async fn stamp_owned(deps: &Deps, games: &[Game], appids: Vec<u32>) {
     tracing::info!(stamped, unstamped, "steam owned refresh: stamps updated");
 }
 
+/// Ownership pass: stamp `owned_by_ben` on every game that has a `steam_app_id`, using Ben's
+/// Steam library fetched via the Web API.
+///
+/// Called once per sync, AFTER `map_missing_appids` (which writes tier-1 and title-pass appids),
+/// so the appid coverage is as complete as possible before we diff ownership. `games` is the
+/// sync's shared catalog scan with the mapper pass's writes applied (#47) — this pass no longer
+/// re-scans.
+///
+/// ## Behavior (spec §3, M1)
+///
+/// - **Identity absent** → skip silently. Ben hasn't connected Steam yet.
+/// - **Fresh STEAMOWN cache (≤24h)** → diff-stamp from the cached appids, ZERO Steam calls
+///   (#47 perf). Stated tradeoff: a privacy flip inside the freshness window is detected (and
+///   pinged) up to 24h late.
+/// - **`Ok(Games)`** → `put_steam_owned` (refresh the 7-day cache) + diff-stamp: write
+///   `set_game_owned_by_ben` only for games whose `owned_by_ben` value CHANGED.
+///   Games with no `steam_app_id` are skipped (nothing to compare against).
+/// - **`Ok(Private)`** → keep stamps frozen (no writes). Log at INFO. Ping Ben ONCE PER EPISODE
+///   with a clear message so he knows why badges stopped updating.
+///
+///   **Ping dedupe (#47):** two conditions — a STEAMOWN entry must be present (written only by
+///   successful fetches, so its presence means "Private is a CHANGE, not the initial state"),
+///   AND the persisted `SyncState.private_pinged` episode marker must be false. Presence alone
+///   re-pinged every sync for the whole 7-day cache TTL, because a `Private` response
+///   deliberately never touches the STEAMOWN entry. A successful `Ok(Games)` fetch resets the
+///   marker — that is what ends an episode and re-arms the ping.
+///
+/// - **`Err(_)`** → keep stamps frozen, log at WARN. No ping — a transient error is not
+///   actionable by Ben and should not noise the channel.
+///
+/// ## Disconnect / frozen stamps (deliberate design)
+///
+/// When Ben's Steam identity is removed (Task 9's handler deletes `CONFIG#STEAM`), this pass
+/// skips silently on the next sync (identity absent → early return). Prior `owned_by_ben` stamps
+/// are frozen in place — they are NOT mass-cleared here. The admin UI hides the owned-badge
+/// column entirely when no Steam identity is configured (Task 11 checks identity presence), so
+/// stale frozen stamps are invisible. A fresh re-connection and the next successful
+/// `Ok(Games)` fetch will recompute and correct every stamp via the normal diff path.
+///
+/// The alternative — an HTTP-path O(catalog) mass-clear in Task 9's handler — would require
+/// iterating and conditionally writing every game on delete. That's expensive, racey, and
+/// unnecessary given the UI hides the column anyway. Keeping it here keeps the logic in one place.
+///
 /// Returns the `private_pinged` episode marker to persist (#47): `already_pinged` carried
 /// through on every lane that learns nothing new about privacy (skips, fresh cache, transient
 /// errors), set true when a Private response is seen (pinging only if `!already_pinged` and a
