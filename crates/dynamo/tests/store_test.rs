@@ -3033,3 +3033,74 @@ async fn unchanged_snapshot_write_lands_and_touches_only_its_field() {
         "everything except the target field is byte-intact"
     );
 }
+
+#[tokio::test]
+async fn sync_upsert_stale_read_cannot_revert_manual_override() {
+    // Delegator-level coverage of the headline #47 bug (#129 review): the walk writer's
+    // read→put window is internal to `upsert_game_from_sync`, so the interleave is staged
+    // through its existing-record arm line-for-line — its read, ben's Manual override
+    // landing inside the window, its `merge_sync`, its guarded put — then the REAL
+    // delegator runs as the next sync pass to prove the re-merge heals against fresh truth.
+    let Some(store) = store_or_skip("race-upsert-manual").await else {
+        return;
+    };
+    let mut g = game(64, true);
+    g.steam_app_id = Some(100);
+    g.appid_source = Some(AppidSource::Title);
+    store.put_game(&g).await.unwrap();
+
+    // The walk's fresh payload: a humble-side cosmetic change, no appid data — the merge
+    // takes the appid pair from the read.
+    let mut fresh = g.clone();
+    fresh.title = "Renamed by walk".into();
+    fresh.steam_app_id = None;
+    fresh.appid_source = None;
+
+    // upsert's internal read, staged:
+    let stale_read = store.get_game(&g.id).await.unwrap().unwrap();
+    // Ben's Manual override lands inside the read→put window:
+    assert_eq!(
+        store
+            .set_game_steam_appid_admin(&g.id, Some(4242))
+            .await
+            .unwrap(),
+        AppidWrite::Written
+    );
+    // upsert's merge, computed from the stale read: the payload carries the PRE-override
+    // appid pair — exactly the write the pre-#47 clause list (no appid_source arm) let land.
+    let merged =
+        domain::merge_sync(Some(&stale_read), fresh.clone()).expect("title change must merge");
+    assert_eq!(
+        merged.steam_app_id,
+        Some(100),
+        "the stale payload really would revert ben — that is what must be refused"
+    );
+    assert_eq!(merged.appid_source, Some(AppidSource::Title));
+    // upsert's write arm: the full-snapshot lock refuses (appid_source Title → Manual).
+    assert_eq!(
+        store
+            .put_game_if_unchanged(&stale_read, &merged)
+            .await
+            .unwrap(),
+        GuardedWrite::Contested,
+        "the delegator's guarded put must CCF on the mid-window Manual override"
+    );
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(after.steam_app_id, Some(4242), "ben's appid must survive");
+    assert_eq!(after.appid_source, Some(AppidSource::Manual));
+
+    // The next sync pass — the REAL delegator against fresh truth: re-merges, keeps the
+    // Manual pair (merge_appid: fresh has no id → existing preserved), lands the cosmetics.
+    assert!(matches!(
+        store.upsert_game_from_sync(fresh).await.unwrap(),
+        SyncWrite::Written
+    ));
+    let healed = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(healed.title, "Renamed by walk");
+    assert_eq!(
+        healed.steam_app_id,
+        Some(4242),
+        "the heal pass must carry ben's Manual pair forward"
+    );
+    assert_eq!(healed.appid_source, Some(AppidSource::Manual));
+}

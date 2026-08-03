@@ -1766,11 +1766,21 @@ impl Store {
     /// Now any mid-window coordination change CCFs → `Contested`; the caller's next pass
     /// re-reads and re-applies against fresh truth.
     ///
-    /// Known residuals, deliberately unchanged: non-coordinated body fields (title/artwork —
-    /// sync-authority, written by `upsert_game_from_sync`) can still be staled in-window and
-    /// self-heal on the next walk; and `claim_game`'s tx rewrites `body` under a status+gsi1pk
-    /// gate only — the same class with a milliseconds-wide window, left to a claim-path-specific
-    /// change rather than a rider here.
+    /// Known residuals, deliberately unchanged (#134 tracks closing the class outright):
+    /// this is a VALUE-equality lock on the four coordination fields, not a full-snapshot
+    /// lock — a mid-window write that changes only UNLOCKED values passes it. Concretely:
+    /// - **Manual→Manual appid re-edit** — `steam_app_id` itself is unmirrored/unlocked, so
+    ///   ben re-editing an appid whose source is already `Manual` can be reverted by a stale
+    ///   in-window write (`Manual == Manual` passes) and the mapper skips Manual games, so it
+    ///   does NOT self-heal.
+    /// - **Admin→Admin unhide** — `hidden` is body-only and `hidden_source` stays `Admin` on
+    ///   both hide and unhide, so a stale in-window write can re-hide an admin-unhidden game;
+    ///   sync never unhides, so it stays wrongly hidden until a human notices.
+    /// - non-coordinated body fields (title/artwork — sync-authority, written by
+    ///   `upsert_game_from_sync`) can still be staled in-window and self-heal on the next walk;
+    ///   `owned_by_ben` is the same class — advisory, and re-stamped by every ownership pass.
+    /// - `claim_game`'s tx rewrites `body` under a status+gsi1pk gate only — the same class
+    ///   with a milliseconds-wide window, left to a claim-path-specific change.
     pub async fn put_game_if_unchanged(
         &self,
         snapshot: &Game,

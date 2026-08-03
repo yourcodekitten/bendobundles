@@ -439,7 +439,7 @@ async fn handle_game_hidden(
         Ok(HiddenWrite::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Ok(HiddenWrite::Contested) => (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "game is mid-claim — try again in a moment"})),
+            Json(serde_json::json!({"error": "game changed underneath this edit (a claim or sync raced it) — try again in a moment"})),
         )
             .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -471,7 +471,7 @@ async fn handle_game_steam_appid(
         Ok(AppidWrite::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Ok(AppidWrite::Contested) => (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "game is mid-claim — try again in a moment"})),
+            Json(serde_json::json!({"error": "game changed underneath this edit (a claim or sync raced it) — try again in a moment"})),
         )
             .into_response(),
         Ok(AppidWrite::Skipped) => {
