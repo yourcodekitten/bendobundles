@@ -425,6 +425,7 @@ describe('Catalog', () => {
   describe('self-claims list', () => {
     it('renders the raw "failed" state with a rose-toned class in the self-claims section', async () => {
       const failedSelfClaim: SelfClaimView = {
+        id: 'c-dome-1',
         game_id: 'gk:dome-keeper',
         state: 'failed',
         revealed_key: null,
@@ -441,6 +442,34 @@ describe('Catalog', () => {
       expect(badge).toBeInTheDocument();
       expect(badge).toHaveClass('bg-rose-950', 'text-rose-200');
       expect(screen.queryByText('returned')).not.toBeInTheDocument();
+    });
+
+    it('renders self-claims newest-first regardless of server order (#44)', async () => {
+      vi.mocked(adminCatalog).mockResolvedValue([gameAvailable]);
+      // Server hands them oldest-first; the list must sort created_at desc.
+      vi.mocked(adminSelfClaims).mockResolvedValue([
+        {
+          id: 'c-old',
+          game_id: 'gk:older',
+          state: 'fulfilled',
+          revealed_key: null,
+          created_at: '2026-07-01T00:00:00Z',
+        },
+        {
+          id: 'c-new',
+          game_id: 'gk:newer',
+          state: 'fulfilled',
+          revealed_key: null,
+          created_at: '2026-07-20T00:00:00Z',
+        },
+      ]);
+      renderCatalog();
+
+      await waitFor(() => expect(screen.getByText('gk:newer')).toBeInTheDocument());
+      const rendered = screen
+        .getAllByText(/^gk:(older|newer)$/)
+        .map((el) => el.textContent);
+      expect(rendered).toEqual(['gk:newer', 'gk:older']);
     });
   });
 

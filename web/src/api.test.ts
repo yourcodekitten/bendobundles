@@ -731,7 +731,7 @@ describe('adminSelfClaims', () => {
       ok: true,
       status: 200,
       json: vi.fn().mockResolvedValue([
-        { game_id: 'g', state: 'fulfilled', revealed_key: 'K', created_at: '2026-07-06T00:00:00Z' },
+        { id: 'c-g-1', game_id: 'g', state: 'fulfilled', revealed_key: 'K', created_at: '2026-07-06T00:00:00Z' },
       ]),
     });
     const out = await adminSelfClaims();
