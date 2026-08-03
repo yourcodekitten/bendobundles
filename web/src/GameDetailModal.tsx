@@ -175,8 +175,8 @@ export function GameDetailModal(props: GameDetailModalProps) {
       cancelled = true;
     };
     // retryKey bumps a refetch without changing the other deps.
-    // loadDetail is the caller-supplied loader — changes when scope changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // loadDetail is the caller-supplied loader — changes when scope changes. Callers MUST pass
+    // a stable identity (useCallback), or this effect re-fires on their every render (#51).
   }, [game.id, mount, token, loadDetail, retryKey]);
 
   // ── Escape key ────────────────────────────────────────────────────────────

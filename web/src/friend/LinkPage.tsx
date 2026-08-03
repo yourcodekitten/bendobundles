@@ -160,6 +160,13 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [viewLoaded, typeDone, skipTyping]);
   const [detailGame, setDetailGame] = useState<GameView | null>(null);
+  // Stable loader identity (#51): the modal's load effect lists loadDetail in its deps, so an
+  // inline arrow re-fired it on every parent render (cancel + re-call mid-load). The modal only
+  // renders under the `token !== undefined` guard below, so the assertion cannot fire undefined.
+  const loadGameDetail = useCallback(
+    (gameId: string) => fetchGameDetail(token!, gameId),
+    [token],
+  );
   const [refreshTick, setRefreshTick] = useState(0);
   const prevTokenRef = useRef<string | undefined>(undefined);
 
@@ -540,7 +547,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
           token={token}
           game={detailGame}
           active={data.state === "active"}
-          loadDetail={(gameId) => fetchGameDetail(token, gameId)}
+          loadDetail={loadGameDetail}
           onClaim={(g) => {
             setDetailGame(null);
             setClaimingGame(g);
