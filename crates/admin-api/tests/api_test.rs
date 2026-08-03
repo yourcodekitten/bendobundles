@@ -47,7 +47,9 @@ async fn store_or_skip(test: &str) -> Option<Arc<Store>> {
         eprintln!("SKIP {test}: no dynamodb-local at {url}");
         return None;
     }
-    let store = Store::new(client, format!("t-adm-{test}"));
+    // PID-scoped like fulfillment's tables (#44 item 7): fixed-token creates (create_link is
+    // conditioned attribute_not_exists) would otherwise panic on a persistent local dynamo.
+    let store = Store::new(client, format!("t-adm-{}-{test}", std::process::id()));
     store.create_table_for_tests().await.unwrap();
     Some(Arc::new(store))
 }
