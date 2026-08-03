@@ -1,12 +1,10 @@
-use std::sync::Arc;
-
 use dynamo::Store;
 use fulfillment::{
     Deps, FulfillRequest, FulfillResponse, SessionStore, compute_enrich_deadline, handle,
 };
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
-use steam_client::{SteamApiKey, SteamClient};
+use steam_client::SteamClient;
 
 /// Fetch one decrypted SSM SecureString. Returns `None` (with a warn) on any error, an empty value,
 /// or the `"UNSET"` placeholder that terraform seeds these containers with — so a param that exists
@@ -73,33 +71,11 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         .build()
         .expect("reqwest client");
 
-    let steam: Option<Arc<SteamClient>> = if let Some(ref param) = steam_key_param {
-        match get_secret(&ssm_client, param).await {
-            Some(key) => match SteamClient::new(
-                "https://api.steampowered.com",
-                "https://store.steampowered.com",
-                "https://steamcommunity.com",
-                SteamApiKey::new(key),
-            ) {
-                Ok(c) => {
-                    tracing::info!("steam client: configured");
-                    Some(Arc::new(c))
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "SteamClient construction failed");
-                    tracing::info!("steam client: absent");
-                    None
-                }
-            },
-            None => {
-                tracing::info!("steam client: absent");
-                None
-            }
-        }
-    } else {
-        tracing::info!("steam client: absent");
-        None
+    let steam_key = match &steam_key_param {
+        Some(param) => get_secret(&ssm_client, param).await,
+        None => None,
     };
+    let steam = SteamClient::configure(steam_key);
 
     // Webhook URL fetched ONCE at startup — non-secret, cache it. On missing/failed param, warn
     // and continue without webhooks; never crash.

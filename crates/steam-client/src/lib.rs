@@ -1,4 +1,6 @@
 //! Steam Web API client — owned-games (privacy-pinned), persona, vanity, OpenID.
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 // ── Key newtype ──────────────────────────────────────────────────────────────
@@ -411,6 +413,43 @@ impl SteamClient {
             http,
             key,
         })
+    }
+
+    /// Construct against the real Steam prod endpoints — the single owner of the three prod base
+    /// URLs, so no lambda can drift them out of sync (#47). Tests keep using [`new`] with wiremock
+    /// bases; production code calls this.
+    pub fn production(key: SteamApiKey) -> Result<Self, SteamError> {
+        Self::new(
+            "https://api.steampowered.com",
+            "https://store.steampowered.com",
+            "https://steamcommunity.com",
+            key,
+        )
+    }
+
+    /// Build a shared production client from an optionally-configured API key — the identical
+    /// startup glue every lambda `main` repeated (#47). The SSM fetch stays the caller's concern;
+    /// this owns only "given a key (or not), build + log + wrap in Arc". A missing key OR a
+    /// construction failure both log "absent" and yield `None`, degrading every `/steam` route to
+    /// 503 rather than failing boot — the safe, opt-in default.
+    pub fn configure(key: Option<String>) -> Option<Arc<Self>> {
+        match key {
+            Some(key) => match Self::production(SteamApiKey::new(key)) {
+                Ok(c) => {
+                    tracing::info!("steam client: configured");
+                    Some(Arc::new(c))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "SteamClient construction failed");
+                    tracing::info!("steam client: absent");
+                    None
+                }
+            },
+            None => {
+                tracing::info!("steam client: absent");
+                None
+            }
+        }
     }
 
     pub async fn get_owned_games(&self, steamid: &SteamId64) -> Result<OwnedGames, SteamError> {

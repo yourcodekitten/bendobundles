@@ -13,7 +13,7 @@ use std::sync::Arc;
 use admin_api::{AdminInvoker, router};
 use async_trait::async_trait;
 use fulfillment::{FulfillRequest, FulfillResponse};
-use steam_client::{SteamApiKey, SteamClient};
+use steam_client::SteamClient;
 
 async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
     match client
@@ -109,33 +109,11 @@ async fn main() {
         .expect("ADMIN_HASH_PARAM exists in SSM but has no value")
         .to_string();
 
-    let steam: Option<Arc<SteamClient>> = if let Some(ref param) = steam_key_param {
-        match get_secret(&ssm_client, param).await {
-            Some(key) => match SteamClient::new(
-                "https://api.steampowered.com",
-                "https://store.steampowered.com",
-                "https://steamcommunity.com",
-                SteamApiKey::new(key),
-            ) {
-                Ok(c) => {
-                    tracing::info!("steam client: configured");
-                    Some(Arc::new(c))
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "SteamClient construction failed");
-                    tracing::info!("steam client: absent");
-                    None
-                }
-            },
-            None => {
-                tracing::info!("steam client: absent");
-                None
-            }
-        }
-    } else {
-        tracing::info!("steam client: absent");
-        None
+    let steam_key = match &steam_key_param {
+        Some(param) => get_secret(&ssm_client, param).await,
+        None => None,
     };
+    let steam = SteamClient::configure(steam_key);
 
     let store = Arc::new(dynamo::Store::new(
         aws_sdk_dynamodb::Client::new(&cfg),
