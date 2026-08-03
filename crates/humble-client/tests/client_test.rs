@@ -1381,8 +1381,10 @@ async fn walk_does_not_era_stop_on_an_unparseable_slug() {
 
 #[tokio::test]
 async fn empty_slug_disqualifies_page_from_era_stop() {
-    // page 2: 2 monthly (pre-2019) + 1 EMPTY machine_name → NOT era-stop; walk continues to the
-    // empty page 3 (cursor end).
+    // page 2: 2 monthly (pre-2019) + 1 empty-machine_name product whose slug ("orphan-slug") is
+    // UNPARSEABLE → that product can't be dated → NOT era-stop; walk continues to the empty page 3
+    // (cursor end). (Post-#95: an empty machine_name is disqualifying only when its slug won't
+    // parse — a datable empty product era-stops normally, see the empty-machine_name test below.)
     let server = MockServer::start().await;
     mount_page(
         &server,
@@ -1407,6 +1409,56 @@ async fn empty_slug_disqualifies_page_from_era_stop() {
         .await
         .unwrap();
     assert!(matches!(walk.stop, WalkStop::CursorEnd));
+}
+
+// #95: prod's LIST endpoint (subscription_products_with_gamekeys) omits productMachineName for most
+// products. A full page of pre-Choice (Nov/Oct/Sep-2019) monthlies with EMPTY machine_names must
+// STILL era-stop — dated by the slug alone — instead of walking to the page cap every sync. This is
+// red before the empty-name rung: without it the empty machine_names disqualify the page, the walk
+// follows the cursor to the empty page 3, and it stops at CursorEnd rather than EraStop.
+#[tokio::test]
+async fn walk_era_stops_on_pre_2019_page_with_empty_machine_names() {
+    let server = MockServer::start().await;
+    mount_page(
+        &server,
+        &sub_path(None),
+        choice_page(&["dec_2019_choice"], Some("C2")),
+    )
+    .await;
+    mount_page(
+        &server,
+        &sub_path(Some("C2")),
+        sub_page(
+            vec![
+                sub_product("november-2019", "", &[]),
+                sub_product("october-2019", "", &[]),
+                sub_product("september-2019", "", &[]),
+            ],
+            Some("C3"),
+        ),
+    )
+    .await;
+    mount_page(&server, &sub_path(Some("C3")), empty_products_page()).await;
+    let walk = client(&server)
+        .await
+        .choice_months(
+            40,
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(walk.stop, WalkStop::EraStop),
+        "a full pre-2019 page with empty machine_names must era-stop by slug date: {:?}",
+        walk.stop
+    );
+    assert!(walk.complete_for_choice());
+    assert_eq!(
+        walk.months.len(),
+        1,
+        "only the dec-2019 choice month is collected"
+    );
 }
 
 #[tokio::test]
