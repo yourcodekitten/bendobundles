@@ -8,9 +8,9 @@ use aws_sdk_dynamodb::types::{
 };
 use domain::{Claim, ClaimState, Game, GameStatus, Link};
 use schema::{
-    claim_item, claim_sk, game_item, game_pk, link_item, link_pk, parse_body, session_item,
-    session_pk, steam_app_item, steam_app_pk, steam_identity_item, steam_owned_item,
-    sync_state_item,
+    claim_item, claim_sk, game_item, game_pk, link_item, link_pk, oidc_state_item, oidc_state_pk,
+    parse_body, session_item, session_pk, steam_app_item, steam_app_pk, steam_identity_item,
+    steam_owned_item, sync_state_item,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -2213,6 +2213,62 @@ impl Store {
                     .ok_or(StoreError::Corrupt("session missing expires_epoch"))
             })
             .transpose()
+    }
+
+    /// Mint a pending OpenID login's server-side CSRF state (#86): `OIDCSTATE#<nonce>` → `ctx`,
+    /// expiring at `expires_epoch`. The nonce (never the `ctx`, which carries the invite token)
+    /// rides in the OpenID `return_to`; [`Store::take_oidc_state`] resolves it back, single-use.
+    pub async fn put_oidc_state(
+        &self,
+        nonce: &str,
+        ctx: &str,
+        expires_epoch: i64,
+    ) -> Result<(), StoreError> {
+        self.client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(oidc_state_item(nonce, ctx, expires_epoch)))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Atomically consume a pending OpenID state by nonce, returning its `ctx` iff the nonce exists
+    /// and has not expired at `now_epoch`. SINGLE-USE: the item is DELETED in the same call
+    /// (`ReturnValues=ALL_OLD`), so a replayed nonce — or two concurrent returns racing the same
+    /// nonce — resolves to `None` for all but the one that won the delete. An unknown nonce → `None`;
+    /// an expired-but-not-yet-TTL-evicted item → `None` (and is consumed anyway).
+    pub async fn take_oidc_state(
+        &self,
+        nonce: &str,
+        now_epoch: i64,
+    ) -> Result<Option<String>, StoreError> {
+        let (pk, sk) = schema::key_pair(oidc_state_pk(nonce), "META");
+        let out = self
+            .client
+            .delete_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
+            .send()
+            .await?;
+        let Some(item) = out.attributes else {
+            return Ok(None); // nonce never existed (or already consumed)
+        };
+        let expires = item
+            .get("expires_epoch")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<i64>().ok())
+            .ok_or(StoreError::Corrupt("oidc state missing expires_epoch"))?;
+        if expires <= now_epoch {
+            return Ok(None); // expired — consumed, but not honored
+        }
+        let ctx = item
+            .get("ctx")
+            .and_then(|v| v.as_s().ok())
+            .ok_or(StoreError::Corrupt("oidc state missing ctx"))?;
+        Ok(Some(ctx.clone()))
     }
 
     /// Delete an admin session. Idempotent — silently succeeds if the token does not exist.
