@@ -385,7 +385,7 @@ describe('adminSetHidden', () => {
     expect(result).toEqual({ ok: true });
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/games/game1/hidden', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
       body: JSON.stringify({ hidden: true }),
     });
   });
@@ -429,7 +429,7 @@ describe('adminCreateLink', () => {
     expect(result).toEqual(mockData);
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/links', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
       body: JSON.stringify({
         label: 'My Link',
         claims_allowed: 10,
@@ -451,7 +451,7 @@ describe('adminCreateLink', () => {
 
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/links', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
       body: JSON.stringify({
         label: 'No Expiry',
         claims_allowed: 5,
@@ -571,6 +571,7 @@ describe('adminRevoke', () => {
 
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/links/token123/revoke', {
       method: 'POST',
+      headers: { 'X-Admin-Request': '1' },
     });
   });
 
@@ -619,6 +620,7 @@ describe('adminSync', () => {
     await expect(adminSync()).resolves.toBeUndefined();
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/sync', {
       method: 'POST',
+      headers: { 'X-Admin-Request': '1' },
     });
     // fire-and-forget: no body is read, no counts are extracted
     expect(mockResponse.json).not.toHaveBeenCalled();

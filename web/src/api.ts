@@ -276,6 +276,13 @@ export async function adminLogout(): Promise<void> {
   });
 }
 
+// #83: the independent CSRF layer for state-changing ADMIN requests. session_middleware rejects a
+// mutating admin request (POST/DELETE/…) that lacks this custom header, and a cross-site attacker
+// can't set a custom header without a CORS preflight — which no CORS layer grants. This second layer
+// holds even if a future subdomain ever weakened SameSite=Strict. Read-only admin GETs and the
+// friend /api/l/* routes don't carry it; login/logout live outside the session middleware.
+const ADMIN_CSRF_HEADER: Record<string, string> = { 'X-Admin-Request': '1' };
+
 async function checkUnauthorized(response: Response): Promise<void> {
   if (response.status === 401) {
     throw new Unauthorized();
@@ -304,7 +311,7 @@ export async function adminSetHidden(
 ): Promise<{ ok: true } | { ok: false; message: string }> {
   const response = await fetch(`/admin/api/games/${id}/hidden`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
     body: JSON.stringify({ hidden }),
   });
 
@@ -362,7 +369,7 @@ export async function adminCreateLink(
 ): Promise<{ token: string; url_path: string }> {
   const response = await fetch('/admin/api/links', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
     body: JSON.stringify({
       label,
       claims_allowed: claims,
@@ -402,6 +409,7 @@ export async function adminLinks(): Promise<AdminLink[]> {
 export async function adminRevoke(token: string): Promise<void> {
   const response = await fetch(`/admin/api/links/${token}/revoke`, {
     method: 'POST',
+    headers: ADMIN_CSRF_HEADER,
   });
   await checkUnauthorized(response);
 
@@ -416,7 +424,7 @@ export async function adminRevoke(token: string): Promise<void> {
 export async function adminSetLinkNote(token: string, note: string): Promise<void> {
   const response = await fetch(`/admin/api/links/${token}/note`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
     body: JSON.stringify({ gift_note: note }),
   });
   await checkUnauthorized(response);
@@ -440,6 +448,7 @@ export async function adminLinkClaims(token: string): Promise<AdminClaimView[]> 
 export async function adminSync(): Promise<void> {
   const response = await fetch('/admin/api/sync', {
     method: 'POST',
+    headers: ADMIN_CSRF_HEADER,
   });
 
   await checkUnauthorized(response);
@@ -465,7 +474,7 @@ export async function adminSelfClaim(gameId: string): Promise<SelfClaimResult> {
   try {
     response = await fetch(`/admin/api/games/${encodeURIComponent(gameId)}/self-claim`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
       body: '{}',
     });
   } catch {
@@ -545,7 +554,7 @@ export async function adminSteamIdentity(): Promise<string | null> {
 export async function adminSetSteamIdentity(steamid: string): Promise<void> {
   const response = await fetch('/admin/api/steam/identity', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
     body: JSON.stringify({ steamid }),
   });
   await checkUnauthorized(response);
@@ -554,7 +563,10 @@ export async function adminSetSteamIdentity(steamid: string): Promise<void> {
 
 /** Removes the admin's Steam identity from the server. */
 export async function adminClearSteamIdentity(): Promise<void> {
-  const response = await fetch('/admin/api/steam/identity', { method: 'DELETE' });
+  const response = await fetch('/admin/api/steam/identity', {
+    method: 'DELETE',
+    headers: ADMIN_CSRF_HEADER,
+  });
   await checkUnauthorized(response);
   if (!response.ok) throw new FetchFailed();
 }
@@ -662,7 +674,7 @@ export async function adminGameDetail(gameId: string): Promise<AdminGameDetailRe
 export async function adminSetAppId(gameId: string, appId: number | null): Promise<void> {
   const response = await fetch(`/admin/api/games/${encodeURIComponent(gameId)}/steam-app-id`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
     body: JSON.stringify({ app_id: appId }),
   });
   await checkUnauthorized(response);
