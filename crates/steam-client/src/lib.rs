@@ -27,6 +27,12 @@ impl std::fmt::Debug for SteamApiKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SteamId64(pub String);
 
+/// The SteamID64 shape invariant: exactly 17 ASCII digits. Single source for the rule the OpenID
+/// `claimed_id` parse, admin identity-set, and the public owned-games proxy all enforce (#47).
+pub fn is_valid_steam_id64(s: &str) -> bool {
+    s.len() == 17 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 // ── Domain types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -817,7 +823,7 @@ impl SteamClient {
         let claimed = get("openid.claimed_id").unwrap_or("");
         let id = claimed
             .strip_prefix("https://steamcommunity.com/openid/id/")
-            .filter(|rest| rest.len() == 17 && rest.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|rest| is_valid_steam_id64(rest))
             .ok_or_else(|| SteamError::OpenIdRejected("claimed_id shape".into()))?;
 
         // claimed_id must be in the signed field set (names in openid.signed omit the
@@ -927,4 +933,18 @@ fn net(e: reqwest::Error) -> SteamError {
     // Strip the request URL before stringifying: keyed endpoints embed ?key=... in the URL,
     // and reqwest::Error::Display can include the full URL → key leak into error strings.
     SteamError::Network(e.without_url().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_steam_id64;
+
+    #[test]
+    fn steam_id64_is_exactly_17_ascii_digits() {
+        assert!(is_valid_steam_id64("76561197960287930")); // 17 digits
+        assert!(!is_valid_steam_id64("7656119796028793")); // 16 — too short
+        assert!(!is_valid_steam_id64("765611979602879300")); // 18 — too long
+        assert!(!is_valid_steam_id64("7656119796028793x")); // non-digit
+        assert!(!is_valid_steam_id64("")); // empty
+    }
 }
