@@ -1,9 +1,9 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
-    AppidWrite, AutoHideWrite, ClaimTxError, HiddenWrite, OwnedWrite, SYNC_RUN_STALE_SECS,
-    SteamAppCache, SteamAppPutError, SteamAppPutGuard, Store, SyncBegin, SyncState, SyncWrite,
-    sync_run_is_live,
+    AppidWrite, AutoHideWrite, ClaimTxError, GuardedWrite, HiddenWrite, OwnedWrite,
+    SYNC_RUN_STALE_SECS, SteamAppCache, SteamAppPutError, SteamAppPutGuard, Store, SyncBegin,
+    SyncState, SyncWrite, sync_run_is_live,
 };
 use std::collections::HashMap;
 use time::macros::datetime;
@@ -2910,4 +2910,197 @@ async fn oidc_state_single_use_and_expiry() {
     );
     // …and it was consumed even though expired — a second take is still None.
     assert_eq!(store.take_oidc_state("nonce-b", 1_000).await.unwrap(), None);
+}
+
+// ── put_game_if_unchanged: the #47 stale-snapshot race, pinned deterministically ─────────────────
+// The five field setters previously full-item-put from their read with a status-only lock, so a
+// concurrent write to any OTHER coordination field inside the read→write window was silently
+// reverted. The public primitive lets these tests drive that exact interleaving by hand:
+// read a snapshot, land an out-of-band write, then attempt the stale write.
+
+#[tokio::test]
+async fn stale_snapshot_write_cannot_clobber_manual_override() {
+    // THE #47 loss scenario: sync's owned-stamp reads the game; ben lands a Manual appid
+    // override inside the window; the stamp's stale write must be REFUSED and ben's
+    // override must survive byte-for-byte (pre-fix: the override was silently reverted
+    // and the next mapper pass re-mapped over it — not self-healing).
+    let Some(store) = store_or_skip("race-manual").await else {
+        return;
+    };
+    let mut g = game(61, true);
+    g.steam_app_id = Some(100);
+    g.appid_source = Some(AppidSource::Title);
+    store.put_game(&g).await.unwrap();
+
+    let snapshot = store.get_game(&g.id).await.unwrap().unwrap();
+
+    // Ben's override lands inside the read→write window.
+    assert_eq!(
+        store
+            .set_game_steam_appid_admin(&g.id, Some(4242))
+            .await
+            .unwrap(),
+        AppidWrite::Written
+    );
+
+    // The stale stamping write from the pre-override snapshot.
+    let mut updated = snapshot.clone();
+    updated.owned_by_ben = true;
+    let res = store
+        .put_game_if_unchanged(&snapshot, &updated)
+        .await
+        .unwrap();
+    assert_eq!(res, GuardedWrite::Contested, "stale write must be refused");
+
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(after.steam_app_id, Some(4242), "ben's appid must survive");
+    assert_eq!(
+        after.appid_source,
+        Some(AppidSource::Manual),
+        "Manual source must survive — its loss is what let the mapper re-map"
+    );
+    assert!(!after.owned_by_ben, "no part of the stale write may land");
+
+    // The caller convention: re-read fresh, retry through the setter → lands, override intact.
+    assert_eq!(
+        store.set_game_owned_by_ben(&g.id, true).await.unwrap(),
+        OwnedWrite::Written
+    );
+    let healed = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(healed.owned_by_ben);
+    assert_eq!(healed.appid_source, Some(AppidSource::Manual));
+}
+
+#[tokio::test]
+async fn stale_snapshot_write_cannot_clobber_admin_hide() {
+    // Reverse direction: admin hides a game mid-window; a mapper-style stale write must not
+    // resurrect it (hidden=false from the stale body would silently re-list the game).
+    let Some(store) = store_or_skip("race-hide").await else {
+        return;
+    };
+    let g = game(62, true);
+    store.put_game(&g).await.unwrap();
+
+    let snapshot = store.get_game(&g.id).await.unwrap().unwrap();
+
+    assert_eq!(
+        store.set_game_hidden(&g.id, true).await.unwrap(),
+        HiddenWrite::Written
+    );
+
+    let mut updated = snapshot.clone();
+    updated.steam_app_id = Some(300);
+    updated.appid_source = Some(AppidSource::Title);
+    let res = store
+        .put_game_if_unchanged(&snapshot, &updated)
+        .await
+        .unwrap();
+    assert_eq!(res, GuardedWrite::Contested);
+
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(after.hidden, "admin hide must survive the stale write");
+    assert_eq!(after.hidden_source, Some(domain::HiddenSource::Admin));
+    assert_eq!(after.steam_app_id, None, "no part of the stale write lands");
+}
+
+#[tokio::test]
+async fn unchanged_snapshot_write_lands_and_touches_only_its_field() {
+    let Some(store) = store_or_skip("race-happy").await else {
+        return;
+    };
+    let mut g = game(63, true);
+    g.steam_app_id = Some(500);
+    g.appid_source = Some(AppidSource::Humble);
+    store.put_game(&g).await.unwrap();
+
+    let snapshot = store.get_game(&g.id).await.unwrap().unwrap();
+    let mut updated = snapshot.clone();
+    updated.owned_by_ben = true;
+    assert_eq!(
+        store
+            .put_game_if_unchanged(&snapshot, &updated)
+            .await
+            .unwrap(),
+        GuardedWrite::Written
+    );
+
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(after.owned_by_ben);
+    let mut expect = snapshot.clone();
+    expect.owned_by_ben = true;
+    assert_eq!(
+        after, expect,
+        "everything except the target field is byte-intact"
+    );
+}
+
+#[tokio::test]
+async fn sync_upsert_stale_read_cannot_revert_manual_override() {
+    // Delegator-level coverage of the headline #47 bug (#129 review): the walk writer's
+    // read→put window is internal to `upsert_game_from_sync`, so the interleave is staged
+    // through its existing-record arm line-for-line — its read, ben's Manual override
+    // landing inside the window, its `merge_sync`, its guarded put — then the REAL
+    // delegator runs as the next sync pass to prove the re-merge heals against fresh truth.
+    let Some(store) = store_or_skip("race-upsert-manual").await else {
+        return;
+    };
+    let mut g = game(64, true);
+    g.steam_app_id = Some(100);
+    g.appid_source = Some(AppidSource::Title);
+    store.put_game(&g).await.unwrap();
+
+    // The walk's fresh payload: a humble-side cosmetic change, no appid data — the merge
+    // takes the appid pair from the read.
+    let mut fresh = g.clone();
+    fresh.title = "Renamed by walk".into();
+    fresh.steam_app_id = None;
+    fresh.appid_source = None;
+
+    // upsert's internal read, staged:
+    let stale_read = store.get_game(&g.id).await.unwrap().unwrap();
+    // Ben's Manual override lands inside the read→put window:
+    assert_eq!(
+        store
+            .set_game_steam_appid_admin(&g.id, Some(4242))
+            .await
+            .unwrap(),
+        AppidWrite::Written
+    );
+    // upsert's merge, computed from the stale read: the payload carries the PRE-override
+    // appid pair — exactly the write the pre-#47 clause list (no appid_source arm) let land.
+    let merged =
+        domain::merge_sync(Some(&stale_read), fresh.clone()).expect("title change must merge");
+    assert_eq!(
+        merged.steam_app_id,
+        Some(100),
+        "the stale payload really would revert ben — that is what must be refused"
+    );
+    assert_eq!(merged.appid_source, Some(AppidSource::Title));
+    // upsert's write arm: the full-snapshot lock refuses (appid_source Title → Manual).
+    assert_eq!(
+        store
+            .put_game_if_unchanged(&stale_read, &merged)
+            .await
+            .unwrap(),
+        GuardedWrite::Contested,
+        "the delegator's guarded put must CCF on the mid-window Manual override"
+    );
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(after.steam_app_id, Some(4242), "ben's appid must survive");
+    assert_eq!(after.appid_source, Some(AppidSource::Manual));
+
+    // The next sync pass — the REAL delegator against fresh truth: re-merges, keeps the
+    // Manual pair (merge_appid: fresh has no id → existing preserved), lands the cosmetics.
+    assert!(matches!(
+        store.upsert_game_from_sync(fresh).await.unwrap(),
+        SyncWrite::Written
+    ));
+    let healed = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(healed.title, "Renamed by walk");
+    assert_eq!(
+        healed.steam_app_id,
+        Some(4242),
+        "the heal pass must carry ben's Manual pair forward"
+    );
+    assert_eq!(healed.appid_source, Some(AppidSource::Manual));
 }

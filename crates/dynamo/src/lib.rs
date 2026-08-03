@@ -74,6 +74,17 @@ pub enum AutoHideWrite {
     Contested,
 }
 
+/// Outcome of [`Store::put_game_if_unchanged`] — the shared guarded game write (#47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedWrite {
+    /// The put landed; every coordination field still matched the caller's read.
+    Written,
+    /// A coordinated field (`status`/`appid_source`/`hidden_source`/`claim_id`) changed between
+    /// the caller's read and this write — NOTHING was written. Re-read and retry, or let the
+    /// next pass re-apply against fresh truth.
+    Contested,
+}
+
 /// Outcome of a guarded owned-by-ben write. The ONLY safe way to toggle `owned_by_ben` on a game.
 /// Closes the admin-toggle vs claim race that an unguarded `put_game` would lose.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1741,63 +1752,124 @@ impl Store {
         }
     }
 
-    /// Toggle a game's `hidden` flag with a guarded conditional write.
+    /// The ONE guarded full-item game write (#47) — all six read-modify-write game writers
+    /// delegate here (the five field setters + `upsert_game_from_sync`'s existing-record arm);
+    /// public only so integration tests can drive the stale-snapshot race deterministically
+    /// (read → out-of-band write → stale put). Prefer the setters.
     ///
-    /// Race handling:
-    /// - If the game is already `Pending` at read time, return `Contested` immediately — the
-    ///   claim is in flight and any hide attempt would race its fulfill/compensate.
-    /// - Otherwise use an optimistic lock on status (`#st = :expected`): a claim that lands
-    ///   between our read and the put flips the game to `Pending`, which CCFs the condition
-    ///   and safely returns `Contested`.
+    /// Conditions the put on the FULL coordination snapshot — `status`, `appid_source`,
+    /// `hidden_source`, `claim_id` (equality with `snapshot`'s values; `attribute_not_exists`
+    /// where the snapshot read `None`). The pre-#47 setters locked only `status` (+ at most one
+    /// extra field), so a concurrent write to any OTHER coordinated field inside the caller's
+    /// read→write window was silently reverted by the stale full-item put — ben's Manual appid
+    /// override being the non-self-healing casualty (once reverted, the mapper re-maps over it).
+    /// Now any mid-window coordination change CCFs → `Contested`; the caller's next pass
+    /// re-reads and re-applies against fresh truth.
     ///
-    /// The old `attribute_not_exists(claim_id)` guard permanently blocked gifted games (which
-    /// retain `claim_id` after `fulfill_claim`) from ever being hidden. The status-only lock
-    /// is the correct gate: `Gifted` games have a stable status string and no competing writer.
-    pub async fn set_game_hidden(
+    /// Known residuals, deliberately unchanged (#134 tracks closing the class outright):
+    /// this is a VALUE-equality lock on the four coordination fields, not a full-snapshot
+    /// lock — a mid-window write that changes only UNLOCKED values passes it. Concretely:
+    /// - **Manual→Manual appid re-edit** — `steam_app_id` itself is unmirrored/unlocked, so
+    ///   ben re-editing an appid whose source is already `Manual` can be reverted by a stale
+    ///   in-window write (`Manual == Manual` passes) and the mapper skips Manual games, so it
+    ///   does NOT self-heal.
+    /// - **Admin→Admin unhide** — `hidden` is body-only and `hidden_source` stays `Admin` on
+    ///   both hide and unhide, so a stale in-window write can re-hide an admin-unhidden game;
+    ///   sync never unhides, so it stays wrongly hidden until a human notices.
+    /// - non-coordinated body fields (title/artwork — sync-authority, written by
+    ///   `upsert_game_from_sync`) can still be staled in-window and self-heal on the next walk;
+    ///   `owned_by_ben` is the same class — advisory, and re-stamped by every ownership pass.
+    /// - `claim_game`'s tx rewrites `body` under a status+gsi1pk gate only — the same class
+    ///   with a milliseconds-wide window, left to a claim-path-specific change.
+    pub async fn put_game_if_unchanged(
         &self,
-        game_id: &str,
-        hidden: bool,
-    ) -> Result<HiddenWrite, StoreError> {
-        let Some(mut game) = self.get_game(game_id).await? else {
-            return Ok(HiddenWrite::NotFound);
-        };
-
-        // Pending means a claim is actively in flight — return Contested immediately.
-        // A claim landing AFTER this read will flip status to Pending → the put condition
-        // below (status must equal the read value) will CCF → Contested.
-        if game.status == GameStatus::Pending {
-            return Ok(HiddenWrite::Contested);
-        }
-
-        game.hidden = hidden;
-        // Every admin toggle — hide OR unhide — stamps Admin: from this moment the
-        // auto-hide sweep defers to Ben on this record forever (#71).
-        game.hidden_source = Some(domain::HiddenSource::Admin);
-
-        // Optimistic lock: status must match what we read. Mirrors upsert_game_from_sync.
-        let status_str = game.status.as_wire();
-
-        let res = self
+        snapshot: &Game,
+        updated: &Game,
+    ) -> Result<GuardedWrite, StoreError> {
+        let mut req = self
             .client
             .put_item()
             .table_name(&self.table)
-            .set_item(Some(game_item(&game)))
+            .set_item(Some(game_item(updated)))
             .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":expected", schema::s(status_str))
-            .condition_expression("#st = :expected")
-            .send()
-            .await;
+            .expression_attribute_names("#asrc", "appid_source")
+            .expression_attribute_names("#hsrc", "hidden_source")
+            .expression_attribute_names("#cid", "claim_id")
+            .expression_attribute_values(":st", schema::s(snapshot.status.as_wire()));
+        let mut cond = String::from("#st = :st");
 
-        match res {
-            Ok(_) => Ok(HiddenWrite::Written),
+        match snapshot.appid_source {
+            Some(src) => {
+                cond.push_str(" AND #asrc = :asrc");
+                req = req.expression_attribute_values(":asrc", schema::s(src.as_wire()));
+            }
+            None => cond.push_str(" AND attribute_not_exists(#asrc)"),
+        }
+        match snapshot.hidden_source {
+            Some(src) => {
+                cond.push_str(" AND #hsrc = :hsrc");
+                req = req.expression_attribute_values(":hsrc", schema::s(src.as_wire()));
+            }
+            None => cond.push_str(" AND attribute_not_exists(#hsrc)"),
+        }
+        match &snapshot.claim_id {
+            Some(cid) => {
+                cond.push_str(" AND #cid = :cid");
+                req = req.expression_attribute_values(":cid", schema::s(cid));
+            }
+            None => cond.push_str(" AND attribute_not_exists(#cid)"),
+        }
+
+        match req.condition_expression(cond).send().await {
+            Ok(_) => Ok(GuardedWrite::Written),
             Err(sdk_err) => {
                 if is_ccf_put(&sdk_err) {
-                    Ok(HiddenWrite::Contested)
+                    Ok(GuardedWrite::Contested)
                 } else {
                     Err(StoreError::Aws(format!("{sdk_err:?}")))
                 }
             }
         }
+    }
+
+    /// Toggle a game's `hidden` flag with a guarded conditional write.
+    ///
+    /// Race handling:
+    /// - If the game is already `Pending` at read time, return `Contested` immediately — the
+    ///   claim is in flight and any hide attempt would race its fulfill/compensate.
+    /// - Otherwise the full-coordination-snapshot lock ([`Store::put_game_if_unchanged`], #47):
+    ///   any coordinated field changing between our read and the put CCFs → `Contested`.
+    ///
+    /// The old `attribute_not_exists(claim_id)` guard permanently blocked gifted games (which
+    /// retain `claim_id` after `fulfill_claim`) from ever being hidden. The snapshot lock keeps
+    /// that fixed: a `Gifted` game's stable `claim_id` matches its own snapshot, so the write
+    /// still lands.
+    pub async fn set_game_hidden(
+        &self,
+        game_id: &str,
+        hidden: bool,
+    ) -> Result<HiddenWrite, StoreError> {
+        let Some(game) = self.get_game(game_id).await? else {
+            return Ok(HiddenWrite::NotFound);
+        };
+
+        // Pending means a claim is actively in flight — return Contested immediately.
+        // A claim landing AFTER this read flips a coordination field → the snapshot
+        // lock in put_game_if_unchanged CCFs → Contested.
+        if game.status == GameStatus::Pending {
+            return Ok(HiddenWrite::Contested);
+        }
+
+        let mut updated = game.clone();
+        updated.hidden = hidden;
+        // Every admin toggle — hide OR unhide — stamps Admin: from this moment the
+        // auto-hide sweep defers to Ben on this record forever (#71).
+        updated.hidden_source = Some(domain::HiddenSource::Admin);
+
+        Ok(match self.put_game_if_unchanged(&game, &updated).await? {
+            GuardedWrite::Written => HiddenWrite::Written,
+            GuardedWrite::Contested => HiddenWrite::Contested,
+        })
     }
 
     /// Sync auto-hide: the ONLY writer allowed to set `hidden` without admin intent.
@@ -1806,7 +1878,7 @@ impl Store {
     /// the read→write window wins (#71 "never fights Ben"; `appid_source` Manual-guard
     /// pattern).
     pub async fn auto_hide_game(&self, game_id: &str) -> Result<AutoHideWrite, StoreError> {
-        let Some(mut game) = self.get_game(game_id).await? else {
+        let Some(game) = self.get_game(game_id).await? else {
             return Ok(AutoHideWrite::NotFound);
         };
         if game.hidden {
@@ -1819,33 +1891,17 @@ impl Store {
             return Ok(AutoHideWrite::Contested);
         }
 
-        game.hidden = true;
-        game.hidden_source = Some(domain::HiddenSource::Sync);
+        let mut updated = game.clone();
+        updated.hidden = true;
+        updated.hidden_source = Some(domain::HiddenSource::Sync);
 
-        let res = self
-            .client
-            .put_item()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&game)))
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_names("#hsrc", "hidden_source")
-            .expression_attribute_values(":expected", schema::s(game.status.as_wire()))
-            .expression_attribute_values(":admin", schema::s(domain::HiddenSource::Admin.as_wire()))
-            .condition_expression(
-                "#st = :expected AND (attribute_not_exists(#hsrc) OR #hsrc <> :admin)",
-            )
-            .send()
-            .await;
-
-        match res {
-            Ok(_) => Ok(AutoHideWrite::Written),
-            Err(sdk_err) => {
-                if is_ccf_put(&sdk_err) {
-                    Ok(AutoHideWrite::Contested)
-                } else {
-                    Err(StoreError::Aws(format!("{sdk_err:?}")))
-                }
-            }
+        // The snapshot lock subsumes the old `#hsrc <> :admin` write guard, strictly stronger:
+        // the read screened Admin above, so a mid-window Admin toggle mismatches the snapshot's
+        // read value and CCFs.
+        match self.put_game_if_unchanged(&game, &updated).await {
+            Ok(GuardedWrite::Written) => Ok(AutoHideWrite::Written),
+            Ok(GuardedWrite::Contested) => Ok(AutoHideWrite::Contested),
+            Err(e) => Err(e),
         }
     }
 
@@ -1854,15 +1910,15 @@ impl Store {
     ///
     /// Returns `AppidWrite::Skipped` when the stored `appid_source` is `Manual` — the admin
     /// override is never overwritten by a mapper pass. Returns `AppidWrite::Contested` when the
-    /// game is `Pending` (a claim is in flight). Uses the same optimistic-lock-on-status pattern
-    /// as `set_game_hidden` to close the read→write race.
+    /// game is `Pending` (a claim is in flight). Delegates to the full-coordination-snapshot
+    /// lock ([`Store::put_game_if_unchanged`], #47) to close the read→write race.
     pub async fn set_game_steam_appid_if_unclaimed(
         &self,
         game_id: &str,
         appid: u32,
         source: domain::AppidSource,
     ) -> Result<AppidWrite, StoreError> {
-        let Some(mut game) = self.get_game(game_id).await? else {
+        let Some(game) = self.get_game(game_id).await? else {
             return Ok(AppidWrite::NotFound);
         };
 
@@ -1876,44 +1932,18 @@ impl Store {
             return Ok(AppidWrite::Contested);
         }
 
-        game.steam_app_id = Some(appid);
-        game.appid_source = Some(source);
+        let mut updated = game.clone();
+        updated.steam_app_id = Some(appid);
+        updated.appid_source = Some(source);
 
-        // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
-        // Additionally guard against a concurrent admin Manual override that landed
-        // inside our read→write window: if appid_source is now Manual in DynamoDB,
-        // we must NOT clobber it. attribute_not_exists allows the write on items that
-        // predate the appid_source attribute (Title/Humble/None all still map).
-        let status_str = game.status.as_wire();
-
-        let res = self
-            .client
-            .put_item()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&game)))
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_names("#asrc", "appid_source")
-            .expression_attribute_values(":expected", schema::s(status_str))
-            .expression_attribute_values(
-                ":manual",
-                schema::s(domain::AppidSource::Manual.as_wire()),
-            )
-            .condition_expression(
-                "#st = :expected AND (attribute_not_exists(#asrc) OR #asrc <> :manual)",
-            )
-            .send()
-            .await;
-
-        match res {
-            Ok(_) => Ok(AppidWrite::Written),
-            Err(sdk_err) => {
-                if is_ccf_put(&sdk_err) {
-                    Ok(AppidWrite::Contested)
-                } else {
-                    Err(StoreError::Aws(format!("{sdk_err:?}")))
-                }
-            }
-        }
+        // The snapshot lock subsumes the old `#asrc <> :manual` write guard, strictly stronger:
+        // the read screened Manual above, so a mid-window flip TO Manual mismatches the
+        // snapshot's read value and CCFs (the old guard only caught the Manual case; a
+        // Title→Humble mid-window flip now also Contests instead of being clobbered).
+        Ok(match self.put_game_if_unchanged(&game, &updated).await? {
+            GuardedWrite::Written => AppidWrite::Written,
+            GuardedWrite::Contested => AppidWrite::Contested,
+        })
     }
 
     /// Guarded sync-upsert: the ONLY correct writer for catalog-sync. `put_game` remains unsafe
@@ -1929,61 +1959,41 @@ impl Store {
             return Ok(SyncWrite::Unchanged);
         };
 
-        // Condition: if no existing record, guard with attribute_not_exists(pk) so a concurrent
-        // first-insert doesn't clobber a claim that landed between our read and write.
-        // If an existing record was found, optimistic-lock on its status string — a CCF means a
-        // concurrent claim/compensate/fulfill changed status under us → SkippedInFlight.
-        // When the existing game is owned (claim_id is Some), add an ownership clause to close a
-        // TOCTOU where a compensate+reclaim lands inside sync's read→write window. Without it, the
-        // put would stamp the stale claim_id and strand the live claim (whose fulfill gate checks
-        // claim_id for ownership).
-        // hidden_source must also be unchanged since the read: an admin toggle landing inside
-        // this window would otherwise be silently reverted — INCLUDING the Admin stamp, which
-        // erases Ben's permanent auto-hide immunity (#71). Sync yields; next run re-merges.
-        let mut req = self
-            .client
-            .put_item()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&merged)));
-
-        let cond = match &existing {
-            None => "attribute_not_exists(pk)".to_string(),
-            Some(e) => {
-                // Clause list, not a format! branch matrix: every guarded field appends
-                // exactly one clause, so guard N+1 can't silently miss an arm.
-                let mut clauses = vec!["#st = :expected".to_string()];
-                req = req
-                    .expression_attribute_names("#st", "status")
-                    .expression_attribute_values(":expected", schema::s(e.status.as_wire()));
-                // If the existing game is owned, add the ownership clause to the condition.
-                if let Some(cid) = &e.claim_id {
-                    req = req.expression_attribute_values(":cid", schema::s(cid.clone()));
-                    clauses.push("claim_id = :cid".to_string());
-                }
-                // hidden_source must be unchanged since our read: an admin toggle landing
-                // inside this window owns the record — sync yields (#71).
-                req = req.expression_attribute_names("#hsrc", "hidden_source");
-                match e.hidden_source {
-                    None => clauses.push("attribute_not_exists(#hsrc)".to_string()),
-                    Some(src) => {
-                        req = req.expression_attribute_values(":hsrc", schema::s(src.as_wire()));
-                        clauses.push("#hsrc = :hsrc".to_string());
+        match &existing {
+            // No existing record: guard with attribute_not_exists(pk) so a concurrent
+            // first-insert doesn't clobber a claim that landed between our read and write.
+            None => {
+                let res = self
+                    .client
+                    .put_item()
+                    .table_name(&self.table)
+                    .set_item(Some(game_item(&merged)))
+                    .condition_expression("attribute_not_exists(pk)")
+                    .send()
+                    .await;
+                match res {
+                    Ok(_) => Ok(SyncWrite::Written),
+                    Err(sdk_err) => {
+                        if is_ccf_put(&sdk_err) {
+                            Ok(SyncWrite::SkippedInFlight)
+                        } else {
+                            Err(StoreError::Aws(format!("{sdk_err:?}")))
+                        }
                     }
                 }
-                clauses.join(" AND ")
             }
-        };
-
-        let res = req.condition_expression(cond).send().await;
-        match res {
-            Ok(_) => Ok(SyncWrite::Written),
-            Err(sdk_err) => {
-                if is_ccf_put(&sdk_err) {
-                    Ok(SyncWrite::SkippedInFlight)
-                } else {
-                    Err(StoreError::Aws(format!("{sdk_err:?}")))
-                }
-            }
+            // Existing record: the SIXTH delegator of put_game_if_unchanged (#47). The previous
+            // hand-rolled clause list guarded status + claim_id + hidden_source but MISSED
+            // appid_source — merge_sync carries the appid pair from this read, so a Manual
+            // override landing inside sync's read→write window was silently reverted (the exact
+            // #47 casualty, via the walk writer). The primitive's full coordination snapshot
+            // makes a missing arm impossible-by-construction: any mid-window change to status /
+            // appid_source / hidden_source / claim_id CCFs → SkippedInFlight; next run re-merges
+            // against fresh truth.
+            Some(e) => Ok(match self.put_game_if_unchanged(e, &merged).await? {
+                GuardedWrite::Written => SyncWrite::Written,
+                GuardedWrite::Contested => SyncWrite::SkippedInFlight,
+            }),
         }
     }
 
@@ -2655,15 +2665,15 @@ impl Store {
     /// - `appid = Some(id)` → sets `steam_app_id = id, appid_source = Manual`.
     /// - `appid = None`     → clears both fields to `None`; auto-resolution reruns next sync.
     ///
-    /// Uses the same optimistic-lock-on-status pattern as `set_game_hidden` — a concurrent
-    /// claim that lands between our read and the put CCFs the condition → `Contested`.
+    /// Delegates to the full-coordination-snapshot lock ([`Store::put_game_if_unchanged`], #47)
+    /// — any coordinated field changing between our read and the put CCFs → `Contested`.
     /// Returns `Contested` immediately if the game is already `Pending` at read time.
     pub async fn set_game_steam_appid_admin(
         &self,
         game_id: &str,
         appid: Option<u32>,
     ) -> Result<AppidWrite, StoreError> {
-        let Some(mut game) = self.get_game(game_id).await? else {
+        let Some(game) = self.get_game(game_id).await? else {
             return Ok(AppidWrite::NotFound);
         };
 
@@ -2671,38 +2681,19 @@ impl Store {
             return Ok(AppidWrite::Contested);
         }
 
-        game.steam_app_id = appid;
-        game.appid_source = appid.map(|_| domain::AppidSource::Manual);
+        let mut updated = game.clone();
+        updated.steam_app_id = appid;
+        updated.appid_source = appid.map(|_| domain::AppidSource::Manual);
 
-        // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
-        let status_str = game.status.as_wire();
-
-        let res = self
-            .client
-            .put_item()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&game)))
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":expected", schema::s(status_str))
-            .condition_expression("#st = :expected")
-            .send()
-            .await;
-
-        match res {
-            Ok(_) => Ok(AppidWrite::Written),
-            Err(sdk_err) => {
-                if is_ccf_put(&sdk_err) {
-                    Ok(AppidWrite::Contested)
-                } else {
-                    Err(StoreError::Aws(format!("{sdk_err:?}")))
-                }
-            }
-        }
+        Ok(match self.put_game_if_unchanged(&game, &updated).await? {
+            GuardedWrite::Written => AppidWrite::Written,
+            GuardedWrite::Contested => AppidWrite::Contested,
+        })
     }
 
     /// Toggle a game's `owned_by_ben` flag with a guarded conditional write. Structural copy of
-    /// `set_game_hidden` — uses the same optimistic-lock-on-status pattern to close the
-    /// admin-toggle vs claim race.
+    /// `set_game_hidden` — delegates to the full-coordination-snapshot lock
+    /// ([`Store::put_game_if_unchanged`], #47) to close the admin-toggle vs claim race.
     ///
     /// Returns `Contested` immediately if the game is `Pending` (a claim is in flight). A claim
     /// landing AFTER the initial read flips status to `Pending`, which CCFs the condition → `Contested`.
@@ -2711,7 +2702,7 @@ impl Store {
         game_id: &str,
         owned: bool,
     ) -> Result<OwnedWrite, StoreError> {
-        let Some(mut game) = self.get_game(game_id).await? else {
+        let Some(game) = self.get_game(game_id).await? else {
             return Ok(OwnedWrite::NotFound);
         };
 
@@ -2720,32 +2711,13 @@ impl Store {
             return Ok(OwnedWrite::Contested);
         }
 
-        game.owned_by_ben = owned;
+        let mut updated = game.clone();
+        updated.owned_by_ben = owned;
 
-        // Optimistic lock: status must match what we read. Mirrors set_game_hidden.
-        let status_str = game.status.as_wire();
-
-        let res = self
-            .client
-            .put_item()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&game)))
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":expected", schema::s(status_str))
-            .condition_expression("#st = :expected")
-            .send()
-            .await;
-
-        match res {
-            Ok(_) => Ok(OwnedWrite::Written),
-            Err(sdk_err) => {
-                if is_ccf_put(&sdk_err) {
-                    Ok(OwnedWrite::Contested)
-                } else {
-                    Err(StoreError::Aws(format!("{sdk_err:?}")))
-                }
-            }
-        }
+        Ok(match self.put_game_if_unchanged(&game, &updated).await? {
+            GuardedWrite::Written => OwnedWrite::Written,
+            GuardedWrite::Contested => OwnedWrite::Contested,
+        })
     }
 
     /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).
