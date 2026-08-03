@@ -191,10 +191,10 @@ async fn session_middleware(State(s): State<AppState>, request: Request, next: N
 
 // ── Steam helper ──────────────────────────────────────────────────────────────
 
-/// Validate that `s` is exactly 17 ASCII digit characters — mirrors steam-client's
-/// `claimed_id` digit rule from `verify_openid_assertion`.
+/// Validate that `s` is exactly 17 ASCII digits — delegates to steam-client's canonical rule
+/// (`is_valid_steam_id64`), the single source shared with the OpenID `claimed_id` parse (#47).
 fn is_valid_steamid(s: &str) -> bool {
-    s.len() == 17 && s.bytes().all(|b| b.is_ascii_digit())
+    steam_client::is_valid_steam_id64(s)
 }
 
 /// Extract the steam client from state or return a 503 response.

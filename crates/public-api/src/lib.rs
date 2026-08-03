@@ -448,7 +448,7 @@ async fn handle_steam_owned_proxy(
     //    Guard placed AFTER the token-resolution + liveness gate so that an
     //    unknown or dead token always returns the byte-identical 404/409 and
     //    never leaks that the steamid was also malformed (no oracle upgrade).
-    if steamid.len() != 17 || !steamid.bytes().all(|b| b.is_ascii_digit()) {
+    if !steam_client::is_valid_steam_id64(&steamid) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "steamid must be exactly 17 ASCII digits"})),
