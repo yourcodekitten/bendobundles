@@ -1891,6 +1891,44 @@ async fn reveal_key_step_up_gate_without_creds_is_step_up_failed() {
 }
 
 #[tokio::test]
+async fn reveal_auth_rejection_is_typed_not_cookie_death() {
+    // Mirror of redeem_auth_rejection_is_typed_not_cookie_death for the reveal path:
+    // reveal_once's non-200 tail is a comment-enforced copy of redeem_once's, but until
+    // this test nothing pinned it — a drift here would misroute an auth/CSRF-layer
+    // rejection into the dead-cookie alarm. Plain 401/403/302 (no secureArea redirect,
+    // no login_required body) must be RedeemAuthRejected, and with no csrf_cookie
+    // offered by the preflight, csrf_minted=true.
+    for status in [401u16, 403, 302] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/humbler/redeemkey"))
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .reveal_key("GK", "some_product_steam", 0)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                humble_client::HumbleError::RedeemAuthRejected {
+                    status: s,
+                    csrf_minted: true
+                } if s == status
+            ),
+            "reveal status {status} must map to RedeemAuthRejected with csrf_minted=true, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn redeem_expired_key_maps_to_key_expired() {
     // The live 2026-07-09 doom_eternal refusal, byte-exact (cloudwatch receipt).
     let server = MockServer::start().await;
