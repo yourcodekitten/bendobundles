@@ -187,7 +187,11 @@ struct SteamCacheSlim {
 
 #[derive(serde::Deserialize)]
 struct SteamDetailSlim {
-    #[serde(default)]
+    // Field-for-field serde parity with the full `SteamAppDetail` so the slim read can NEVER
+    // diverge from the full read (#64 review): `genres` is REQUIRED on the full struct, so it stays
+    // required here — a genres-missing detail must error in BOTH paths, never silent-empty in one and
+    // loud in the other. `tags` carries `#[serde(default)]` on the full struct (blobs predating #71),
+    // so the slim mirrors that exactly.
     genres: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
@@ -2741,6 +2745,18 @@ mod tests {
             .into();
         assert_eq!(gt.genres, vec!["Action".to_string()]);
         assert!(gt.tags.is_empty());
+    }
+
+    #[test]
+    fn steam_slim_genres_missing_errors_like_the_full_parse() {
+        // `genres` is REQUIRED on the full SteamAppDetail, so a detail without it must ERROR in the
+        // slim read too — never silently keep an item the full `parse_body::<SteamAppCache>` would
+        // have rejected. The slim-vs-full parity guard.
+        let body = serde_json::json!({
+            "app_id": 5, "detail": {"tags": ["X"]}, // detail present, but no `genres`
+            "fetched_at": 0, "reviews_fetched_at": 0
+        });
+        assert!(serde_json::from_value::<SteamCacheSlim>(body).is_err());
     }
 
     // dynamodb-local can't be coerced into producing a live TransactionConflict on demand, so
