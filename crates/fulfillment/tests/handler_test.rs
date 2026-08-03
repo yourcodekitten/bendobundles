@@ -5693,6 +5693,98 @@ async fn enrich_stale_reviews_only_skips_appdetails() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// Frozen-at-death (#51, family call 2026-08-03): a delisted stub's reviews are NEVER refetched
+// on the 14d window. Pre-fix this was a saw-tooth ACCIDENT: the `delisted` skip flag was only
+// set by a same-pass detail fetch, so a stub whose reviews clock lapsed while its detail clock
+// was still fresh (day 14–30 band) re-entered the worklist and refetched reviews — while both
+// in-code comments claimed reviews were skipped. Last-known-at-death is the headstone number.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_stub_reviews_are_frozen_at_death() {
+    let Some(store) = store_or_skip("t3-stub-frozen").await else {
+        return;
+    };
+    let app_id = 999889;
+    seed_steam_game(&store, "gk-fz", "mn-fz", "Frozen Game", Some(app_id), None).await;
+
+    // The honest day-15 stub: both clocks stamped at death 15 days ago — detail (30d TTL)
+    // still fresh, reviews (14d TTL) lapsed. Detail None, last-known reviews retained.
+    let mut stub = fresh_cache(app_id, days_ago(15));
+    stub.detail = None;
+    store
+        .put_steam_app(&stub, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+
+    // Full mocks mounted: ANY storefront call would be visible (and counted).
+    let steam_mock = steam_mock_empty().await;
+    mount_steam_ok(&steam_mock, app_id).await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    assert_eq!(
+        steam_mock.received_requests().await.unwrap().len(),
+        0,
+        "a stub with lapsed reviews but fresh detail must make ZERO storefront calls"
+    );
+    let after = d.store.get_steam_app(app_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.overall, stub.overall,
+        "last-known reviews are FROZEN, not wiped and not refetched"
+    );
+    assert_eq!(
+        after.reviews_fetched_at, stub.reviews_fetched_at,
+        "the reviews clock stays at death — the 30d detail retry is the only heartbeat"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Reviews failure keeps the fetched detail half (#51 item 2): pre-fix, a failed appreviews call
+// threw away an already-fetched appdetails response — the politeness cost was paid twice.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_reviews_failure_keeps_fetched_detail_half() {
+    let Some(store) = store_or_skip("t3-reviews-fail-detail").await else {
+        return;
+    };
+    let app_id = 999890;
+    seed_steam_game(&store, "gk-rf", "mn-rf", "Half Game", Some(app_id), None).await;
+
+    let steam_mock = steam_mock_empty().await;
+    // appdetails succeeds; appreviews 500s (histogram never reached).
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", app_id.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(appdetails_found_body("Game")))
+        .mount(&steam_mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/appreviews/{app_id}")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let cache = d
+        .store
+        .get_steam_app(app_id)
+        .await
+        .unwrap()
+        .expect("the fetched detail half must be persisted despite the reviews failure");
+    assert!(cache.detail.is_some(), "detail half banked");
+    assert!(cache.fetched_at > 0, "detail clock stamped");
+    assert!(
+        cache.overall.is_none() && cache.reviews_fetched_at == 0,
+        "reviews half untouched — clock stays stale so ONLY reviews retry next sync"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
 // (c) 429 on the 3rd app aborts — apps 1-2 persisted, 4+ untouched.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
