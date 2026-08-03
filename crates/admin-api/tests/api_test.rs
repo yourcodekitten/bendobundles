@@ -318,6 +318,7 @@ async fn login_correct_password_sets_cookie_and_enables_auth() {
     // Authed GET /admin/api/catalog → 200
     let catalog_req = Request::get("/admin/api/catalog")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
 
@@ -346,6 +347,7 @@ async fn create_link_token_is_64_chars_and_visible_in_list() {
     let create_req = Request::post("/admin/api/links")
         .header("content-type", "application/json")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::from(
             serde_json::to_vec(&serde_json::json!({"label": "Dave", "claims_allowed": 2})).unwrap(),
         ))
@@ -374,6 +376,7 @@ async fn create_link_token_is_64_chars_and_visible_in_list() {
     // GET /admin/api/links — the created link must appear
     let list_req = Request::get("/admin/api/links")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
 
@@ -422,6 +425,7 @@ async fn list_links_carries_thank_note_and_omits_when_unset() {
 
     let list_req = Request::get("/admin/api/links")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let list_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -455,6 +459,7 @@ async fn post_create_link(
     let req = Request::post("/admin/api/links")
         .header("content-type", "application/json")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     router(
@@ -633,6 +638,7 @@ async fn create_link_gift_note_roundtrips_trimmed_and_blank_collapses_to_absent(
 
     let list_req = Request::get("/admin/api/links")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let list_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -681,6 +687,7 @@ async fn set_link_note_after_create_edits_clears_and_validates() {
             let req = Request::post(format!("/admin/api/links/{token}/note"))
                 .header("content-type", "application/json")
                 .header("cookie", format!("session={session}"))
+                .header("x-admin-request", "1")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap();
             router(store, invoker, admin_hash, None)
@@ -730,6 +737,7 @@ async fn set_link_note_after_create_edits_clears_and_validates() {
     // scoped write makes that unrepresentable — this pins the contract.)
     let revoke = Request::post("/admin/api/links/note-edit-tok/revoke")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(
@@ -853,6 +861,7 @@ async fn link_claims_unknown_token_returns_404() {
 
     let req = Request::get("/admin/api/links/no-such-token/claims")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -883,6 +892,7 @@ async fn catalog_and_hidden_toggle_reflected() {
     // GET /admin/api/catalog: game must be present, hidden=false
     let cat1_req = Request::get("/admin/api/catalog")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let cat1_resp = router(
@@ -908,6 +918,7 @@ async fn catalog_and_hidden_toggle_reflected() {
     let hide_req = Request::post(format!("/admin/api/games/{gid}/hidden"))
         .header("content-type", "application/json")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::from(r#"{"hidden":true}"#))
         .unwrap();
     let hide_resp = router(
@@ -924,6 +935,7 @@ async fn catalog_and_hidden_toggle_reflected() {
     // GET /admin/api/catalog again: game must now show hidden=true
     let cat2_req = Request::get("/admin/api/catalog")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let cat2_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -958,6 +970,7 @@ async fn revoke_link_is_reflected_in_store() {
 
     let revoke_req = Request::post("/admin/api/links/test-revoke-tok/revoke")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let revoke_resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -992,6 +1005,7 @@ async fn status_never_synced_serializes_sync_null() {
 
     let req = Request::get("/admin/api/status")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -1027,6 +1041,7 @@ async fn catalog_does_not_leak_order_key_material() {
 
     let req = Request::get("/admin/api/catalog")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -1094,6 +1109,7 @@ async fn link_claims_redact_gift_url_to_issued_bool() {
 
     let req = Request::get("/admin/api/links/aud-tok/claims")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -1139,6 +1155,7 @@ async fn sync_now_fires_async_and_returns_202() {
 
     let req = Request::post("/admin/api/sync")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -1180,6 +1197,7 @@ async fn sync_now_refuses_while_run_live() {
 
     let req = Request::post("/admin/api/sync")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -1224,6 +1242,7 @@ async fn sync_now_fires_past_stale_run_marker() {
 
     let req = Request::post("/admin/api/sync")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -1350,6 +1369,7 @@ async fn authed_post(app: &axum::Router, path: &str, body: &str) -> axum::respon
     let req = Request::post(path)
         .header("content-type", "application/json")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::from(body.to_string()))
         .unwrap();
     app.clone().oneshot(req).await.unwrap()
@@ -1359,6 +1379,7 @@ async fn authed_get(app: &axum::Router, path: &str) -> axum::response::Response 
     let session = get_session(app).await;
     let req = Request::get(path)
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     app.clone().oneshot(req).await.unwrap()
@@ -1704,6 +1725,7 @@ async fn steam_endpoints_503_when_not_configured() {
                 .method(method)
                 .uri(path)
                 .header("cookie", format!("session={session}"))
+                .header("x-admin-request", "1")
                 .body(Body::empty())
                 .unwrap()
         } else {
@@ -1712,6 +1734,7 @@ async fn steam_endpoints_503_when_not_configured() {
                 .uri(path)
                 .header("content-type", "application/json")
                 .header("cookie", format!("session={session}"))
+                .header("x-admin-request", "1")
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
@@ -1766,6 +1789,7 @@ async fn steam_identity_roundtrip() {
     let session = get_session(&app).await;
     let req = Request::delete("/admin/api/steam/identity")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -2283,6 +2307,7 @@ async fn catalog_joins_steam_summary() {
 
     let req = Request::get("/admin/api/catalog")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -2362,6 +2387,7 @@ async fn catalog_carries_tags_descriptors_and_hidden_source() {
 
     let req = Request::get("/admin/api/catalog")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -2468,6 +2494,7 @@ async fn logout_revokes_session_server_side() {
     // Cookie works before logout.
     let before = Request::get("/admin/api/catalog")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(
@@ -2488,6 +2515,7 @@ async fn logout_revokes_session_server_side() {
     // Logout with that cookie → 204.
     let logout = Request::post("/admin/api/logout")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(
@@ -2510,6 +2538,7 @@ async fn logout_revokes_session_server_side() {
     // Same cookie is now rejected on a protected route.
     let after = Request::get("/admin/api/catalog")
         .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
         .body(Body::empty())
         .unwrap();
     let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
@@ -2579,5 +2608,76 @@ async fn logout_store_failure_returns_500_without_clearing_cookie() {
     assert!(
         resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
         "cookie must NOT be cleared while the session is still live server-side"
+    );
+}
+
+// ── CSRF defense-in-depth (#83) ────────────────────────────────────────────────
+// State-changing admin requests must carry the X-Admin-Request custom header (the independent
+// second layer under SameSite=Strict for the bodyless POSTs). Read-only GETs are exempt.
+#[tokio::test]
+async fn csrf_state_changing_needs_admin_header_get_exempt() {
+    let Some(store) = store_or_skip("csrf-header").await else {
+        return;
+    };
+    let password = "csrfpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    // A valid session but NO X-Admin-Request on a state-changing POST → 403 (the CSRF gate).
+    let no_header = Request::post("/admin/api/sync")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(no_header)
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a mutating request without the CSRF header is rejected before the handler"
+    );
+
+    // Same POST WITH the header → clears the CSRF gate (reaches the handler, not 403).
+    let with_header = Request::post("/admin/api/sync")
+        .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(
+        Arc::clone(&store),
+        Arc::clone(&invoker),
+        admin_hash.clone(),
+        None,
+    )
+    .oneshot(with_header)
+    .await
+    .unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "the custom header clears the CSRF gate"
+    );
+
+    // A read-only GET is EXEMPT — no header needed (a cross-site GET changes nothing and lands
+    // cookie-less under SameSite anyway).
+    let get_no_header = Request::get("/admin/api/catalog")
+        .header("cookie", format!("session={session}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
+        .oneshot(get_no_header)
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a read-only GET needs no CSRF header"
     );
 }

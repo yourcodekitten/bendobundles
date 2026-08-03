@@ -20,6 +20,8 @@
 //! - GET   /admin/api/steam/owned/:steamid — session-guarded proxy: serve cache (≤24h) or fetch
 //!
 //! All routes except `/login` and `/logout` require a valid session cookie (`session=<token>`).
+//! State-changing routes (POST/DELETE/…) additionally require the `X-Admin-Request` header —
+//! CSRF defense-in-depth, an independent second layer under `SameSite=Strict` (#83).
 //! All `/admin/api/steam/*` routes additionally require a configured steam client; absent → 503.
 use std::sync::Arc;
 
@@ -27,7 +29,7 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{Path, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -148,6 +150,17 @@ fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
         })
 }
 
+/// The custom header every state-changing admin request must carry — the independent CSRF layer
+/// (#83). Unforgeable cross-site: a browser can't set a custom header on a cross-origin request
+/// without a CORS preflight, and no `CorsLayer` exists anywhere in `crates/` to grant one.
+const ADMIN_REQUEST_HEADER: &str = "x-admin-request";
+
+/// Methods that mutate server state — the ones that need CSRF protection. Read-only methods are
+/// exempt (a cross-site GET can't change anything, and it lands cookie-less under SameSite anyway).
+fn is_state_changing(method: &Method) -> bool {
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
 async fn session_middleware(State(s): State<AppState>, request: Request, next: Next) -> Response {
     let Some(token) = extract_session_cookie(request.headers()) else {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -161,6 +174,16 @@ async fn session_middleware(State(s): State<AppState>, request: Request, next: N
         }
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+
+    // #83: CSRF defense-in-depth. Beyond a valid session, a STATE-CHANGING request must also carry
+    // the `X-Admin-Request` custom header. This is the independent second layer under
+    // `SameSite=Strict` for the bodyless POSTs (`/sync`, `/revoke`, `/self-claim`) that lack the
+    // `Json` Content-Type barrier — and it holds even if a future subdomain ever weakened SameSite
+    // (a cross-site request still can't forge the header). Read-only methods are exempt.
+    if is_state_changing(request.method()) && !request.headers().contains_key(ADMIN_REQUEST_HEADER)
+    {
+        return StatusCode::FORBIDDEN.into_response();
     }
 
     next.run(request).await
