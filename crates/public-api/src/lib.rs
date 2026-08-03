@@ -219,17 +219,19 @@ fn ctx_is_allowed(ctx: &str) -> bool {
 
 // ── return_to URL helper ──────────────────────────────────────────────────────
 
-/// Build the OpenID `return_to` URL from the server-trusted `base_url` and the
-/// (already-validated) `ctx`. Both the login endpoint (emitting it) and the return
-/// endpoint (expecting it) call this helper — byte-match by construction.
+/// Build the OpenID `return_to` URL from the server-trusted `base_url` and the opaque server-side
+/// `state` nonce (#86). The invite `ctx` no longer rides here — only the nonce, which the return
+/// endpoint resolves back to `ctx` via `take_oidc_state`. So the 64-hex invite token never crosses
+/// to Valve's origin. Both login (emitting the nonce) and return (rebuilding it after resolving the
+/// nonce) call this helper → byte-match by construction, which `verify_openid_assertion` pins.
 ///
-/// Security: `base_url` comes from config (env-threaded into AppState), NEVER
-/// from Host/X-Forwarded-* request headers — this is the critical gate.
-fn build_return_to(base_url: &str, ctx: &str) -> String {
+/// Security: `base_url` comes from config (env-threaded into AppState), NEVER from
+/// Host/X-Forwarded-* request headers — this is the critical gate.
+fn build_return_to(base_url: &str, state: &str) -> String {
     format!(
-        "{}/api/steam/return?ctx={}",
+        "{}/api/steam/return?state={}",
         base_url,
-        urlencoding::encode(ctx)
+        urlencoding::encode(state)
     )
 }
 
@@ -264,7 +266,24 @@ async fn handle_steam_login(
         return redirect_to(&format!("{ctx}#steam_error=steam_unreachable"));
     }
 
-    let return_to = build_return_to(&s.base_url, &ctx);
+    // #86: mint an opaque single-use nonce, store OIDCSTATE#<nonce> → ctx (~5-min TTL), and put ONLY
+    // the nonce in return_to. The invite token in `ctx` never crosses to Valve; the return endpoint
+    // resolves the nonce back, single-use. A failed state write can't proceed (the return couldn't
+    // resolve it) → bounce back with the same error fragment the SPA already handles.
+    // Two v4 UUIDs concatenated (64 hex, ≥128 bits of getrandom/CSPRNG entropy) — the same shape as
+    // the admin session token. A guessable state is a forgeable state, so this is unguessable by
+    // construction, not by hope; a single v4 (122 bits) sits below the codebase's security-token bar.
+    let nonce = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    let expires = OffsetDateTime::now_utc().unix_timestamp() + dynamo::schema::OIDC_STATE_TTL_SECS;
+    if s.store.put_oidc_state(&nonce, &ctx, expires).await.is_err() {
+        return redirect_to(&format!("{ctx}#steam_error=steam_unreachable"));
+    }
+
+    let return_to = build_return_to(&s.base_url, &nonce);
     let redirect_url = steam_client::steam_openid_redirect_url(&s.base_url, &return_to);
 
     // Redirect to Steam's OpenID endpoint (302 Found).
@@ -281,15 +300,24 @@ async fn handle_steam_return(
     // collapse duplicates, making the guard dead code at the endpoint level.
     Query(all_params): Query<Vec<(String, String)>>,
 ) -> Response {
-    // Take the FIRST occurrence of `ctx` (first-occurrence semantics, consistent
-    // with how the steam-client crate's get() helper works for openid.* params).
-    let ctx = all_params
+    // #86: the return_to carries an opaque `state` nonce, not the invite `ctx`. Resolve it
+    // server-side and SINGLE-USE (take_oidc_state deletes on read) to recover the original ctx. An
+    // unknown, expired, or already-consumed nonce — or a store error — → 302 `/` (no fragment), the
+    // same dead-end a bad ctx got. First-occurrence semantics for `state`, mirroring the openid.*
+    // params. This is the CSRF gate: a return can't be honored without a nonce this server minted.
+    let state = all_params
         .iter()
-        .find(|(k, _)| k == "ctx")
+        .find(|(k, _)| k == "state")
         .map(|(_, v)| v.clone())
         .unwrap_or_default();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let ctx = match s.store.take_oidc_state(&state, now).await {
+        Ok(Some(ctx)) => ctx,
+        _ => return redirect_to("/"),
+    };
 
-    // ctx allowlist — failure → 302 `/` no fragment.
+    // Defense-in-depth: the stored ctx was allowlisted at login, but re-validate the resolved value —
+    // ctx_is_allowed stays the open-redirect guard on whatever actually builds the final redirect.
     if !ctx_is_allowed(&ctx) {
         return redirect_to("/");
     }
@@ -306,14 +334,16 @@ async fn handle_steam_return(
         }
     };
 
-    // Reconstruct expected_return_to from server-trusted BASE_URL config —
-    // NEVER from any request header. Both login and return call build_return_to
-    // → byte-match by construction.
-    let expected_return_to = build_return_to(&s.base_url, &ctx);
+    // Reconstruct expected_return_to from server-trusted BASE_URL config — NEVER from any request
+    // header. Login built it from the NONCE, so rebuild it from the same nonce here (not the ctx)
+    // → byte-match by construction, which verify_openid_assertion pins.
+    let expected_return_to = build_return_to(&s.base_url, &state);
 
-    // Collect all params except `ctx` as the openid.* assertion params.
-    let openid_params: Vec<(String, String)> =
-        all_params.into_iter().filter(|(k, _)| k != "ctx").collect();
+    // Collect all params except our own `state` as the openid.* assertion params.
+    let openid_params: Vec<(String, String)> = all_params
+        .into_iter()
+        .filter(|(k, _)| k != "state")
+        .collect();
 
     // Verify the OpenID assertion.
     let steamid = match steam

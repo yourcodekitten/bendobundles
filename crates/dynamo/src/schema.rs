@@ -193,6 +193,33 @@ pub fn session_item(token: &str, expires_epoch: i64) -> HashMap<String, Attribut
     ])
 }
 
+/// A pending OpenID login's CSRF state lives ~5 minutes — a redirect to Steam and back is seconds,
+/// so this is generous. The nonce is single-use (`Store::take_oidc_state` deletes on read); the TTL
+/// is only the janitor for logins the friend abandoned mid-flow.
+pub const OIDC_STATE_TTL_SECS: i64 = 5 * 60;
+
+pub fn oidc_state_pk(nonce: &str) -> String {
+    format!("OIDCSTATE#{nonce}")
+}
+
+/// Build the item for a pending OpenID login's server-side CSRF state (#86). pk="OIDCSTATE#<nonce>",
+/// sk="META", top-level `ctx` S (the already-validated return path — never sent to Valve) +
+/// `expires_epoch` N + `ttl` N (same value, the DynamoDB TTL attribute).
+pub fn oidc_state_item(
+    nonce: &str,
+    ctx: &str,
+    expires_epoch: i64,
+) -> HashMap<String, AttributeValue> {
+    let epoch_str = expires_epoch.to_string();
+    HashMap::from([
+        ("pk".into(), s(oidc_state_pk(nonce))),
+        ("sk".into(), s("META")),
+        ("ctx".into(), s(ctx.to_string())),
+        ("expires_epoch".into(), AttributeValue::N(epoch_str.clone())),
+        ("ttl".into(), AttributeValue::N(epoch_str)),
+    ])
+}
+
 pub fn parse_body<T: serde::de::DeserializeOwned>(
     item: &HashMap<String, AttributeValue>,
 ) -> Result<T, crate::StoreError> {

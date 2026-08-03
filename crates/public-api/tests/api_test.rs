@@ -1243,9 +1243,15 @@ async fn steam_return_valid_redirects_with_fragment() {
     let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
 
     let ctx = format!("/l/{CTX_TOKEN}");
+    // #86: login stored a nonce → ctx; return_to carries the NONCE, not ctx. Seed it (far-future exp).
+    let nonce = "test-nonce-valid";
+    store
+        .put_oidc_state(nonce, &ctx, 9_999_999_999)
+        .await
+        .unwrap();
     let expected_return_to = format!(
-        "{TEST_BASE_URL}/api/steam/return?ctx={}",
-        urlencoding::encode(&ctx)
+        "{TEST_BASE_URL}/api/steam/return?state={}",
+        urlencoding::encode(nonce)
     );
 
     // Build the assertion params with the expected_return_to.
@@ -1255,7 +1261,7 @@ async fn steam_return_valid_redirects_with_fragment() {
     );
 
     // Build query string for GET /api/steam/return
-    let mut qs = format!("ctx={}", urlencoding::encode(&ctx));
+    let mut qs = format!("state={}", urlencoding::encode(nonce));
     for (k, v) in &params {
         qs.push('&');
         qs.push_str(&urlencoding::encode(k));
@@ -1288,10 +1294,12 @@ async fn steam_return_valid_redirects_with_fragment() {
     );
 }
 
-/// Steam return: bad ctx → 302 `/` (no fragment).
+/// Steam return: no/unknown `state` nonce → 302 `/` (no fragment). #86 moved ctx server-side, so a
+/// return that carries no nonce this server minted (here a stray `ctx=` and no `state`) can't resolve
+/// and is a dead-end — the CSRF gate. (Also covers a bogus nonce: `take_oidc_state` → None → `/`.)
 #[tokio::test]
-async fn steam_return_bad_ctx_redirects_root_no_fragment() {
-    let Some(store) = store_or_skip("steam-return-bad-ctx").await else {
+async fn steam_return_no_state_redirects_root_no_fragment() {
+    let Some(store) = store_or_skip("steam-return-no-state").await else {
         return;
     };
     let server = wiremock::MockServer::start().await;
@@ -1302,7 +1310,7 @@ async fn steam_return_bad_ctx_redirects_root_no_fragment() {
 
     let resp = app
         .oneshot(
-            Request::get("/api/steam/return?ctx=%2Fevil")
+            Request::get("/api/steam/return?state=never-minted&ctx=%2Fevil")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1311,7 +1319,7 @@ async fn steam_return_bad_ctx_redirects_root_no_fragment() {
 
     assert_eq!(resp.status(), StatusCode::FOUND);
     let loc = resp.headers().get("location").unwrap().to_str().unwrap();
-    assert_eq!(loc, "/", "bad ctx must redirect to /; got: {loc}");
+    assert_eq!(loc, "/", "unknown nonce must redirect to /; got: {loc}");
 }
 
 /// Steam return: is_valid:false → 302 `{ctx}#steam_error=verify_failed`.
@@ -1341,9 +1349,14 @@ async fn steam_return_invalid_assertion_gets_steam_error_fragment() {
     let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
 
     let ctx = format!("/l/{CTX_TOKEN}");
+    let nonce = "test-nonce-invalid";
+    store
+        .put_oidc_state(nonce, &ctx, 9_999_999_999)
+        .await
+        .unwrap();
     let expected_return_to = format!(
-        "{TEST_BASE_URL}/api/steam/return?ctx={}",
-        urlencoding::encode(&ctx)
+        "{TEST_BASE_URL}/api/steam/return?state={}",
+        urlencoding::encode(nonce)
     );
 
     let params = assertion_params(
@@ -1351,7 +1364,7 @@ async fn steam_return_invalid_assertion_gets_steam_error_fragment() {
         &expected_return_to,
     );
 
-    let mut qs = format!("ctx={}", urlencoding::encode(&ctx));
+    let mut qs = format!("state={}", urlencoding::encode(nonce));
     for (k, v) in &params {
         qs.push('&');
         qs.push_str(&urlencoding::encode(k));
@@ -1566,9 +1579,14 @@ async fn steam_return_duplicate_claimed_id_gets_verify_failed() {
     let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
 
     let ctx = format!("/l/{CTX_TOKEN}");
+    let nonce = "test-nonce-dup";
+    store
+        .put_oidc_state(nonce, &ctx, 9_999_999_999)
+        .await
+        .unwrap();
     let expected_return_to = format!(
-        "{TEST_BASE_URL}/api/steam/return?ctx={}",
-        urlencoding::encode(&ctx)
+        "{TEST_BASE_URL}/api/steam/return?state={}",
+        urlencoding::encode(nonce)
     );
 
     // Build the standard assertion params.
@@ -1578,7 +1596,7 @@ async fn steam_return_duplicate_claimed_id_gets_verify_failed() {
     );
 
     // Build query string with a DUPLICATE openid.claimed_id injected at the end.
-    let mut qs = format!("ctx={}", urlencoding::encode(&ctx));
+    let mut qs = format!("state={}", urlencoding::encode(nonce));
     for (k, v) in &params {
         qs.push('&');
         qs.push_str(&urlencoding::encode(k));
@@ -1720,9 +1738,14 @@ async fn steam_return_admin_ops_ctx_valid_assertion() {
     let app = steam_router(Arc::clone(&store), mock.clone(), &server.uri());
 
     let ctx = "/admin/ops";
+    let nonce = "test-nonce-adminops";
+    store
+        .put_oidc_state(nonce, ctx, 9_999_999_999)
+        .await
+        .unwrap();
     let expected_return_to = format!(
-        "{TEST_BASE_URL}/api/steam/return?ctx={}",
-        urlencoding::encode(ctx)
+        "{TEST_BASE_URL}/api/steam/return?state={}",
+        urlencoding::encode(nonce)
     );
 
     let params = assertion_params(
@@ -1730,7 +1753,7 @@ async fn steam_return_admin_ops_ctx_valid_assertion() {
         &expected_return_to,
     );
 
-    let mut qs = format!("ctx={}", urlencoding::encode(ctx));
+    let mut qs = format!("state={}", urlencoding::encode(nonce));
     for (k, v) in &params {
         qs.push('&');
         qs.push_str(&urlencoding::encode(k));

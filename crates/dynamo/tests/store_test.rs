@@ -2862,3 +2862,50 @@ async fn put_steam_app_legacy_migration() {
         .await
         .unwrap();
 }
+
+/// #86: OIDCSTATE round trip — put → take resolves the ctx, is SINGLE-USE (second take is None),
+/// unknown nonce is None, and an expired item is not honored (and is consumed anyway).
+#[tokio::test]
+async fn oidc_state_single_use_and_expiry() {
+    let Some(store) = store_or_skip("oidc-state").await else {
+        return;
+    };
+    let ctx = "/l/00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    // Fresh nonce, far-future expiry → first take resolves the stored ctx.
+    store
+        .put_oidc_state("nonce-a", ctx, 9_999_999_999)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .take_oidc_state("nonce-a", 1_000)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(ctx),
+        "first take resolves the stored ctx"
+    );
+    // SINGLE-USE: the item was deleted on that take → a replay resolves to None.
+    assert_eq!(
+        store.take_oidc_state("nonce-a", 1_000).await.unwrap(),
+        None,
+        "second take of the same nonce is None — single-use"
+    );
+
+    // An unknown nonce is None, never a spurious ctx.
+    assert_eq!(
+        store.take_oidc_state("never-minted", 1_000).await.unwrap(),
+        None
+    );
+
+    // EXPIRED: stored with an expiry in the past (500) vs now (1000) → not honored.
+    store.put_oidc_state("nonce-b", ctx, 500).await.unwrap();
+    assert_eq!(
+        store.take_oidc_state("nonce-b", 1_000).await.unwrap(),
+        None,
+        "expired nonce (500 <= now 1000) is not honored"
+    );
+    // …and it was consumed even though expired — a second take is still None.
+    assert_eq!(store.take_oidc_state("nonce-b", 1_000).await.unwrap(), None);
+}
