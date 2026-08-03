@@ -345,20 +345,29 @@ pub fn sync_status(redeemed: bool, expired: bool) -> GameStatus {
     }
 }
 
-/// Merge rule for `steam_app_id` + `appid_source`: Manual admin override wins, then a fresh
-/// Humble-sourced id beats a stale Title-sourced one, otherwise keep existing.
+/// Merge rule for `steam_app_id` + `appid_source`. Precedence is **Manual > Humble > Title**, with
+/// fresh preferred on equal source (a sync refresh). The one non-obvious rung is that Humble is
+/// authoritative over Title: a fresh Title-sourced id must NOT overwrite an existing Humble one.
 ///
 /// Precedence (highest wins):
-/// 1. `existing.appid_source == Some(Manual)` → keep existing's pair unconditionally.
-/// 2. `fresh.steam_app_id.is_some()` → take fresh's pair (Humble beats stale Title; new
-///    Title beats None).
-/// 3. else → keep existing's pair (fresh has no id; don't clear an existing one).
+/// 1. `existing == Manual` → keep existing's pair unconditionally (admin override, untouchable).
+/// 2. `existing == Humble` AND `fresh == Title` → keep existing (never downgrade an authoritative
+///    Humble id to a guessed Title one — #47). Latent today (the sync walk only ever produces
+///    Humble/None), but the invariant is now mechanical, not conventional.
+/// 3. `fresh.steam_app_id.is_some()` → take fresh's pair (refresh; a Humble id upgrades a Title one;
+///    a new id fills a None).
+/// 4. else → keep existing's pair (fresh has no id; don't clear an existing one).
 fn merge_appid(existing: &Game, fresh: &Game) -> (Option<u32>, Option<AppidSource>) {
     if existing.appid_source == Some(AppidSource::Manual) {
         // Admin override — untouchable
         (existing.steam_app_id, existing.appid_source)
+    } else if existing.appid_source == Some(AppidSource::Humble)
+        && fresh.appid_source == Some(AppidSource::Title)
+    {
+        // Humble outranks Title — never downgrade an authoritative id to a guessed one (#47).
+        (existing.steam_app_id, existing.appid_source)
     } else if fresh.steam_app_id.is_some() {
-        // Fresh has an id: take it (Humble beats stale Title; new Title beats None)
+        // Fresh has an id: take it (Humble upgrades a stale Title; new id fills a None)
         (fresh.steam_app_id, fresh.appid_source)
     } else {
         // Fresh has no id: preserve existing
@@ -708,6 +717,51 @@ mod tests {
     #[test]
     fn merge_new_game_is_fresh() {
         assert_eq!(merge_sync(None, fresh_game()), Some(fresh_game()));
+    }
+
+    #[test]
+    fn merge_appid_precedence_manual_over_humble_over_title() {
+        let with = |id: Option<u32>, src: Option<AppidSource>| Game {
+            steam_app_id: id,
+            appid_source: src,
+            ..fresh_game()
+        };
+        // #47 regression: a fresh Title id must NOT downgrade an authoritative Humble id.
+        assert_eq!(
+            merge_appid(
+                &with(Some(100), Some(AppidSource::Humble)),
+                &with(Some(200), Some(AppidSource::Title)),
+            ),
+            (Some(100), Some(AppidSource::Humble)),
+            "Humble outranks a fresh Title — never downgrade"
+        );
+        // ...but a fresh Humble id DOES upgrade a stale Title id.
+        assert_eq!(
+            merge_appid(
+                &with(Some(100), Some(AppidSource::Title)),
+                &with(Some(200), Some(AppidSource::Humble)),
+            ),
+            (Some(200), Some(AppidSource::Humble)),
+            "Humble upgrades a stale Title"
+        );
+        // Equal source (a normal refresh) takes fresh.
+        assert_eq!(
+            merge_appid(
+                &with(Some(100), Some(AppidSource::Humble)),
+                &with(Some(200), Some(AppidSource::Humble)),
+            ),
+            (Some(200), Some(AppidSource::Humble)),
+            "equal source refreshes to fresh"
+        );
+        // Manual is untouchable, even by a fresh Humble id.
+        assert_eq!(
+            merge_appid(
+                &with(Some(100), Some(AppidSource::Manual)),
+                &with(Some(200), Some(AppidSource::Humble)),
+            ),
+            (Some(100), Some(AppidSource::Manual)),
+            "Manual override is untouchable"
+        );
     }
 
     #[test]
