@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -7,7 +7,9 @@ import type { AdminGame, SelfClaimView } from '../api';
 import { Unauthorized } from '../api';
 
 vi.mock('../api');
-import { adminCatalog, adminSetHidden, adminSelfClaim, adminSelfClaims, adminSteamIdentity } from '../api';
+import { adminCatalog, adminGameDetail, adminSetHidden, adminSelfClaim, adminSelfClaims, adminSteamIdentity } from '../api';
+import type { AdminGameDetailResponse } from '../api';
+import { clearGameDetailCache } from '../gameDetailCache';
 
 function renderCatalog() {
   return render(
@@ -825,5 +827,46 @@ describe('Catalog toolkit wiring', () => {
     expect(screen.getByText('Mixed · 55% · 2021')).toBeInTheDocument();
     // steam-null row: no readout — its row renders only title + bundle
     expect(screen.queryByText(/null/)).not.toBeInTheDocument();
+  });
+});
+
+// ── Detail loader stability (#51): parent re-renders must not re-fire the load ─
+// The modal's load effect honestly lists loadDetail in its deps; an inline arrow
+// at the call site gives it a new identity every parent render, which cancels an
+// in-flight load and calls the API again. The loader is now useCallback-stable.
+describe('detail loader stability', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameDetailCache();
+    vi.mocked(adminSelfClaims).mockResolvedValue([]);
+    vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+  });
+
+  it('a parent re-render while the detail is loading does not re-call the API', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([gameAvailable]);
+    let resolveDetail!: (v: AdminGameDetailResponse) => void;
+    vi.mocked(adminGameDetail).mockImplementation(
+      () =>
+        new Promise<AdminGameDetailResponse>((res) => {
+          resolveDetail = res;
+        }),
+    );
+    const user = userEvent.setup();
+    renderCatalog();
+
+    // Open the modal — the load stays PENDING (unresolved promise).
+    fireEvent.click(await screen.findByText('Hollow Knight'));
+    await waitFor(() => expect(adminGameDetail).toHaveBeenCalledTimes(1));
+
+    // Force a parent re-render mid-load: arming the self-claim flips Catalog state
+    // (armedId), which re-renders Catalog and re-passes every modal prop. The modal
+    // renders its own claim button — use the dialog-scoped one.
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('button', { name: /claim for me/i }));
+    expect(within(dialog).getByRole('button', { name: /confirm/i })).toBeInTheDocument();
+
+    // Pre-fix, the fresh inline-loader identity re-fired the effect here → 2 calls.
+    expect(adminGameDetail).toHaveBeenCalledTimes(1);
+    resolveDetail({ game: gameAvailable, steam: null });
   });
 });

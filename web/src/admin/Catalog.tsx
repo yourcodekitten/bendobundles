@@ -112,6 +112,14 @@ export function Catalog() {
   // Detail modal — opens on row click
   const [detailGame, setDetailGame] = useState<AdminGame | null>(null);
 
+  // Stable loader identity (#51): the modal's load effect honestly lists loadDetail in its
+  // deps, so an inline arrow here re-fired the effect on EVERY parent render — cancelling
+  // an in-flight load and re-calling the API while the detail was still loading.
+  const loadGameDetail = useCallback(
+    (gameId: string) => withAuth(() => adminGameDetail(gameId), navigate),
+    [navigate],
+  );
+
   const load = useCallback(() => {
     setState({ phase: 'loading' });
     // withAuth re-throws non-Unauthorized errors → .catch sets error state
@@ -315,7 +323,7 @@ export function Catalog() {
         <GameDetailModal
           mount="admin"
           game={detailGame}
-          loadDetail={(gameId) => withAuth(() => adminGameDetail(gameId), navigate)}
+          loadDetail={loadGameDetail}
           onClose={() => setDetailGame(null)}
           armedId={armedId}
           claiming={claiming}
