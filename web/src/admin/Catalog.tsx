@@ -392,45 +392,54 @@ export function Catalog() {
           const r = rowResult;
           return (
             <div key={game.id} className="space-y-1">
-              <div
-                className="flex flex-wrap items-center gap-3 rounded bg-floor px-4 py-3 cursor-pointer"
-                onClick={() => setDetailGame(game)}
-              >
-                {/* Artwork thumbnail — colored fallback when url absent */}
-                {game.artwork_url !== null ? (
-                  <img
-                    src={game.artwork_url}
-                    alt={game.title}
-                    className="h-10 w-16 flex-shrink-0 rounded object-cover"
-                  />
-                ) : (
-                  <div
-                    className={`h-10 w-16 flex-shrink-0 rounded ${titleColorClass(game.title)}`}
-                    aria-hidden="true"
-                  />
-                )}
+              <div className="flex flex-wrap items-center gap-3 rounded bg-floor px-4 py-3">
+                {/* Detail trigger — a REAL button wrapping only the artwork + title region.
+                    The row div must NOT be the control: it contains the self-claim button,
+                    the hidden switch, and dismiss/copy buttons, and interactive controls
+                    nested inside an interactive role is its own a11y anti-pattern (#51).
+                    Action controls stay SIBLINGS in the flex row. */}
+                <button
+                  type="button"
+                  onClick={() => setDetailGame(game)}
+                  aria-label={`view details for ${game.title}`}
+                  className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded text-left focus-visible:outline-2 focus-visible:outline-pixel focus-visible:outline-offset-2"
+                >
+                  {/* Artwork thumbnail — colored fallback when url absent */}
+                  {game.artwork_url !== null ? (
+                    <img
+                      src={game.artwork_url}
+                      alt=""
+                      className="h-10 w-16 flex-shrink-0 rounded object-cover"
+                    />
+                  ) : (
+                    <div
+                      className={`h-10 w-16 flex-shrink-0 rounded ${titleColorClass(game.title)}`}
+                      aria-hidden="true"
+                    />
+                  )}
 
-                {/* Title + bundle + compact steam readout (rating · % · year) */}
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium">{game.title}</p>
-                  <p className="truncate text-xs text-dust">{game.bundle}</p>
-                  {game.steam !== null &&
-                    (game.steam.review_desc !== null ||
-                      game.steam.review_percent !== null ||
-                      game.steam.release_date_iso !== null) && (
-                      <p className="truncate text-xs text-dust-faint">
-                        {[
-                          game.steam.review_desc,
-                          game.steam.review_percent !== null
-                            ? `${game.steam.review_percent}%`
-                            : null,
-                          game.steam.release_date_iso?.slice(0, 4),
-                        ]
-                          .filter(Boolean)
-                          .join(' · ')}
-                      </p>
-                    )}
-                </div>
+                  {/* Title + bundle + compact steam readout (rating · % · year) */}
+                  <span className="block min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium">{game.title}</span>
+                    <span className="block truncate text-xs text-dust">{game.bundle}</span>
+                    {game.steam !== null &&
+                      (game.steam.review_desc !== null ||
+                        game.steam.review_percent !== null ||
+                        game.steam.release_date_iso !== null) && (
+                        <span className="block truncate text-xs text-dust-faint">
+                          {[
+                            game.steam.review_desc,
+                            game.steam.review_percent !== null
+                              ? `${game.steam.review_percent}%`
+                              : null,
+                            game.steam.release_date_iso?.slice(0, 4),
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </span>
+                      )}
+                  </span>
+                </button>
 
                 {/* key_type */}
                 <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
@@ -476,7 +485,7 @@ export function Catalog() {
                   <button
                     type="button"
                     disabled={isClaiming}
-                    onClick={(e) => { e.stopPropagation(); void handleSelfClaim(game); }}
+                    onClick={() => void handleSelfClaim(game)}
                     className={`rounded px-3 py-1 text-xs ${
                       isArmed
                         ? 'bg-emerald-700 text-emerald-100 hover:bg-emerald-600'
@@ -497,11 +506,9 @@ export function Catalog() {
                   </button>
                 )}
 
-                {/* Hidden toggle switch — stopPropagation prevents row click from opening modal */}
-                <label
-                  className="flex cursor-pointer items-center gap-1.5"
-                  onClick={(e) => e.stopPropagation()}
-                >
+                {/* Hidden toggle switch — a sibling of the detail button, so toggling can't
+                    open the modal by construction (no propagation guard needed) */}
+                <label className="flex cursor-pointer items-center gap-1.5">
                   <input
                     type="checkbox"
                     role="switch"

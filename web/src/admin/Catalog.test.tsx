@@ -127,11 +127,15 @@ describe('Catalog', () => {
       vi.mocked(adminCatalog).mockResolvedValue([gamePending]);
       renderCatalog();
 
-      await waitFor(() => screen.getByRole('img', { name: 'Celeste' }));
-      expect(screen.getByRole('img', { name: 'Celeste' })).toHaveAttribute(
-        'src',
-        'https://example.com/celeste.jpg',
-      );
+      // The artwork is decorative (alt="") — the accessible name lives on the
+      // detail-trigger button wrapping it (#51), so a screen reader hears the
+      // title once, not twice.
+      const trigger = await screen.findByRole('button', {
+        name: /view details for Celeste/i,
+      });
+      const img = within(trigger).getByRole('presentation');
+      expect(img).toHaveAttribute('src', 'https://example.com/celeste.jpg');
+      expect(img).toHaveAttribute('alt', '');
     });
 
     it('renders colored fallback div when artwork_url is null', async () => {
@@ -830,6 +834,62 @@ describe('Catalog toolkit wiring', () => {
   });
 });
 
+// ── Detail-trigger a11y (#51): the row is NOT the control ────────────────────
+// The row contains the self-claim button, the hidden switch, and dismiss/copy
+// buttons — so making the whole row a button would nest interactive controls
+// inside an interactive role. Instead only the artwork+title region is a real
+// <button>; the action controls are SIBLINGS. These tests pin that structure.
+describe('catalog detail trigger a11y', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    clearGameDetailCache();
+    vi.mocked(adminSelfClaims).mockResolvedValue([]);
+    vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+  });
+
+  it('opens the detail modal from the keyboard via a real button', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([gameAvailable]);
+    vi.mocked(adminGameDetail).mockResolvedValue({ game: gameAvailable, steam: null });
+    const user = userEvent.setup();
+    renderCatalog();
+
+    const trigger = await screen.findByRole('button', {
+      name: /view details for Hollow Knight/i,
+    });
+    trigger.focus();
+    await user.keyboard('{Enter}');
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    expect(adminGameDetail).toHaveBeenCalledWith('g1');
+  });
+
+  it('keeps action controls as siblings, never descendants, of the detail trigger', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([gameAvailable]);
+    renderCatalog();
+
+    const trigger = await screen.findByRole('button', {
+      name: /view details for Hollow Knight/i,
+    });
+    // No interactive control may live inside the trigger — nested-interactive
+    // is the anti-pattern this restructure exists to avoid.
+    expect(within(trigger).queryAllByRole('button')).toHaveLength(0);
+    expect(within(trigger).queryAllByRole('switch')).toHaveLength(0);
+    // The controls still exist in the row, as siblings.
+    expect(screen.getByRole('button', { name: /claim for me/i })).toBeInTheDocument();
+    expect(screen.getByRole('switch', { name: /hide Hollow Knight/i })).toBeInTheDocument();
+  });
+
+  it('toggling hidden does not open the modal (sibling by construction)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([gameAvailable]);
+    vi.mocked(adminSetHidden).mockResolvedValue({ ok: true });
+    const user = userEvent.setup();
+    renderCatalog();
+
+    await user.click(await screen.findByRole('switch', { name: /hide Hollow Knight/i }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+});
+
 // ── Detail loader stability (#51): parent re-renders must not re-fire the load ─
 // The modal's load effect honestly lists loadDetail in its deps; an inline arrow
 // at the call site gives it a new identity every parent render, which cancels an
@@ -854,8 +914,11 @@ describe('detail loader stability', () => {
     const user = userEvent.setup();
     renderCatalog();
 
-    // Open the modal — the load stays PENDING (unresolved promise).
-    fireEvent.click(await screen.findByText('Hollow Knight'));
+    // Open the modal via the restructured detail trigger — the load stays PENDING
+    // (unresolved promise).
+    fireEvent.click(
+      await screen.findByRole('button', { name: /view details for Hollow Knight/i }),
+    );
     await waitFor(() => expect(adminGameDetail).toHaveBeenCalledTimes(1));
 
     // Force a parent re-render mid-load: arming the self-claim flips Catalog state
