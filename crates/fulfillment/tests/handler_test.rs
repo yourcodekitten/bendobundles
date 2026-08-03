@@ -5781,6 +5781,98 @@ async fn enrich_pacing_floor_is_real() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// Frozen-at-death (#51, family call 2026-08-03): a delisted stub's reviews are NEVER refetched
+// on the 14d window. Pre-fix this was a saw-tooth ACCIDENT: the `delisted` skip flag was only
+// set by a same-pass detail fetch, so a stub whose reviews clock lapsed while its detail clock
+// was still fresh (day 14–30 band) re-entered the worklist and refetched reviews — while both
+// in-code comments claimed reviews were skipped. Last-known-at-death is the headstone number.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_stub_reviews_are_frozen_at_death() {
+    let Some(store) = store_or_skip("t3-stub-frozen").await else {
+        return;
+    };
+    let app_id = 999889;
+    seed_steam_game(&store, "gk-fz", "mn-fz", "Frozen Game", Some(app_id), None).await;
+
+    // The honest day-15 stub: both clocks stamped at death 15 days ago — detail (30d TTL)
+    // still fresh, reviews (14d TTL) lapsed. Detail None, last-known reviews retained.
+    let mut stub = fresh_cache(app_id, days_ago(15));
+    stub.detail = None;
+    store
+        .put_steam_app(&stub, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+
+    // Full mocks mounted: ANY storefront call would be visible (and counted).
+    let steam_mock = steam_mock_empty().await;
+    mount_steam_ok(&steam_mock, app_id).await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    assert_eq!(
+        steam_mock.received_requests().await.unwrap().len(),
+        0,
+        "a stub with lapsed reviews but fresh detail must make ZERO storefront calls"
+    );
+    let after = d.store.get_steam_app(app_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.overall, stub.overall,
+        "last-known reviews are FROZEN, not wiped and not refetched"
+    );
+    assert_eq!(
+        after.reviews_fetched_at, stub.reviews_fetched_at,
+        "the reviews clock stays at death — the 30d detail retry is the only heartbeat"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Reviews failure keeps the fetched detail half (#51 item 2): pre-fix, a failed appreviews call
+// threw away an already-fetched appdetails response — the politeness cost was paid twice.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_reviews_failure_keeps_fetched_detail_half() {
+    let Some(store) = store_or_skip("t3-reviews-fail-detail").await else {
+        return;
+    };
+    let app_id = 999890;
+    seed_steam_game(&store, "gk-rf", "mn-rf", "Half Game", Some(app_id), None).await;
+
+    let steam_mock = steam_mock_empty().await;
+    // appdetails succeeds; appreviews 500s (histogram never reached).
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", app_id.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(appdetails_found_body("Game")))
+        .mount(&steam_mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/appreviews/{app_id}")))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&steam_mock)
+        .await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let cache = d
+        .store
+        .get_steam_app(app_id)
+        .await
+        .unwrap()
+        .expect("the fetched detail half must be persisted despite the reviews failure");
+    assert!(cache.detail.is_some(), "detail half banked");
+    assert!(cache.fetched_at > 0, "detail clock stamped");
+    assert!(
+        cache.overall.is_none() && cache.reviews_fetched_at == 0,
+        "reviews half untouched — clock stays stale so ONLY reviews retry next sync"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
 // (c) 429 on the 3rd app aborts — apps 1-2 persisted, 4+ untouched.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
@@ -5833,6 +5925,187 @@ async fn enrich_429_on_third_app_aborts_pass() {
         count_path(&reqs, "/appreviews/400"),
         0,
         "app 400 must never be fetched after the 429 abort"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// 429 on a REVIEWS call banks the fetched detail half, then aborts the pass (#51 item 2 /
+// #133 review): the persist happens (politeness cost kept), but the NEXT app must never be
+// started mid-rate-limit. Full mocks on app 200 make a wrongful continue countable.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_429_on_reviews_banks_detail_half_then_aborts() {
+    let Some(store) = store_or_skip("t3-429-reviews-bank").await else {
+        return;
+    };
+    // Ascending appid order = processing order: 100 first, 200 next.
+    seed_steam_game(&store, "gk-rb1", "mn-rb1", "Bank Game", Some(100), None).await;
+    seed_steam_game(&store, "gk-rb2", "mn-rb2", "Next Game", Some(200), None).await;
+
+    let steam_mock = steam_mock_empty().await;
+    // App 100: appdetails succeeds, appreviews 429s (histogram never reached).
+    Mock::given(method("GET"))
+        .and(path("/api/appdetails"))
+        .and(query_param("appids", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(appdetails_found_body("Game")))
+        .mount(&steam_mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/appreviews/100"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&steam_mock)
+        .await;
+    // App 200: FULL success mocks — if the pass wrongly continues, the calls are counted.
+    mount_steam_ok(&steam_mock, 200).await;
+
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&steam_mock.uri()));
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let reqs = steam_mock.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs, "/appreviews/100"),
+        1,
+        "the 429'd appreviews is a single attempt — the client does not retry"
+    );
+    assert_eq!(
+        count_path(&reqs, "/appreviewhistogram/100"),
+        0,
+        "the histogram is never reached after the appreviews 429"
+    );
+    // Total: app 100's appdetails + its 429'd appreviews + the per-run GetItems/GetTagList
+    // tag batch (#71) — and NOTHING of app 200's.
+    assert_eq!(
+        reqs.len(),
+        4,
+        "nothing after the abort beyond app 100's two calls + the tag pair"
+    );
+    assert_eq!(
+        count_path(&reqs, "/appreviews/200") + count_path(&reqs, "/appreviewhistogram/200"),
+        0,
+        "app 200 must never be fetched mid-rate-limit"
+    );
+    let banked = d
+        .store
+        .get_steam_app(100)
+        .await
+        .unwrap()
+        .expect("the fetched detail half must be persisted BEFORE the abort");
+    assert!(banked.detail.is_some(), "detail half banked");
+    assert!(
+        banked.overall.is_none() && banked.reviews_fetched_at == 0,
+        "reviews half untouched — only reviews retry next sync"
+    );
+    assert!(
+        d.store.get_steam_app(200).await.unwrap().is_none(),
+        "app 200 must be untouched — deferred to the next sync"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Relist thaw (#51 / #133 review): a stub whose 30d heartbeat lapses refetches detail; once the
+// detail is Live again, the NEXT pass's decide gate schedules the (long-stale) reviews. This is
+// the doc's "a relist thaws the reviews automatically on their next lapse", end-to-end. The
+// fetch-side Live exemption itself is pinned by the stub_freezes_reviews truth table in lib.rs —
+// at pass level, a stub snapshot with need_reviews=true is reachable only through the
+// concurrent-writer window (the decide gate can't schedule reviews for a stub it can see).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn enrich_relisted_stub_thaws_reviews_on_next_lapse() {
+    let Some(store) = store_or_skip("t3-relist-thaw").await else {
+        return;
+    };
+    let app_id = 999891;
+    seed_steam_game(&store, "gk-rt", "mn-rt", "Relist Game", Some(app_id), None).await;
+
+    // A stub dead past its 30d heartbeat: both clocks stamped at death 31 days ago,
+    // detail None, last-known reviews retained.
+    let mut stub = fresh_cache(app_id, days_ago(31));
+    stub.detail = None;
+    store
+        .put_steam_app(&stub, SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+
+    // Pass 1 — the heartbeat fires: detail refetched (the game relisted), reviews STILL
+    // gated this pass (the decide gate saw a stub).
+    let mock1 = steam_mock_empty().await;
+    mount_steam_ok(&mock1, app_id).await;
+    let mut d = deps(store, "http://unused", None);
+    d.steam = Some(steam_client_at(&mock1.uri()));
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let reqs1 = mock1.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs1, "/api/appdetails"),
+        1,
+        "the 30d heartbeat must refetch the stub's detail"
+    );
+    assert_eq!(
+        count_path(&reqs1, &format!("/appreviews/{app_id}"))
+            + count_path(&reqs1, &format!("/appreviewhistogram/{app_id}")),
+        0,
+        "reviews stay frozen through the relist pass itself"
+    );
+    // appdetails + the per-run GetItems/GetTagList tag batch (#71) — nothing else.
+    assert_eq!(
+        reqs1.len(),
+        3,
+        "the relist pass is detail (+ tag batch) only"
+    );
+    let thawed = d.store.get_steam_app(app_id).await.unwrap().unwrap();
+    assert!(
+        thawed.detail.is_some(),
+        "the relist must land a Live detail"
+    );
+    assert_eq!(
+        thawed.reviews_fetched_at, stub.reviews_fetched_at,
+        "the reviews clock is untouched by the relist pass — that lapse is what thaws them"
+    );
+
+    // Pass 2 — detail is Live and fresh, reviews long-stale: the decide gate now schedules
+    // the reviews fetch. Fresh mock server so pass-2 counts stand alone.
+    let mock2 = steam_mock_empty().await;
+    mount_steam_ok(&mock2, app_id).await;
+    d.steam = Some(steam_client_at(&mock2.uri()));
+    enrich_steam_apps(&d, far_deadline()).await;
+
+    let reqs2 = mock2.received_requests().await.unwrap();
+    assert_eq!(
+        count_path(&reqs2, "/api/appdetails"),
+        0,
+        "detail is fresh — the thaw pass must be reviews-only"
+    );
+    assert_eq!(
+        count_path(&reqs2, &format!("/appreviews/{app_id}")),
+        1,
+        "the thawed reviews must be fetched"
+    );
+    assert_eq!(
+        count_path(&reqs2, &format!("/appreviewhistogram/{app_id}")),
+        1,
+        "the thawed histogram must be fetched"
+    );
+    // Reviews-only work schedules no detail ids → no tag batch either: exactly two calls.
+    assert_eq!(
+        reqs2.len(),
+        2,
+        "the thaw pass is the review pair, nothing else"
+    );
+    let after = d.store.get_steam_app(app_id).await.unwrap().unwrap();
+    assert_eq!(
+        after.overall,
+        Some(steam_client::ReviewSummary {
+            desc: "Overwhelmingly Positive".into(),
+            total_positive: 455_578,
+            total_negative: 5303,
+            total_reviews: 460_881,
+        }),
+        "the thawed summary must be the mock's, verbatim — not the frozen seed"
+    );
+    assert!(
+        after.reviews_fetched_at > stub.reviews_fetched_at,
+        "the reviews clock must finally advance past death"
     );
 }
 

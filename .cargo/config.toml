@@ -1,0 +1,6 @@
+# Arm store_or_skip's fail-loud branch for every local run: with the URL explicitly set,
+# an unreachable dynamodb-local PANICS instead of silently skipping the store-backed tests
+# (the silent-skip default forged a green run once — #133 review, 2026-08-03).
+# A shell `export DYNAMODB_LOCAL_URL=...` still wins: cargo [env] does not override.
+[env]
+DYNAMODB_LOCAL_URL = "http://localhost:8000"

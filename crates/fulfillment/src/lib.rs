@@ -2333,6 +2333,18 @@ pub enum DetailFetch {
 /// Each half applies only if our stamp is >= the snapshot's (ties go to us: we
 /// hold data fetched moments ago). A snapshot half NEWER than ours survives —
 /// that's the concurrent writer's fresher fetch, not a loss.
+/// Fetch-side frozen-at-death gate (#51): a stub snapshot (`detail: None`) freezes the reviews
+/// fetch UNLESS this pass itself fetched Live detail — the relist exemption. At pass level this
+/// gate only bites inside the JIT-stub concurrent-writer window: the decide gate never schedules
+/// reviews for a stub it can already see, so a stub snapshot paired with scheduled reviews work
+/// implies the stub landed between the decide read and this app's just-in-time read.
+pub fn stub_freezes_reviews(
+    snapshot: Option<&dynamo::SteamAppCache>,
+    fetched: &Option<DetailFetch>,
+) -> bool {
+    snapshot.is_some_and(|c| c.detail.is_none()) && !matches!(fetched, Some(DetailFetch::Live(_)))
+}
+
 pub fn merge_fetched_halves(cache: &mut dynamo::SteamAppCache, ours: &FetchedHalves) {
     match &ours.detail {
         Some(DetailFetch::Live(d)) if ours.now >= cache.fetched_at => {
@@ -2440,11 +2452,19 @@ pub async fn persist_fetched_halves(
 /// made.
 ///
 /// **Negative cache.** A `Delisted` app writes a stub (`detail: None`) with BOTH clocks stamped, so
-/// it's retried on the 30d window rather than every sync, and its (non-existent) reviews are skipped.
+/// it's retried on the 30d window rather than every sync. A stub's reviews are FROZEN at
+/// last-known (#51 family call, 2026-08-03): Steam does still serve reviews for delisted apps,
+/// but a corpse's recent-histogram decays toward "no recent reviews" noise — refetching would
+/// undersell the game exactly when the number matters, and it would bless an undocumented Steam
+/// behavior. The 30d detail retry is the stub's ONLY heartbeat; a relist thaws the reviews
+/// automatically on their next lapse.
 ///
-/// **Error semantics.** A `429` (`RateLimited`) on ANY call aborts the whole pass — what's already
-/// written stays, the rest waits for the next sync. Any other per-app error logs and skips just that
-/// app. The `SteamError` match names every variant (no `_` arm) — the crate convention.
+/// **Error semantics.** A `429` (`RateLimited`) on appdetails aborts the pass on the spot; a `429`
+/// on either reviews call banks any fetched detail half first (one persist), THEN aborts — what's
+/// written stays, the rest waits for the next sync. Any other appdetails error logs and skips just
+/// that app; any other reviews error keeps the fetched detail half, so only the reviews half
+/// retries next sync (#51 item 2). The `SteamError` match names every variant (no `_` arm) — the
+/// crate convention.
 ///
 /// One summary log line per run: `steam enrichment: fetched=<n> fresh=<n> negative=<n>
 /// lost_race=<n> aborted_429=<bool> auto_hidden=<n> tag_batch_failed=<bool>` (`fetched` = apps
@@ -2517,7 +2537,11 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             None => (true, true),
             Some(c) => (
                 now - c.fetched_at >= STEAM_DETAIL_TTL_SECS,
-                now - c.reviews_fetched_at >= STEAM_REVIEWS_TTL_SECS,
+                // Frozen-at-death (#51): a delisted stub (detail None) never schedules a
+                // reviews refetch — pre-fix, a stub with a lapsed reviews clock but a fresh
+                // detail clock re-entered the worklist every 14d window (the `delisted` flag
+                // is only set by a same-pass detail fetch: the saw-tooth).
+                now - c.reviews_fetched_at >= STEAM_REVIEWS_TTL_SECS && c.detail.is_some(),
             ),
         };
         if !need_detail && !need_reviews {
@@ -2611,8 +2635,8 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
                     fresh += 1;
                 }
                 // Delisted: negative-cache stub. The merge stamps BOTH clocks so it's
-                // retried on the 30d window (not every sync), and reviews are skipped —
-                // a dead app has none.
+                // retried on the 30d window (not every sync), and the reviews half is
+                // FROZEN at last-known — see the frozen-at-death rule in the pass doc.
                 Ok(steam_client::AppDetails::Delisted) => {
                     ours.detail = Some(DetailFetch::Delisted);
                     negative += 1;
@@ -2636,46 +2660,69 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
             }
         }
 
-        if need_reviews && !delisted {
-            tokio::time::sleep(deps.steam_enrich_pace).await;
-            let overall = match steam.get_review_summary(app_id).await {
-                Ok(s) => s,
-                Err(steam_client::SteamError::RateLimited) => {
-                    aborted_429 = true;
-                    break 'apps;
-                }
-                Err(
-                    e @ (steam_client::SteamError::Api(_)
-                    | steam_client::SteamError::Network(_)
-                    | steam_client::SteamError::Parse(_)
-                    | steam_client::SteamError::KeyRejected
-                    | steam_client::SteamError::NotFound
-                    | steam_client::SteamError::OpenIdRejected(_)),
-                ) => {
-                    tracing::warn!(app_id, error = ?e, "steam enrichment: appreviews failed — skipping app");
-                    continue 'apps;
-                }
-            };
-            tokio::time::sleep(deps.steam_enrich_pace).await;
-            let recent = match steam.get_recent_reviews(app_id).await {
-                Ok(r) => r,
-                Err(steam_client::SteamError::RateLimited) => {
-                    aborted_429 = true;
-                    break 'apps;
-                }
-                Err(
-                    e @ (steam_client::SteamError::Api(_)
-                    | steam_client::SteamError::Network(_)
-                    | steam_client::SteamError::Parse(_)
-                    | steam_client::SteamError::KeyRejected
-                    | steam_client::SteamError::NotFound
-                    | steam_client::SteamError::OpenIdRejected(_)),
-                ) => {
-                    tracing::warn!(app_id, error = ?e, "steam enrichment: histogram failed — skipping app");
-                    continue 'apps;
-                }
-            };
-            ours.reviews = Some((overall, recent));
+        // Frozen-at-death, fetch-level gate (#51): the just-in-time snapshot can reveal a stub
+        // the decide pass didn't know about (concurrent writer), and `delisted` covers only a
+        // same-pass discovery — both mean the reviews half stays frozen.
+        let snapshot_is_stub =
+            stub_freezes_reviews(snapshot.as_ref().map(|(c, _)| c), &ours.detail);
+        // A reviews failure no longer throws away a fetched detail half (#51 item 2): the
+        // block falls through to the persist below with `ours.reviews = None`, so the
+        // appdetails politeness cost is banked and ONLY the reviews retry next sync.
+        // A 429 still aborts the pass — after the persist.
+        let mut abort_after_persist = false;
+        if need_reviews && !delisted && !snapshot_is_stub {
+            'reviews: {
+                tokio::time::sleep(deps.steam_enrich_pace).await;
+                let overall = match steam.get_review_summary(app_id).await {
+                    Ok(s) => s,
+                    Err(steam_client::SteamError::RateLimited) => {
+                        aborted_429 = true;
+                        abort_after_persist = true;
+                        break 'reviews;
+                    }
+                    Err(
+                        e @ (steam_client::SteamError::Api(_)
+                        | steam_client::SteamError::Network(_)
+                        | steam_client::SteamError::Parse(_)
+                        | steam_client::SteamError::KeyRejected
+                        | steam_client::SteamError::NotFound
+                        | steam_client::SteamError::OpenIdRejected(_)),
+                    ) => {
+                        tracing::warn!(app_id, error = ?e, "steam enrichment: appreviews failed — keeping any fetched detail half");
+                        break 'reviews;
+                    }
+                };
+                tokio::time::sleep(deps.steam_enrich_pace).await;
+                let recent = match steam.get_recent_reviews(app_id).await {
+                    Ok(r) => r,
+                    Err(steam_client::SteamError::RateLimited) => {
+                        aborted_429 = true;
+                        abort_after_persist = true;
+                        break 'reviews;
+                    }
+                    Err(
+                        e @ (steam_client::SteamError::Api(_)
+                        | steam_client::SteamError::Network(_)
+                        | steam_client::SteamError::Parse(_)
+                        | steam_client::SteamError::KeyRejected
+                        | steam_client::SteamError::NotFound
+                        | steam_client::SteamError::OpenIdRejected(_)),
+                    ) => {
+                        tracing::warn!(app_id, error = ?e, "steam enrichment: histogram failed — keeping any fetched detail half");
+                        break 'reviews;
+                    }
+                };
+                ours.reviews = Some((overall, recent));
+            }
+        }
+
+        // Nothing fetched for this app (reviews-only work that failed) — nothing to
+        // persist; skip (or abort, post-429) exactly as before #51 item 2.
+        if ours.detail.is_none() && ours.reviews.is_none() {
+            if abort_after_persist {
+                break 'apps;
+            }
+            continue 'apps;
         }
 
         // Merge write per-item: partial progress survives an abort/timeout later
@@ -2697,12 +2744,15 @@ pub async fn enrich_steam_apps(deps: &Deps, deadline: tokio::time::Instant) {
                     app_id,
                     "steam enrichment: lost the STEAMAPP# race twice — skipping app, next sync retries"
                 );
-                continue 'apps;
             }
             Err(e) => {
                 tracing::warn!(app_id, error = ?e, "steam enrichment: put_steam_app failed — this app not persisted");
-                continue 'apps;
             }
+        }
+        // The reviews-429 abort, AFTER the detail half is banked (all persist outcomes —
+        // a lost race or failed put doesn't un-rate-limit Steam).
+        if abort_after_persist {
+            break 'apps;
         }
     }
     // Whatever's left unstarted (deadline stop, or the tail after a 429 abort) is deferred too.
@@ -4227,6 +4277,29 @@ mod tests {
             detail: None,
             reviews: None,
         }
+    }
+
+    /// Frozen-at-death fetch gate (#51): the full truth table for `stub_freezes_reviews`,
+    /// pinning the Live relist exemption — the one arm that keeps a relisted game's
+    /// reviews reachable inside the JIT-stub concurrent-writer window. (The pass-level
+    /// thaw is covered end-to-end by `enrich_relisted_stub_thaws_reviews_on_next_lapse`.)
+    #[test]
+    fn stub_gate_truth_table() {
+        let stub = dynamo::SteamAppCache::empty(570);
+        let mut live_cache = dynamo::SteamAppCache::empty(570);
+        live_cache.detail = Some(test_detail(570));
+        let fetched_live = Some(DetailFetch::Live(Box::new(test_detail(570))));
+
+        // Stub snapshot: frozen unless THIS pass fetched Live (the relist exemption).
+        assert!(!stub_freezes_reviews(Some(&stub), &fetched_live));
+        assert!(stub_freezes_reviews(Some(&stub), &None));
+        assert!(stub_freezes_reviews(
+            Some(&stub),
+            &Some(DetailFetch::Delisted)
+        ));
+        // Live snapshot or no snapshot at all: never frozen by this gate.
+        assert!(!stub_freezes_reviews(Some(&live_cache), &None));
+        assert!(!stub_freezes_reviews(None, &None));
     }
 
     /// #75 merge policy: our fresh detail applies over a staler snapshot half; the
