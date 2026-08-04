@@ -4063,15 +4063,19 @@ async fn revealed_key_value_never_appears_in_logs_or_pings() {
 
 /// #88 gate supersedes the terminal-CCF scrub path. This test previously forced a
 /// `Compensated` self-claim so the reveal SUCCEEDED and the key-write then CCF'd, exercising
-/// record_revealed_key's store-failure ping (asserting it alerts + is scrubbed of the key).
-/// The pre-redeem gate now parks a terminal self-claim BEFORE the reveal — so the key is
-/// never revealed, which is strictly safer than revealing it and scrambling to scrub the
-/// alert. The "reveal-succeeds-but-record-fails" burn this ping damage-controlled is exactly
-/// what the gate prevents; the only residual trigger for that ping is a transient store
-/// error mid-record, which moto state-seeding can't stage. The scrub guarantee itself is
-/// preserved by construction: the ping message (lib.rs ~1809) is a static string that never
-/// interpolates the key, so it cannot regress silently. See PR #150 for the chairs' call on
-/// whether the residual transient-error scrub path wants a follow-up unit test.
+/// record_revealed_key's store-failure ping. The pre-redeem gate now parks a terminal
+/// self-claim BEFORE the reveal — the key is never revealed, strictly safer than revealing
+/// then scrambling to scrub the alert. This test asserts that gate behavior.
+///
+/// It does NOT prove the ping is key-safe — and #151 records why that matters: the ping
+/// interpolates `{e}` (the raw StoreError, whose Aws variant carries the full SDK Debug of
+/// an item that includes `revealed_key`), so the scrub guarantee currently rests on an
+/// UNVERIFIED assumption that the SDK error Debug never echoes request-item attributes —
+/// variant- and SDK-version-dependent, per OMBB. The residual trigger (a transient store
+/// error mid-record) can't be staged with moto, but the scrub property is message
+/// construction, not the error path — #151 sanitizes the ping by construction and pins it
+/// with a synthetic-worst-case test (a StoreError whose string CONTAINS the key, asserting
+/// the ping excludes it). That is the real guarantee; this test is not it.
 #[tokio::test]
 async fn gate_parks_terminal_self_claim_before_reveal_so_no_key_is_exposed() {
     let Some(store) = store_or_skip("sc-gate-terminal").await else {
