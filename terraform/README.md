@@ -80,8 +80,11 @@ needs — no part of this waits on Ben.**
      shows `permissions_boundary -> null` **updates on all three lambda roles** — a silent boundary
      strip. Any plan containing that line means the tfvars is missing this value: discard the plan,
      add the var, re-plan. (Nearly shipped 2026-07-10.)
-   - `humble_username` / `discord_webhook_url` from **`~/.secrets/bendobundles-deploy.env`** (600, outside
-     git — the saved deploy secrets; see `code-kitten` `state/decisions.md` 2026-07-06 pointer)
+   - `humble_username` from **`~/.secrets/bendobundles-deploy.env`** (600, outside git — the saved
+     deploy secrets; see `code-kitten` `state/decisions.md` 2026-07-06 pointer). The Discord webhook
+     URL no longer rides TF_VAR at all: `discord_webhook_enabled = true` (tfvars, not a secret)
+     creates the SecureString container and the URL is `PutParameter`'d out of band once (see
+     "After first deploy").
    - `ops_alarm_email` — **MANDATORY, no default.** Ben's alert email address (the ops-alarm SNS
      topic subscription target — he confirms it once by mail). Value supplied at deploy time only,
      never committed. Omitting it hard-fails the apply.
@@ -101,7 +104,6 @@ needs — no part of this waits on Ben.**
    routine apply; re-hashing is the clobber.
 
 ```bash
-export TF_VAR_discord_webhook_url='…'   # optional; from ~/.secrets, enables cookie-death pings
 cd terraform
 AWS_PROFILE=kitten-deploy terraform init -backend-config=backend.hcl -input=false
 AWS_PROFILE=kitten-deploy terraform plan -var-file=production.tfvars -out=tf.plan
@@ -293,13 +295,30 @@ lambda_permissions_boundary_arn = "arn:aws:iam::123456789012:policy/your-app-bou
 ops_alarm_email = "ben@example.com"
 ```
 
-Keep `admin_password_hash` and `discord_webhook_url` out of the tfvars file. Pass them via
-environment variables so they stay out of plan output and git history:
+Keep `admin_password_hash` out of the tfvars file. Pass it via an environment variable so it
+stays out of plan output and git history:
 
 ```bash
 export TF_VAR_admin_password_hash='$argon2id$v=19$...'   # the PHC string from bootstrap step 2
-export TF_VAR_discord_webhook_url='https://discord.com/api/webhooks/...'  # optional
 ```
+
+The Discord webhook URL never passes through terraform (it IS the post-access credential):
+`discord_webhook_enabled = true` in tfvars creates an empty SecureString container, and the real
+URL is set out of band once:
+
+```bash
+AWS_PROFILE=kitten-deploy aws ssm put-parameter \
+  --name /brd-prod-ue1-bendobundles-param/discord-webhook \
+  --type SecureString --value 'https://discord.com/api/webhooks/...' --overwrite
+```
+
+Until that PutParameter lands, the param holds the `UNSET` placeholder and fulfillment runs
+webhooks-off (same container pattern as `steam-web-api-key` / `humble-cookie`).
+
+> Migration note: the URL previously passed through terraform, so it exists in old state
+> versions (the S3 backend keeps them). When cutting over, prefer **rotating the webhook in
+> Discord** (delete + recreate on the channel) and PutParameter the *new* URL — rotation is
+> free and retires every copy the old flow left behind.
 
 ### Optional variables (all have defaults)
 
@@ -311,7 +330,7 @@ export TF_VAR_discord_webhook_url='https://discord.com/api/webhooks/...'  # opti
 | `domain_zone_name` | `bendobundles.com` | Route53 zone name |
 | `route53_profile` | `null` | AWS profile for the Route53 account if different from the main account |
 | `sync_schedule_expression` | `cron(0 9 * * ? *)` | EventBridge schedule for daily Humble sync (09:00 UTC = pre-dawn US-East) |
-| `discord_webhook_url` | `null` | Omit entirely to disable cookie-death pings |
+| `discord_webhook_enabled` | `false` | `true` creates the SecureString container for cookie-death pings; the URL itself is set out of band (PutParameter, see above) |
 | `humble_username` | `null` | Enables self-login: creates the `humble-password` / `humble-totp-secret` param containers (values set out of band) so fulfillment logs in and maintains its own session |
 
 ---
@@ -359,7 +378,8 @@ multi-key Humble order with a real recipient:
 - [ ] **Gift URL renders and copies on a real phone** — open the gift link on an actual mobile
   device; the landing page renders; the copy-to-clipboard button works.
 - [ ] **Cookie-death Discord ping fires** — let the Humble session expire (or force it by
-  overwriting the `humble-cookie` param with garbage) with `discord_webhook_url` set; confirm the
+  overwriting the `humble-cookie` param with garbage) with `discord_webhook_enabled = true` and the
+  real URL `PutParameter`'d; confirm the
   self-heal/dead-session ping arrives in the configured channel.
 
 ---
