@@ -3,6 +3,8 @@
 # only "fix" it offers for the entry below is a DOWNGRADE. This fails on any
 # production-dependency advisory NOT explicitly allowlisted here, so new ones
 # still break CI while documented-unreachable ones don't bury the signal.
+# NOTE: this is one of TWO advisory parking lots — rust advisories live in
+# .cargo/audit.toml's ignore list. Check both to see the full story.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

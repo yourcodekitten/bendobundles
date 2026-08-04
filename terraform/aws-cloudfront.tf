@@ -26,6 +26,89 @@ resource "aws_cloudfront_function" "spa_rewrite" {
   EOT
 }
 
+module "label_site_headers" {
+  source  = "bendoerr-terraform-modules/label/null"
+  version = "1.0.1"
+  context = module.context.shared
+  name    = "site-headers"
+}
+
+# CSP derived from what the app actually loads (#81) — every source below is
+# tied to a concrete code path, so a directive can be retired when its code is:
+#   img-src *.steamstatic.com    — GameGrid hardcodes shared.akamai.steamstatic.com;
+#                                  stored header_image/screenshots/video_thumbnail
+#                                  hosts vary across the akamai/cloudflare variants
+#   img-src hb.imgix.net         — artwork_url (Humble subproduct icon via
+#                                  match_artwork): GameGrid/Catalog/GameDetailModal
+#                                  <img> fallbacks + MediaHeader poster. Host-specific:
+#                                  hb.imgix.net is the only Humble image host observed
+#                                  (fixtures + sync); *.imgix.net would admit every
+#                                  imgix customer
+#   media-src blob: + steamstatic — hls.js plays through MSE (blob: object URL);
+#                                  Safari native HLS sets video.src to the
+#                                  steamstatic URL directly (MediaHeader.handlePlay)
+#   connect-src steamstatic      — hls.js XHRs manifests + segments
+#   worker-src blob:             — hls.js demuxer worker
+#   style-src 'unsafe-inline'    — CursorCompanion renders a literal <style> element
+#                                  (friend-surface cursor CSS). NOT for React style={}
+#                                  attrs — those go through CSSOM, which CSP never
+#                                  gates. Retire if CursorCompanion's CSS moves to the
+#                                  stylesheet
+# No inline scripts (vite module bundle only), no data:/blob: images, no frames,
+# no external fonts; both <form>s are onSubmit-handled (no action navigation).
+locals {
+  site_csp = join("; ", [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' https://*.steamstatic.com https://hb.imgix.net",
+    "media-src 'self' blob: https://*.steamstatic.com",
+    "connect-src 'self' https://*.steamstatic.com",
+    "worker-src blob:",
+    "font-src 'self'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ])
+}
+
+# Replaces the AWS Managed-SecurityHeadersPolicy 1:1 on the non-CSP headers
+# (same HSTS max-age, nosniff, referrer, xss-protection) and adds the CSP.
+# Deltas from managed: X-Frame-Options DENY instead of SAMEORIGIN (nothing
+# frames this site; pairs with frame-ancestors 'none').
+resource "aws_cloudfront_response_headers_policy" "site" {
+  name    = module.label_site_headers.id
+  comment = "managed security headers + app-derived CSP (#81)"
+
+  security_headers_config {
+    strict_transport_security {
+      access_control_max_age_sec = 31536000
+      override                   = true
+    }
+    content_type_options {
+      override = true
+    }
+    frame_options {
+      frame_option = "DENY"
+      override     = true
+    }
+    referrer_policy {
+      referrer_policy = "strict-origin-when-cross-origin"
+      override        = true
+    }
+    xss_protection {
+      protection = true
+      mode_block = true
+      override   = true
+    }
+    content_security_policy {
+      content_security_policy = local.site_csp
+      override                = true
+    }
+  }
+}
+
 module "site" {
   source  = "bendoerr-terraform-modules/cloudfront-and-s3-origin/aws"
   version = "0.6.0"
@@ -43,7 +126,8 @@ module "site" {
     event_type   = "viewer-request"
     function_arn = aws_cloudfront_function.spa_rewrite.arn
   }]
-  security_headers = "managed"
+  security_headers           = "custom"
+  response_headers_policy_id = aws_cloudfront_response_headers_policy.site.id
 
   additional_origins = [{
     origin_id   = "api"

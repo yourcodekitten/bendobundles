@@ -1,6 +1,8 @@
 # cargo-audit config — dated, commented ignores ONLY (#81). An entry here is a
 # documented block, not a dismissal: each names why it's unreachable/unfixable
 # today and what event retires it. CI's audit job fails on anything NOT listed.
+# NOTE: this is one of TWO advisory parking lots — npm advisories live in
+# web/scripts/npm-audit-check.sh's ALLOWLIST. Check both to see the full story.
 [advisories]
 ignore = [
     # rustls 0.21.12 / rustls-webpki 0.101.7 — the aws-sdk's LEGACY TLS path, still
