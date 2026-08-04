@@ -5,6 +5,11 @@
 // one view where an admin scans for exactly that difference.
 // Shared by admin Links (claims audit) and Catalog (self-claims list) — the two copies
 // had diverged on exactly the compensated arm; now they can't drift.
+// NOT shared by friend/ClaimsHistory.tsx, deliberately: that surface maps state to
+// {label, className} with friend vocabulary ("gifted"/"processing"/"returned") and darker
+// shades — and its fulfilled arm wears give-violet CORRECTLY (on that surface the gift
+// succeeded, which is exactly the signature the verdict reserves the color for). Its
+// compensated arm is already slate. Do not "unify" it into this module.
 export function stateBadgeClass(state: string): string {
   switch (state) {
     case 'fulfilled':
