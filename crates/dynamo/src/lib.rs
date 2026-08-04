@@ -2291,7 +2291,8 @@ impl Store {
             .transpose()
     }
 
-    /// Persist an admin session. pk="SESSION#<token>", sk="META". Both `expires_epoch` and `ttl`
+    /// Persist an admin session. pk="SESSION#<sha256(token) hex>" (#88 — the raw token never
+    /// reaches the table; see `schema::session_pk`), sk="META". Both `expires_epoch` and `ttl`
     /// are set to the same value; `ttl` drives DynamoDB TTL (enabled in `terraform/aws-dynamodb.tf`).
     /// Because TTL deletion is lazy, callers still check expiry against wall clock — TTL is
     /// reclamation + defense-in-depth, not the correctness gate.
