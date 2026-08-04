@@ -7369,3 +7369,37 @@ async fn gate_admits_fulfilled_redrive_and_flip_completes() {
         "the stranded flip completes"
     );
 }
+
+/// #88 gate on the CHOICE entry (the coords=None branch — where the gate is the sole guard
+/// before the first Humble `order()` call, since a choice tpk is born fresh in-flow). A
+/// terminal choice claim must park before any Humble touch.
+#[tokio::test]
+async fn gate_parks_terminal_choice_claim_before_order() {
+    let Some(store) = store_or_skip("gate-choice-terminal").await else {
+        return;
+    };
+    let gid = seed_pending_choice_claim(
+        &store,
+        "gk",
+        OFFERED_ID,
+        TITLE,
+        OffsetDateTime::now_utc(),
+        None,
+    )
+    .await;
+    // a compensate raced this choice fulfillment
+    store.compensate_claim("tok1", "c1", &gid).await.unwrap();
+
+    let humble = MockServer::start().await; // zero mocks: any call would 404, but expect none
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, choice_gift_req(&gid, "gk", OFFERED_ID)).await;
+
+    assert!(
+        matches!(&resp, FulfillResponse::Parked { reason } if reason.contains("terminal")),
+        "terminal choice claim must park at the gate, got {resp:?}"
+    );
+    assert!(
+        humble.received_requests().await.unwrap().is_empty(),
+        "the gate must refuse before the order() self-heal call — zero Humble requests"
+    );
+}
