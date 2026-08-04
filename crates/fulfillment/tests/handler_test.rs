@@ -4061,13 +4061,24 @@ async fn revealed_key_value_never_appears_in_logs_or_pings() {
     }
 }
 
-/// Store-failure sibling of the scrub test above (#44 item 1): the ping loop there iterates
-/// zero requests because neither exercised path pings — this drives record_revealed_key's
-/// store-failure ping (the ONLY self-claim ping that fires with a real key value in scope)
-/// and asserts it is non-empty, alerts the operator, and is scrubbed of the key.
+/// #88 gate supersedes the terminal-CCF scrub path. This test previously forced a
+/// `Compensated` self-claim so the reveal SUCCEEDED and the key-write then CCF'd, exercising
+/// record_revealed_key's store-failure ping. The pre-redeem gate now parks a terminal
+/// self-claim BEFORE the reveal — the key is never revealed, strictly safer than revealing
+/// then scrambling to scrub the alert. This test asserts that gate behavior.
+///
+/// It does NOT prove the ping is key-safe — and #151 records why that matters: the ping
+/// interpolates `{e}` (the raw StoreError, whose Aws variant carries the full SDK Debug of
+/// an item that includes `revealed_key`), so the scrub guarantee currently rests on an
+/// UNVERIFIED assumption that the SDK error Debug never echoes request-item attributes —
+/// variant- and SDK-version-dependent, per OMBB. The residual trigger (a transient store
+/// error mid-record) can't be staged with moto, but the scrub property is message
+/// construction, not the error path — #151 sanitizes the ping by construction and pins it
+/// with a synthetic-worst-case test (a StoreError whose string CONTAINS the key, asserting
+/// the ping excludes it). That is the real guarantee; this test is not it.
 #[tokio::test]
-async fn self_claim_store_failure_ping_fires_and_is_scrubbed() {
-    let Some(store) = store_or_skip("sc-scrub-fail").await else {
+async fn gate_parks_terminal_self_claim_before_reveal_so_no_key_is_exposed() {
+    let Some(store) = store_or_skip("sc-gate-terminal").await else {
         return;
     };
     let key = "AAAA-BBBB-CCCC";
@@ -4077,9 +4088,7 @@ async fn self_claim_store_failure_ping_fires_and_is_scrubbed() {
         .claim_game_self("gkSF:mnSF", "sc-sf", now())
         .await
         .unwrap();
-    // Force fulfill_self_claim to fail AFTER the reveal succeeds: a Compensated claim
-    // consumes the gsi2pk pending marker, so the conditional key-write CCFs and the
-    // recheck sees a terminal state (same seed as store_test's sc-fulfill-3).
+    // the race: compensate landed before this fulfill invoke (claim → Compensated)
     let mut c = store
         .get_claim(SELF_LINK_TOKEN, "sc-sf")
         .await
@@ -4089,7 +4098,7 @@ async fn self_claim_store_failure_ping_fires_and_is_scrubbed() {
     store.put_claim(&c).await.unwrap();
 
     let humble = MockServer::start().await;
-    mount_reveal_success(&humble, key).await;
+    mount_reveal_success(&humble, key).await; // mounted, but the gate must not reach it
     let discord = discord_ok().await;
     let deps = deps(store.clone(), &humble.uri(), Some(discord.uri()));
     let resp = handle(
@@ -4104,21 +4113,18 @@ async fn self_claim_store_failure_ping_fires_and_is_scrubbed() {
         },
     )
     .await;
-    assert!(
-        matches!(resp, FulfillResponse::Error { .. }),
-        "revealed-but-unrecorded must surface as Error, got {resp:?}"
-    );
 
-    let pings = discord.received_requests().await.unwrap();
-    assert_eq!(pings.len(), 1, "exactly one operator ping must fire");
-    let body = String::from_utf8_lossy(&pings[0].body).to_string();
     assert!(
-        body.contains("not recorded"),
-        "ping must alert that the key was revealed but not recorded: {body}"
+        matches!(&resp, FulfillResponse::Parked { reason } if reason.contains("terminal")),
+        "terminal self-claim must park at the gate, got {resp:?}"
     );
     assert!(
-        !body.contains(key),
-        "key value leaked into the store-failure ping: {body}"
+        humble.received_requests().await.unwrap().is_empty(),
+        "the gate must refuse BEFORE reveal — the key is never touched, nothing to scrub"
+    );
+    assert!(
+        discord.received_requests().await.unwrap().is_empty(),
+        "no reveal means no key-in-scope, so no store-failure ping fires at all"
     );
 }
 
@@ -7249,5 +7255,155 @@ async fn reconcile_choice_resume_snapshot_completes_never_strands() {
         count_path(&reqs, "/humbler/redeemkey"),
         1,
         "B2 redeems the present key exactly once"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// #88 pre-redeem gate: stored state is validated BEFORE the irreversible Humble write.
+// The burn-prevention IS the assertion: the mock server records every request, and the
+// parked paths must show ZERO — a key that was never touched, not a failure handled well.
+// ---------------------------------------------------------------------------------------------
+
+/// keyindex drift: a sync re-key refreshed the game's keyindex after the claim payload was
+/// born. The redeem must park without a single Humble call — redeeming the payload's stale
+/// keyindex would burn a key nothing tracks.
+#[tokio::test]
+async fn gate_parks_on_keyindex_drift_without_touching_humble() {
+    let Some(store) = store_or_skip("gate-keyindex-drift").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+
+    // the drift: sync re-keyed the game (keyindex 0 → 7) inside the claim→fulfill window
+    let mut g = store.get_game(&gid).await.unwrap().unwrap();
+    g.keyindex = 7;
+    store.put_game(&g).await.unwrap();
+
+    // no mocks mounted: ANY request to humble would 404 — but the point is stronger:
+    // there must be NO request at all.
+    let humble = MockServer::start().await;
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+
+    assert!(
+        matches!(&resp, FulfillResponse::Parked { reason } if reason.contains("coordinates")),
+        "expected coordinate-drift park, got {resp:?}"
+    );
+    assert!(
+        humble.received_requests().await.unwrap().is_empty(),
+        "the gate must refuse BEFORE any Humble call — zero requests, key untouched"
+    );
+    // the claim is untouched and still pending: reconcile-visible, nothing burned
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+}
+
+/// terminal claim: a compensate raced the fulfill invoke. The redeem must park with zero
+/// Humble calls — a redeem on a compensated claim is exactly the burn #88 names.
+#[tokio::test]
+async fn gate_parks_on_terminal_claim_without_touching_humble() {
+    let Some(store) = store_or_skip("gate-terminal-claim").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+    // the race: compensate landed first (claim → Compensated, game re-listed)
+    store.compensate_claim("tok1", "c1", &gid).await.unwrap();
+
+    let humble = MockServer::start().await;
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+
+    assert!(
+        matches!(&resp, FulfillResponse::Parked { reason } if reason.contains("terminal")),
+        "expected terminal-state park, got {resp:?}"
+    );
+    assert!(
+        humble.received_requests().await.unwrap().is_empty(),
+        "zero Humble requests on a terminal claim"
+    );
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Compensated,
+        "claim untouched by the park"
+    );
+}
+
+/// the re-drive stays alive: a Fulfilled claim with a stranded pending game (write-1
+/// landed, flip didn't) must pass the gate and complete — a Pending-only gate would park
+/// the recovery path forever. (The happy-path and ladder tests prove matching-Pending
+/// proceeds; this pins the OTHER legitimate entry state.)
+#[tokio::test]
+async fn gate_admits_fulfilled_redrive_and_flip_completes() {
+    let Some(store) = store_or_skip("gate-redrive").await else {
+        return;
+    };
+    let gid = seed_pending_claim(&store, "gk1", "mn").await;
+
+    let humble = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "giftkey": "GIFTTOKEN"
+        })))
+        .mount(&humble)
+        .await;
+    let deps = deps(store, &humble.uri(), None);
+
+    // first pass fulfills normally
+    let first = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+    assert!(matches!(first, FulfillResponse::GiftUrl { .. }));
+
+    // strand the game back to pending (simulating a failed flip), then re-drive
+    let mut g = deps.store.get_game(&gid).await.unwrap().unwrap();
+    g.status = GameStatus::Pending;
+    g.claim_id = Some("c1".into());
+    deps.store.put_game(&g).await.unwrap();
+
+    let redrive = handle(&deps, gift_req(&gid, "gk1", "mn")).await;
+    assert!(
+        matches!(redrive, FulfillResponse::GiftUrl { .. }),
+        "Fulfilled re-drive must pass the gate, got {redrive:?}"
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        game.status,
+        GameStatus::Gifted,
+        "the stranded flip completes"
+    );
+}
+
+/// #88 gate on the CHOICE entry (the coords=None branch — where the gate is the sole guard
+/// before the first Humble `order()` call, since a choice tpk is born fresh in-flow). A
+/// terminal choice claim must park before any Humble touch.
+#[tokio::test]
+async fn gate_parks_terminal_choice_claim_before_order() {
+    let Some(store) = store_or_skip("gate-choice-terminal").await else {
+        return;
+    };
+    let gid = seed_pending_choice_claim(
+        &store,
+        "gk",
+        OFFERED_ID,
+        TITLE,
+        OffsetDateTime::now_utc(),
+        None,
+    )
+    .await;
+    // a compensate raced this choice fulfillment
+    store.compensate_claim("tok1", "c1", &gid).await.unwrap();
+
+    let humble = MockServer::start().await; // zero mocks: any call would 404, but expect none
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(&deps, choice_gift_req(&gid, "gk", OFFERED_ID)).await;
+
+    assert!(
+        matches!(&resp, FulfillResponse::Parked { reason } if reason.contains("terminal")),
+        "terminal choice claim must park at the gate, got {resp:?}"
+    );
+    assert!(
+        humble.received_requests().await.unwrap().is_empty(),
+        "the gate must refuse before the order() self-heal call — zero Humble requests"
     );
 }
