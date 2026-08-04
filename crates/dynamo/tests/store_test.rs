@@ -3324,3 +3324,99 @@ async fn version_lock_claim_lifecycle_is_strictly_monotonic() {
         "fulfill's flip bumps atomically"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #88 PR-a: session tokens hashed at rest. The property, pinned three ways.
+// ---------------------------------------------------------------------------
+
+/// Roundtrip through the store API is unchanged by the hashing: create → get (expiry
+/// intact) → delete → gone.
+#[tokio::test]
+async fn session_hash_roundtrip() {
+    let Some(store) = store_or_skip("sess-hash-roundtrip").await else {
+        return;
+    };
+    store
+        .create_session("tok-roundtrip-secret", 2_000_000_000)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_session("tok-roundtrip-secret").await.unwrap(),
+        Some(2_000_000_000)
+    );
+    store.delete_session("tok-roundtrip-secret").await.unwrap();
+    assert_eq!(
+        store.get_session("tok-roundtrip-secret").await.unwrap(),
+        None
+    );
+}
+
+/// The security property, pinned raw: the stored pk is `SESSION#` + exactly 64 lowercase
+/// hex chars, and the raw token appears in NO attribute value of the item. The 64-hex pin
+/// also freezes the encoding — changing it would silently invalidate every live session.
+#[tokio::test]
+async fn session_item_at_rest_carries_digest_never_token() {
+    let test = "sess-hash-at-rest";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let token = "tok-super-secret-cookie-value";
+    store.create_session(token, 2_000_000_000).await.unwrap();
+
+    let raw = raw_client(test).await;
+    let scan = raw
+        .scan()
+        .table_name(format!("t-{test}"))
+        .send()
+        .await
+        .unwrap();
+    let items = scan.items();
+    assert_eq!(items.len(), 1, "exactly the one session item");
+    let item = &items[0];
+    let pk = item.get("pk").unwrap().as_s().unwrap();
+    let hex = pk.strip_prefix("SESSION#").expect("SESSION# prefix");
+    assert_eq!(hex.len(), 64, "sha256 hex is 64 chars");
+    assert!(
+        hex.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "lowercase hex only"
+    );
+    // token absent from EVERY attribute value, not just pk — a future field can't
+    // quietly reintroduce the raw token.
+    for (name, value) in item {
+        let debug = format!("{value:?}");
+        assert!(
+            !debug.contains(token),
+            "raw token leaked into attribute {name}: {debug}"
+        );
+    }
+}
+
+/// The deliberate migration story: a pre-#88 item stored at the RAW-token pk no longer
+/// authenticates — hashed lookup never addresses it. (At deploy this invalidates every
+/// live session once; ben re-logs. A dual-lookup shim would keep replayable rows alive
+/// exactly as long as the shim existed, defeating the point.)
+#[tokio::test]
+async fn session_hash_old_raw_pk_items_do_not_authenticate() {
+    let test = "sess-hash-legacy";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let token = "tok-legacy-raw";
+    let raw = raw_client(test).await;
+    raw.put_item()
+        .table_name(format!("t-{test}"))
+        .item("pk", AttributeValue::S(format!("SESSION#{token}")))
+        .item("sk", AttributeValue::S("META".into()))
+        .item("expires_epoch", AttributeValue::N("2000000000".into()))
+        .item("ttl", AttributeValue::N("2000000000".into()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.get_session(token).await.unwrap(),
+        None,
+        "raw-pk legacy session must not authenticate against hashed lookup"
+    );
+}

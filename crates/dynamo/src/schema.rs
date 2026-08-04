@@ -182,8 +182,20 @@ pub fn sync_state_item(state: &crate::SyncState) -> HashMap<String, AttributeVal
     ])
 }
 
+/// Session pk = `SESSION#<hex(sha256(token))>` (#88): the cookie value itself never
+/// touches the table, so any read primitive over the table yields non-replayable
+/// digests instead of bearer tokens. This is the ONE place a session key is built —
+/// `create_session` (via `session_item`), `get_session`, and `delete_session` all route
+/// through it, so hash-on-write and hash-on-lookup cannot drift. Encoding is pinned
+/// lowercase hex (64 chars) by a raw-item test: changing it silently invalidates every
+/// live session, which is exactly what happened ONCE, deliberately, at #88's deploy
+/// (no dual-lookup migration — a shim keeping raw pks alive would keep them replayable
+/// for as long as it existed).
 pub fn session_pk(token: &str) -> String {
-    format!("SESSION#{token}")
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("SESSION#{hex}")
 }
 
 /// Build the item for an admin session. pk="SESSION#<token>", sk="META", top-level
