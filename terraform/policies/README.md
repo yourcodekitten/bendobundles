@@ -37,7 +37,7 @@ Public's `UpdateItem` is split out of the broad allow into two statements condit
 paths utter (`claim_game`'s transact updates; `set_link_thanks`), keys and
 condition-expression names included, straight from the corpus:
 
-- `ScopedUpdateGAME` (`GAME#*`): `pk, sk, body, status, claim_id, gsi1pk, gsi1sk`
+- `ScopedUpdateGAME` (`GAME#*`): `pk, sk, body, status, claim_id, gsi1pk, gsi1sk, version` (#134: the claim tx bumps the game's version counter)
 - `ScopedUpdateLINK` (`LINK#*`): `pk, sk, body, claims_used, claims_allowed, expires_at, revoked, thank_note, thanked_at`
 
 Both pin `dynamodb:ReturnValues` to `NONE | UPDATED_*` (`StringEqualsIfExists`) so a

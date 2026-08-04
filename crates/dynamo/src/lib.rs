@@ -79,9 +79,10 @@ pub enum AutoHideWrite {
 pub enum GuardedWrite {
     /// The put landed; every coordination field still matched the caller's read.
     Written,
-    /// A coordinated field (`status`/`appid_source`/`hidden_source`/`claim_id`) changed between
-    /// the caller's read and this write — NOTHING was written. Re-read and retry, or let the
-    /// next pass re-apply against fresh truth.
+    /// The item's `version` counter moved between the caller's read and this write —
+    /// something else wrote the item, whatever the field — NOTHING was written. Re-read
+    /// and retry, or let the next pass re-apply against fresh truth. (#134; pre-counter
+    /// this meant one of the four value-equality coordination fields changed.)
     Contested,
 }
 
@@ -1847,30 +1848,20 @@ impl Store {
     /// public only so integration tests can drive the stale-snapshot race deterministically
     /// (read → out-of-band write → stale put). Prefer the setters.
     ///
-    /// Conditions the put on the FULL coordination snapshot — `status`, `appid_source`,
-    /// `hidden_source`, `claim_id` (equality with `snapshot`'s values; `attribute_not_exists`
-    /// where the snapshot read `None`). The pre-#47 setters locked only `status` (+ at most one
-    /// extra field), so a concurrent write to any OTHER coordinated field inside the caller's
-    /// read→write window was silently reverted by the stale full-item put — ben's Manual appid
-    /// override being the non-self-healing casualty (once reverted, the mapper re-maps over it).
-    /// Now any mid-window coordination change CCFs → `Contested`; the caller's next pass
-    /// re-reads and re-applies against fresh truth.
+    /// Conditions the put on the monotonic `version` counter (#134): `version = :seen` from
+    /// the caller's [`Store::get_game_versioned`] read, or `attribute_not_exists(version)`
+    /// when the read saw a pre-counter legacy item (adopted at 1 on first write — the whole
+    /// migration story, no backfill). ANY concurrent write of ANY field bumps the counter,
+    /// so ANY mid-window change CCFs → `Contested`; the caller's next pass re-reads and
+    /// re-applies against fresh truth. This closed the #47→#129 residual class outright:
+    /// the old value-equality lock on the four coordination fields could not see mid-window
+    /// writes that changed only unlocked values (Manual→Manual appid re-edits, Admin→Admin
+    /// unhides — the R1/R2 red-proofs in store_test).
     ///
-    /// Known residuals, deliberately unchanged (#134 tracks closing the class outright):
-    /// this is a VALUE-equality lock on the four coordination fields, not a full-snapshot
-    /// lock — a mid-window write that changes only UNLOCKED values passes it. Concretely:
-    /// - **Manual→Manual appid re-edit** — `steam_app_id` itself is unmirrored/unlocked, so
-    ///   ben re-editing an appid whose source is already `Manual` can be reverted by a stale
-    ///   in-window write (`Manual == Manual` passes) and the mapper skips Manual games, so it
-    ///   does NOT self-heal.
-    /// - **Admin→Admin unhide** — `hidden` is body-only and `hidden_source` stays `Admin` on
-    ///   both hide and unhide, so a stale in-window write can re-hide an admin-unhidden game;
-    ///   sync never unhides, so it stays wrongly hidden until a human notices.
-    /// - non-coordinated body fields (title/artwork — sync-authority, written by
-    ///   `upsert_game_from_sync`) can still be staled in-window and self-heal on the next walk;
-    ///   `owned_by_ben` is the same class — advisory, and re-stamped by every ownership pass.
-    /// - `claim_game`'s tx rewrites `body` under a status+gsi1pk gate only — the same class
-    ///   with a milliseconds-wide window, left to a claim-path-specific change.
+    /// Known residual, deliberately unchanged: the claim-path writes rewrite `body` under
+    /// their own narrow gates (pending-marker + ownership, ms-wide windows) without a
+    /// version gate — reasons at [`Store::game_claim_path_update`] and
+    /// `flip_game_from_pending`; they bump atomically instead.
     pub async fn put_game_if_unchanged(
         &self,
         seen: GameVersion,
