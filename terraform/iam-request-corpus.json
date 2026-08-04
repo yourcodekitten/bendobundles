@@ -50,7 +50,8 @@
           "gsi1sk",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       }
     ],
@@ -280,15 +281,14 @@
           "GAME#"
         ],
         "attributes": [
-          "appid_source",
           "body",
-          "claim_id",
           "gsi1pk",
           "gsi1sk",
           "hidden_source",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       },
       {
@@ -297,13 +297,12 @@
           "GAME#"
         ],
         "attributes": [
-          "appid_source",
           "body",
-          "claim_id",
           "hidden_source",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       }
     ],
@@ -326,13 +325,13 @@
         "attributes": [
           "appid_source",
           "body",
-          "claim_id",
           "gsi1pk",
           "gsi1sk",
           "hidden_source",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       }
     ],
@@ -386,11 +385,11 @@
         "attributes": [
           "appid_source",
           "body",
-          "claim_id",
           "hidden_source",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       }
     ],
@@ -452,7 +451,8 @@
           "gsi1sk",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       },
       {
@@ -514,7 +514,8 @@
           "gsi1sk",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       },
       {
@@ -574,7 +575,8 @@
           "body",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       },
       {
@@ -634,7 +636,8 @@
           "body",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       },
       {
@@ -682,7 +685,8 @@
           "claim_id",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       },
       {
@@ -729,7 +733,8 @@
           "claim_id",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       },
       {
@@ -924,13 +929,12 @@
         "attributes": [
           "appid_source",
           "body",
-          "claim_id",
           "gsi1pk",
           "gsi1sk",
-          "hidden_source",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       }
     ],
@@ -953,13 +957,12 @@
         "attributes": [
           "appid_source",
           "body",
-          "claim_id",
           "gsi1pk",
           "gsi1sk",
-          "hidden_source",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       }
     ],
@@ -980,29 +983,13 @@
           "GAME#"
         ],
         "attributes": [
-          "appid_source",
-          "body",
-          "claim_id",
-          "gsi1pk",
-          "gsi1sk",
-          "hidden_source",
-          "pk",
-          "sk",
-          "status"
-        ]
-      },
-      {
-        "action": "dynamodb:PutItem",
-        "leading_keys": [
-          "GAME#"
-        ],
-        "attributes": [
           "body",
           "gsi1pk",
           "gsi1sk",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       }
     ]
@@ -1080,7 +1067,8 @@
           "gsi1sk",
           "pk",
           "sk",
-          "status"
+          "status",
+          "version"
         ]
       },
       {
