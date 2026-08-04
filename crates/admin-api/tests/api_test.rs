@@ -47,9 +47,11 @@ async fn store_or_skip(test: &str) -> Option<Arc<Store>> {
         eprintln!("SKIP {test}: no dynamodb-local at {url}");
         return None;
     }
-    // PID-scoped like fulfillment's tables (#44 item 7): fixed-token creates (create_link is
-    // conditioned attribute_not_exists) would otherwise panic on a persistent local dynamo.
-    let store = Store::new(client, format!("t-adm-{}-{test}", std::process::id()));
+    // Stable per-test names: create_table_for_tests delete-then-creates (#80), so a
+    // persistent local dynamo hands every run a virgin table — the root fix that replaced
+    // #44 item 7's PID-scoping sidestep (which dodged fixed-token collisions by never
+    // reusing a name, leaking tables every run).
+    let store = Store::new(client, format!("t-adm-{test}"));
     store.create_table_for_tests().await.unwrap();
     Some(Arc::new(store))
 }
