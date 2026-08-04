@@ -38,12 +38,22 @@ module "label_site_headers" {
 #   img-src *.steamstatic.com    — GameGrid hardcodes shared.akamai.steamstatic.com;
 #                                  stored header_image/screenshots/video_thumbnail
 #                                  hosts vary across the akamai/cloudflare variants
+#   img-src hb.imgix.net         — artwork_url (Humble subproduct icon via
+#                                  match_artwork): GameGrid/Catalog/GameDetailModal
+#                                  <img> fallbacks + MediaHeader poster. Host-specific:
+#                                  hb.imgix.net is the only Humble image host observed
+#                                  (fixtures + sync); *.imgix.net would admit every
+#                                  imgix customer
 #   media-src blob: + steamstatic — hls.js plays through MSE (blob: object URL);
 #                                  Safari native HLS sets video.src to the
 #                                  steamstatic URL directly (MediaHeader.handlePlay)
 #   connect-src steamstatic      — hls.js XHRs manifests + segments
 #   worker-src blob:             — hls.js demuxer worker
-#   style-src 'unsafe-inline'    — React style={} attributes (no external styles)
+#   style-src 'unsafe-inline'    — CursorCompanion renders a literal <style> element
+#                                  (friend-surface cursor CSS). NOT for React style={}
+#                                  attrs — those go through CSSOM, which CSP never
+#                                  gates. Retire if CursorCompanion's CSS moves to the
+#                                  stylesheet
 # No inline scripts (vite module bundle only), no data:/blob: images, no frames,
 # no external fonts; both <form>s are onSubmit-handled (no action navigation).
 locals {
@@ -51,7 +61,7 @@ locals {
     "default-src 'self'",
     "script-src 'self'",
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' https://*.steamstatic.com",
+    "img-src 'self' https://*.steamstatic.com https://hb.imgix.net",
     "media-src 'self' blob: https://*.steamstatic.com",
     "connect-src 'self' https://*.steamstatic.com",
     "worker-src blob:",
