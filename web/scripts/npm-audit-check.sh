@@ -14,7 +14,15 @@ ALLOWLIST=(
   "GHSA-qwww-vcr4-c8h2"
 )
 
+# npm audit exits 1 when advisories exist — that's data, not failure. But an
+# infra failure (registry down, bad JSON) must fail LOUD, not read as "clean":
+# require a parseable object with a vulnerabilities key before trusting emptiness.
 json=$(npm audit --omit=dev --json || true)
+if ! jq -e 'type == "object" and has("vulnerabilities")' <<<"$json" >/dev/null 2>&1; then
+  echo "npm audit produced no usable JSON — refusing to pass vacuously:"
+  echo "$json" | head -20
+  exit 1
+fi
 mapfile -t advisories < <(jq -r '
   [.vulnerabilities[]?.via[]? | objects | .url // empty]
   | unique | .[] | split("/") | last
