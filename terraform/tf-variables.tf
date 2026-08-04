@@ -44,11 +44,10 @@ variable "admin_password_hash" {
   description = "Argon2 PHC string for the admin password (generate: `echo -n 'pw' | argon2 \"$(openssl rand -base64 16)\" -id -e`). Stored as SSM SecureString; admin-api refuses to boot without it."
 }
 
-variable "discord_webhook_url" {
-  type        = string
-  default     = null
-  sensitive   = true
-  description = "Optional Discord webhook for cookie-death pings. Null disables (fulfillment treats a missing param as webhooks-off)."
+variable "discord_webhook_enabled" {
+  type        = bool
+  default     = false
+  description = "Create the SecureString container for the cookie-death Discord webhook. The URL itself is set out of band (PutParameter) — it never passes through terraform. False: no param, no env var, no grant; fulfillment runs webhooks-off."
 }
 
 variable "humble_username" {

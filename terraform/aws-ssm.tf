@@ -92,17 +92,25 @@ resource "aws_ssm_parameter" "steam_web_api_key" {
   }
 }
 
+# Discord webhook URL — a webhook URL IS the credential (anyone holding it can post
+# to the channel), so it follows the container pattern above: SecureString, value set
+# out of band, never through terraform state or TF_VAR (#81). `UNSET` reads as
+# webhooks-off in fulfillment's get_secret.
 resource "aws_ssm_parameter" "discord_webhook" {
-  count = var.discord_webhook_url == null ? 0 : 1
+  count = var.discord_webhook_enabled ? 1 : 0
   name  = "/${module.label_param.id}/discord-webhook"
-  type  = "String"
-  value = var.discord_webhook_url
+  type  = "SecureString"
+  value = "UNSET"
   tags  = module.label_param.tags
+
+  lifecycle {
+    ignore_changes = [value]
+  }
 }
 
 locals {
-  discord_webhook_param_name = var.discord_webhook_url == null ? null : aws_ssm_parameter.discord_webhook[0].name
-  discord_webhook_param_arn  = var.discord_webhook_url == null ? null : aws_ssm_parameter.discord_webhook[0].arn
+  discord_webhook_param_name = var.discord_webhook_enabled ? aws_ssm_parameter.discord_webhook[0].name : null
+  discord_webhook_param_arn  = var.discord_webhook_enabled ? aws_ssm_parameter.discord_webhook[0].arn : null
 
   # Secure-area step-up is opt-in via humble_username: null → the whole feature is
   # off (no params, no env vars, no extra SSM grant) and a gated redeem parks as
