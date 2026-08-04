@@ -601,6 +601,95 @@ async fn handle_self_claim_choice(
     .await
 }
 
+/// #88 item 4: the pre-redeem gate — validate stored state BEFORE the irreversible Humble
+/// write. The redeem coordinates ride the invoke payload from a `get_game` read taken in
+/// public-api BEFORE the claim tx; a concurrent compensate/re-list/re-key can stale them,
+/// and a redeem on stale coordinates burns a key nothing tracks. This re-reads claim and
+/// game and refuses — parks, ZERO writes, reconcile owns recovery — unless:
+///
+/// - the claim exists and its state is `Pending` or `Fulfilled`. `Fulfilled` is the
+///   stranded-game re-drive (write-1 landed, the flip didn't): Humble's redeem/reveal is
+///   idempotent on re-POST — but only against the SAME coordinates, so the coordinate
+///   check applies to re-drives too. `Compensated`/`Failed` are terminal: a redeem there
+///   is exactly the burn this gate exists to stop.
+/// - the claim's `game_id` matches the payload's (linkage).
+/// - the CURRENT game record matches the payload's `gamekey`, and — where the payload
+///   carries real key coordinates (non-choice paths) — `machine_name` + `keyindex` too.
+///   `keyindex` is the coordinate that actually drifts: `game_id` derives from
+///   gamekey:machine_name, but keyindex is refreshed from the wire by sync re-keys.
+///   Choice paths pass `None`: their tpk coordinates are born fresh inside the choice
+///   flow, and the offered id is validated downstream against the order itself.
+///
+/// TOCTOU honesty: the gate shrinks the stale window from claim-age (minutes/hours) to
+/// read→redeem (ms). It cannot be zero without a lock Humble doesn't participate in.
+async fn redeem_gate(
+    deps: &Deps,
+    claim_id: &str,
+    link_token: &str,
+    game_id: &str,
+    gamekey: &str,
+    key_coords: Option<(&str, u32)>,
+) -> Result<(), FulfillResponse> {
+    let claim = match deps.store.get_claim(link_token, claim_id).await {
+        Ok(Some(c)) => c,
+        // Missing claim: park, matching this handler's established fail-safe contract
+        // (the get_game-missing path parks too). Zero spend either way; a park keeps the
+        // "nothing seeded / precondition absent → park" invariant the suite pins.
+        Ok(None) => {
+            return Err(FulfillResponse::Parked {
+                reason: "pre-redeem gate: claim not found".into(),
+            });
+        }
+        Err(e) => {
+            return Err(FulfillResponse::Parked {
+                reason: format!("pre-redeem gate: claim read failed: {e}"),
+            });
+        }
+    };
+    if !matches!(
+        claim.state,
+        domain::ClaimState::Pending | domain::ClaimState::Fulfilled
+    ) {
+        return Err(FulfillResponse::Parked {
+            reason: format!(
+                "pre-redeem gate: claim state {:?} is terminal — refusing to touch a key",
+                claim.state
+            ),
+        });
+    }
+    if claim.game_id != game_id {
+        return Err(FulfillResponse::Parked {
+            reason: "pre-redeem gate: claim/game linkage mismatch".into(),
+        });
+    }
+    let game = match deps.store.get_game(game_id).await {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return Err(FulfillResponse::Parked {
+                reason: "pre-redeem gate: game record missing".into(),
+            });
+        }
+        Err(e) => {
+            return Err(FulfillResponse::Parked {
+                reason: format!("pre-redeem gate: game read failed: {e}"),
+            });
+        }
+    };
+    if game.gamekey != gamekey {
+        return Err(FulfillResponse::Parked {
+            reason: "pre-redeem gate: gamekey drift since claim".into(),
+        });
+    }
+    if let Some((machine_name, keyindex)) = key_coords
+        && (game.machine_name != machine_name || game.keyindex != keyindex)
+    {
+        return Err(FulfillResponse::Parked {
+            reason: "pre-redeem gate: key coordinates drifted since claim".into(),
+        });
+    }
+    Ok(())
+}
+
 /// The gift ladder's side-effecting half. Policy lives in [`gift_decision`]; this executes it.
 async fn handle_gift(
     deps: &Deps,
@@ -611,6 +700,19 @@ async fn handle_gift(
     machine_name: &str,
     keyindex: u32,
 ) -> FulfillResponse {
+    // #88: validate stored state before the irreversible Humble write.
+    if let Err(resp) = redeem_gate(
+        deps,
+        claim_id,
+        link_token,
+        game_id,
+        gamekey,
+        Some((machine_name, keyindex)),
+    )
+    .await
+    {
+        return resp;
+    }
     // The redeem rides the shared heal ladder: on a dead session (`Unauthorized`) with self-login
     // configured, heal IN-LINE and retry the redeem once — the friend gets their gift now instead
     // of parking until the next scheduled sync/validate. Burn-safety of retrying this WRITE is
@@ -843,6 +945,11 @@ async fn handle_choice_claim(
     offered_id: &str,
     flavor: ClaimFlavor,
 ) -> FulfillResponse {
+    // #88: validate stored state before any Humble write. Choice coords (the tpk) are
+    // born fresh inside this flow, so the gate checks the shared core + gamekey only.
+    if let Err(resp) = redeem_gate(deps, claim_id, link_token, game_id, gamekey, None).await {
+        return resp;
+    }
     let selfheal = deps.session_store.is_some();
     // One self-login per invoke, total (mirrors run_sync's one-heal-per-run cap): every humble call
     // below passes `selfheal && !healed`, and any heal flips this.
@@ -1574,6 +1681,19 @@ async fn handle_self_claim(
     machine_name: &str,
     keyindex: u32,
 ) -> FulfillResponse {
+    // #88: validate stored state before the irreversible Humble write.
+    if let Err(resp) = redeem_gate(
+        deps,
+        claim_id,
+        domain::SELF_LINK_TOKEN,
+        game_id,
+        gamekey,
+        Some((machine_name, keyindex)),
+    )
+    .await
+    {
+        return resp;
+    }
     let (heal, outcome) = selfheal_once(deps, deps.session_store.is_some(), || {
         deps.humble.reveal_key(gamekey, machine_name, keyindex)
     })
