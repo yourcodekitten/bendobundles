@@ -990,6 +990,20 @@
           "sk",
           "status"
         ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status"
+        ]
       }
     ]
   },

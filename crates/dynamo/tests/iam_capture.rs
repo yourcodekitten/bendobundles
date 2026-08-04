@@ -151,17 +151,22 @@ struct Op {
     return_values: Option<String>,
 }
 
-/// Words that appear in DynamoDB expressions but are never attribute names.
-const EXPR_KEYWORDS: &[&str] = &[
-    "set",
-    "remove",
-    "add",
-    "delete",
-    "and",
-    "or",
-    "not",
-    "between",
-    "in",
+/// Expression operator keywords — every one is a DynamoDB **reserved word**, so the
+/// service itself rejects an un-aliased attribute by any of these names (they can only
+/// reach an expression via a `#alias`, which resolves before this list is consulted).
+/// Skipping them unconditionally is therefore provably safe. (#142 item 4)
+const EXPR_OPERATORS: &[&str] = &[
+    "set", "remove", "add", "delete", "and", "or", "not", "between", "in",
+];
+
+/// Expression function names — skipped ONLY when the token is actually a call (next
+/// non-space char is `(`). Some of these are also reserved words (`contains`, `size`),
+/// others are not (`attribute_exists`, `begins_with`, `if_not_exists`, `list_append`,
+/// `attribute_type`) — a future un-aliased attribute named like an unreserved function
+/// would otherwise be silently dropped from a `dynamodb:Attributes` allowlist, which is
+/// exactly the 403 class this harness exists to prevent. Gating on `(` makes the
+/// reserved-or-not distinction moot. (#142 item 4)
+const EXPR_FUNCTIONS: &[&str] = &[
     "attribute_exists",
     "attribute_not_exists",
     "attribute_type",
@@ -176,7 +181,13 @@ const EXPR_KEYWORDS: &[&str] = &[
 /// keywords, `#aliases` resolved via ExpressionAttributeNames, document paths reduced to
 /// their top-level name (which is what `dynamodb:Attributes` carries).
 fn expr_attr_names(expr: &str, aliases: &BTreeMap<String, String>, out: &mut BTreeSet<String>) {
-    fn flush(tok: &mut String, aliases: &BTreeMap<String, String>, out: &mut BTreeSet<String>) {
+    let chars: Vec<char> = expr.chars().collect();
+    fn flush(
+        tok: &mut String,
+        is_call: bool,
+        aliases: &BTreeMap<String, String>,
+        out: &mut BTreeSet<String>,
+    ) {
         if tok.is_empty() {
             return;
         }
@@ -185,24 +196,36 @@ fn expr_attr_names(expr: &str, aliases: &BTreeMap<String, String>, out: &mut BTr
             return;
         }
         let base = t.split('.').next().unwrap();
+        let lower = base.to_ascii_lowercase();
         if let Some(alias) = base.strip_prefix('#') {
             let resolved = aliases
                 .get(&format!("#{alias}"))
                 .unwrap_or_else(|| panic!("unresolved expression alias #{alias} in {t:?}"));
             out.insert(resolved.clone());
-        } else if !EXPR_KEYWORDS.contains(&base.to_ascii_lowercase().as_str()) {
+        } else if EXPR_OPERATORS.contains(&lower.as_str())
+            || (is_call && EXPR_FUNCTIONS.contains(&lower.as_str()))
+        {
+            // operator: reserved word, never an attribute; function name: only a call
+        } else {
             out.insert(base.to_string());
         }
     }
     let mut tok = String::new();
-    for c in expr.chars() {
+    for i in 0..chars.len() {
+        let c = chars[i];
         if c.is_ascii_alphanumeric() || matches!(c, '_' | '#' | ':' | '.') {
             tok.push(c);
         } else {
-            flush(&mut tok, aliases, out);
+            // is the token we just finished a function call? scan past whitespace for `(`
+            let is_call = chars[i..]
+                .iter()
+                .find(|ch| !ch.is_ascii_whitespace())
+                .is_some_and(|ch| *ch == '(');
+            flush(&mut tok, is_call, aliases, out);
         }
     }
-    flush(&mut tok, aliases, out);
+    // end-of-string terminator: nothing follows, so a trailing token is never a call
+    flush(&mut tok, false, aliases, out);
 }
 
 /// Key prefix through the first `#` — `"GAME#x"` → `"GAME#"`, `"SYNC#STATE"` → `"SYNC#"`;
@@ -360,17 +383,27 @@ fn ops_from_request(target: &str, body: &str) -> Vec<Op> {
 type MethodOps = BTreeMap<String, BTreeSet<Op>>;
 
 /// Run one store method under capture and fold its request shapes into the corpus.
-async fn capture<F: Future>(cap: &Capture, methods: &mut MethodOps, method: &str, fut: F) {
+/// Returns THIS leg's parsed ops so a caller can assert leg-specific shapes — the merged
+/// corpus map can't do that once entries from earlier legs share the method key (#142).
+async fn capture<F: Future>(
+    cap: &Capture,
+    methods: &mut MethodOps,
+    method: &str,
+    fut: F,
+) -> Vec<Op> {
     cap.drain();
     fut.await;
     let reqs = cap.drain();
     assert!(!reqs.is_empty(), "{method}: captured no requests");
     let entry = methods.entry(method.to_string()).or_default();
+    let mut leg = Vec::new();
     for (target, body) in reqs {
         for op in ops_from_request(&target, &body) {
-            entry.insert(op);
+            entry.insert(op.clone());
+            leg.push(op);
         }
     }
+    leg
 }
 
 fn game(n: u32, listable: bool) -> Game {
@@ -732,6 +765,22 @@ async fn drive_fulfillment(rig: &Rig) -> MethodOps {
         s.upsert_game_from_sync(fresh).await.unwrap();
     })
     .await;
+    // first-insert branch (#142 item 3): gk11 is never seeded, so merge_sync takes the
+    // None arm → bare PutItem guarded only by attribute_not_exists(pk). Assert THIS leg
+    // captured that put: the guarded put_game_if_unchanged shape from the previous leg
+    // always names appid_source in its condition (attribute_not_exists(#asrc) when the
+    // snapshot has none), while the first-insert condition names only pk — so absence of
+    // appid_source uniquely identifies the first-insert shape.
+    let first_insert = capture(cap, &mut m, "upsert_game_from_sync", async {
+        s.upsert_game_from_sync(game(11, true)).await.unwrap();
+    })
+    .await;
+    assert!(
+        first_insert.iter().any(|o| o.action == "dynamodb:PutItem"
+            && o.attributes.contains("pk")
+            && !o.attributes.contains("appid_source")),
+        "first-insert leg did not capture the attribute_not_exists(pk) PutItem shape"
+    );
     capture(cap, &mut m, "set_game_steam_appid_if_unclaimed", async {
         s.set_game_steam_appid_if_unclaimed(&gid(10), 620, AppidSource::Title)
             .await
