@@ -2583,23 +2583,6 @@ fn steam_app_cache_pre_screenshots_blob_deserializes() {
 
 // ── #71: auto_hide_game + hidden_source provenance ──────────────────────────────────────────
 
-/// Raw top-level attribute surgery: crafts the body/mirror mismatch the Store API can never
-/// produce, so the DDB-level condition (not the in-memory fast path) is what a test proves.
-async fn raw_set_top_level_string(test: &str, game_id: &str, attr: &str, val: &str) {
-    let client = raw_client(test).await;
-    client
-        .update_item()
-        .table_name(format!("t-{test}"))
-        .key("pk", AttributeValue::S(format!("GAME#{game_id}")))
-        .key("sk", AttributeValue::S("META".into()))
-        .update_expression("SET #a = :v")
-        .expression_attribute_names("#a", attr)
-        .expression_attribute_values(":v", AttributeValue::S(val.into()))
-        .send()
-        .await
-        .unwrap();
-}
-
 async fn raw_get_top_level_string(test: &str, game_id: &str, attr: &str) -> Option<String> {
     let client = raw_client(test).await;
     let out = client
