@@ -29,7 +29,8 @@
             "gsi1sk",
             "pk",
             "sk",
-            "status"
+            "status",
+            "version"
           ]
         },
         "ForAllValues:StringLike": {

@@ -39,25 +39,31 @@ pub(crate) fn key_pair(
     (s(pk), s(sk))
 }
 
-pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
+/// `version` is the monotonic counter value this write CARRIES (#134): callers pass the
+/// next value (seen+1, or 1 for first-insert/legacy adoption). A required param — not an
+/// Option — so no game writer can forget the stamp; a missed bump is a compile error.
+pub fn game_item(g: &Game, version: i64) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::from([
         ("pk".into(), s(game_pk(&g.id))),
         ("sk".into(), s("META")),
+        ("version".into(), AttributeValue::N(version.to_string())),
         (
             "body".into(),
             s(serde_json::to_string(g).expect("game serializes")),
         ),
     ]);
     item.insert("status".into(), s(g.status.as_wire()));
-    // Top-level `appid_source` mirrors the body so the mapper's PutItem condition can guard
-    // against a concurrent admin Manual override. Only written when Some — attribute_not_exists
-    // then correctly matches unmapped/legacy items (None → no attribute, condition fires).
+    // Top-level `appid_source` mirrors the body. Historically the mapper's write condition
+    // guarded on it; since #134 the version counter carries that protection and no condition
+    // references this mirror — it stays for parity/diagnostics (top-level truth visible in
+    // console scans without parsing body). Only written when Some.
     if let Some(src) = g.appid_source {
         item.insert("appid_source".into(), s(src.as_wire()));
     }
-    // Top-level `hidden_source` mirrors the body so auto-hide's PutItem condition can guard
-    // against racing an admin toggle. Only written when Some — attribute_not_exists then
-    // correctly matches legacy items (never admin-touched → auto-hide eligible).
+    // Top-level `hidden_source` mirrors the body. Historically auto-hide's write condition
+    // guarded on it; since #134 the version counter carries that protection (auto-hide's
+    // read-screen still consults the body value). Stays for parity/diagnostics. Only
+    // written when Some.
     if let Some(src) = g.hidden_source {
         item.insert("hidden_source".into(), s(src.as_wire()));
     }

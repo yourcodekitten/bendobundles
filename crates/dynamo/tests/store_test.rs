@@ -1,5 +1,7 @@
 use aws_sdk_dynamodb::types::AttributeValue;
-use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
+use domain::{
+    AppidSource, Claim, ClaimState, Game, GameStatus, HiddenSource, Link, SELF_LINK_TOKEN, game_id,
+};
 use dynamo::{
     AppidWrite, AutoHideWrite, ClaimTxError, GuardedWrite, HiddenWrite, OwnedWrite,
     SYNC_RUN_STALE_SECS, SteamAppCache, SteamAppPutError, SteamAppPutGuard, Store, SyncBegin,
@@ -2581,23 +2583,6 @@ fn steam_app_cache_pre_screenshots_blob_deserializes() {
 
 // ── #71: auto_hide_game + hidden_source provenance ──────────────────────────────────────────
 
-/// Raw top-level attribute surgery: crafts the body/mirror mismatch the Store API can never
-/// produce, so the DDB-level condition (not the in-memory fast path) is what a test proves.
-async fn raw_set_top_level_string(test: &str, game_id: &str, attr: &str, val: &str) {
-    let client = raw_client(test).await;
-    client
-        .update_item()
-        .table_name(format!("t-{test}"))
-        .key("pk", AttributeValue::S(format!("GAME#{game_id}")))
-        .key("sk", AttributeValue::S("META".into()))
-        .update_expression("SET #a = :v")
-        .expression_attribute_names("#a", attr)
-        .expression_attribute_values(":v", AttributeValue::S(val.into()))
-        .send()
-        .await
-        .unwrap();
-}
-
 async fn raw_get_top_level_string(test: &str, game_id: &str, attr: &str) -> Option<String> {
     let client = raw_client(test).await;
     let out = client
@@ -2689,27 +2674,6 @@ async fn auto_hide_mid_claim_is_contested() {
 }
 
 #[tokio::test]
-async fn auto_hide_ddb_condition_fires_without_in_memory_guard() {
-    // The plan-2 lesson: prove the DDB-LEVEL guard, not the fast path. Seed an item whose
-    // BODY says hidden_source: null but whose TOP-LEVEL attribute says "admin" — only the
-    // condition expression can see the mismatch. (This state can't arise from our writers;
-    // it's a scalpel for the guard.)
-    let test = "auto-hide-ddb-condition";
-    let Some(store) = store_or_skip(test).await else {
-        return;
-    };
-    let g = game(1, true);
-    store.put_game(&g).await.unwrap();
-    raw_set_top_level_string(test, &g.id, "hidden_source", "admin").await;
-    assert_eq!(
-        store.auto_hide_game(&g.id).await.unwrap(),
-        AutoHideWrite::Contested
-    );
-    let read = store.get_game(&g.id).await.unwrap().unwrap();
-    assert!(!read.hidden, "the guarded put must not have landed");
-}
-
-#[tokio::test]
 async fn admin_toggle_stamps_admin_source_top_level_snake_case() {
     let test = "admin-toggle-stamps-admin";
     let Some(store) = store_or_skip(test).await else {
@@ -2724,27 +2688,48 @@ async fn admin_toggle_stamps_admin_source_top_level_snake_case() {
     assert_eq!(attr.as_deref(), Some("admin"));
 }
 
+// #134 NOTE: two pre-counter "raw-mismatch scalpel" tests stood here
+// (auto_hide_ddb_condition_fires_without_in_memory_guard,
+// upsert_condition_protects_hidden_source_from_clobber). They pinned the value-equality
+// clauses by staging a body/top-level divergence no real writer can produce. Under the
+// version counter that divergence class is structurally gone — the token rides the SAME
+// GetItem as the body, so a read can never be torn against the guard — and the protection
+// they proved (mid-window admin toggle beats a stale write) is pinned by real-writer
+// interleaves instead (version_lock_r2, stale_snapshot_write_cannot_clobber_admin_hide,
+// upsert staged-interleave). The DDB-level-scalpel tradition they carried lives on below.
+
+/// The counter-era DDB-level scalpel: an out-of-band `version` bump — body untouched, so
+/// the in-memory read sees nothing — must CCF the guarded put. Only the condition
+/// expression can see it; this is the direct heir of the old raw-mismatch tests.
 #[tokio::test]
-async fn upsert_condition_protects_hidden_source_from_clobber() {
-    // The inherited sync-upsert TOCTOU, now higher-stakes (OMBB sign-off): an admin
-    // toggle landing inside upsert's read→put window would be silently reverted —
-    // INCLUDING the Admin stamp, erasing Ben's permanent immunity. Same raw-mismatch
-    // scalpel as the auto-hide test: body read says hidden_source null, top-level
-    // mirror says "admin" → only the DDB condition can see it.
-    let test = "upsert-protects-hsrc";
+async fn version_gate_sees_raw_out_of_band_bump() {
+    let test = "vlock-raw-bump";
     let Some(store) = store_or_skip(test).await else {
         return;
     };
     let g = game(1, true);
     store.put_game(&g).await.unwrap();
-    raw_set_top_level_string(test, &g.id, "hidden_source", "admin").await;
-    let mut fresh = game(1, true);
-    fresh.title = "Renamed".into();
-    let res = store.upsert_game_from_sync(fresh).await.unwrap();
+
+    let (snapshot, seen) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
+
+    // out-of-band bump: version only, nothing the body read could have seen
+    let raw = raw_client(test).await;
+    raw.update_item()
+        .table_name(format!("t-{test}"))
+        .key("pk", AttributeValue::S(format!("GAME#{}", g.id)))
+        .key("sk", AttributeValue::S("META".into()))
+        .update_expression("ADD version :one")
+        .expression_attribute_values(":one", AttributeValue::N("1".into()))
+        .send()
+        .await
+        .unwrap();
+
+    let mut stale = snapshot.clone();
+    stale.title = "stale".into();
     assert_eq!(
-        res,
-        SyncWrite::SkippedInFlight,
-        "the write must CCF, not clobber the admin stamp"
+        store.put_game_if_unchanged(seen, &stale).await.unwrap(),
+        GuardedWrite::Contested,
+        "an out-of-band version bump must be visible to the condition"
     );
 }
 
@@ -2932,7 +2917,7 @@ async fn stale_snapshot_write_cannot_clobber_manual_override() {
     g.appid_source = Some(AppidSource::Title);
     store.put_game(&g).await.unwrap();
 
-    let snapshot = store.get_game(&g.id).await.unwrap().unwrap();
+    let (snapshot, seen) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
 
     // Ben's override lands inside the read→write window.
     assert_eq!(
@@ -2946,10 +2931,7 @@ async fn stale_snapshot_write_cannot_clobber_manual_override() {
     // The stale stamping write from the pre-override snapshot.
     let mut updated = snapshot.clone();
     updated.owned_by_ben = true;
-    let res = store
-        .put_game_if_unchanged(&snapshot, &updated)
-        .await
-        .unwrap();
+    let res = store.put_game_if_unchanged(seen, &updated).await.unwrap();
     assert_eq!(res, GuardedWrite::Contested, "stale write must be refused");
 
     let after = store.get_game(&g.id).await.unwrap().unwrap();
@@ -2981,7 +2963,7 @@ async fn stale_snapshot_write_cannot_clobber_admin_hide() {
     let g = game(62, true);
     store.put_game(&g).await.unwrap();
 
-    let snapshot = store.get_game(&g.id).await.unwrap().unwrap();
+    let (snapshot, seen) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
 
     assert_eq!(
         store.set_game_hidden(&g.id, true).await.unwrap(),
@@ -2991,10 +2973,7 @@ async fn stale_snapshot_write_cannot_clobber_admin_hide() {
     let mut updated = snapshot.clone();
     updated.steam_app_id = Some(300);
     updated.appid_source = Some(AppidSource::Title);
-    let res = store
-        .put_game_if_unchanged(&snapshot, &updated)
-        .await
-        .unwrap();
+    let res = store.put_game_if_unchanged(seen, &updated).await.unwrap();
     assert_eq!(res, GuardedWrite::Contested);
 
     let after = store.get_game(&g.id).await.unwrap().unwrap();
@@ -3013,14 +2992,11 @@ async fn unchanged_snapshot_write_lands_and_touches_only_its_field() {
     g.appid_source = Some(AppidSource::Humble);
     store.put_game(&g).await.unwrap();
 
-    let snapshot = store.get_game(&g.id).await.unwrap().unwrap();
+    let (snapshot, seen) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
     let mut updated = snapshot.clone();
     updated.owned_by_ben = true;
     assert_eq!(
-        store
-            .put_game_if_unchanged(&snapshot, &updated)
-            .await
-            .unwrap(),
+        store.put_game_if_unchanged(seen, &updated).await.unwrap(),
         GuardedWrite::Written
     );
 
@@ -3057,7 +3033,7 @@ async fn sync_upsert_stale_read_cannot_revert_manual_override() {
     fresh.appid_source = None;
 
     // upsert's internal read, staged:
-    let stale_read = store.get_game(&g.id).await.unwrap().unwrap();
+    let (stale_read, stale_seen) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
     // Ben's Manual override lands inside the read→put window:
     assert_eq!(
         store
@@ -3079,7 +3055,7 @@ async fn sync_upsert_stale_read_cannot_revert_manual_override() {
     // upsert's write arm: the full-snapshot lock refuses (appid_source Title → Manual).
     assert_eq!(
         store
-            .put_game_if_unchanged(&stale_read, &merged)
+            .put_game_if_unchanged(stale_seen, &merged)
             .await
             .unwrap(),
         GuardedWrite::Contested,
@@ -3133,4 +3109,218 @@ async fn create_table_for_tests_resets_a_reused_table() {
     // on stale rows now lands.
     store.put_game(&g).await.unwrap();
     assert!(store.get_game(&g.id).await.unwrap().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// #134 version-counter red-proofs: the residual class the value-equality lock
+// cannot see — mid-window writes that change only UNLOCKED values. R1/R2 are
+// the two named residuals from OMBB's #129 review; each asserts the outcome
+// the counter must produce (`Contested`) and FAILS on the value lock
+// (`Written` — the silent revert). The red receipts live in PR #134's body.
+// ---------------------------------------------------------------------------
+
+/// R1: Manual→Manual appid re-edit. `appid_source` stays `Manual` through the
+/// re-edit, so the coordination snapshot matches and a stale in-window write
+/// silently reverts ben's new appid — and the mapper skips Manual games, so it
+/// never self-heals.
+#[tokio::test]
+async fn version_lock_r1_manual_to_manual_appid_reedit_survives_stale_write() {
+    let Some(store) = store_or_skip("vlock-r1").await else {
+        return;
+    };
+    let mut g = game(1, true);
+    g.steam_app_id = Some(100);
+    g.appid_source = Some(AppidSource::Manual);
+    store.put_game(&g).await.unwrap();
+
+    // writer X (a sync-walk body refresh, say) snapshots
+    let (snapshot, seen) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
+
+    // ben re-edits the appid; source is Manual before AND after
+    assert_eq!(
+        store
+            .set_game_steam_appid_admin(&g.id, Some(200))
+            .await
+            .unwrap(),
+        AppidWrite::Written
+    );
+
+    // X lands its stale write: only unlocked values differ from the snapshot
+    let mut stale = snapshot.clone();
+    stale.title = "stale body refresh".into();
+    let res = store.put_game_if_unchanged(seen, &stale).await.unwrap();
+    assert_eq!(
+        res,
+        GuardedWrite::Contested,
+        "stale write with a pre-re-edit snapshot must contest, not silently revert the appid"
+    );
+
+    // and ben's re-edit survives
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(after.steam_app_id, Some(200));
+}
+
+/// R2: Admin→Admin unhide. `hidden_source` is stamped `Admin` on hide AND
+/// unhide, so the coordination snapshot matches across ben's unhide and a
+/// stale in-window write re-hides the game — and nothing ever unhides it
+/// automatically.
+#[tokio::test]
+async fn version_lock_r2_admin_unhide_survives_stale_write() {
+    let Some(store) = store_or_skip("vlock-r2").await else {
+        return;
+    };
+    let mut g = game(2, true);
+    g.hidden = true;
+    g.hidden_source = Some(HiddenSource::Admin);
+    store.put_game(&g).await.unwrap();
+
+    let (snapshot, seen) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
+
+    // ben unhides; hidden_source stays Admin (every admin toggle stamps Admin)
+    assert_eq!(
+        store.set_game_hidden(&g.id, false).await.unwrap(),
+        HiddenWrite::Written
+    );
+
+    // stale in-window write built from the still-hidden snapshot
+    let mut stale = snapshot.clone();
+    stale.title = "stale body refresh".into();
+    let res = store.put_game_if_unchanged(seen, &stale).await.unwrap();
+    assert_eq!(
+        res,
+        GuardedWrite::Contested,
+        "stale write with a pre-unhide snapshot must contest, not silently re-hide the game"
+    );
+
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(!after.hidden, "ben's unhide must survive the stale write");
+}
+
+/// R3: legacy self-heal. An item written before the counter existed (raw-seeded, no
+/// `version` attr) is guarded by the `attribute_not_exists(version)` arm: the first
+/// guarded write adopts it (stamps 1), and a concurrent in-window stamp flips the arm
+/// to a CCF — the legacy migration story is the condition itself, no backfill.
+#[tokio::test]
+async fn version_lock_r3_legacy_item_self_heals_and_inwindow_stamp_contests() {
+    let Some(store) = store_or_skip("vlock-r3").await else {
+        return;
+    };
+    // raw-seed a legacy item: game_item minus the version attr (the pre-#134 shape)
+    let g = game(3, true);
+    let raw = raw_client("vlock-r3").await;
+    let mut item = dynamo::schema::game_item(&g, 1);
+    item.remove("version");
+    raw.put_item()
+        .table_name("t-vlock-r3")
+        .set_item(Some(item))
+        .send()
+        .await
+        .unwrap();
+
+    // writer A snapshots the legacy item (token = None inside)
+    let (snap_a, seen_a) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
+    // writer B lands first — adopts the item, stamps version 1
+    let mut b = snap_a.clone();
+    b.owned_by_ben = true;
+    assert_eq!(
+        store.put_game_if_unchanged(seen_a, &b).await.unwrap(),
+        GuardedWrite::Written
+    );
+    // A's stale write: its None token hits attribute_not_exists(version) → now false
+    let mut a = snap_a.clone();
+    a.title = "stale".into();
+    assert_eq!(
+        store.put_game_if_unchanged(seen_a, &a).await.unwrap(),
+        GuardedWrite::Contested,
+        "the in-window stamp must contest the second legacy-token write"
+    );
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(after.owned_by_ben, "B's adopting write survives");
+    assert_ne!(after.title, "stale");
+}
+
+/// R4: claim-path regression pin. The claim tx bumps `version` (ADD version :one), so a
+/// snapshot taken BEFORE the claim cannot pass the version gate afterward. Without the tx
+/// bump the counter would be WEAKER than the value lock it replaced (the stale write below
+/// would pass version-equality and clobber a pending game). Green on the counter ONLY
+/// because the tx bumps; a counter-without-tx-bump implementation fails here.
+#[tokio::test]
+async fn version_lock_r4_claim_tx_bump_breaks_preclaim_snapshots() {
+    let Some(store) = store_or_skip("vlock-r4").await else {
+        return;
+    };
+    let g = game(4, true);
+    store.put_game(&g).await.unwrap();
+    store.create_link(&link("vtok4")).await.unwrap();
+
+    // writer X snapshots while the game is still available
+    let (snapshot, seen) = store.get_game_versioned(&g.id).await.unwrap().unwrap();
+
+    // a friend's claim lands: tx flips status AND bumps version
+    store
+        .claim_game("vtok4", &g.id, "vc4", datetime!(2026-07-03 03:00 UTC))
+        .await
+        .unwrap();
+
+    // X's stale write must contest on the version gate
+    let mut stale = snapshot.clone();
+    stale.title = "stale body refresh".into();
+    assert_eq!(
+        store.put_game_if_unchanged(seen, &stale).await.unwrap(),
+        GuardedWrite::Contested,
+        "a pre-claim snapshot must never clobber a pending game"
+    );
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(after.status, GameStatus::Pending, "the claim survives");
+}
+
+/// #134 post-review pin: `version` increases at EVERY claim-lifecycle write — put=1,
+/// claim tx=2, fulfill flip=3 — and the flip's bump is a server-side `ADD`, so the
+/// counter can never be rewritten to a stale read+1 (the ABA the /review pass caught:
+/// a concurrent sync bump inside flip's window must yield a FURTHER increment, never a
+/// same-number overwrite; `ADD` makes that true by construction).
+#[tokio::test]
+async fn version_lock_claim_lifecycle_is_strictly_monotonic() {
+    let test = "vlock-lifecycle";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let raw = raw_client(test).await;
+    let ver = |raw: aws_sdk_dynamodb::Client, id: String| async move {
+        raw.get_item()
+            .table_name("t-vlock-lifecycle")
+            .key("pk", AttributeValue::S(format!("GAME#{id}")))
+            .key("sk", AttributeValue::S("META".into()))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap()
+            .get("version")
+            .and_then(|v| v.as_n().ok().cloned())
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+    };
+
+    let g = game(5, true);
+    store.put_game(&g).await.unwrap();
+    assert_eq!(ver(raw.clone(), g.id.clone()).await, 1, "seed stamps 1");
+
+    store.create_link(&link("vtok5")).await.unwrap();
+    store
+        .claim_game("vtok5", &g.id, "vc5", datetime!(2026-07-03 04:00 UTC))
+        .await
+        .unwrap();
+    assert_eq!(ver(raw.clone(), g.id.clone()).await, 2, "claim tx bumps");
+
+    store
+        .fulfill_claim("vtok5", "vc5", &g.id, "https://gift.example/v")
+        .await
+        .unwrap();
+    assert_eq!(
+        ver(raw.clone(), g.id.clone()).await,
+        3,
+        "fulfill's flip bumps atomically"
+    );
 }

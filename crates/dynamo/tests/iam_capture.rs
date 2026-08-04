@@ -790,11 +790,20 @@ async fn drive_fulfillment(rig: &Rig) -> MethodOps {
     })
     .await;
     // first-insert branch (#142 item 3): gk11 is never seeded, so merge_sync takes the
-    // None arm → bare PutItem guarded only by attribute_not_exists(pk). Assert THIS leg
-    // captured that put: the guarded put_game_if_unchanged shape from the previous leg
-    // always names appid_source in its condition (attribute_not_exists(#asrc) when the
-    // snapshot has none), while the first-insert condition names only pk — so absence of
-    // appid_source uniquely identifies the first-insert shape.
+    // None arm → bare PutItem guarded only by attribute_not_exists(pk) stamping version 1.
+    // Assert THIS leg captured that put. Discriminator (#145, post-#134): the existing-arm
+    // guarded put gates on `version`, while the first-insert condition names only pk — so
+    // a PutItem whose attributes lack `appid_source` AND whose condition never binds
+    // :seen identifies the first-insert shape. (Pre-#134 the guarded put named
+    // appid_source in BOTH its condition arms — `#asrc = :asrc` and
+    // attribute_not_exists(#asrc) — an invariant stronger than first written up.)
+    // #145 fixture pin: the absence-of-appid_source discriminator is sound ONLY while the
+    // fixture carries no appid pair (game_item writes top-level appid_source when Some) —
+    // fail HERE with a pinpoint message rather than confusingly at the shape assert.
+    assert!(
+        game(11, true).appid_source.is_none(),
+        "#145: game(11) grew an appid_source — pick a new discriminator for the first-insert leg"
+    );
     let first_insert = capture(cap, &mut m, "upsert_game_from_sync", async {
         s.upsert_game_from_sync(game(11, true)).await.unwrap();
     })
