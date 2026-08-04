@@ -595,6 +595,31 @@ describe('Links', () => {
       issued: false,
     };
 
+    const claimCompensated: AdminClaimView = {
+      game_id: 'game-tunic',
+      state: 'compensated',
+      issued: false,
+    };
+
+    it('compensated chip wears slate, not give-violet (#136 regression guard)', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([link1]);
+      vi.mocked(adminLinkClaims).mockResolvedValue([claimCompensated, claimFailed]);
+
+      renderLinks();
+      await waitFor(() => screen.getByText('Alice'));
+
+      await user.click(screen.getByRole('button', { name: 'expand audit for Alice' }));
+
+      await waitFor(() => {
+        const chip = screen.getByText('compensated');
+        // the exact drift #136 fixed: this call site hardcoded bg-give for compensated.
+        // pin the shared-module output at the component level so it can't come back.
+        expect(chip.className).toContain('bg-slate-600');
+        expect(chip.className).not.toContain('bg-give');
+      });
+    });
+
     it('expand audit button loads claims and renders game_id + state chips', async () => {
       const user = userEvent.setup();
       vi.mocked(adminLinks).mockResolvedValue([link1]);
