@@ -77,16 +77,12 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     };
     let steam = SteamClient::configure(steam_key);
 
-    // Webhook URL fetched ONCE at startup — non-secret, cache it. On missing/failed param, warn
-    // and continue without webhooks; never crash.
+    // Webhook URL fetched ONCE at startup — cache it. The param is a SecureString (a webhook
+    // URL is itself the post-access credential, #81) seeded with the UNSET placeholder until an
+    // operator PutParameters the real value: get_secret decrypts, reads UNSET/empty/error as
+    // webhooks-off, and never logs the value. Never crash over it.
     let webhook_url: Option<String> = if let Some(ref param) = webhook_param {
-        match ssm_client.get_parameter().name(param).send().await {
-            Ok(out) => out.parameter().and_then(|p| p.value()).map(str::to_string),
-            Err(e) => {
-                tracing::warn!(error = %e, param, "discord webhook param fetch failed; webhooks disabled");
-                None
-            }
-        }
+        get_secret(&ssm_client, param).await
     } else {
         None
     };
