@@ -21,6 +21,11 @@ export function stateBadgeClass(state: string): string {
     case 'failed':
       return 'bg-rose-950 text-rose-200';
     default:
+      // DELIBERATE RUNTIME NET — do not swap for an exhaustiveness assert. The state
+      // unions in api.ts are bare `as` assertions over untrusted JSON (api.ts:442), so a
+      // fifth backend state walks straight into this arm at runtime. Neutral-control is
+      // the honest render: the old Catalog fallback was amber, which made an unknown
+      // state impersonate "pending" in the exact view an admin scans for differences.
       return 'bg-control text-ink';
   }
 }
