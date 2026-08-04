@@ -5,6 +5,10 @@ terraform/backend.hcl
 terraform/artifacts/
 terraform/*.tfplan
 terraform/*.tfvars
+# EXCEPT production.tfvars — non-secret prod CONFIG lives in source where it's diffable and
+# reviewable (#88, lilith+ombb). Secrets (admin_password_hash, discord_webhook_url) never
+# land here; they stay TF_VAR. A gitignored *.tfvars still blocks any OTHER accidental tfvars.
+!terraform/production.tfvars
 terraform-iam/.terraform/
 terraform-iam/backend.hcl
 terraform-iam/*.tfplan
