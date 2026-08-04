@@ -1,0 +1,17 @@
+# cargo-audit config — dated, commented ignores ONLY (#81). An entry here is a
+# documented block, not a dismissal: each names why it's unreachable/unfixable
+# today and what event retires it. CI's audit job fails on anything NOT listed.
+[advisories]
+ignore = [
+    # rustls 0.21.12 / rustls-webpki 0.101.7 — the aws-sdk's LEGACY TLS path, still
+    # shipped by aws-smithy-http-client 1.2.0 even at aws-config 1.10.1 (verified
+    # 2026-08-03; the 0.23/0.103 modern path is also present and is what runs).
+    # No CRLs are used and AWS endpoints aren't behind name-constrained CAs.
+    # Retire these three when an SDK bump drops hyper-rustls 0.24 from the lock.
+    "RUSTSEC-2026-0104", # reachable panic in CRL parsing
+    "RUSTSEC-2026-0098", # URI name-constraint incorrectly accepted
+    "RUSTSEC-2026-0099", # wildcard name-constraint accepted
+    # lru 0.13.0 IterMut unsoundness (informational). Pinned by wreq 5.3 → lru 0.13;
+    # not expressible as a direct bump. Retire on a wreq release that moves lru.
+    "RUSTSEC-2026-0002",
+]
