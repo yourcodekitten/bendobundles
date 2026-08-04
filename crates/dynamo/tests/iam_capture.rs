@@ -228,6 +228,30 @@ fn expr_attr_names(expr: &str, aliases: &BTreeMap<String, String>, out: &mut BTr
     flush(&mut tok, false, aliases, out);
 }
 
+/// The paren-gating contract, pinned (#142 item 4): a function-NAMED token is dropped
+/// only when it is actually a call; anywhere else it is an attribute and must survive
+/// into the allowlist. No live expression exercises the bare-name case (that's exactly
+/// why the gap was latent), so this test is the only thing keeping it true.
+#[test]
+fn expr_extractor_keeps_bare_function_names_and_drops_calls() {
+    let aliases = BTreeMap::from([("#st".to_string(), "status".to_string())]);
+    let mut out = BTreeSet::new();
+    expr_attr_names(
+        "attribute_not_exists(gsi1pk) AND size = :v AND begins_with (sk, :c) AND #st = :s AND contains(tags, :t)",
+        &aliases,
+        &mut out,
+    );
+    let got: Vec<&str> = out.iter().map(String::as_str).collect();
+    // kept: gsi1pk (call ARG), size (bare attr despite being a function name), sk (arg),
+    //       status (alias-resolved), tags (arg). dropped: the three calls + operators.
+    assert_eq!(got, ["gsi1pk", "size", "sk", "status", "tags"]);
+
+    // operator keywords stay dropped even bare — they're reserved words.
+    let mut out2 = BTreeSet::new();
+    expr_attr_names("a BETWEEN :lo AND :hi", &BTreeMap::new(), &mut out2);
+    assert_eq!(out2.iter().collect::<Vec<_>>(), [&"a".to_string()]);
+}
+
 /// Key prefix through the first `#` — `"GAME#x"` → `"GAME#"`, `"SYNC#STATE"` → `"SYNC#"`;
 /// a value with no `#` (GSI partition constants) is used whole.
 fn key_prefix(v: &str) -> String {
