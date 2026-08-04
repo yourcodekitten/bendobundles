@@ -509,6 +509,16 @@ impl Store {
     /// (pending) game — it clobbers status/claim_id and re-adds/removes the listable GSI attrs
     /// wholesale. Plan 2's catalog sync MUST guard (skip or condition on status) before calling
     /// this on games that may be mid-claim.
+    ///
+    /// **#134 — it also RESETS the version counter.** It stamps a constant `version = 1`, so
+    /// on an existing game at version N it rewinds the counter — and a rewound counter is how
+    /// the ABA class this lock exists to end comes back (a stale token from the old era would
+    /// pass the gate again). This is the one writer that satisfies `game_item`'s compile-time
+    /// stamp requirement while violating the invariant's SPIRIT: the compiler enforces the
+    /// presence of a version, never its monotonicity. Test seeding of fresh scenarios is the
+    /// only legitimate use (all current callers); it must never gain a production caller —
+    /// `upsert_game_from_sync` is the guarded upsert.
+    #[doc(hidden)]
     pub async fn put_game(&self, g: &Game) -> Result<(), StoreError> {
         self.client
             .put_item()
