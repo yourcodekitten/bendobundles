@@ -443,22 +443,6 @@
         "action": "dynamodb:PutItem",
         "via": "TransactWriteItems",
         "leading_keys": [
-          "GAME#"
-        ],
-        "attributes": [
-          "body",
-          "gsi1pk",
-          "gsi1sk",
-          "pk",
-          "sk",
-          "status",
-          "version"
-        ]
-      },
-      {
-        "action": "dynamodb:PutItem",
-        "via": "TransactWriteItems",
-        "leading_keys": [
           "LINK#"
         ],
         "attributes": [
@@ -466,6 +450,23 @@
           "gsi2pk",
           "pk",
           "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status",
+          "version"
         ]
       },
       {
@@ -506,22 +507,6 @@
         "action": "dynamodb:PutItem",
         "via": "TransactWriteItems",
         "leading_keys": [
-          "GAME#"
-        ],
-        "attributes": [
-          "body",
-          "gsi1pk",
-          "gsi1sk",
-          "pk",
-          "sk",
-          "status",
-          "version"
-        ]
-      },
-      {
-        "action": "dynamodb:PutItem",
-        "via": "TransactWriteItems",
-        "leading_keys": [
           "LINK#"
         ],
         "attributes": [
@@ -529,6 +514,23 @@
           "gsi2pk",
           "pk",
           "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status",
+          "version"
         ]
       }
     ],
@@ -569,20 +571,6 @@
         "action": "dynamodb:PutItem",
         "via": "TransactWriteItems",
         "leading_keys": [
-          "GAME#"
-        ],
-        "attributes": [
-          "body",
-          "pk",
-          "sk",
-          "status",
-          "version"
-        ]
-      },
-      {
-        "action": "dynamodb:PutItem",
-        "via": "TransactWriteItems",
-        "leading_keys": [
           "LINK#"
         ],
         "attributes": [
@@ -590,6 +578,23 @@
           "gsi2pk",
           "pk",
           "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status",
+          "version"
         ]
       },
       {
@@ -630,20 +635,6 @@
         "action": "dynamodb:PutItem",
         "via": "TransactWriteItems",
         "leading_keys": [
-          "GAME#"
-        ],
-        "attributes": [
-          "body",
-          "pk",
-          "sk",
-          "status",
-          "version"
-        ]
-      },
-      {
-        "action": "dynamodb:PutItem",
-        "via": "TransactWriteItems",
-        "leading_keys": [
           "LINK#"
         ],
         "attributes": [
@@ -651,6 +642,23 @@
           "gsi2pk",
           "pk",
           "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status",
+          "version"
         ]
       }
     ],
@@ -678,6 +686,18 @@
       {
         "action": "dynamodb:PutItem",
         "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
           "GAME#"
         ],
         "attributes": [
@@ -687,18 +707,6 @@
           "sk",
           "status",
           "version"
-        ]
-      },
-      {
-        "action": "dynamodb:PutItem",
-        "leading_keys": [
-          "LINK#"
-        ],
-        "attributes": [
-          "body",
-          "gsi2pk",
-          "pk",
-          "sk"
         ]
       }
     ],
@@ -726,6 +734,18 @@
       {
         "action": "dynamodb:PutItem",
         "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
           "GAME#"
         ],
         "attributes": [
@@ -735,18 +755,6 @@
           "sk",
           "status",
           "version"
-        ]
-      },
-      {
-        "action": "dynamodb:PutItem",
-        "leading_keys": [
-          "LINK#"
-        ],
-        "attributes": [
-          "body",
-          "gsi2pk",
-          "pk",
-          "sk"
         ]
       }
     ],

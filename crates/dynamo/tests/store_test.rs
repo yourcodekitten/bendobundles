@@ -3290,3 +3290,54 @@ async fn version_lock_r4_claim_tx_bump_breaks_preclaim_snapshots() {
     let after = store.get_game(&g.id).await.unwrap().unwrap();
     assert_eq!(after.status, GameStatus::Pending, "the claim survives");
 }
+
+/// #134 post-review pin: `version` increases at EVERY claim-lifecycle write — put=1,
+/// claim tx=2, fulfill flip=3 — and the flip's bump is a server-side `ADD`, so the
+/// counter can never be rewritten to a stale read+1 (the ABA the /review pass caught:
+/// a concurrent sync bump inside flip's window must yield a FURTHER increment, never a
+/// same-number overwrite; `ADD` makes that true by construction).
+#[tokio::test]
+async fn version_lock_claim_lifecycle_is_strictly_monotonic() {
+    let test = "vlock-lifecycle";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let raw = raw_client(test).await;
+    let ver = |raw: aws_sdk_dynamodb::Client, id: String| async move {
+        raw.get_item()
+            .table_name("t-vlock-lifecycle")
+            .key("pk", AttributeValue::S(format!("GAME#{id}")))
+            .key("sk", AttributeValue::S("META".into()))
+            .send()
+            .await
+            .unwrap()
+            .item
+            .unwrap()
+            .get("version")
+            .and_then(|v| v.as_n().ok().cloned())
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+    };
+
+    let g = game(5, true);
+    store.put_game(&g).await.unwrap();
+    assert_eq!(ver(raw.clone(), g.id.clone()).await, 1, "seed stamps 1");
+
+    store.create_link(&link("vtok5")).await.unwrap();
+    store
+        .claim_game("vtok5", &g.id, "vc5", datetime!(2026-07-03 04:00 UTC))
+        .await
+        .unwrap();
+    assert_eq!(ver(raw.clone(), g.id.clone()).await, 2, "claim tx bumps");
+
+    store
+        .fulfill_claim("vtok5", "vc5", &g.id, "https://gift.example/v")
+        .await
+        .unwrap();
+    assert_eq!(
+        ver(raw.clone(), g.id.clone()).await,
+        3,
+        "fulfill's flip bumps atomically"
+    );
+}

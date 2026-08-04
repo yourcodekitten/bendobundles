@@ -1282,28 +1282,86 @@ impl Store {
     /// owns. A failed condition (already flipped, or ownership moved after a re-list+re-claim) is
     /// the designed idempotent no-op → `Ok(())`. (compensate's re-list runs inside its own
     /// TransactWriteItems and so does NOT use this helper.)
+    /// The claim-path transact game write (#134 post-review): compensate/fail re-list or
+    /// retire a pending game as an UpdateItem whose `ADD version :one` bumps atomically —
+    /// never a value stamped from the caller's read (the same ABA reasoning as
+    /// `flip_game_from_pending`; sync's pending-branch upsert can bump inside the window).
+    /// Gate stays `#st = :pending` — the pending-marker consumption on the CLAIM item is
+    /// the mutual-exclusion authority; a lost race here cancels the tx and reconcile
+    /// retries against fresh truth. All four callers clear `claim_id`; gsi1 attrs follow
+    /// `is_listable` exactly as `game_item` would have written them.
+    fn game_claim_path_update(&self, game: &Game) -> aws_sdk_dynamodb::types::Update {
+        let expr = if game.is_listable() {
+            "SET body = :b, #st = :new, gsi1pk = :g1p, gsi1sk = :g1s REMOVE claim_id ADD version :one"
+        } else {
+            "SET body = :b, #st = :new REMOVE claim_id, gsi1pk, gsi1sk ADD version :one"
+        };
+        let mut b = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", schema::s(game_pk(&game.id)))
+            .key("sk", schema::s("META"))
+            .update_expression(expr)
+            .condition_expression("#st = :pending")
+            .expression_attribute_names("#st", "status")
+            .expression_attribute_values(
+                ":b",
+                schema::s(serde_json::to_string(game).expect("game serializes")),
+            )
+            .expression_attribute_values(":new", schema::s(game.status.as_wire()))
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()));
+        if game.is_listable() {
+            b = b
+                .expression_attribute_values(":g1p", schema::s("LISTABLE"))
+                .expression_attribute_values(
+                    ":g1s",
+                    schema::s(format!("{}#{}", game.title.to_lowercase(), game.id)),
+                );
+        }
+        b.build().expect("game_claim_path_update")
+    }
+
     async fn flip_game_from_pending(
         &self,
         game_id: &str,
         claim_id: Option<&str>,
         new_status: GameStatus,
     ) -> Result<(), StoreError> {
-        let (game, seen) = self
-            .get_game_versioned(game_id)
+        let mut game = self
+            .get_game(game_id)
             .await?
             .ok_or(StoreError::Corrupt("flip: game missing"))?;
-        let mut game = game;
         game.status = new_status;
+        // #134 (post-review): an UpdateItem with `ADD version :one` — the bump is a
+        // server-side atomic increment, never a value stamped from this read. A stamped
+        // read+1 has an ABA hole: a concurrent bump inside our read→write window (sync's
+        // pending-branch upsert is the one writer that doesn't screen Pending) would be
+        // overwritten with the SAME number under different content, and a token from the
+        // bumped era would then falsely pass its gate. The gate below stays
+        // ownership/pending-only — a version gate here would turn a benign concurrent
+        // write into a swallowed CCF (flip treats CCF as idempotent-ok) and strand the
+        // game in pending. Neither flipped status is listable, and a pending game carries
+        // no gsi1 attrs (the claim tx removed them), so no GSI handling is needed.
         let mut req = self
             .client
-            .put_item()
+            .update_item()
             .table_name(&self.table)
-            // #134: stamps read-version+1 so other writers' snapshots break; the gate
-            // stays ownership/pending-only — a version gate here would turn a benign
-            // concurrent unlocked-field write into a swallowed CCF (flip treats CCF as
-            // idempotent-ok) and strand the game in pending.
-            .set_item(Some(game_item(&game, seen.next())))
+            .key("pk", schema::s(game_pk(game_id)))
+            .key("sk", schema::s("META"))
+            .update_expression("SET body = :b, #st = :new ADD version :one")
             .expression_attribute_names("#st", "status")
+            .expression_attribute_values(
+                ":b",
+                schema::s(serde_json::to_string(&game).expect("game serializes")),
+            )
+            .expression_attribute_values(":new", schema::s(new_status.as_wire()))
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
             .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()));
         let cond = if let Some(cid) = claim_id {
             req = req.expression_attribute_values(":cid", schema::s(cid));
@@ -1315,7 +1373,7 @@ impl Store {
         match res {
             Ok(_) => Ok(()),
             Err(sdk_err) => {
-                if is_ccf_put(&sdk_err) {
+                if is_ccf_update(&sdk_err) {
                     Ok(()) // already flipped / ownership moved: idempotent no-op
                 } else {
                     Err(StoreError::Aws(format!("{sdk_err:?}")))
@@ -1403,13 +1461,12 @@ impl Store {
             .ok_or(StoreError::Corrupt("compensate: claim missing"))?;
         claim.state = ClaimState::Compensated;
 
-        let (game, seen) = self
-            .get_game_versioned(game_id)
+        let mut game = self
+            .get_game(game_id)
             .await?
             .ok_or(StoreError::Corrupt("compensate: game missing"))?;
-        let mut game = game;
         game.status = GameStatus::Available;
-        game.claim_id = None; // game_item omits top-level claim_id → the re-listed game is unowned
+        game.claim_id = None; // the update REMOVEs top-level claim_id → the re-listed game is unowned
 
         // item 0: CLAIM put — consume the pending marker (dedup / mutual-exclusion gate).
         let claim_put = aws_sdk_dynamodb::types::Put::builder()
@@ -1418,16 +1475,9 @@ impl Store {
             .condition_expression("attribute_exists(gsi2pk)")
             .build()
             .expect("claim_put");
-        // item 1: GAME put — re-list (game_item re-adds the listable GSI attrs); never resurrect a
-        // game fulfill already flipped to gifted.
-        let game_put = aws_sdk_dynamodb::types::Put::builder()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&game, seen.next())))
-            .condition_expression("#st = :pending")
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()))
-            .build()
-            .expect("game_put");
+        // item 1: GAME update — re-list (re-adds the listable GSI attrs, clears claim_id,
+        // bumps version atomically); never resurrect a game fulfill already flipped to gifted.
+        let game_update = self.game_claim_path_update(&game);
         // item 2: LINK decrement — atomic ADD, guarded ≥ 1 so it can't go negative.
         let link_update = aws_sdk_dynamodb::types::Update::builder()
             .table_name(&self.table)
@@ -1456,7 +1506,7 @@ impl Store {
             )
             .transact_items(
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
-                    .put(game_put)
+                    .update(game_update)
                     .build(),
             )
             .transact_items(
@@ -1522,11 +1572,10 @@ impl Store {
             .ok_or(StoreError::Corrupt("compensate_self: claim missing"))?;
         claim.state = ClaimState::Compensated;
 
-        let (game, seen) = self
-            .get_game_versioned(game_id)
+        let mut game = self
+            .get_game(game_id)
             .await?
             .ok_or(StoreError::Corrupt("compensate_self: game missing"))?;
-        let mut game = game;
         game.status = GameStatus::Available;
         game.claim_id = None;
 
@@ -1536,14 +1585,7 @@ impl Store {
             .condition_expression("attribute_exists(gsi2pk)")
             .build()
             .expect("claim_put");
-        let game_put = aws_sdk_dynamodb::types::Put::builder()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&game, seen.next())))
-            .condition_expression("#st = :pending")
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()))
-            .build()
-            .expect("game_put");
+        let game_update = self.game_claim_path_update(&game);
 
         let result = self
             .client
@@ -1555,7 +1597,7 @@ impl Store {
             )
             .transact_items(
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
-                    .put(game_put)
+                    .update(game_update)
                     .build(),
             )
             .send()
@@ -1622,11 +1664,10 @@ impl Store {
         claim.state = ClaimState::Failed;
         claim.failure_reason = Some(reason.to_string());
 
-        let (game, seen) = self
-            .get_game_versioned(game_id)
+        let mut game = self
+            .get_game(game_id)
             .await?
             .ok_or(StoreError::Corrupt("fail_dead_key: game missing"))?;
-        let mut game = game;
         game.status = GameStatus::Expired;
         game.claim_id = None; // game_item omits top-level claim_id → the retired game is unowned
 
@@ -1639,14 +1680,7 @@ impl Store {
             .expect("claim_put");
         // item 1: GAME put — retire (game_item omits the listable GSI attrs for Expired); never
         // resurrect a game fulfill already flipped to gifted.
-        let game_put = aws_sdk_dynamodb::types::Put::builder()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&game, seen.next())))
-            .condition_expression("#st = :pending")
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()))
-            .build()
-            .expect("game_put");
+        let game_update = self.game_claim_path_update(&game);
         // item 2: LINK decrement — atomic ADD, guarded ≥ 1 so it can't go negative.
         let link_update = aws_sdk_dynamodb::types::Update::builder()
             .table_name(&self.table)
@@ -1675,7 +1709,7 @@ impl Store {
             )
             .transact_items(
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
-                    .put(game_put)
+                    .update(game_update)
                     .build(),
             )
             .transact_items(
@@ -1741,11 +1775,10 @@ impl Store {
         claim.state = ClaimState::Failed;
         claim.failure_reason = Some(reason.to_string());
 
-        let (game, seen) = self
-            .get_game_versioned(game_id)
+        let mut game = self
+            .get_game(game_id)
             .await?
             .ok_or(StoreError::Corrupt("fail_self_dead_key: game missing"))?;
-        let mut game = game;
         game.status = GameStatus::Expired;
         game.claim_id = None;
 
@@ -1755,14 +1788,7 @@ impl Store {
             .condition_expression("attribute_exists(gsi2pk)")
             .build()
             .expect("claim_put");
-        let game_put = aws_sdk_dynamodb::types::Put::builder()
-            .table_name(&self.table)
-            .set_item(Some(game_item(&game, seen.next())))
-            .condition_expression("#st = :pending")
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":pending", schema::s(GameStatus::Pending.as_wire()))
-            .build()
-            .expect("game_put");
+        let game_update = self.game_claim_path_update(&game);
 
         let result = self
             .client
@@ -1774,7 +1800,7 @@ impl Store {
             )
             .transact_items(
                 aws_sdk_dynamodb::types::TransactWriteItem::builder()
-                    .put(game_put)
+                    .update(game_update)
                     .build(),
             )
             .send()
