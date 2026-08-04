@@ -39,10 +39,14 @@ pub(crate) fn key_pair(
     (s(pk), s(sk))
 }
 
-pub fn game_item(g: &Game) -> HashMap<String, AttributeValue> {
+/// `version` is the monotonic counter value this write CARRIES (#134): callers pass the
+/// next value (seen+1, or 1 for first-insert/legacy adoption). A required param — not an
+/// Option — so no game writer can forget the stamp; a missed bump is a compile error.
+pub fn game_item(g: &Game, version: i64) -> HashMap<String, AttributeValue> {
     let mut item = HashMap::from([
         ("pk".into(), s(game_pk(&g.id))),
         ("sk".into(), s("META")),
+        ("version".into(), AttributeValue::N(version.to_string())),
         (
             "body".into(),
             s(serde_json::to_string(g).expect("game serializes")),
