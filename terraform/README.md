@@ -315,6 +315,11 @@ AWS_PROFILE=kitten-deploy aws ssm put-parameter \
 Until that PutParameter lands, the param holds the `UNSET` placeholder and fulfillment runs
 webhooks-off (same container pattern as `steam-web-api-key` / `humble-cookie`).
 
+> Migration note: the URL previously passed through terraform, so it exists in old state
+> versions (the S3 backend keeps them). When cutting over, prefer **rotating the webhook in
+> Discord** (delete + recreate on the channel) and PutParameter the *new* URL — rotation is
+> free and retires every copy the old flow left behind.
+
 ### Optional variables (all have defaults)
 
 | Variable | Default | Notes |
