@@ -1,5 +1,5 @@
 use aws_sdk_dynamodb::types::AttributeValue;
-use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, Link, SELF_LINK_TOKEN, game_id};
+use domain::{AppidSource, Claim, ClaimState, Game, GameStatus, HiddenSource, Link, SELF_LINK_TOKEN, game_id};
 use dynamo::{
     AppidWrite, AutoHideWrite, ClaimTxError, GuardedWrite, HiddenWrite, OwnedWrite,
     SYNC_RUN_STALE_SECS, SteamAppCache, SteamAppPutError, SteamAppPutGuard, Store, SyncBegin,
@@ -3133,4 +3133,89 @@ async fn create_table_for_tests_resets_a_reused_table() {
     // on stale rows now lands.
     store.put_game(&g).await.unwrap();
     assert!(store.get_game(&g.id).await.unwrap().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// #134 version-counter red-proofs: the residual class the value-equality lock
+// cannot see — mid-window writes that change only UNLOCKED values. R1/R2 are
+// the two named residuals from OMBB's #129 review; each asserts the outcome
+// the counter must produce (`Contested`) and FAILS on the value lock
+// (`Written` — the silent revert). The red receipts live in PR #134's body.
+// ---------------------------------------------------------------------------
+
+/// R1: Manual→Manual appid re-edit. `appid_source` stays `Manual` through the
+/// re-edit, so the coordination snapshot matches and a stale in-window write
+/// silently reverts ben's new appid — and the mapper skips Manual games, so it
+/// never self-heals.
+#[tokio::test]
+async fn version_lock_r1_manual_to_manual_appid_reedit_survives_stale_write() {
+    let Some(store) = store_or_skip("vlock-r1").await else {
+        return;
+    };
+    let mut g = game(1, true);
+    g.steam_app_id = Some(100);
+    g.appid_source = Some(AppidSource::Manual);
+    store.put_game(&g).await.unwrap();
+
+    // writer X (a sync-walk body refresh, say) snapshots
+    let snapshot = store.get_game(&g.id).await.unwrap().unwrap();
+
+    // ben re-edits the appid; source is Manual before AND after
+    assert_eq!(
+        store
+            .set_game_steam_appid_admin(&g.id, Some(200))
+            .await
+            .unwrap(),
+        AppidWrite::Written
+    );
+
+    // X lands its stale write: only unlocked values differ from the snapshot
+    let mut stale = snapshot.clone();
+    stale.title = "stale body refresh".into();
+    let res = store.put_game_if_unchanged(&snapshot, &stale).await.unwrap();
+    assert_eq!(
+        res,
+        GuardedWrite::Contested,
+        "stale write with a pre-re-edit snapshot must contest, not silently revert the appid"
+    );
+
+    // and ben's re-edit survives
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert_eq!(after.steam_app_id, Some(200));
+}
+
+/// R2: Admin→Admin unhide. `hidden_source` is stamped `Admin` on hide AND
+/// unhide, so the coordination snapshot matches across ben's unhide and a
+/// stale in-window write re-hides the game — and nothing ever unhides it
+/// automatically.
+#[tokio::test]
+async fn version_lock_r2_admin_unhide_survives_stale_write() {
+    let Some(store) = store_or_skip("vlock-r2").await else {
+        return;
+    };
+    let mut g = game(2, true);
+    g.hidden = true;
+    g.hidden_source = Some(HiddenSource::Admin);
+    store.put_game(&g).await.unwrap();
+
+    let snapshot = store.get_game(&g.id).await.unwrap().unwrap();
+
+    // ben unhides; hidden_source stays Admin (every admin toggle stamps Admin)
+    assert_eq!(
+        store.set_game_hidden(&g.id, false).await.unwrap(),
+        HiddenWrite::Written
+    );
+
+    // stale in-window write built from the still-hidden snapshot
+    let mut stale = snapshot.clone();
+    stale.title = "stale body refresh".into();
+    let res = store.put_game_if_unchanged(&snapshot, &stale).await.unwrap();
+    assert_eq!(
+        res,
+        GuardedWrite::Contested,
+        "stale write with a pre-unhide snapshot must contest, not silently re-hide the game"
+    );
+
+    let after = store.get_game(&g.id).await.unwrap().unwrap();
+    assert!(!after.hidden, "ben's unhide must survive the stale write");
 }
