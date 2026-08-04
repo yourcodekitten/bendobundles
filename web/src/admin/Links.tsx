@@ -12,6 +12,7 @@ import {
   type AdminClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
+import { stateBadgeClass } from '../stateBadge';
 import { clampCodePoints, codePointCount } from '../text';
 import { inviteUrl } from '../inviteUrl';
 
@@ -26,21 +27,6 @@ type AuditData =
   | { phase: 'loading' }
   | { phase: 'error' }
   | { phase: 'loaded'; claims: AdminClaimView[] };
-
-function stateBadgeClass(state: string): string {
-  switch (state) {
-    case 'fulfilled':
-      return 'bg-green-700 text-green-100';
-    case 'pending':
-      return 'bg-amber-700 text-amber-100';
-    case 'compensated':
-      return 'bg-give text-give-ink';
-    case 'failed':
-      return 'bg-rose-950 text-rose-200';
-    default:
-      return 'bg-control text-ink';
-  }
-}
 
 /** Immutably drop one key from a record — the destructuring-rest omit idiom
  * trips this repo's no-unused-vars (no ignoreRestSiblings). */
