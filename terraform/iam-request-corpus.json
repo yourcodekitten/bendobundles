@@ -1,0 +1,1221 @@
+{
+  "admin-api": {
+    "batch_get_steam_apps": [
+      {
+        "action": "dynamodb:BatchGetItem",
+        "leading_keys": [
+          "STEAMAPP#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "claim_game_self": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "gsi2sk",
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status"
+        ]
+      }
+    ],
+    "claims_for_link": [
+      {
+        "action": "dynamodb:Query",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "create_link": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "claims_allowed",
+          "claims_used",
+          "pk",
+          "revoked",
+          "sk"
+        ]
+      }
+    ],
+    "create_session": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "SESSION#"
+        ],
+        "attributes": [
+          "expires_epoch",
+          "pk",
+          "sk",
+          "ttl"
+        ]
+      }
+    ],
+    "delete_session": [
+      {
+        "action": "dynamodb:DeleteItem",
+        "leading_keys": [
+          "SESSION#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "delete_steam_identity": [
+      {
+        "action": "dynamodb:DeleteItem",
+        "leading_keys": [
+          "CONFIG#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_game": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_link": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_session": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "SESSION#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_app": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "STEAMAPP#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_identity": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "CONFIG#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_owned": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "STEAMOWN#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_sync_run": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "SYNC#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_sync_state": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "SYNC#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "list_all_games": [
+      {
+        "action": "dynamodb:Scan",
+        "leading_keys": [],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "list_links": [
+      {
+        "action": "dynamodb:Scan",
+        "leading_keys": [],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "put_steam_identity": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "CONFIG#"
+        ],
+        "attributes": [
+          "body",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "put_steam_owned": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "STEAMOWN#"
+        ],
+        "attributes": [
+          "body",
+          "pk",
+          "sk",
+          "ttl"
+        ]
+      }
+    ],
+    "set_game_hidden": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "appid_source",
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "hidden_source",
+          "pk",
+          "sk",
+          "status"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "appid_source",
+          "body",
+          "claim_id",
+          "hidden_source",
+          "pk",
+          "sk",
+          "status"
+        ]
+      }
+    ],
+    "set_game_steam_appid_admin": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "appid_source",
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "hidden_source",
+          "pk",
+          "sk",
+          "status"
+        ]
+      }
+    ],
+    "set_link_gift_note": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "gift_note",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "update_link_meta": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "claims_allowed",
+          "expires_at",
+          "pk",
+          "revoked",
+          "sk"
+        ]
+      }
+    ]
+  },
+  "fulfillment": {
+    "auto_hide_game": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "appid_source",
+          "body",
+          "claim_id",
+          "hidden_source",
+          "pk",
+          "sk",
+          "status"
+        ]
+      }
+    ],
+    "batch_get_steam_apps": [
+      {
+        "action": "dynamodb:BatchGetItem",
+        "leading_keys": [
+          "STEAMAPP#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "begin_sync_run": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "SYNC#"
+        ],
+        "attributes": [
+          "pk",
+          "sk",
+          "started_epoch"
+        ]
+      }
+    ],
+    "compensate_claim": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "claims_used",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "compensate_self_claim": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "end_sync_run": [
+      {
+        "action": "dynamodb:DeleteItem",
+        "leading_keys": [
+          "SYNC#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "fail_claim_dead_key": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "pk",
+          "sk",
+          "status"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "claims_used",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "fail_self_claim_dead_key": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "pk",
+          "sk",
+          "status"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "fulfill_claim": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "claim_id",
+          "pk",
+          "sk",
+          "status"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "fulfill_self_claim": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "claim_id",
+          "pk",
+          "sk",
+          "status"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_game": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_app": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "STEAMAPP#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_app_versioned": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "STEAMAPP#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_identity": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "CONFIG#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_owned": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "STEAMOWN#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_sync_state": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "SYNC#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "list_all_games": [
+      {
+        "action": "dynamodb:Scan",
+        "leading_keys": [],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "list_pending_claims": [
+      {
+        "action": "dynamodb:Query",
+        "index": "pending-claims",
+        "leading_keys": [
+          "PENDINGCLAIM"
+        ],
+        "attributes": [
+          "gsi2pk"
+        ]
+      }
+    ],
+    "put_steam_app": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "STEAMAPP#"
+        ],
+        "attributes": [
+          "body",
+          "pk",
+          "sk",
+          "version"
+        ]
+      }
+    ],
+    "put_steam_owned": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "STEAMOWN#"
+        ],
+        "attributes": [
+          "body",
+          "pk",
+          "sk",
+          "ttl"
+        ]
+      }
+    ],
+    "put_sync_state": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "SYNC#"
+        ],
+        "attributes": [
+          "body",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "record_choice_intent": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "gsi2sk",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "set_game_owned_by_ben": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "appid_source",
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "hidden_source",
+          "pk",
+          "sk",
+          "status"
+        ]
+      }
+    ],
+    "set_game_steam_appid_if_unclaimed": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "appid_source",
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "hidden_source",
+          "pk",
+          "sk",
+          "status"
+        ]
+      }
+    ],
+    "upsert_game_from_sync": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "appid_source",
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "hidden_source",
+          "pk",
+          "sk",
+          "status"
+        ]
+      }
+    ]
+  },
+  "public-api": {
+    "batch_get_games": [
+      {
+        "action": "dynamodb:BatchGetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "batch_get_steam_genres_tags": [
+      {
+        "action": "dynamodb:BatchGetItem",
+        "leading_keys": [
+          "STEAMAPP#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "claim_game": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "gsi2pk",
+          "gsi2sk",
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "pk",
+          "sk",
+          "status"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "claims_allowed",
+          "claims_used",
+          "expires_at",
+          "pk",
+          "revoked",
+          "sk"
+        ]
+      }
+    ],
+    "claims_for_link": [
+      {
+        "action": "dynamodb:Query",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_game": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "GAME#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_link": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_app": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "STEAMAPP#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "get_steam_owned": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "STEAMOWN#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "list_listable_games": [
+      {
+        "action": "dynamodb:Query",
+        "index": "listable",
+        "leading_keys": [
+          "LISTABLE"
+        ],
+        "attributes": [
+          "gsi1pk"
+        ]
+      }
+    ],
+    "put_oidc_state": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "OIDCSTATE#"
+        ],
+        "attributes": [
+          "ctx",
+          "expires_epoch",
+          "pk",
+          "sk",
+          "ttl"
+        ]
+      }
+    ],
+    "put_steam_owned": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "STEAMOWN#"
+        ],
+        "attributes": [
+          "body",
+          "pk",
+          "sk",
+          "ttl"
+        ]
+      }
+    ],
+    "set_link_thanks": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "claims_used",
+          "expires_at",
+          "pk",
+          "revoked",
+          "sk",
+          "thank_note",
+          "thanked_at"
+        ]
+      }
+    ],
+    "take_oidc_state": [
+      {
+        "action": "dynamodb:DeleteItem",
+        "leading_keys": [
+          "OIDCSTATE#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ],
+        "return_values": "ALL_OLD"
+      }
+    ]
+  }
+}

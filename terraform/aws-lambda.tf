@@ -29,7 +29,7 @@ module "lambda_fulfillment" {
   )
 
   addl_inline_policies = {
-    dynamo = data.aws_iam_policy_document.dynamo_rw.json
+    dynamo = local.dynamo_policies["fulfillment"]
     ssm = jsonencode({
       Version = "2012-10-17"
       Statement = concat(
@@ -90,7 +90,7 @@ module "lambda_public_api" {
   }
 
   addl_inline_policies = {
-    dynamo             = data.aws_iam_policy_document.dynamo_rw_public.json
+    dynamo             = local.dynamo_policies["public"]
     invoke_fulfillment = data.aws_iam_policy_document.invoke_fulfillment.json
     ssm = jsonencode({
       Version = "2012-10-17"
@@ -133,7 +133,7 @@ module "lambda_admin_api" {
   }
 
   addl_inline_policies = {
-    dynamo             = data.aws_iam_policy_document.dynamo_rw.json
+    dynamo             = local.dynamo_policies["admin"]
     invoke_fulfillment = data.aws_iam_policy_document.invoke_fulfillment.json
     # hash: boot read only. The humble-cookie Get+Put the paste flow needed is gone —
     # fulfillment's self-login owns that param now.
@@ -160,81 +160,33 @@ data "aws_iam_policy_document" "invoke_fulfillment" {
   }
 }
 
-# Privileged dynamo policy — full data-plane on the table + its indexes.
-# TransactWriteItems authorizes as the underlying item ops.
-# Attached by admin-api (legitimately reads/writes SESSION# + Scans list_all_games/list_links) and
-# fulfillment (internal invoke-only; Scans list_all_games, owns SYNC#). public-api gets the tighter
-# dynamo_rw_public below (#84) — it is the unauthenticated internet-facing lambda.
-data "aws_iam_policy_document" "dynamo_rw" {
-  statement {
-    effect = "Allow"
-    actions = [
-      "dynamodb:BatchGetItem",
-      "dynamodb:ConditionCheckItem",
-      "dynamodb:DeleteItem",
-      "dynamodb:GetItem",
-      "dynamodb:PutItem",
-      "dynamodb:Query",
-      "dynamodb:Scan",
-      "dynamodb:UpdateItem",
-    ]
-    resources = [
-      aws_dynamodb_table.this.arn,
-      "${aws_dynamodb_table.this.arn}/index/*",
-    ]
-  }
-}
-
-# public-api dynamo policy (#84): the unauthenticated internet-facing lambda, scoped tighter than the
-# shared dynamo_rw in two ways.
-#   1. NO Scan. public-api never Scans (it Querys the `listable` GSI); and dynamodb:LeadingKeys cannot
-#      constrain a Scan, so keeping Scan would make the SESSION# split below theater (a Scan reads
-#      every item regardless of any key condition).
-#   2. Explicit Deny on SESSION#*/SYNC#* leading keys. public-api never touches admin sessions or
-#      sync-control items (audited: no session/sync store methods), so denying the key-specifying
-#      actions there removes the "mint or read an admin session" blast radius a future public-api bug
-#      could otherwise reach — the one place the trust-boundary split (public-api gets ZERO ssm) was
-#      not mirrored on the data plane.
-# Deny (not a LeadingKeys allowlist) is deliberate: an allowlist on the base pk breaks the `listable`
-# GSI Query — a GSI query's LeadingKeys is the index key, not the base pk — whereas a Deny on
-# SESSION#*/SYNC#* never matches that query's GAME# items, so it is GSI-safe. The allowed actions keep
-# ConditionCheckItem (public-api's claim_game runs a TransactWriteItems) and DeleteItem
-# (take_oidc_state) — dropping either would 403 a real path.
-data "aws_iam_policy_document" "dynamo_rw_public" {
-  statement {
-    sid    = "DataPlaneNoScan"
-    effect = "Allow"
-    actions = [
-      "dynamodb:BatchGetItem",
-      "dynamodb:ConditionCheckItem",
-      "dynamodb:DeleteItem",
-      "dynamodb:GetItem",
-      "dynamodb:PutItem",
-      "dynamodb:Query",
-      "dynamodb:UpdateItem",
-    ]
-    resources = [
-      aws_dynamodb_table.this.arn,
-      "${aws_dynamodb_table.this.arn}/index/*",
-    ]
-  }
-  statement {
-    sid    = "DenySessionAndSyncItems"
-    effect = "Deny"
-    actions = [
-      "dynamodb:BatchGetItem",
-      "dynamodb:ConditionCheckItem",
-      "dynamodb:DeleteItem",
-      "dynamodb:GetItem",
-      "dynamodb:PutItem",
-      "dynamodb:Query",
-      "dynamodb:UpdateItem",
-    ]
-    resources = [aws_dynamodb_table.this.arn]
-    condition {
-      test     = "ForAnyValue:StringLike"
-      variable = "dynamodb:LeadingKeys"
-      values   = ["SESSION#*", "SYNC#*"]
-    }
+# Per-lambda dynamo policies (#70) — GENERATED documents. Do not hand-edit the
+# .json.tpl files: they are emitted by `crates/dynamo/tests/iam_capture.rs`, which drives
+# every Store method exactly as each lambda calls it and derives the policies from the
+# captured request shapes (`IAM_CORPUS_WRITE=1 cargo test -p dynamo --test iam_capture`
+# regenerates; the same test run WITHOUT the env var is the CI drift gate — a new or
+# widened store call fails the build instead of 403ing in prod after this policy ships).
+#
+# What each lambda gets (rationale lives with the generator + terraform/policies/README.md):
+#  - public-api (unauthenticated, internet-facing): no Scan (#84 — and LeadingKeys cannot
+#    constrain a Scan, so any Scan grant would make the denies theater); UpdateItem only
+#    through per-prefix scoped-writer statements whose dynamodb:Attributes allowlists are
+#    the captured claim/thanks traffic verbatim (gift_note and the enforcer attrs are
+#    structurally unwritable — the app-layer scoped-writer guarantee, now in IAM);
+#    Deny SESSION#*/SYNC#* (#84).
+#  - admin-api: full captured surface incl. Scan + SESSION# (it owns sessions);
+#    Deny OIDCSTATE#* — the one partition it never touches.
+#  - fulfillment: captured surface incl. Scan + SYNC#; Deny SESSION#* + OIDCSTATE#* —
+#    after #70 no lambda except admin-api can read or mint an admin session token.
+# All three keep ConditionCheckItem defensively (TransactWriteItems is documented to
+# authorize per-element as the underlying ops; #84 kept it, we hold that line everywhere).
+# The Deny statements ride ForAnyValue:StringLike on the BASE table only — a GSI query's
+# LeadingKeys is the index key, so listable/pending-claims queries never match (#84).
+locals {
+  dynamo_policies = {
+    for who in ["public", "admin", "fulfillment"] :
+    who => templatefile("${path.module}/policies/dynamo-rw-${who}.json.tpl", {
+      table_arn = aws_dynamodb_table.this.arn
+    })
   }
 }

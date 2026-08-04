@@ -15,6 +15,10 @@ time.workspace = true
 
 [dev-dependencies]
 aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
+# iam_capture.rs only: request-shape interceptor (#70). Both are already in the tree as
+# transitive deps of the SDK; pinning "1" keeps them lockstep with aws-sdk-dynamodb.
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
 steam-client = { path = "../steam-client" }
 tokio.workspace = true
 uuid.workspace = true
