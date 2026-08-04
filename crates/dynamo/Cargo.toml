@@ -6,6 +6,9 @@ publish.workspace = true
 
 [dependencies]
 aws-sdk-dynamodb = "1"
+# session_pk hashes tokens at rest (#88): a table read yields digests, never replayable
+# bearer tokens. Version matches the workspace lockfile.
+sha2 = "0.11"
 domain = { path = "../domain" }
 serde.workspace = true
 serde_json.workspace = true

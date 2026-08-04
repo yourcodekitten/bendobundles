@@ -1181,6 +1181,7 @@ dependencies = [
  "domain",
  "serde",
  "serde_json",
+ "sha2",
  "steam-client",
  "thiserror",
  "time",
