@@ -15,6 +15,7 @@ import { withAuth } from './withAuth';
 import { isMature } from '../tags';
 import { titleColorClass } from '../titleColor';
 import { statusBadgeClass } from '../statusBadge';
+import { stateBadgeClass } from '../stateBadge';
 import { selfClaimLabel } from '../selfClaimLabel';
 import { GameDetailModal } from '../GameDetailModal';
 import {
@@ -328,15 +329,7 @@ export function Catalog() {
               >
                 <span className="font-mono text-xs text-dust">{sc.game_id}</span>
                 <span
-                  className={`rounded px-2 py-0.5 text-xs font-medium ${
-                    sc.state === 'fulfilled'
-                      ? 'bg-green-700 text-green-100'
-                      : sc.state === 'compensated'
-                        ? 'bg-slate-600 text-slate-100'
-                        : sc.state === 'failed'
-                          ? 'bg-rose-950 text-rose-200'
-                          : 'bg-amber-700 text-amber-100'
-                  }`}
+                  className={`rounded px-2 py-0.5 text-xs font-medium ${stateBadgeClass(sc.state)}`}
                 >
                   {sc.state}
                 </span>
