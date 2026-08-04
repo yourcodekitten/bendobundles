@@ -7,7 +7,7 @@ claim games and instantly receive humble gift links.
 - **stack:** rust lambdas (trust-boundary split) + typescript SPA, serverless AWS
   (lambda / dynamodb / s3+cloudfront / apigateway), terraform via `bendoerr-terraform-modules/*`
 - **domain:** bendobundles.com
-- **status:** designed, awaiting spec review → implementation plan
+- **status:** live at [bendobundles.com](https://bendobundles.com) since 2026-07-08; enhancement sweeps ongoing
 
 built by [code kitten](https://github.com/yourcodekitten) for [ben](https://github.com/bendoerr),
 who forgets his bundles exist 95% of the time. this fixes that.

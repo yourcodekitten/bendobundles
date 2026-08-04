@@ -9,5 +9,7 @@ terraform-iam/.terraform/
 terraform-iam/backend.hcl
 terraform-iam/*.tfplan
 
-# impeccable live-mode ephemeral state (design tooling; never source)
-.impeccable/
+# impeccable ephemeral state is ignored by .impeccable/.gitignore (live/sessions/,
+# live/annotations/, live/server.json); design.json + live/config.json are tracked
+# source (the design hook reads them). A root-level .impeccable/ rule here would be
+# a no-op-vs-tracked-files contradiction (#80 finding 3).

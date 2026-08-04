@@ -100,7 +100,9 @@ async fn store_or_skip(test: &str) -> Option<Store> {
         eprintln!("SKIP {test}: no dynamodb-local at {url}");
         return None;
     }
-    let store = Store::new(client, format!("t-fulfill-{}-{test}", std::process::id()));
+    // Stable per-test names — delete-then-create in create_table_for_tests (#80) replaced
+    // the PID-scoping sidestep; see admin-api's harness note.
+    let store = Store::new(client, format!("t-fulfill-{test}"));
     store.create_table_for_tests().await.unwrap();
     Some(store)
 }

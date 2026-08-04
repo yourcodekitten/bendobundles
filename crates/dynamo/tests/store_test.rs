@@ -3104,3 +3104,33 @@ async fn sync_upsert_stale_read_cannot_revert_manual_override() {
     );
     assert_eq!(healed.appid_source, Some(AppidSource::Manual));
 }
+
+// ── #80 finding 1: create_table_for_tests must hand back a VIRGIN table ──────────────────────────
+// The old helper discarded the create result, silently accepting a pre-existing table plus all
+// of last run's rows — fixed-name fixtures then failed with Corrupt("link token already exists")
+// on the second local run, a red run that isn't real. Delete-then-create makes re-construction
+// mean "fresh table", every time.
+#[tokio::test]
+async fn create_table_for_tests_resets_a_reused_table() {
+    let Some(store) = store_or_skip("recreate").await else {
+        return;
+    };
+    let g = game(70, true);
+    store.put_game(&g).await.unwrap();
+    assert!(
+        store.get_game(&g.id).await.unwrap().is_some(),
+        "seed row present before the re-create"
+    );
+
+    // A second harness construction against the SAME table name — run №2 in miniature.
+    store.create_table_for_tests().await.unwrap();
+
+    assert!(
+        store.get_game(&g.id).await.unwrap().is_none(),
+        "re-creating for tests must drop last run's rows (old code kept them)"
+    );
+    // And the fresh table is fully usable — the guarded first-insert that used to trip
+    // on stale rows now lands.
+    store.put_game(&g).await.unwrap();
+    assert!(store.get_game(&g.id).await.unwrap().is_some());
+}
