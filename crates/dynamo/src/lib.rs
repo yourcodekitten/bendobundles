@@ -2721,6 +2721,13 @@ impl Store {
     }
 
     /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).
+    ///
+    /// Deletes any pre-existing table of the same name FIRST (#80 finding 1): silently
+    /// accepting a leftover table also accepts last run's rows, and fixed-name fixtures
+    /// then die with `Corrupt("link token already exists")` — a red run that isn't real,
+    /// the mirror of `store_or_skip`'s refuse-to-forge-a-green. The delete tolerates
+    /// NotFound (the virgin-container case, same as CI); the create's error PROPAGATES —
+    /// the old `let _ =` discard also swallowed genuine create failures.
     pub async fn create_table_for_tests(&self) -> Result<(), StoreError> {
         let attr = |name: &str| {
             AttributeDefinition::builder()
@@ -2749,8 +2756,14 @@ impl Store {
                 .build()
                 .expect("gsi")
         };
+        // NotFound is the virgin-container case (CI's fresh service, first local run).
         let _ = self
             .client
+            .delete_table()
+            .table_name(&self.table)
+            .send()
+            .await;
+        self.client
             .create_table()
             .table_name(&self.table)
             .billing_mode(BillingMode::PayPerRequest)
@@ -2765,7 +2778,8 @@ impl Store {
             .global_secondary_indexes(gsi(schema::GSI_LISTABLE, "gsi1pk", "gsi1sk"))
             .global_secondary_indexes(gsi(schema::GSI_PENDING, "gsi2pk", "gsi2sk"))
             .send()
-            .await; // ignore ResourceInUse on re-run
+            .await
+            .map_err(|e| StoreError::Aws(format!("{e:?}")))?;
         Ok(())
     }
 }
