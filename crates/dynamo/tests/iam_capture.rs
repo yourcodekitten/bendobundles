@@ -539,8 +539,12 @@ async fn drive_admin(rig: &Rig) -> MethodOps {
         s.update_link_meta(&l).await.unwrap();
     })
     .await;
+    // both legs (SET and REMOVE) captured separately so each asserts its own traffic
     capture(cap, &mut m, "set_link_gift_note", async {
         s.set_link_gift_note("atok2", Some("hi")).await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "set_link_gift_note", async {
         s.set_link_gift_note("atok2", None).await.unwrap();
     })
     .await;
@@ -560,8 +564,12 @@ async fn drive_admin(rig: &Rig) -> MethodOps {
         s.get_game(&gid2).await.unwrap().unwrap();
     })
     .await;
+    // both legs captured separately so each asserts its own traffic
     capture(cap, &mut m, "set_game_hidden", async {
         s.set_game_hidden(&gid2, true).await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "set_game_hidden", async {
         s.set_game_hidden(&gid2, false).await.unwrap();
     })
     .await;
@@ -816,6 +824,21 @@ fn key_addressed(actions: &BTreeSet<String>) -> Vec<Value> {
         .collect()
 }
 
+/// The traffic-vs-deny cross-assert: a deny prefix that appears in the lambda's OWN
+/// captured traffic means regeneration would emit a policy whose Deny 403s a real path —
+/// fail the build here instead. (OMBB's #141 review: this guarded admin/fulfillment but
+/// not public's SESSION#/SYNC# deny; every deny now routes through it.)
+fn assert_denies_unused(methods: &MethodOps, prefixes: &[&str]) {
+    let leading = leading_key_union(methods);
+    for p in prefixes {
+        let stripped = p.trim_end_matches('*');
+        assert!(
+            !leading.contains(stripped),
+            "corpus shows a captured request into denied partition {p} — the deny would break a real path"
+        );
+    }
+}
+
 fn deny_statement(sid: &str, actions: &BTreeSet<String>, prefixes: &[&str]) -> Value {
     serde_json::json!({
         "Sid": sid,
@@ -846,14 +869,7 @@ fn policy_json(statements: Vec<Value>) -> String {
 fn backend_policy(methods: &MethodOps, deny_sid: &str, deny_prefixes: &[&str]) -> String {
     let mut actions = action_union(methods);
     actions.insert("dynamodb:ConditionCheckItem".into());
-    let leading = leading_key_union(methods);
-    for p in deny_prefixes {
-        let stripped = p.trim_end_matches('*');
-        assert!(
-            !leading.contains(stripped),
-            "corpus shows a captured request into denied partition {p} — the deny would break a real path"
-        );
-    }
+    assert_denies_unused(methods, deny_prefixes);
     let allow = serde_json::json!({
         "Sid": "DataPlane",
         "Effect": "Allow",
@@ -870,6 +886,7 @@ fn backend_policy(methods: &MethodOps, deny_sid: &str, deny_prefixes: &[&str]) -
 /// broad statement into per-prefix scoped-writer statements whose dynamodb:Attributes
 /// allowlists are the captured traffic, verbatim.
 fn public_policy(methods: &MethodOps) -> String {
+    assert_denies_unused(methods, &["SESSION#*", "SYNC#*"]);
     let mut actions = action_union(methods);
     assert!(
         !actions.contains("dynamodb:Scan"),
