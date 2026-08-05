@@ -649,6 +649,7 @@ async fn handle_create_link(
         claims_used: 0,
         revoked: false,
         expires_at,
+        unlock_at: None, // Task 5 wires the create-time seal
         created_at: now,
     };
 

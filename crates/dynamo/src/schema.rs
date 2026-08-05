@@ -100,6 +100,7 @@ pub fn link_body(l: &Link) -> String {
         gift_note: None,
         thank_note: None,
         thanked_at: None,
+        unlock_at: None,
         ..l.clone()
     };
     serde_json::to_string(&noteless).expect("link serializes")

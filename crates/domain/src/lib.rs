@@ -206,6 +206,22 @@ pub struct Link {
     // bricks a whole list read). `default` restores None-on-missing.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
+    /// The wrapped-gift unlock moment: while `unlock_at > now` the link is SEALED — the
+    /// friend surface shows a countdown and the server withholds the payload; every claim
+    /// path refuses with [`ClaimRefusal::Sealed`]. Absent = born open; a seal is
+    /// CREATE-TIME-ONLY (spec 2026-08-05 §4: a link born open can never gain one, because
+    /// the server can't know whether a friend already looked).
+    /// Authoritative in a top-level numeric dynamo attribute like the enforcer fields;
+    /// `schema::link_body` strips it from the body blob (the notes' one-place contract).
+    /// Serde is thanked_at's combo — `default` restores None-on-missing under `with`, and
+    /// skip-on-None keeps the stripped body free of even a null key (the body-strip test
+    /// depends on absence, not null-ness).
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unlock_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -250,6 +266,10 @@ pub struct Claim {
 pub enum ClaimRefusal {
     #[error("link revoked")]
     Revoked,
+    /// Wrapped gift, pre-unlock: `unlock_at > now`. Outranked only by Revoked; outranks
+    /// Expired/Exhausted (a sealed link reports sealed whatever else is wrong with it).
+    #[error("link sealed")]
+    Sealed,
     #[error("link expired")]
     Expired,
     #[error("all claims used")]
@@ -266,6 +286,14 @@ impl Link {
     pub fn can_claim(&self, now: OffsetDateTime) -> Result<(), ClaimRefusal> {
         if self.revoked {
             return Err(ClaimRefusal::Revoked);
+        }
+        // Sealed iff strictly before the unlock moment: `unlock_at == now` is OPEN,
+        // matching expires_at's `<=`-dead edge (and the storage conditions' complement
+        // pair — edit `> :now`, claim `<= :now`).
+        if let Some(unlock) = self.unlock_at
+            && unlock > now
+        {
+            return Err(ClaimRefusal::Sealed);
         }
         if let Some(exp) = self.expires_at
             && exp <= now
@@ -486,8 +514,70 @@ mod tests {
             claims_used: 0,
             revoked: false,
             expires_at: None,
+            unlock_at: None,
             created_at: datetime!(2026-07-02 00:00 UTC),
         }
+    }
+
+    #[test]
+    fn can_claim_sealed_before_unlock() {
+        let mut l = link();
+        let now = datetime!(2026-07-02 12:00 UTC);
+        l.unlock_at = Some(now + time::Duration::seconds(1));
+        assert_eq!(l.can_claim(now), Err(ClaimRefusal::Sealed));
+    }
+
+    #[test]
+    fn can_claim_open_at_exact_unlock_instant() {
+        // unlock_at == now ⇒ OPEN (strict >, matching expires_at's <=-dead edge).
+        let mut l = link();
+        let now = datetime!(2026-07-02 12:00 UTC);
+        l.unlock_at = Some(now);
+        assert!(l.can_claim(now).is_ok());
+    }
+
+    #[test]
+    fn can_claim_revoked_outranks_sealed() {
+        let mut l = link();
+        let now = datetime!(2026-07-02 12:00 UTC);
+        l.revoked = true;
+        l.unlock_at = Some(now + time::Duration::hours(1));
+        assert_eq!(l.can_claim(now), Err(ClaimRefusal::Revoked));
+    }
+
+    #[test]
+    fn can_claim_sealed_outranks_expired_and_exhausted() {
+        // Unreachable via admin validation (unlock must precede expiry) but the ordering
+        // is still pinned: a sealed link reports sealed, whatever else is wrong with it.
+        let mut l = link();
+        let now = datetime!(2026-07-02 12:00 UTC);
+        l.unlock_at = Some(now + time::Duration::hours(1));
+        l.expires_at = Some(now - time::Duration::hours(1));
+        l.claims_used = l.claims_allowed;
+        assert_eq!(l.can_claim(now), Err(ClaimRefusal::Sealed));
+    }
+
+    #[test]
+    fn link_unlock_at_missing_absent_and_skipped() {
+        // Pre-feature record: no unlock_at key at all → None (the `default` half).
+        let mut json = serde_json::to_value(link()).unwrap();
+        json.as_object_mut().unwrap().remove("unlock_at");
+        let l: Link = serde_json::from_value(json).unwrap();
+        assert_eq!(l.unlock_at, None, "missing unlock_at must default to None");
+
+        // None must serialize to NO key at all (the skip half — gate B1: the stripped
+        // body blob depends on absence, not null-ness).
+        let s = serde_json::to_string(&link()).unwrap();
+        assert!(
+            !s.contains("unlock_at"),
+            "unlock_at: None must not serialize even a null key: {s}"
+        );
+
+        // Set value round-trips.
+        let mut l2 = link();
+        l2.unlock_at = Some(datetime!(2026-12-25 05:00 UTC));
+        let back: Link = serde_json::from_str(&serde_json::to_string(&l2).unwrap()).unwrap();
+        assert_eq!(back, l2);
     }
 
     #[test]

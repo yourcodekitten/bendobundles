@@ -84,6 +84,7 @@ fn test_link(token: &str) -> Link {
         claims_used: 0,
         revoked: false,
         expires_at: None,
+        unlock_at: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }

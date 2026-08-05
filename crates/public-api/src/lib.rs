@@ -470,6 +470,7 @@ async fn handle_steam_owned_proxy(
         use domain::ClaimRefusal;
         let msg = match refusal {
             ClaimRefusal::Revoked => "this link has been revoked",
+            ClaimRefusal::Sealed => "this gift is still wrapped",
             ClaimRefusal::Expired => "this link has expired",
             ClaimRefusal::Exhausted => "no claims left on this link",
         };
@@ -550,6 +551,9 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
     let (state, hide_games) = match link.can_claim(now) {
         Ok(()) => ("active", false),
         Err(domain::ClaimRefusal::Revoked) => ("revoked", true),
+        // Interim arm (Task 1 ripple): hides games+notes; Task 4 replaces this with the
+        // real sealed early-return (countdown fields, no-store, zero reads).
+        Err(domain::ClaimRefusal::Sealed) => ("sealed", true),
         Err(domain::ClaimRefusal::Expired) => ("expired", true),
         Err(domain::ClaimRefusal::Exhausted) => ("exhausted", false),
     };
@@ -669,6 +673,7 @@ async fn handle_post_claim(
         use domain::ClaimRefusal;
         let msg = match refusal {
             ClaimRefusal::Revoked => "this link has been revoked",
+            ClaimRefusal::Sealed => "this gift is still wrapped",
             ClaimRefusal::Expired => "this link has expired",
             ClaimRefusal::Exhausted => "no claims left on this link",
         };
@@ -934,6 +939,17 @@ async fn handle_post_thanks(
     let now = OffsetDateTime::now_utc();
     match link.can_claim(now) {
         Ok(()) | Err(domain::ClaimRefusal::Exhausted) => {}
+        // Sealed: refuse, same 409 shape as its neighbors. Unreachable in practice —
+        // sealed ⇒ zero claims ⇒ the handler's claims-first guard already refused — but
+        // pinned anyway: a ruling without an arm is a guess with a compiler error
+        // attached (step-5 gate M1).
+        Err(domain::ClaimRefusal::Sealed) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "this gift is still wrapped"})),
+            )
+                .into_response();
+        }
         Err(domain::ClaimRefusal::Revoked) => {
             return (
                 StatusCode::CONFLICT,
@@ -1071,7 +1087,11 @@ async fn handle_game_detail(
     let now = OffsetDateTime::now_utc();
     match link.can_claim(now) {
         Ok(()) | Err(domain::ClaimRefusal::Exhausted) => {}
-        Err(domain::ClaimRefusal::Revoked | domain::ClaimRefusal::Expired) => {
+        Err(
+            domain::ClaimRefusal::Revoked
+            | domain::ClaimRefusal::Expired
+            | domain::ClaimRefusal::Sealed,
+        ) => {
             return link_not_found_response();
         }
     }

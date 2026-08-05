@@ -88,6 +88,7 @@ fn link(token: &str) -> Link {
         claims_used: 0,
         revoked: false,
         expires_at: None,
+        unlock_at: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }
@@ -1354,6 +1355,7 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
         claims_used: 9,
         revoked: true,
         expires_at: Some(datetime!(2020-01-01 00:00 UTC)),
+        unlock_at: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     };
     // Top-level attrs are the AUTHORITATIVE truth: allowed=5, used=2, revoked=false, no expiry.
