@@ -978,9 +978,9 @@ async fn handle_post_thanks(
     match link.can_claim(now) {
         Ok(()) | Err(domain::ClaimRefusal::Exhausted) => {}
         // Sealed: refuse, same 409 shape as its neighbors. Unreachable in practice —
-        // sealed ⇒ zero claims ⇒ the handler's claims-first guard already refused — but
-        // pinned anyway: a ruling without an arm is a guess with a compiler error
-        // attached (step-5 gate M1).
+        // sealed ⇒ zero claims, so even without this arm the claims-first guard BELOW
+        // this match would refuse — but pinned anyway: a ruling without an arm is a
+        // guess with a compiler error attached (step-5 gate M1).
         Err(domain::ClaimRefusal::Sealed) => {
             return (
                 StatusCode::CONFLICT,

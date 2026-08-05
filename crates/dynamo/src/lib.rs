@@ -993,7 +993,8 @@ impl Store {
     }
 
     /// Atomic claim intake. Three-item transaction: GAME available→pending (removes listable GSI
-    /// attrs), LINK counter increment (conditions: not revoked, not expired, not exhausted),
+    /// attrs), LINK counter increment (conditions: not revoked, not SEALED — unlock_at absent or
+    /// <= :now, the edit condition's exact complement — not expired, not exhausted),
     /// CLAIM put (condition: attribute_not_exists = dedup).
     /// Cancellation reasons map positionally to the three writes.
     pub async fn claim_game(
