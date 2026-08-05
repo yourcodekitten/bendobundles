@@ -52,17 +52,20 @@ export function SealedGift({
 
   useEffect(() => {
     const iv = setInterval(() => {
-      setRemaining((r) => {
-        const next = Math.max(0, r - 1);
-        if (next === 0 && !firedRef.current) {
-          firedRef.current = true;
-          onRefetchRef.current();
-        }
-        return next;
-      });
+      setRemaining((r) => Math.max(0, r - 1));
     }, 1000);
     return () => clearInterval(iv);
   }, []);
+
+  // The zero-crossing fires the refetch from an EFFECT, not from inside the
+  // state updater — updaters must stay pure (StrictMode replays them), and
+  // the ref guard keeps it to one refetch per elapse (re-armed on reseed).
+  useEffect(() => {
+    if (remaining === 0 && !firedRef.current) {
+      firedRef.current = true;
+      onRefetchRef.current();
+    }
+  }, [remaining]);
 
   useEffect(() => {
     const onVisible = () => {
