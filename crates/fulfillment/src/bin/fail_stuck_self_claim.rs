@@ -7,7 +7,12 @@
 //! **DRY-RUN BY DEFAULT; `--execute` writes.**
 //!
 //! No new write path: this drives the production `Store::fail_self_claim_dead_key`
-//! transaction — claim → Failed with the reason durable, game → Expired (retired,
+//! transaction. The bin trusts the HUMAN dead-key diagnosis BY DESIGN — the machine can
+//! see that a key name is absent, but only an operator can know WHY the claim can never
+//! complete (here: ben redeemed the provisioned key out of band, receipt in the PR).
+//! The verification that the diagnosis is right lives in the four-eyes review of the
+//! run, not in this code. It is the same trust boundary as the reconcile's own
+//! dead-key path, moved to a human — claim → Failed with the reason durable, game → Expired (retired,
 //! never re-listed), claim_id cleared, pending marker consumed, idempotent under the
 //! marker race. The bin only adds operator eyes: it prints the current claim + game
 //! state and refuses to act unless the claim is SELF-linked, Pending, and pointing at
@@ -110,5 +115,9 @@ async fn main() {
         game.status,
         domain::GameStatus::Expired,
         "post-write game not Expired"
+    );
+    assert_eq!(
+        game.claim_id, None,
+        "post-write game still references the claim — the transaction clears it"
     );
 }
