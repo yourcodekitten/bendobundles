@@ -66,8 +66,8 @@ After sync completes, verify all three changes:
    - Verify it is not accessible to public browse/listing
 
 3. **Discord Notifications**: Confirm both completion pings in Discord
-   - Sync completion ping in ops channel
-   - Audit completion ping with final changelist metrics
+   - Grep for `"reconcile recovered the already-revealed key for self claim"` (claim-recovery ping, carries claim id 3f46c058)
+   - Grep for `"shelf audit: pulled"` (audit de-list ping, carries "My Little Universe")
 
 ### Step 5: Ship Green
 Once all three verifications pass:
