@@ -1908,17 +1908,69 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
         // §2.3) ⇒ pick NOT spent ⇒ compensate (slot returns, game re-lists). Same shape as the
         // bundle "not redeemed → compensate" arm. SELF uses compensate_self_claim (no link-meta).
         None => {
-            tracing::info!(claim_id = %claim.id, "reconcile(choice): no intent snapshot — choose never ran, compensating (no pick spent)");
-            let _ = compensate_any(deps, claim).await;
-            ping(
-                deps,
-                &format!(
-                    "reconcile compensated choice claim {} ({}) — no choose intent was ever \
-                     recorded, so the monthly pick was NOT spent — slot returned, game re-listed.",
-                    claim.id, game.title
-                ),
-            )
-            .await;
+            // Diff against the empty baseline — title-scoped, NOT find_new_tpk: an unrelated tpk
+            // elsewhere in the order (a different game entirely) must not park this claim, but ANY
+            // key that could plausibly BE this game's pick must stop a blind compensate.
+            let hits: Vec<&KeyEntry> = order
+                .keys
+                .iter()
+                .filter(|k| k.human_name.eq_ignore_ascii_case(&game.title))
+                .collect();
+            match hits.as_slice() {
+                [] => {
+                    // Verified-nothing FOR THIS GAME: zero title-matched tpks exist anywhere in the
+                    // order, so zero keys anyone could have revealed for it ⇒ choose never ran ⇒ pick
+                    // NOT spent ⇒ compensate (slot returns, game re-lists). Same shape as the bundle
+                    // "not redeemed → compensate" arm. SELF uses compensate_self_claim (no link-meta).
+                    tracing::info!(claim_id = %claim.id, "reconcile(choice): no intent snapshot, no title-matched key anywhere in the order — compensating (verified nothing for this game)");
+                    let _ = compensate_any(deps, claim).await;
+                    ping(
+                        deps,
+                        &format!(
+                            "reconcile compensated choice claim {} ({}) — no choose intent was ever \
+                             recorded, so the monthly pick was NOT spent — slot returned, game re-listed.",
+                            claim.id, game.title
+                        ),
+                    )
+                    .await;
+                }
+                [tpk] => {
+                    // Absence of a measurement is not a measurement of absence: with no snapshot the
+                    // wire cannot date this tpk (nothing ordinal on TpkWire) — attribution to THIS
+                    // claim is unfounded. Park; the human attributes. SELF included: auto-recovery is
+                    // a Some-only privilege.
+                    tracing::warn!(claim_id = %claim.id, machine_name = %tpk.machine_name, redeemed = tpk.redeemed, "reconcile(choice): no intent snapshot, but a title-matched key exists on humble — NOT auto-compensating, parking");
+                    let msg = if tpk.redeemed {
+                        format!(
+                            "choice claim {} ({}) has no intent snapshot, but humble shows a key for \
+                             this title (`{}`) already revealed — a pick was spent outside the app's \
+                             writes. Cannot attribute it to this claim (no snapshot = no \
+                             arrival-order evidence). Left pending for review.",
+                            claim.id, game.title, tpk.machine_name
+                        )
+                    } else {
+                        format!(
+                            "choice claim {} ({}) has no intent snapshot, but humble shows an \
+                             unredeemed key for this title (`{}`). Cannot attribute it to this \
+                             claim. Left pending for review.",
+                            claim.id, game.title, tpk.machine_name
+                        )
+                    };
+                    ping(deps, &msg).await;
+                }
+                _ => {
+                    tracing::warn!(claim_id = %claim.id, "reconcile(choice): no intent snapshot, multiple title-matched keys on humble — NOT auto-compensating, parking ambiguous");
+                    ping(
+                        deps,
+                        &format!(
+                            "choice claim {} ({}) has no intent snapshot and multiple keys on \
+                             humble could match the title. Left pending for review.",
+                            claim.id, game.title
+                        ),
+                    )
+                    .await;
+                }
+            }
         }
         Some(pre) => match find_new_tpk(order, pre, &game.title) {
             // B1. Snapshot present but no new tpk (and no exact-title match) ⇒ NEVER compensate, on

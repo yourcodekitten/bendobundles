@@ -2457,6 +2457,208 @@ async fn reconcile_choice_no_snapshot_compensates() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// reconcile: NO snapshot, but humble shows a title-scoped hit → park (never blind-compensate).
+// Title-scoped, NOT find_new_tpk: the probe filters `order.keys` by `human_name == game.title`
+// directly, so it is independent of the (nonexistent, since pre=None) snapshot diff. Contrast with
+// `reconcile_choice_no_snapshot_compensates` above, which seeds one UNRELATED (non-title-matched)
+// tpk and must still compensate — that's the 0-hits shape, this is the 1-hit and 2-hits shapes.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_choice_no_snapshot_found_redeemed_parks() {
+    let Some(store) = store_or_skip("choice-recon-nosnap-redeemed").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, None).await;
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    // Title-matched tpk, already redeemed → a pick was spent out of band; no snapshot means no
+    // arrival-order evidence to attribute it to THIS claim.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gk",
+            serde_json::json!([tpk_json(TPK_MN, TITLE, true)]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        1,
+        "slot NOT returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
+    assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!(
+        "choice claim c1 ({TITLE}) has no intent snapshot, but humble shows a key for this title \
+         (`{TPK_MN}`) already revealed — a pick was spent outside the app's writes. Cannot \
+         attribute it to this claim (no snapshot = no arrival-order evidence). Left pending for \
+         review."
+    );
+    assert!(
+        ping.contains(&expected),
+        "ping must carry the exact pinned park text: {ping}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_choice_no_snapshot_found_clean_parks() {
+    let Some(store) = store_or_skip("choice-recon-nosnap-clean").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, None).await;
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    // Title-matched tpk, NOT redeemed — still can't attribute it to THIS claim without a snapshot.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gk",
+            serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        1,
+        "slot NOT returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
+    assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!(
+        "choice claim c1 ({TITLE}) has no intent snapshot, but humble shows an unredeemed key for \
+         this title (`{TPK_MN}`). Cannot attribute it to this claim. Left pending for review."
+    );
+    assert!(
+        ping.contains(&expected),
+        "ping must carry the exact pinned park text: {ping}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_choice_no_snapshot_found_ambiguous_parks() {
+    let Some(store) = store_or_skip("choice-recon-nosnap-ambiguous").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, None).await;
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    // TWO tpks, BOTH title-matched (distinct machine_names) — can't single one out.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gk",
+            serde_json::json!([
+                tpk_json(TPK_MN, TITLE, false),
+                tpk_json("octopathtraveler2_row_choice_steam_2", TITLE, true),
+            ]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        1,
+        "slot NOT returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
+    assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!(
+        "choice claim c1 ({TITLE}) has no intent snapshot and multiple keys on humble could match \
+         the title. Left pending for review."
+    );
+    assert!(
+        ping.contains(&expected),
+        "ping must carry the exact pinned park text: {ping}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
 // reconcile: key present but ALREADY redeemed, URL unrecorded → human-recover ping, stays pending.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
