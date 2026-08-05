@@ -75,6 +75,35 @@ async fn parses_order_key_states() {
 }
 
 #[tokio::test]
+async fn is_gift_models_absence_distinctly() {
+    let server = MockServer::start().await;
+    // Three states of is_gift: present-true, present-false, absent (must stay None).
+    // Mount an order whose tpkd_dict.all_tpks carries three tpks with these three states.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GK"))
+        .and(query_param("all_tpkds", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "GK",
+            "product": { "human_name": "Test Bundle", "machine_name": "test_bundle" },
+            "tpkd_dict": {
+                "all_tpks": [
+                    {"machine_name":"a_row_choice_steam","human_name":"A","key_type":"steam","is_gift":true},
+                    {"machine_name":"b_row_choice_steam","human_name":"B","key_type":"steam","is_gift":false},
+                    {"machine_name":"c_row_choice_steam","human_name":"C","key_type":"steam"}
+                ]
+            },
+            "subproducts": []
+        })))
+        .mount(&server)
+        .await;
+
+    let order = client(&server).await.order("GK").await.unwrap();
+    assert_eq!(order.keys[0].is_gift, Some(true));
+    assert_eq!(order.keys[1].is_gift, Some(false));
+    assert_eq!(order.keys[2].is_gift, None, "absence must stay None — never default to false");
+}
+
+#[tokio::test]
 async fn dead_cookie_is_unauthorized() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

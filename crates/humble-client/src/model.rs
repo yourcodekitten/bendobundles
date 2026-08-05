@@ -45,6 +45,8 @@ pub(crate) struct TpkWire {
     pub keyindex: u32,
     #[serde(default)]
     pub steam_app_id: Option<u32>,
+    #[serde(default)]
+    pub is_gift: Option<bool>,
 }
 
 #[derive(Deserialize)]

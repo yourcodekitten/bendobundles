@@ -4285,6 +4285,7 @@ mod tests {
                 keyindex: 0,
                 redeemed_key_val: None,
                 steam_app_id: None,
+                is_gift: None,
             }
         }
         fn order(keys: Vec<KeyEntry>) -> Order {
