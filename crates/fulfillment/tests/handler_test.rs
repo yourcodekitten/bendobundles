@@ -1323,6 +1323,106 @@ async fn reconcile_unsplittable_game_id_over_threshold_pings() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// MESSAGE PIN (#158 task 8): the bundle path's absent-from-order park (`alert_unreconcilable`'s
+// `else` site) enriches its reason with domain::choice_tpk_matches — messaging ONLY, arms nothing,
+// changes no routing, causes no writes. Claim's own machine_name never appears among the order's
+// exact keys (that's WHY it parks); the probe additionally checks whether the order carries a
+// choice-shaped tpk whose derived base equals the claim's machine_name — the out-of-band-redeemed
+// key humble is quietly holding under a name the exact `find` above can never see.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn unreconcilable_nag_names_out_of_band_key_when_grammar_finds_one() {
+    let Some(store) = store_or_skip("recon-nag-grammar-hit").await else {
+        return;
+    };
+    // Bundle path: choice_pre_tpks None + requires_choice false (seed_aged_pending's default
+    // shape) — claim's machine_name "mlu" never exact-matches the order's tpk
+    // "mlu_row_choice_steam", so it parks. The grammar probe (domain::choice_tpk_matches) finds
+    // the tpk anyway: base "mlu_row" strips its "_row" region token down to "mlu".
+    let gid = game_id("gkN", "mlu");
+    seed_aged_pending(&store, &gid, "tokN", "cN", hours_ago(30)).await; // > 24h -> loud
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gkN",
+            serde_json::json!([tpk_json("mlu_row_choice_steam", "My Little Universe", true)]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // Routing/park behavior is UNCHANGED — the probe arms nothing, causes no writes.
+    let claim = deps.store.get_claim("tokN", "cN").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+
+    let reqs = discord.received_requests().await.unwrap();
+    let bodies: Vec<String> = reqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies.iter().any(|b| b.contains(
+            "NOTE: humble carries a key for this game under `mlu_row_choice_steam`, already \
+             revealed outside the app"
+        )),
+        "the stuck-alert names the out-of-band key the grammar can see: {bodies:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MESSAGE PIN (#158 task 8) — the flip side: no grammar hit → the reason stays byte-identical to
+// the pre-existing text, no "NOTE:" suffix appended. Kept as a pin (may already pass pre-Step-3).
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn unreconcilable_nag_stays_generic_without_a_grammar_hit() {
+    let Some(store) = store_or_skip("recon-nag-no-hit").await else {
+        return;
+    };
+    // "mnREAL" is not choice-shaped (no `_choice_`/`_monthly_` infix) — domain::choice_tpk_bases
+    // returns None for it, so the probe can never hit.
+    let gid = game_id("gkP", "mnGHOST");
+    seed_aged_pending(&store, &gid, "tokP", "cP", hours_ago(30)).await; // > 24h -> loud
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkP"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkP", "mnREAL", false)))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tokP", "cP").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+
+    let reqs = discord.received_requests().await.unwrap();
+    let bodies: Vec<String> = reqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies.iter().any(|b| b.contains(
+            "cannot act on it: machine_name `mnGHOST` is not among order `gkP`'s keys on humble, \
+             so there is nothing to reconcile it against."
+        )),
+        "the reason is byte-identical to the pre-existing generic text: {bodies:?}"
+    );
+    assert!(
+        !bodies.iter().any(|b| b.contains("NOTE:")),
+        "no grammar hit must never append a NOTE: {bodies:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // PLACEMENT PIN (gate review B-4): the pending-age sweep is the FIRST statement in run_sync, before
 // even the listing acquisition — so a dead humble session (which makes run_sync ping COOKIE_DEAD and
 // return before reconcile ever runs) must NOT starve the watchdog. If a future refactor adds an

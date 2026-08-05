@@ -4123,16 +4123,33 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             continue;
         }
         let Some(key) = order.keys.iter().find(|k| k.machine_name == machine_name) else {
-            alert_unreconcilable(
-                deps,
-                &claim,
-                age,
-                &format!(
-                    "machine_name `{machine_name}` is not among order `{gamekey}`'s keys on \
-                     humble, so there is nothing to reconcile it against"
-                ),
-            )
-            .await;
+            let mut reason = format!(
+                "machine_name `{machine_name}` is not among order `{gamekey}`'s keys on \
+                 humble, so there is nothing to reconcile it against"
+            );
+            // Messaging-only probe (#158 task 8): the exact `find` above just missed, but the
+            // order may still carry a choice-shaped tpk whose derived base equals this claim's
+            // machine_name — an out-of-band-redeemed key humble is quietly holding under a name
+            // the exact match can never see. Same grammar rung heal_pairs already uses. This ARMS
+            // NOTHING — no routing change, no write — it only enriches the reason string.
+            if let Some(hit) = order
+                .keys
+                .iter()
+                .find(|k| domain::choice_tpk_matches(&k.machine_name, machine_name))
+            {
+                let mut flags = String::new();
+                if hit.redeemed {
+                    flags.push_str(", already revealed outside the app");
+                }
+                if hit.expired {
+                    flags.push_str(", expired");
+                }
+                let tpk_machine_name = &hit.machine_name;
+                reason.push_str(&format!(
+                    "; NOTE: humble carries a key for this game under `{tpk_machine_name}`{flags}"
+                ));
+            }
+            alert_unreconcilable(deps, &claim, age, &reason).await;
             continue;
         };
         if key.redeemed {
