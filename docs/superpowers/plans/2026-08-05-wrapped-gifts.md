@@ -27,7 +27,7 @@ SPA (vite, vitest). No terraform changes — read-time gating only.
 - `unlock_at` storage: top-level numeric attr (epoch seconds via `schema::epoch_s`), NEVER in the body blob, REMOVE to unset (absent = born open / unsealed) — never write null.
 - Seal state machine (one DDB condition, `attribute_exists(unlock_at) AND unlock_at > :now`): editable while sealed, immutable once open, never addable to a link born open.
 - Friend-facing copy is lowercase, warm, no storefront energy (PRODUCT.md). Admin copy plain.
-- moto tests: follow the existing store_test.rs harness (moto server per test, see file top; note decisions.md trap "moto 8155").
+- Store/api tests need dynamodb-local (CI: `amazon/dynamodb-local:2.5.2` service on :8000 with `DYNAMODB_LOCAL_URL=http://localhost:8000` — see .github/workflows/ci.yml:12-16; locally run the same container, or any dynamodb-compatible endpoint, and export `DYNAMODB_LOCAL_URL`). Tests SKIP quietly when no endpoint is up; if `DYNAMODB_LOCAL_URL` is set but unreachable they PANIC on purpose (anti-forged-green guard in `store_or_skip` — never remove it).
 
 ---
 
@@ -50,15 +50,82 @@ exists at `api_test.rs:76`; the byte-identical-404 assertion pattern to mirror i
 compare-against-unknown-token shape.
 
 ```rust
+/// KNOWN POSITIVE for #154: a revoked link must not serve game detail. Byte-identical
+/// to the unknown-token 404 per owned_proxy_404s_without_live_link_byte_identical (:1137).
 #[tokio::test]
 async fn game_detail_refuses_revoked_link_154() {
-    // KNOWN POSITIVE for #154: revoked link + listable game → detail must 404,
-    // byte-identical to the unknown-token 404 (assert status AND body bytes equal,
-    // per owned_proxy_404s_without_live_link_byte_identical's pattern).
-    // expired link → 404 identically. exhausted link → 200 (grid stays browsable
-    // ⇒ detail stays reachable). active link → 200.
+    let Some(store) = store_or_skip("detail-revoked-154").await else {
+        return;
+    };
+    let g = test_game(1);
+    store.put_game(&g).await.unwrap();
+    let mut lnk = test_link("rev-detail-tok");
+    lnk.revoked = true;
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = plain_router(Arc::clone(&store), mock.clone());
+
+    // Revoked link, real game → must be byte-identical to unknown-token 404.
+    let detail_req = Request::get(format!("/api/l/rev-detail-tok/games/{}/detail", g.id))
+        .body(Body::empty())
+        .unwrap();
+    let detail_resp = app.clone().oneshot(detail_req).await.unwrap();
+    let unknown_req = Request::get(format!("/api/l/{CTX_TOKEN}/games/{}/detail", g.id))
+        .body(Body::empty())
+        .unwrap();
+    let unknown_resp = app.clone().oneshot(unknown_req).await.unwrap();
+
+    assert_eq!(detail_resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(unknown_resp.status(), StatusCode::NOT_FOUND);
+    let detail_bytes = axum::body::to_bytes(detail_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let unknown_bytes = axum::body::to_bytes(unknown_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail_bytes, unknown_bytes,
+        "revoked-link detail 404 must be byte-identical to unknown-token 404 (#154)"
+    );
+
+    // Expired link → same refusal. Exhausted link → 200 (grid stays browsable).
+    let mut expired = test_link("exp-detail-tok");
+    expired.expires_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+    store.create_link(&expired).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/exp-detail-tok/games/{}/detail", g.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let mut exhausted = test_link("exh-detail-tok");
+    exhausted.claims_used = exhausted.claims_allowed;
+    store.create_link(&exhausted).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/exh-detail-tok/games/{}/detail", g.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 ```
+
+(Harness symbols all exist in api_test.rs today: `store_or_skip`, `test_game`, `test_link` :76,
+`plain_router`, `MockInvoker`, `CTX_TOKEN`, `body_json`. If `put_game` isn't the seeding call the
+neighboring tests use, copy whichever seeding call `revoked_link_active_false_games_empty` :193
+uses verbatim.)
 
 - [ ] **Step 2: Run to verify failure**: `cargo test -p public-api game_detail_refuses_revoked` → FAILS against current code (revoked serves 200 — the test proves it can catch the bug).
 
@@ -88,10 +155,10 @@ async fn game_detail_refuses_revoked_link_154() {
 
 **Files:**
 - Modify: `crates/domain/src/lib.rs` (Link struct ~:168-215, ClaimRefusal enum ~:250, `can_claim` ~:266, cfg(test) block at bottom)
-- Modify (mechanical compile ripple only — real behavior in Tasks 2/4/5): `crates/dynamo/src/schema.rs` `link_body`, every `Link { ... }` literal in `crates/admin-api/src/lib.rs`, `crates/dynamo/src/lib.rs`, `crates/public-api/src/lib.rs`, and test files; `can_claim` match sites in `crates/public-api/src/lib.rs` (4 sites: ~:471 claim, ~:554 get_link, ~:470-region steam proxy, and Task 0's new `handle_game_detail` gate)
+- Modify (mechanical compile ripple only — real behavior in Tasks 2/4/5): `crates/dynamo/src/schema.rs` `link_body`, every `Link { ... }` literal in `crates/admin-api/src/lib.rs`, `crates/dynamo/src/lib.rs`, `crates/public-api/src/lib.rs`, and test files; `can_claim` match sites in `crates/public-api/src/lib.rs` — **FIVE sites after Task 0** (step-5 gate M1 corrected this list): steam proxy :469-475, `handle_get_link` :550-556, claim pre-check :668-675, **`handle_post_thanks` :935-944** (exhaustive, no wildcard — easy to miss), and Task 0's `handle_game_detail` gate
 
 **Interfaces:**
-- Produces: `Link.unlock_at: Option<OffsetDateTime>` (serde `default` + `rfc3339::option`, no skip — serializes as null when None, like `expires_at`); `ClaimRefusal::Sealed`; `can_claim` refusal order revoked → **sealed** → expired → exhausted.
+- Produces: `Link.unlock_at: Option<OffsetDateTime>` — serde is the **`thanked_at` combo** (`default` + `rfc3339::option` + `skip_serializing_if = "Option::is_none"`, in-repo precedent domain :194-199): None ⇒ the key is ABSENT on every serialized wire (body blob, admin list). This is what makes Task 2's `!body.contains("unlock_at")` assertion satisfiable — a no-skip shape would serialize `"unlock_at":null` and that test could never go green (step-5 gate B1). Also: `ClaimRefusal::Sealed`; `can_claim` refusal order revoked → **sealed** → expired → exhausted.
 
 - [ ] **Step 1: Write the failing tests** (domain cfg(test); follow the existing `can_claim` test style)
 
@@ -106,7 +173,7 @@ fn can_claim_sealed_before_unlock() {
 
 #[test]
 fn can_claim_open_at_exact_unlock_instant() {
-    let mut l = test_link();
+    let mut l = link();
     let now = OffsetDateTime::now_utc();
     l.unlock_at = Some(now); // unlock_at == now ⇒ OPEN (strict >)
     assert_eq!(l.can_claim(now), Ok(()));
@@ -114,7 +181,7 @@ fn can_claim_open_at_exact_unlock_instant() {
 
 #[test]
 fn can_claim_revoked_outranks_sealed() {
-    let mut l = test_link();
+    let mut l = link();
     let now = OffsetDateTime::now_utc();
     l.revoked = true;
     l.unlock_at = Some(now + time::Duration::hours(1));
@@ -125,7 +192,7 @@ fn can_claim_revoked_outranks_sealed() {
 fn can_claim_sealed_outranks_expired_and_exhausted() {
     // Unreachable via admin validation (unlock must precede expiry) but the ordering is
     // still pinned: a sealed link reports sealed, whatever else is wrong with it.
-    let mut l = test_link();
+    let mut l = link();
     let now = OffsetDateTime::now_utc();
     l.unlock_at = Some(now + time::Duration::hours(1));
     l.expires_at = Some(now - time::Duration::hours(1));
@@ -154,8 +221,14 @@ In `Link`, directly after `expires_at`:
     /// CREATE-TIME-ONLY (spec 2026-08-05 §4: a link born open can never gain one).
     /// Authoritative in a top-level numeric dynamo attribute like the enforcer fields;
     /// `schema::link_body` strips it from the body blob (the notes' one-place contract).
-    /// Same serde shape as `expires_at` — `default` restores None-on-missing under `with`.
-    #[serde(default, with = "time::serde::rfc3339::option")]
+    /// Serde is thanked_at's combo — `default` restores None-on-missing under `with`,
+    /// and skip-on-None keeps the stripped body free of even a null key (the Task-2
+    /// body-strip test depends on absence, not null-ness).
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub unlock_at: Option<OffsetDateTime>,
 ```
 
@@ -176,10 +249,11 @@ In `can_claim`, between the revoked check and the expires check:
         }
 ```
 
-- [ ] **Step 4: Mechanical ripple to green** — every `Link { ... }` literal gains `unlock_at: None` (admin-api `handle_create_link` uses `unlock_at: None` FOR NOW — Task 5 wires the real value); `schema::link_body`'s stripped copy gains `unlock_at: None` (Task 2 replaces this fn wholesale); the three public-api `can_claim` matches gain minimal-correct arms:
-  - claim handler (~:471) and steam proxy: `ClaimRefusal::Sealed => "this gift is still wrapped"`
-  - `handle_get_link` (~:554): `Err(domain::ClaimRefusal::Sealed) => ("sealed", true)` (Task 4 replaces with the real sealed response; this interim leaks nothing — games/notes hidden)
-  - `handle_game_detail` (Task 0's gate): `Sealed` joins the refusing arm alongside `Revoked | Expired` — the gate is now the feature's fourth socket
+- [ ] **Step 4: Mechanical ripple to green** — every `Link { ... }` literal gains `unlock_at: None` (admin-api `handle_create_link` uses `unlock_at: None` FOR NOW — Task 5 wires the real value); `schema::link_body`'s stripped copy gains `unlock_at: None` (Task 2 replaces this fn wholesale); the FIVE public-api `can_claim` matches gain their arms, each one PINNED here (no site left as an executor's product decision — gate M1):
+  - claim pre-check :668-675 and steam proxy :469-475: `ClaimRefusal::Sealed => "this gift is still wrapped"` (same 409 shape as the neighbors)
+  - `handle_get_link` :550-556: `Err(domain::ClaimRefusal::Sealed) => ("sealed", true)` (Task 4 replaces with the real sealed response; this interim leaks nothing — games/notes hidden)
+  - **`handle_post_thanks` :935-944**: `Err(domain::ClaimRefusal::Sealed)` refuses, same 409 shape as its Revoked/Expired arms, body `{"error": "this gift is still wrapped"}`. Unreachable in practice (sealed ⇒ zero claims ⇒ the handler's claims-first guard already refused) — pinned anyway: a ruling without an arm is a guess with a compiler error attached. Add that reasoning as the arm's comment.
+  - `handle_game_detail` (Task 0's gate): `Sealed` joins the refusing arm alongside `Revoked | Expired` — the gate is now one of the feature's five sockets
 
 - [ ] **Step 5: Run**: `cargo test --workspace` → PASS; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean.
 
@@ -195,6 +269,7 @@ In `can_claim`, between the revoked check and the expires check:
 - Test: `crates/dynamo/tests/store_test.rs`
 
 **Interfaces:**
+- Consumes: `Link.unlock_at` with skip-on-None serde (Task 1).
 - Produces: stored links carry top-level `unlock_at` (N, epoch seconds) iff Some; body blob NEVER contains an `unlock_at` key; `link_from_item` unconditionally overrides from the top-level attr (absent ⇒ None).
 
 - [ ] **Step 1: Write failing tests** — HARNESS FACTS (store_test.rs, verified): tests get a
@@ -326,6 +401,7 @@ pub fn link_body(l: &Link) -> String {
 - Test: `crates/dynamo/tests/store_test.rs`
 
 **Interfaces:**
+- Consumes: `Link.unlock_at` (Task 1); top-level `unlock_at` storage + `link_from_item` override (Task 2); existing `is_ccf_update`, `schema::key_pair`, `schema::epoch_s` (all pub(crate), in-crate use only).
 - Produces: `pub async fn set_link_unlock(&self, token: &str, unlock_at: OffsetDateTime, now: OffsetDateTime) -> Result<bool, StoreError>` and `pub async fn remove_link_unlock(&self, token: &str, now: OffsetDateTime) -> Result<bool, StoreError>` — `Ok(false)` = condition refused (missing link / never sealed / already open; deliberately indistinguishable). `claim_game` refuses sealed links at the transaction (maps to existing `ClaimTxError::LinkNotClaimable`).
 
 - [ ] **Step 1: Write failing moto tests**
@@ -346,15 +422,41 @@ async fn set_link_unlock_edits_only_while_sealed() {
     // unknown token:              set_link_unlock(+1h) → Ok(false)
 }
 
+/// THE RULING, with its name on it (family review round 3 — lilith): a link born open
+/// can never gain a seal. State A of the seal machine — the ONE state the complement
+/// test can't see. Pins the argument lilith lost 2026-08-05 (`attribute_exists` vs
+/// `attribute_not_exists ... OR`): if a future reader re-runs that argument and flips
+/// the condition, every other seal test stays green and THIS one goes red. A ruling
+/// without a regression test is a preference.
 #[tokio::test]
 async fn seal_cannot_be_added_to_an_unsealed_link() {
-    // THE RULING, with its name on it (family review round 3 — lilith): a link born open
-    // (unlock_at: None) must refuse set_link_unlock → Ok(false), and its raw item must
-    // still have NO unlock_at attr afterward. This is state A of the seal machine — the
-    // ONE state the complement test can't see. It pins the argument lilith lost this
-    // morning (`attribute_exists` vs `attribute_not_exists ... OR`): if a future reader
-    // re-runs that argument and flips the condition, every other seal test stays green
-    // and THIS one goes red. A ruling without a regression test is a preference.
+    let Some(store) = store_or_skip("seal-not-addable").await else {
+        return;
+    };
+    let l = link("born-open"); // store_test's existing helper :80 — unlock_at: None
+    store.create_link(&l).await.unwrap();
+
+    let now = OffsetDateTime::now_utc();
+    let accepted = store
+        .set_link_unlock("born-open", now + time::Duration::hours(1), now)
+        .await
+        .unwrap();
+    assert!(!accepted, "a link born open must refuse gaining a seal");
+
+    // And the raw item still has NO unlock_at attr afterward.
+    let client = raw_client("seal-not-addable").await;
+    let item = client
+        .get_item()
+        .table_name("t-seal-not-addable")
+        .key("pk", AttributeValue::S("LINK#born-open".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(item.get("unlock_at").is_none());
 }
 
 #[tokio::test]
@@ -363,23 +465,58 @@ async fn remove_link_unlock_unseals_only_while_sealed() {
     // open/never-sealed/unknown → Ok(false).
 }
 
+/// THE COMPLEMENT PROPERTY (family review round 2 — step-5 gate item (b)): once
+/// unlock_at exists, edit (`unlock_at > :now`) and claim (`unlock_at <= :now`) are
+/// exact complements — no instant where both pass, none where neither does. The EXACT
+/// row is the one earning its keep: an off-by-one surfaces there as an overlap (both
+/// pass) or a gap (neither does), which one-sided testing structurally cannot see.
 #[tokio::test]
 async fn seal_conditions_are_exact_complements_at_the_instant() {
-    // THE COMPLEMENT PROPERTY (family review round 2 — OMBB's step-5 gate checks this):
-    // once unlock_at exists, edit (`unlock_at > :now`) and claim (`unlock_at <= :now`)
-    // are exact complements. Three rows × BOTH verbs, all against ONE stored link whose
-    // unlock_at is a fixed instant T (epoch_s truncates to whole seconds — pick T on a
-    // whole second so the rows are exact):
-    //   now = T − 1s: set_link_unlock → Ok(true)  ; claim_game → Err(LinkNotClaimable)
-    //   now = T     : set_link_unlock → Ok(false) ; claim_game → Ok(())
-    //   now = T + 1s: set_link_unlock → Ok(false) ; claim_game → Ok(())
-    // (Recreate the link/game between rows — a successful claim consumes state.)
-    // The EXACT row is the one earning its keep: an off-by-one surfaces there as an
-    // overlap (both pass) or a gap (neither does), which one-sided testing cannot see.
+    let Some(store) = store_or_skip("seal-complement").await else {
+        return;
+    };
+    // T pinned to a WHOLE second — epoch_s truncates, and the exact row must be exact.
+    let t = OffsetDateTime::from_unix_timestamp(
+        OffsetDateTime::now_utc().unix_timestamp() + 3600,
+    )
+    .unwrap();
+
+    // Three rows x BOTH verbs. Fresh link + game per row: a successful claim consumes state.
+    for (label, now, edit_ok, claim_ok) in [
+        ("t-minus-1s", t - time::Duration::seconds(1), true, false),
+        ("t-exact", t, false, true),
+        ("t-plus-1s", t + time::Duration::seconds(1), false, true),
+    ] {
+        let tok = format!("comp-{label}");
+        let mut l = link(&tok);
+        l.unlock_at = Some(t);
+        store.create_link(&l).await.unwrap();
+        let g = game(1, true); // store_test's existing listable-game helper
+        // NOTE: give each row its own game id if game(n, ..) collides across rows —
+        // follow how neighboring claim_game tests seed games.
+        store.put_game(&g).await.unwrap();
+
+        let edited = store
+            .set_link_unlock(&tok, t + time::Duration::hours(2), now)
+            .await
+            .unwrap();
+        assert_eq!(edited, edit_ok, "edit verb at {label}");
+
+        let claim = store
+            .claim_game(&tok, &g.id, &format!("claim-{label}"), now)
+            .await;
+        assert_eq!(claim.is_ok(), claim_ok, "claim verb at {label}: {claim:?}");
+        if !claim_ok {
+            assert!(
+                matches!(claim, Err(ClaimTxError::LinkNotClaimable)),
+                "sealed claim must refuse as LinkNotClaimable, got {claim:?}"
+            );
+        }
+    }
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** (functions don't exist; claim test fails on the missing clause — the sealed claim SUCCEEDS pre-fix, the known-positive proving the test can catch it).
+- [ ] **Step 2: Run to verify failure** — sequencing (gate minor 7): four of five tests red as COMPILE errors (`set_link_unlock`/`remove_link_unlock` don't exist). For the behavioral red on `claim_game_transaction_refuses_sealed_link`, stub the two verbs first (bodies `todo!()`), run ONLY that test: the sealed claim SUCCEEDS pre-clause — the known positive proving the test can catch the missing condition — then implement for green.
 
 - [ ] **Step 3: Implement**
 
@@ -473,17 +610,49 @@ New verbs, `set_link_gift_note`'s scoped shape with the seal condition:
 - [ ] **Step 1: Write failing axum-oneshot tests** (existing api_test.rs harness — moto store + router oneshot)
 
 ```rust
+/// The devtools test: while sealed, the wire carries NOTHING a curious friend can peek
+/// at — asserted on the RAW body string, not the parsed JSON (spec §2).
 #[tokio::test]
 async fn sealed_link_view_withholds_everything_and_counts_down() {
-    // link: unlock_at = now + 3600s, gift_note = Some("happy birthday maya"), one listable game.
-    // GET /api/l/:token →
-    //   200; header cache-control == "no-store"
-    //   json: state == "sealed", games == [], claims == []
-    //   RAW body string assertions (the devtools test): !contains("gift_note"),
-    //     !contains("happy birthday"), !contains(<game title>)
-    //   unlocks_in_seconds: Some(n) with 3595 <= n <= 3600 (ceiled, never 0)
-    //   unlocks_at present, parses rfc3339
-    //   claims_allowed/claims_used present (the deliberate tease)
+    let Some(store) = store_or_skip("sealed-view").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap(); // title "Game 1" — must NOT appear
+    let mut lnk = test_link("sealed-tok");
+    lnk.unlock_at = Some(OffsetDateTime::now_utc() + time::Duration::seconds(3600));
+    lnk.gift_note = Some("happy birthday maya".into());
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(Request::get("/api/l/sealed-tok").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "a cached sealed 200 would pin a countdown past midnight"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+
+    // RAW-string withholding — devtools is not a spoiler channel.
+    assert!(!raw.contains("gift_note"), "sealed body leaked gift_note key: {raw}");
+    assert!(!raw.contains("happy birthday"), "sealed body leaked the note text");
+    assert!(!raw.contains("Game 1"), "sealed body leaked a game title");
+
+    let j: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(j["state"], "sealed");
+    assert_eq!(j["games"], serde_json::json!([]));
+    assert_eq!(j["claims"], serde_json::json!([]));
+    let secs = j["unlocks_in_seconds"].as_u64().unwrap();
+    assert!((3595..=3600).contains(&secs), "ceiled remaining, got {secs}");
+    assert!(j["unlocks_at"].as_str().unwrap().contains('T'), "rfc3339 instant");
+    assert_eq!(j["claims_allowed"], 1); // the deliberate tease stays
 }
 
 #[tokio::test]
@@ -580,7 +749,7 @@ ripple); this task only adds the sealed regression test above. Verify the arm re
 
 **Interfaces:**
 - Consumes: `Store::set_link_unlock` / `Store::remove_link_unlock` (Task 3).
-- Produces (admin wire): `POST /admin/api/links` accepts `unlock_at: Option<String>` (rfc3339 WITH offset — an absolute instant; the browser resolved ben's local pick); `POST /admin/api/links/:token/unlock` body `{"unlock_at": "<rfc3339>"}` (null/absent = 422 — unseal is not a null set); `DELETE /admin/api/links/:token/unlock`; both map store `Ok(false)` → 409 `{"error": "link is not sealed — seals are create-time-only and end at the unlock moment"}`. `handle_list_links` needs NO change (serializes `domain::Link`; `unlock_at` rides as rfc3339-or-null automatically).
+- Produces (admin wire): `POST /admin/api/links` accepts `unlock_at: Option<String>` (rfc3339 WITH offset — an absolute instant; the browser resolved ben's local pick); `POST /admin/api/links/:token/unlock` body `{"unlock_at": "<rfc3339>"}` (null/absent = 422 — unseal is not a null set); `DELETE /admin/api/links/:token/unlock`; both map store `Ok(false)` → 409 `{"error": "link is not sealed — seals are create-time-only and end at the unlock moment"}`. `handle_list_links` needs NO change (serializes `domain::Link`; `unlock_at` rides as rfc3339-or-ABSENT automatically — skip-on-None serde, gate B1).
 
 - [ ] **Step 1: Write failing tests**
 
@@ -591,7 +760,7 @@ ripple); this task only adds the sealed regression test above. Verify the arm re
 // edit: sealed link POST /unlock {future instant} → 200, list reflects it;
 //   past instant → 422 (rejected BEFORE the store call — fat-finger guard);
 //   open link → 409; never-sealed → 409; body {"unlock_at": null} → 422.
-// unseal: DELETE on sealed → 200, list shows null; DELETE on open/never-sealed → 409.
+// unseal: DELETE on sealed → 200, list omits unlock_at (absent, not null); DELETE on open/never-sealed → 409.
 ```
 
 - [ ] **Step 2: Run to verify failure.**
@@ -689,6 +858,11 @@ async fn handle_delete_link_unlock(
 
 Router: `.route("/admin/api/links/:token/unlock", post(handle_set_link_unlock).delete(handle_delete_link_unlock))`
 
+Deliberate asymmetry (gate minor 3, decided): POST distinguishes unknown-token (404) from
+not-sealed (409) because it already reads the link for the expiry cross-check; DELETE does no
+read — unknown and not-sealed both mean "nothing to unseal" and collapse into one 409. Admin-only
+surface; no oracle concern. Stated here so nobody "fixes" the symmetry with an extra read.
+
 - [ ] **Step 4: Run**: `cargo test -p admin-api` → PASS; full workspace + clippy → PASS.
 - [ ] **Step 5: Commit** `git commit -S -m "admin-api: create sealed links + edit/unseal verbs (past rejected, null rejected, unseal is DELETE)"`
 
@@ -701,7 +875,7 @@ Router: `.route("/admin/api/links/:token/unlock", post(handle_set_link_unlock).d
 - Test: `web/src/api.test.ts`
 
 **Interfaces:**
-- Produces: `LinkState` includes `'sealed'`; `LinkView` gains `unlocks_in_seconds?: number; unlocks_at?: string;`; `AdminLink` gains `unlock_at: string | null;`; `adminCreateLink(label, claims, expiresDays?, giftNote?, unlockAt?)` sends `unlock_at`; `adminSetLinkUnlock(token: string, unlockAtIso: string): Promise<void>`; `adminDeleteLinkUnlock(token: string): Promise<void>` — both throw the 409 message on conflict, follow `adminSetLinkNote`'s 422 mapping.
+- Produces: `LinkState` includes `'sealed'`; `LinkView` gains `unlocks_in_seconds?: number; unlocks_at?: string;`; `AdminLink` gains `unlock_at?: string;` (absent when unsealed — matches `thanked_at?`; skip-on-None serde, gate B1); `adminCreateLink(label, claims, expiresDays?, giftNote?, unlockAt?)` sends `unlock_at`; `adminSetLinkUnlock(token: string, unlockAtIso: string): Promise<void>`; `adminDeleteLinkUnlock(token: string): Promise<void>` — both throw the 409 message on conflict, follow `adminSetLinkNote`'s 422 mapping.
 
 - [ ] **Step 1: Failing tests** (api.test.ts, existing fetch-mock style): sealed LinkView parses; adminCreateLink includes `unlock_at` in body when given, omits when not; adminSetLinkUnlock POSTs `{unlock_at}` with CSRF header; adminDeleteLinkUnlock sends DELETE; 409 → thrown message.
 - [ ] **Step 2: Run**: `npx vitest run src/api.test.ts` → FAIL.
@@ -747,7 +921,7 @@ Router: `.route("/admin/api/links/:token/unlock", post(handle_set_link_unlock).d
 }
 ```
   - copy (brand voice, lowercase): heading `"a gift is waiting for you ♡"`, sub `"ben wrapped this one — it opens itself when the moment comes"`.
-- [ ] **Step 4: Wire into LinkPage**: in the loaded branch before the shelf markup: `if (data.state === "sealed") return <SealedGift label={data.label} unlocksInSeconds={data.unlocks_in_seconds ?? 1} unlocksAt={data.unlocks_at ?? ""} onRefetch={refetchLink} />` (use LinkPage's existing fetch fn; if only an initial-load effect exists, extract it into a `useCallback` refetch — follow the file's existing state machine). The sealed→active transition then renders the normal shelf, whose existing boot/typewriter entrance IS the unwrap ceremony beat.
+- [ ] **Step 4: Wire into LinkPage**: in the loaded branch — immediately after `const { data } = view;` (~:340, AFTER every hook): `if (data.state === "sealed") return <SealedGift label={data.label} unlocksInSeconds={data.unlocks_in_seconds ?? 1} unlocksAt={data.unlocks_at ?? ""} onRefetch={refresh} />` — `refresh` is the file's EXISTING refetch mechanism (`const refresh = useCallback(() => setRefreshTick((t) => t + 1), [])` at LinkPage.tsx:180); do not invent a new one. CEREMONY DECISION (gate open-question 1, decided): the sealed→active transition renders the normal shelf, whose existing boot/typewriter entrance IS the unwrap ceremony beat — deliberate reuse, no bespoke crossfade; the spec's "soft ceremony beat" language is satisfied by that entrance (spec updated to match).
 - [ ] **Step 5: Run**: `npx vitest run src/friend` → PASS; typecheck clean.
 - [ ] **Step 6: Commit** `git commit -S -m "friend: SealedGift — the wrapped present, countdown from remaining, refetch-never-self-unseal"`
 
@@ -764,7 +938,7 @@ Router: `.route("/admin/api/links/:token/unlock", post(handle_set_link_unlock).d
 
 - [ ] **Step 1: Failing tests**:
   - create form has a `datetime-local` input labeled "unlocks at (optional)"; submitting with a value calls `adminCreateLink` with an ISO **instant** (assert the arg matches `new Date(value).toISOString()` — the browser-resolves-ben's-zone rule)
-  - a row whose `unlock_at` is future shows a `sealed until <local datetime>` chip; past/null shows none
+  - a row whose `unlock_at` is future shows a `sealed until <local datetime>` chip; past or ABSENT (the field is omitted when unsealed — gate B1) shows none
   - sealed row exposes "move the moment" (datetime-local + save → `adminSetLinkUnlock` with ISO instant) and "unseal" (→ `adminDeleteLinkUnlock`); neither renders on open links
   - a 409 from either verb surfaces the server message inline (the link opened under him — the row then refreshes)
 - [ ] **Step 2: Run** → FAIL.
@@ -783,5 +957,7 @@ Router: `.route("/admin/api/links/:token/unlock", post(handle_set_link_unlock).d
 - [ ] **Step 1: Full gates**: `cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace` then in `web/`: `npm run typecheck && npm run lint && npx vitest run && npm run build`.
 - [ ] **Step 1b: Tip assertion for the access fix** (family review round 3 — lilith; OMBB gate item (j)): `cargo test -p public-api game_detail_refuses -- --nocapture` at the BRANCH TIP and confirm BOTH `game_detail_refuses_revoked_link_154` and `game_detail_refuses_sealed_link` ran and passed — Task 1's ripple rewrote the very gate Task 0's test guards; green-when-written is a statement about history, not about the ship.
 - [ ] **Step 2: Spec status flip**: spec doc `status: draft` → `status: implemented (PR pending)`; confirm spec + this plan are committed on the branch.
-- [ ] **Step 3: Grep sweep**: `grep -rn "unlock_at" crates/ web/src/ | grep -v test` — every hit is one of the sites this plan names (no stragglers writing null / reading body copies).
+- [ ] **Step 3: Two-grep sweep, two truth conditions** (family review round 4 — an assertion aimed at a grep with no invariant cries wolf until someone mutes it):
+  - **`grep -rn "can_claim(" crates/public-api/src/ crates/admin-api/src/ crates/fulfillment/src/ crates/dynamo/src/`** (production code only — test files legitimately call it): assert BOTH directions against the five-site list in THIS plan doc (`docs/superpowers/plans/2026-08-05-wrapped-gifts.md`, Task 1 Files): (a) every hit is on the list — a silent sixth site is a gate nobody decided; (b) every listed site still hits — a listed site gone quiet lost its arm in a refactor. One direction without the other tests the bound from one side.
+  - **`grep -rn "unlock_at" crates/ web/src/`** (INCLUDING tests — a hand-rolled null-writer fixture hides in exactly the excluded set): no site assertion (the symbol legitimately appears in serde/store/admin/web/tests by design) — this is a CLASSIFICATION pass: read each hit and confirm no stragglers writing null instead of REMOVE and no reads of a body-blob copy.
 - [ ] **Step 4: Commit any fixups** `git commit -S -m "wrapped-gifts: gate sweep fixups"`.

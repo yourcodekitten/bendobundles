@@ -29,9 +29,11 @@ of the ceremony. "do not open until" is the oldest gift magic there is.
 
 ### 1. domain: `unlock_at` on `Link`, `Sealed` on `ClaimRefusal`
 
-- `Link.unlock_at: Option<OffsetDateTime>` — same serde shape as `expires_at`
-  (`default` + `rfc3339::option`; absent on every pre-existing record ⇒ `None` ⇒ unchanged
-  behavior for all current links).
+- `Link.unlock_at: Option<OffsetDateTime>` — serde is the **`thanked_at` combo** (`default`
+  + `rfc3339::option` + `skip_serializing_if = "Option::is_none"`; gate B1): absent on every
+  pre-existing record ⇒ `None` ⇒ unchanged behavior for all current links, and None never
+  serializes even a null key — which is what lets the stripped body blob be key-free and the
+  body-strip test assert absence rather than null-ness.
 - `Link::can_claim(now)` gains the check: `unlock_at > now ⇒ Err(ClaimRefusal::Sealed)`.
   ordering: revoked → **sealed** → expired → exhausted (a revoked gift stays revoked; a sealed
   link that also expired is a config error surfaced as sealed until unlock, then expired —
@@ -90,8 +92,9 @@ on the gift tag, and a countdown in the pixel type. reduced-motion gets a static
 present with the date; the countdown text still updates (text change ≠ motion).
 
 unwrap moment: when the countdown hits zero the client refetches; on `state: "active"` it
-transitions into the normal shelf (one soft ceremony beat, honoring `prefers-reduced-motion`
-with a plain crossfade). refetch retries with small backoff if the server still says sealed
+transitions into the normal shelf, whose existing boot/typewriter entrance IS the ceremony
+beat (deliberate reuse, decided at the step-5 gate — no bespoke crossfade; the entrance
+already honors `prefers-reduced-motion`). refetch retries with small backoff if the server still says sealed
 (clock skew between lambda and client is real; remaining-seconds makes it rare, retry makes
 it invisible).
 
@@ -124,8 +127,9 @@ it invisible).
   exactly / +1s on BOTH verbs; the exact row is where an off-by-one would surface as an
   overlap or a gap, and one-sided testing structurally cannot see it.
 - admin wire note (OMBB): `handle_list_links` serializes `domain::Link` raw, so `unlock_at`
-  reaches the admin list automatically (rfc3339-or-null, same shape as `expires_at`) —
-  intentional, no admin view type to touch server-side.
+  reaches the admin list automatically (rfc3339-or-ABSENT — skip-on-None serde, the
+  `thanked_at` combo; chosen at the step-5 gate so the stripped body can be key-free,
+  not merely null-valued) — intentional, no admin view type to touch server-side.
 - storage follows the enforcer-field rule OMBB set in the #69 review, sharpened type-level
   (lilith): `unlock_at` is authoritative in a **top-level numeric dynamo attribute** (epoch
   seconds, like `expires_at`; claim enforcement compares it numerically in the
