@@ -3422,3 +3422,72 @@ async fn session_hash_old_raw_pk_items_do_not_authenticate() {
         "raw-pk legacy session must not authenticate against hashed lookup"
     );
 }
+
+// ── wrapped gifts: unlock_at storage (spec 2026-08-05 §4) ────────────────────
+
+#[tokio::test]
+async fn link_unlock_at_top_level_only_and_round_trips() {
+    let Some(store) = store_or_skip("link-unlock-roundtrip").await else {
+        return;
+    };
+    let mut l = link("tok-sealed");
+    l.unlock_at = Some(time::OffsetDateTime::now_utc() + time::Duration::hours(24));
+    store.create_link(&l).await.unwrap();
+
+    // Round-trip: unlock_at comes back (truncated to whole seconds by epoch_s).
+    let got = store.get_link("tok-sealed").await.unwrap().unwrap();
+    assert_eq!(
+        got.unlock_at.unwrap().unix_timestamp(),
+        l.unlock_at.unwrap().unix_timestamp()
+    );
+
+    // Raw item: top-level N attr present; body blob lacks the key entirely.
+    let client = raw_client("link-unlock-roundtrip").await;
+    let item = client
+        .get_item()
+        .table_name("t-link-unlock-roundtrip")
+        .key("pk", AttributeValue::S("LINK#tok-sealed".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(
+        item.get("unlock_at").and_then(|v| v.as_n().ok()).is_some(),
+        "unlock_at must be a top-level N attr"
+    );
+    let body = item["body"].as_s().unwrap();
+    assert!(
+        !body.contains("unlock_at"),
+        "body must never carry unlock_at: {body}"
+    );
+}
+
+#[tokio::test]
+async fn link_without_unlock_at_reads_none_and_stores_no_attr() {
+    let Some(store) = store_or_skip("link-unlock-absent").await else {
+        return;
+    };
+    store.create_link(&link("tok-open")).await.unwrap();
+    let got = store.get_link("tok-open").await.unwrap().unwrap();
+    assert_eq!(got.unlock_at, None);
+
+    let client = raw_client("link-unlock-absent").await;
+    let item = client
+        .get_item()
+        .table_name("t-link-unlock-absent")
+        .key("pk", AttributeValue::S("LINK#tok-open".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(
+        item.get("unlock_at").is_none(),
+        "a link born open must store NO unlock_at attr"
+    );
+}

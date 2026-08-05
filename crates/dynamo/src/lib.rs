@@ -410,6 +410,21 @@ fn link_from_item(
             )
         }
     };
+    // unlock_at follows the full notes contract (top-level authoritative, absent = born
+    // open, body never carries it — schema::link_body strips it) with expires_at's numeric
+    // representation. Unconditional override: absence ⇒ None.
+    link.unlock_at = match n_attr("unlock_at") {
+        None => None,
+        Some(n) => {
+            let secs = n
+                .parse::<i64>()
+                .map_err(|_| StoreError::Corrupt("link unlock_at not numeric"))?;
+            Some(
+                OffsetDateTime::from_unix_timestamp(secs)
+                    .map_err(|_| StoreError::Corrupt("link unlock_at out of range"))?,
+            )
+        }
+    };
     // gift_note is post-creation-editable via `set_link_gift_note`'s scoped write, so the
     // top-level attribute is authoritative and absence means no-note — unconditional
     // override, same rule as expires_at. (body never carries the note at all — see
