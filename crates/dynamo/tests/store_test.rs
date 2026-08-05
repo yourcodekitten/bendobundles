@@ -3708,3 +3708,48 @@ async fn seal_conditions_are_exact_complements_at_the_instant() {
         }
     }
 }
+
+/// Revoking a sealed link must not disturb the seal — update_link_meta rewrites the
+/// whole `body` from a pre-write read, and only link_body's strip + the untouched
+/// top-level attr keep the seal intact. This pins the #69 class (a body-rewriting
+/// write silently clobbering a scoped attribute) for unlock_at specifically.
+#[tokio::test]
+async fn revoke_preserves_seal_attr() {
+    let Some(store) = store_or_skip("revoke-keeps-seal").await else {
+        return;
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let mut l = link("tok-rev-sealed");
+    l.unlock_at = Some(now + time::Duration::hours(1));
+    store.create_link(&l).await.unwrap();
+
+    // Revoke via the same read-modify-update the admin handler uses.
+    let mut got = store.get_link("tok-rev-sealed").await.unwrap().unwrap();
+    got.revoked = true;
+    store.update_link_meta(&got).await.unwrap();
+
+    // Seal survives: readable, and still a top-level attr with a body free of it.
+    let after = store.get_link("tok-rev-sealed").await.unwrap().unwrap();
+    assert!(after.revoked);
+    assert_eq!(
+        after.unlock_at.unwrap().unix_timestamp(),
+        (now + time::Duration::hours(1)).unix_timestamp()
+    );
+    // Refusal order: revoked outranks sealed.
+    assert_eq!(after.can_claim(now), Err(domain::ClaimRefusal::Revoked));
+
+    let client = raw_client("revoke-keeps-seal").await;
+    let item = client
+        .get_item()
+        .table_name("t-revoke-keeps-seal")
+        .key("pk", AttributeValue::S("LINK#tok-rev-sealed".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(item.get("unlock_at").and_then(|v| v.as_n().ok()).is_some());
+    assert!(!item["body"].as_s().unwrap().contains("unlock_at"));
+}
