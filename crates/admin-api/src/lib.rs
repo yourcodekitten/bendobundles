@@ -105,6 +105,10 @@ pub fn router(
         )
         .route("/admin/api/links/:token/revoke", post(handle_revoke_link))
         .route("/admin/api/links/:token/note", post(handle_set_link_note))
+        .route(
+            "/admin/api/links/:token/unlock",
+            post(handle_set_link_unlock).delete(handle_delete_link_unlock),
+        )
         .route("/admin/api/links/:token/claims", get(handle_link_claims))
         .route("/admin/api/claims/self", get(handle_self_claims))
         .route("/admin/api/sync", post(handle_sync))
@@ -550,6 +554,7 @@ async fn handle_game_detail(State(s): State<AppState>, Path(id): Path<String>) -
 /// representable range (year > 9999) — as does the rfc3339 serializer in dynamo's link schema.
 /// A panic here is a lambda 502 + cold restart, so absurd input gets a 422 instead.
 const EXPIRES_DAYS_MAX: u32 = 3650; // ~10 years — nobody needs a longer-lived gift link
+const UNLOCK_MAX_DAYS: i64 = 370; // a typo'd year must not seal a gift forever
 const CLAIMS_ALLOWED_MAX: u32 = 100;
 const LABEL_MAX_CHARS: usize = 200;
 const GIFT_NOTE_MAX_CHARS: usize = 500; // fits the friend page's dialog box without scrolling
@@ -581,12 +586,31 @@ fn unprocessable(msg: String) -> Response {
         .into_response()
 }
 
+/// Parse an absolute rfc3339 unlock instant and bound it to (now, now + UNLOCK_MAX_DAYS].
+/// Shared by create and the edit verb. The browser already resolved ben's local pick to
+/// an instant — a bare datetime without offset is a client bug and parses as Err here.
+fn parse_unlock_at(raw: &str, now: OffsetDateTime) -> Result<OffsetDateTime, String> {
+    let t = OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| "unlock_at must be an rfc3339 instant with offset".to_string())?;
+    if t <= now {
+        return Err("unlock_at must be in the future".to_string());
+    }
+    if t > now + time::Duration::days(UNLOCK_MAX_DAYS) {
+        return Err(format!("unlock_at must be within {UNLOCK_MAX_DAYS} days"));
+    }
+    Ok(t)
+}
+
 #[derive(Deserialize)]
 struct CreateLinkBody {
     label: String,
     claims_allowed: u32,
     expires_days: Option<u32>,
     gift_note: Option<String>,
+    /// Wrapped gift: absolute rfc3339 instant (WITH offset — the browser resolved ben's
+    /// local pick at write time; a bare datetime is a client bug and parses as Err).
+    /// Optional; a seal is create-time-only (spec 2026-08-05 §4).
+    unlock_at: Option<String>,
 }
 
 impl CreateLinkBody {
@@ -636,6 +660,21 @@ async fn handle_create_link(
         .expires_days
         .map(|d| now + time::Duration::days(d as i64));
 
+    // Wrapped gift: parse + bound the unlock instant, then cross-check it precedes
+    // expiry — a link that expires before it unwraps is a gift nobody can ever open.
+    let unlock_at = match body.unlock_at.as_deref() {
+        None => None,
+        Some(raw) => match parse_unlock_at(raw, now) {
+            Ok(t) => {
+                if expires_at.is_some_and(|exp| t >= exp) {
+                    return unprocessable("unlock_at must be before the link expires".into());
+                }
+                Some(t)
+            }
+            Err(msg) => return unprocessable(msg),
+        },
+    };
+
     let link = domain::Link {
         token: token.clone(),
         gift_note: parse_gift_note(body.gift_note.as_deref())
@@ -649,7 +688,7 @@ async fn handle_create_link(
         claims_used: 0,
         revoked: false,
         expires_at,
-        unlock_at: None, // Task 5 wires the create-time seal
+        unlock_at,
         created_at: now,
     };
 
@@ -722,6 +761,75 @@ async fn handle_set_link_note(
     match s.store.set_link_gift_note(&token, note.as_deref()).await {
         Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── /admin/api/links/:token/unlock — the two seal verbs (spec 2026-08-05 §4) ─
+
+#[derive(Deserialize)]
+struct SetUnlockBody {
+    /// Required: unseal is DELETE, never a null set (family review — a null that
+    /// means "unseal" is a fat-finger away from a set).
+    unlock_at: String,
+}
+
+const NOT_SEALED_MSG: &str =
+    "link is not sealed — seals are create-time-only and end at the unlock moment";
+
+async fn handle_set_link_unlock(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+    body: Result<Json<SetUnlockBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return unprocessable(
+            "unlock_at (rfc3339 instant) is required — to unseal, DELETE instead".into(),
+        );
+    };
+    let now = OffsetDateTime::now_utc();
+    let unlock = match parse_unlock_at(&body.unlock_at, now) {
+        Ok(t) => t,
+        Err(msg) => return unprocessable(msg),
+    };
+    // Cross-check expiry from a read (benign: the SEAL rules are enforced atomically in
+    // the store condition; expiry ordering is admin-input hygiene, not enforcement).
+    match s.store.get_link(&token).await {
+        Ok(Some(l)) => {
+            if l.expires_at.is_some_and(|exp| unlock >= exp) {
+                return unprocessable("unlock_at must be before the link expires".into());
+            }
+        }
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    match s.store.set_link_unlock(&token, unlock, now).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": NOT_SEALED_MSG})),
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Deliberate asymmetry with the POST verb (plan, gate minor 3): POST distinguishes
+/// unknown-token (404) from not-sealed (409) because it already reads the link for the
+/// expiry cross-check; DELETE does no read — unknown and not-sealed both mean "nothing
+/// to unseal" and collapse into one 409. Admin-only surface; no oracle concern.
+async fn handle_delete_link_unlock(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+) -> Response {
+    let now = OffsetDateTime::now_utc();
+    match s.store.remove_link_unlock(&token, now).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": NOT_SEALED_MSG})),
+        )
+            .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

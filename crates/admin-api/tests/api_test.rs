@@ -2693,3 +2693,222 @@ async fn csrf_state_changing_needs_admin_header_get_exempt() {
         "a read-only GET needs no CSRF header"
     );
 }
+
+// ── wrapped gifts: create with a seal + the two admin verbs (spec §4) ────────
+
+/// Shared: an authed admin request to an arbitrary path/method with a JSON body.
+async fn admin_request(
+    store: &Arc<Store>,
+    invoker: &Arc<dyn AdminInvoker>,
+    admin_hash: &str,
+    session: &str,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> axum::response::Response {
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1");
+    let req = match body {
+        Some(b) => req
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&b).unwrap()))
+            .unwrap(),
+        None => req.body(Body::empty()).unwrap(),
+    };
+    router(
+        Arc::clone(store),
+        Arc::clone(invoker),
+        admin_hash.to_string(),
+        None,
+    )
+    .oneshot(req)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn create_link_unlock_at_validation_and_roundtrip() {
+    let Some(store) = store_or_skip("link-unlock-create").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+
+    let future = |h: i64| {
+        (time::OffsetDateTime::now_utc() + time::Duration::hours(h))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+
+    // Past instant → 422.
+    let resp = post_create_link(
+        &store, &invoker, &admin_hash, &session,
+        serde_json::json!({"label": "P", "claims_allowed": 1, "unlock_at": future(-1)}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Beyond the 370-day bound → 422.
+    let resp = post_create_link(
+        &store, &invoker, &admin_hash, &session,
+        serde_json::json!({"label": "F", "claims_allowed": 1, "unlock_at": future(24 * 371)}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Unlock at-or-after expiry → 422 (unlock 10d, expires 7d).
+    let resp = post_create_link(
+        &store, &invoker, &admin_hash, &session,
+        serde_json::json!({"label": "X", "claims_allowed": 1, "expires_days": 7, "unlock_at": future(24 * 10)}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Bare local datetime (no offset) → 422: the browser must resolve the instant.
+    let resp = post_create_link(
+        &store, &invoker, &admin_hash, &session,
+        serde_json::json!({"label": "B", "claims_allowed": 1, "unlock_at": "2026-12-25T00:00:00"}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Valid future instant → 200, and the list serves it back as rfc3339.
+    let resp = post_create_link(
+        &store, &invoker, &admin_hash, &session,
+        serde_json::json!({"label": "Sealed ok", "claims_allowed": 1, "unlock_at": future(48)}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let token = body_json(resp).await["token"].as_str().unwrap().to_string();
+
+    let resp = admin_request(
+        &store, &invoker, &admin_hash, &session,
+        "GET", "/admin/api/links", None,
+    )
+    .await;
+    let links = body_json(resp).await;
+    let row = links
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["token"] == token.as_str())
+        .unwrap()
+        .clone();
+    assert!(
+        row["unlock_at"].as_str().is_some(),
+        "list must serve unlock_at rfc3339, got {row}"
+    );
+}
+
+#[tokio::test]
+async fn set_link_unlock_endpoint_moves_only_sealed() {
+    let Some(store) = store_or_skip("link-unlock-move").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let now = time::OffsetDateTime::now_utc();
+    let iso = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339).unwrap()
+    };
+
+    let mut sealed = test_link("adm-sealed");
+    sealed.unlock_at = Some(now + time::Duration::hours(1));
+    store.create_link(&sealed).await.unwrap();
+
+    // Move the moment → 200, list reflects.
+    let resp = admin_request(
+        &store, &invoker, &admin_hash, &session,
+        "POST", "/admin/api/links/adm-sealed/unlock",
+        Some(serde_json::json!({"unlock_at": iso(now + time::Duration::hours(3))})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = store.get_link("adm-sealed").await.unwrap().unwrap();
+    assert_eq!(
+        got.unlock_at.unwrap().unix_timestamp(),
+        (now + time::Duration::hours(3)).unix_timestamp()
+    );
+
+    // Past instant → 422 BEFORE the store (fat-finger guard).
+    let resp = admin_request(
+        &store, &invoker, &admin_hash, &session,
+        "POST", "/admin/api/links/adm-sealed/unlock",
+        Some(serde_json::json!({"unlock_at": iso(now - time::Duration::hours(1))})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Null → 422 (unseal is DELETE, never a null set).
+    let resp = admin_request(
+        &store, &invoker, &admin_hash, &session,
+        "POST", "/admin/api/links/adm-sealed/unlock",
+        Some(serde_json::json!({"unlock_at": null})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Open link (unlock passed) → 409.
+    let mut opened = test_link("adm-opened");
+    opened.unlock_at = Some(now - time::Duration::seconds(1));
+    store.create_link(&opened).await.unwrap();
+    let resp = admin_request(
+        &store, &invoker, &admin_hash, &session,
+        "POST", "/admin/api/links/adm-opened/unlock",
+        Some(serde_json::json!({"unlock_at": iso(now + time::Duration::hours(1))})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    // Never-sealed link → 409 (create-time-only).
+    store.create_link(&test_link("adm-open-born")).await.unwrap();
+    let resp = admin_request(
+        &store, &invoker, &admin_hash, &session,
+        "POST", "/admin/api/links/adm-open-born/unlock",
+        Some(serde_json::json!({"unlock_at": iso(now + time::Duration::hours(1))})),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn delete_link_unlock_unseals_only_sealed() {
+    let Some(store) = store_or_skip("link-unlock-del").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let now = time::OffsetDateTime::now_utc();
+
+    let mut sealed = test_link("adm-unseal");
+    sealed.unlock_at = Some(now + time::Duration::hours(1));
+    store.create_link(&sealed).await.unwrap();
+
+    let resp = admin_request(
+        &store, &invoker, &admin_hash, &session,
+        "DELETE", "/admin/api/links/adm-unseal/unlock", None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(store.get_link("adm-unseal").await.unwrap().unwrap().unlock_at, None);
+
+    // Open link → 409 (deliberate: unknown/not-sealed collapse — DELETE does no read).
+    let mut opened = test_link("adm-unseal-late");
+    opened.unlock_at = Some(now - time::Duration::seconds(1));
+    store.create_link(&opened).await.unwrap();
+    let resp = admin_request(
+        &store, &invoker, &admin_hash, &session,
+        "DELETE", "/admin/api/links/adm-unseal-late/unlock", None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
