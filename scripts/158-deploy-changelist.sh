@@ -42,8 +42,8 @@ COOKIE=$(aws ssm get-parameter --profile "$PROFILE_SSM" --region "$R" \
   --name "$SSM_PARAM" --with-decryption --query Parameter.Value --output text)
 PULLS=0; CHECKED=0; FETCH_FAIL=0
 for gk in $(echo "$ROWS" | jq -r '[.[].gamekey] | unique | .[]'); do
-  ORDER=$(curl -sfS "https://www.humblebundle.com/api/v1/order/$gk?all_tpkds=true" \
-    -H "Cookie: _simpleauth_sess=$COOKIE" || echo '{}')
+  ORDER=$(printf 'header = "Cookie: _simpleauth_sess=%s"\n' "$COOKIE" \
+    | curl -sfS -K - "https://www.humblebundle.com/api/v1/order/$gk?all_tpkds=true" || echo '{}')
   if [ "$(echo "$ORDER" | jq 'has("tpkd_dict")')" != "true" ]; then
     FETCH_FAIL=$((FETCH_FAIL+1)); echo "FETCH-FAIL: $gk"; sleep 0.3; continue
   fi

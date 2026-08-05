@@ -8352,11 +8352,37 @@ async fn audit_batches_pings_above_three() {
     .await;
     handle(&deps, FulfillRequest::Sync).await; // pass 1: clean
 
-    let states: Vec<(&str, &str, bool, bool)> = tpk_names
+    // Pass 2: all five revealed on humble — "a3"'s tpk additionally carries is_gift: true, the one
+    // wrinkle remount_order_with_states' fixture doesn't carry (same reason
+    // audit_ping_marks_gift_when_key_is_gift builds its own body instead of using the helper).
+    let all_tpks: Vec<serde_json::Value> = tpk_names
         .iter()
-        .map(|tpk| (tpk.as_str(), "Revealed", true, false))
+        .map(|tpk| {
+            let mut v = serde_json::json!({
+                "machine_name": tpk,
+                "human_name": tpk,
+                "key_type": "steam",
+                "is_expired": false,
+                "keyindex": 0,
+                "redeemed_key_val": "REDEEMED-KEY-VALUE",
+            });
+            if tpk == "a3_row_choice_steam" {
+                v["is_gift"] = serde_json::json!(true);
+            }
+            v
+        })
         .collect();
-    remount_order_with_states(&humble, "GKD", "some_month_choice", &states).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GKD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "GKD",
+            "product": { "human_name": "Test Choice Month", "machine_name": "some_month_choice" },
+            "tpkd_dict": { "all_tpks": all_tpks },
+            "subproducts": [],
+        })))
+        .with_priority(1)
+        .mount(&humble)
+        .await;
     handle(&deps, FulfillRequest::Sync).await; // pass 2: all five revealed on humble
 
     for n in names {
@@ -8398,6 +8424,15 @@ async fn audit_batches_pings_above_three() {
             "batch ping lists every title ({n} missing): {ping}"
         );
     }
+    assert!(
+        ping.contains("Title a3 (gift)"),
+        "a3's tpk carries is_gift == Some(true) => the batch ping must append the gift suffix \
+         to its title: {ping}"
+    );
+    assert!(
+        !ping.contains("Title a1 (gift)"),
+        "a1's tpk carries no is_gift => its title must appear without the gift suffix: {ping}"
+    );
 }
 
 /// Precedent: the identical `is_gift == Some(true)` conditional at the reconcile recovery site is

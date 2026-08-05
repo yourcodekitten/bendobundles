@@ -3677,7 +3677,16 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
 
     if pulled.len() > 3 {
         let ids: Vec<&str> = pulled.iter().map(|p| p.id.as_str()).collect();
-        let titles: Vec<&str> = pulled.iter().map(|p| p.title.as_str()).collect();
+        let titles: Vec<String> = pulled
+            .iter()
+            .map(|p| {
+                if p.is_gift == Some(true) {
+                    format!("{} (gift)", p.title)
+                } else {
+                    p.title.clone()
+                }
+            })
+            .collect();
         tracing::warn!(
             ids = ?ids,
             "shelf audit: batch-pulled {} listed games whose keys are spent on humble",
