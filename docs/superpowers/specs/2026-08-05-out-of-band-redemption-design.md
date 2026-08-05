@@ -109,8 +109,11 @@ game.requires_choice || claim.choice_pre_tpks.is_some()
     be attributed: the MLU story (provisioned after claim) and the stale-legacy story (existed
     all along) are indistinguishable, and auto-fulfilling would bind an old key to this
     claim's record and grow the autonomous-write set past the `Some`-only bound enumerated
-    for ben. **auto-recovery is a `Some`-only privilege, because `Some` is a receipt and
-    `None` is a shrug.** the ping carries everything found; the human does the attributing.
+    for ben. stronger still (lilith, verified): `TpkWire` carries no timestamp and nothing
+    ordinal — **the snapshot is the only mechanism in the entire data model that can establish
+    "this key arrived after the claim."** auto-attribution on `None` isn't weakly-founded,
+    it's unfounded. **auto-recovery is a `Some`-only privilege, because `Some` is a receipt
+    and `None` is a shrug.** the ping carries everything found; the human does the attributing.
   - genuinely nothing in the order for this game → **compensate — now having actually looked.**
   why A-compensates-on-nothing while B1-parks-on-nothing is principled, not inconsistent:
   a `Some` snapshot can HIDE a spent pick (an in-snapshot tpk revealed after the claim — the
