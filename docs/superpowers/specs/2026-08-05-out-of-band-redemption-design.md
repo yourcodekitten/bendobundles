@@ -184,7 +184,10 @@ wiremock + dynamodb-local in `fulfillment/tests/handler_test.rs`, existing helpe
 - **the MLU test, end to end (the named known positive):** claim `pre_tpks: []` + offered row
   flipped `requires_choice: false` + frozen sibling row listable + order shows the tpk redeemed
   → one `run_sync` → claim `Fulfilled` with recovered key, sibling de-listed (`BenRedeemed`, no
-  `gsi1pk`), both pings fired. this test IS the acceptance criterion in miniature.
+  `gsi1pk`), both pings fired. this test IS the acceptance criterion in miniature — and both
+  game items are seeded **without a `version` attribute** (prod's real shape: the live rows are
+  pre-#134 legacy items; the guarded write's `attribute_not_exists(version)` adopt-at-1 arm is
+  exactly what the deploy-day run will exercise, so the test exercises it too).
 - discriminator: snapshot-`Some` + `requires_choice: false` routes choice (B3); snapshot-`None`
   still routes bundle; `requires_choice: true` + snapshot-`None` still routes choice.
 - downgrade rule: via-snapshot + no new tpk → parks + specific ping, does NOT compensate;
