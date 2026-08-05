@@ -352,6 +352,18 @@ data "aws_iam_policy_document" "deploy" {
       "cloudfront:GetFunction",
       "cloudfront:PublishFunction",
       "cloudfront:AssociateAlias",
+      # aws_cloudfront_response_headers_policy.site (the #140 CSP policy) refreshes at
+      # EVERY plan via GetResponseHeadersPolicy. This role never held ANY
+      # ResponseHeadersPolicy action: the 2026-08-04 CREATE ran under the
+      # brd-prod-ue1-core-bendoerr profile (OMBB's cutover apply), so the first kitten-deploy plan
+      # after it (2026-08-05) 403'd on refresh — the refresh-403 class this file's
+      # cache-policy comment already names; the cure is the grant, never
+      # -refresh=false. Get ONLY, deliberately: it cures refresh completely, and the
+      # policy's write lifecycle stays with whoever next changes the CSP — if that's
+      # this role someday, Update gets granted then, with its own rationale (family
+      # review 2026-08-05: rides-along on * are how Delete ends up in a role that
+      # only ever needed to read).
+      "cloudfront:GetResponseHeadersPolicy",
     ]
     resources = ["*"]
   }
