@@ -12,6 +12,8 @@ tpk matching the offered name. The order authorizes; the scan only schedules.
 The delete lives ONLY in this operator bin (`Store::delete_game` is `#[cfg(feature = "heal")]`) —
 the lambda/sync build cannot compile it. "Sync never deletes" is a compiler guarantee.
 
+**Gate widening (Task 11):** The `pair_verdict` gate now accepts `BenRedeemed` and `Expired` siblings when the live order confirms the key is redeemed or expired respectively. Audited rows that pass this widened gate remain healable. Step 4's manual MLU instructions remain unchanged — if the gate still refuses after the pending claim resolves, heal by hand with four-eyes review as documented.
+
 ## Preconditions
 
 - The D7 sync change (Task 8) is DEPLOYED and at least one sync has run — the flip must exist

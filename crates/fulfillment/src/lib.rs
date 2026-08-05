@@ -1908,34 +1908,87 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
         // §2.3) ⇒ pick NOT spent ⇒ compensate (slot returns, game re-lists). Same shape as the
         // bundle "not redeemed → compensate" arm. SELF uses compensate_self_claim (no link-meta).
         None => {
-            tracing::info!(claim_id = %claim.id, "reconcile(choice): no intent snapshot — choose never ran, compensating (no pick spent)");
-            let _ = compensate_any(deps, claim).await;
-            ping(
-                deps,
-                &format!(
-                    "reconcile compensated choice claim {} ({}) — no choose intent was ever \
-                     recorded, so the monthly pick was NOT spent — slot returned, game re-listed.",
-                    claim.id, game.title
-                ),
-            )
-            .await;
+            // Diff against the empty baseline — title-scoped, NOT find_new_tpk: an unrelated tpk
+            // elsewhere in the order (a different game entirely) must not park this claim, but ANY
+            // key that could plausibly BE this game's pick must stop a blind compensate.
+            let hits: Vec<&KeyEntry> = order
+                .keys
+                .iter()
+                .filter(|k| k.human_name.eq_ignore_ascii_case(&game.title))
+                .collect();
+            match hits.as_slice() {
+                [] => {
+                    // Verified-nothing FOR THIS GAME: zero title-matched tpks exist anywhere in the
+                    // order, so zero keys anyone could have revealed for it ⇒ choose never ran ⇒ pick
+                    // NOT spent ⇒ compensate (slot returns, game re-lists). Same shape as the bundle
+                    // "not redeemed → compensate" arm. SELF uses compensate_self_claim (no link-meta).
+                    tracing::info!(claim_id = %claim.id, "reconcile(choice): no intent snapshot, no title-matched key anywhere in the order — compensating (verified nothing for this game)");
+                    let _ = compensate_any(deps, claim).await;
+                    ping(
+                        deps,
+                        &format!(
+                            "reconcile compensated choice claim {} ({}) — no choose intent was ever \
+                             recorded, so the monthly pick was NOT spent — slot returned, game re-listed.",
+                            claim.id, game.title
+                        ),
+                    )
+                    .await;
+                }
+                [tpk] => {
+                    // Absence of a measurement is not a measurement of absence: with no snapshot the
+                    // wire cannot date this tpk (nothing ordinal on TpkWire) — attribution to THIS
+                    // claim is unfounded. Park; the human attributes. SELF included: auto-recovery is
+                    // a Some-only privilege.
+                    tracing::warn!(claim_id = %claim.id, machine_name = %tpk.machine_name, redeemed = tpk.redeemed, "reconcile(choice): no intent snapshot, but a title-matched key exists on humble — NOT auto-compensating, parking");
+                    let msg = if tpk.redeemed {
+                        format!(
+                            "choice claim {} ({}) has no intent snapshot, but humble shows a key for \
+                             this title (`{}`) already revealed — a pick was spent outside the app's \
+                             writes. Cannot attribute it to this claim (no snapshot = no \
+                             arrival-order evidence). Left pending for review.",
+                            claim.id, game.title, tpk.machine_name
+                        )
+                    } else {
+                        format!(
+                            "choice claim {} ({}) has no intent snapshot, but humble shows an \
+                             unredeemed key for this title (`{}`). Cannot attribute it to this \
+                             claim. Left pending for review.",
+                            claim.id, game.title, tpk.machine_name
+                        )
+                    };
+                    ping(deps, &msg).await;
+                }
+                _ => {
+                    tracing::warn!(claim_id = %claim.id, "reconcile(choice): no intent snapshot, multiple title-matched keys on humble — NOT auto-compensating, parking ambiguous");
+                    ping(
+                        deps,
+                        &format!(
+                            "choice claim {} ({}) has no intent snapshot and multiple keys on \
+                             humble could match the title. Left pending for review.",
+                            claim.id, game.title
+                        ),
+                    )
+                    .await;
+                }
+            }
         }
         Some(pre) => match find_new_tpk(order, pre, &game.title) {
-            // B1. Snapshot present but no new tpk (and no exact-title match) ⇒ the choose did not
-            // commit ⇒ pick NOT spent ⇒ compensate. Hard backstop against a mis-decided ambiguous
-            // choose: a re-list → re-claim → re-choose of the same game is REFUSED by humble
-            // ("already chosen" → ChooseFailed → park), so no pick is ever double-spent — the
-            // residual is churn + pings, never value. SELF uses compensate_self_claim (no link-meta).
+            // B1. Snapshot present but no new tpk (and no exact-title match) ⇒ NEVER compensate, on
+            // ANY route. The re-choose backstop (humble refuses "already chosen") only covers a
+            // second PICK — it does nothing for re-LISTING a key that was already revealed: a
+            // `Some` snapshot can hide a pick spent out of band (redeemed straight on humble,
+            // outside this app, between the snapshot write and this reconcile pass), and
+            // compensating would re-list a game whose key is already gone. Park + ping instead —
+            // stays Pending for a human to look at the order directly. SELF and gift both park
+            // identically; no store write at all.
             TpkPick::None => {
-                tracing::info!(claim_id = %claim.id, "reconcile(choice): snapshot present, no new tpk — choose did not commit, compensating (no pick spent)");
-                let _ = compensate_any(deps, claim).await;
+                tracing::warn!(claim_id = %claim.id, "reconcile(choice): snapshot present, no new tpk — NOT auto-compensating (a snapshot can hide an out-of-band spend), parking");
                 ping(
                     deps,
                     &format!(
-                        "reconcile compensated choice claim {} ({}) — a choose intent was recorded \
-                         but no new key ever appeared, so the pick was NOT spent — slot returned, \
-                         game re-listed. (If humble later shows the pick spent, its re-choose \
-                         refusal is the backstop — no double-spend.)",
+                        "choice claim {} ({}) has an intent snapshot but no new key on humble — \
+                         NOT auto-compensating: a snapshot can hide a pick spent out of band. Left \
+                         pending for review.",
                         claim.id, game.title
                     ),
                 )
@@ -1992,7 +2045,7 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                         claim_id = %claim.id,
                         "reconcile(choice): self-claim key already redeemed — recovering key from order"
                     );
-                    let _ = recover_already_redeemed_key(
+                    let resp = recover_already_redeemed_key(
                         deps,
                         &claim.id,
                         &claim.game_id,
@@ -2000,6 +2053,23 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                         &tpk.machine_name,
                     )
                     .await;
+                    if let FulfillResponse::RevealedKey { .. } = resp {
+                        let gift_flag = if tpk.is_gift == Some(true) {
+                            " (humble marks it a gift)"
+                        } else {
+                            ""
+                        };
+                        ping(
+                            deps,
+                            &format!(
+                                "reconcile recovered the already-revealed key for self claim {} \
+                                 ({}) from the order — claim completed autonomously; the key was \
+                                 redeemed out of band{}.",
+                                claim.id, game.title, gift_flag
+                            ),
+                        )
+                        .await;
+                    }
                 } else {
                     tracing::warn!(claim_id = %claim.id, "reconcile(choice): key present but already redeemed — human recovery (URL unrecorded)");
                     ping(
@@ -3287,6 +3357,11 @@ async fn run_sync(deps: &Deps) {
     // Built as the order walk reads orders; handed to choice discovery for order-authoritative
     // claimed-sets (spec D3) and the D2 gamekey ladder. Lives past the loop.
     let mut order_index = OrderIndex::default();
+    // Order-walk truth for every key this pass actually FETCHED (#158 shelf-truth audit) — keyed
+    // by (gamekey, machine_name) so it matches a row regardless of which id the D7 routing ladder
+    // wrote its fresh copy under. A gamekey whose order read failed never inserts here: absence is
+    // the rule, not a special case — see `shelf_truth_audit`.
+    let mut truth: TruthMap = std::collections::HashMap::new();
 
     'orders: for gamekey in gamekeys {
         tokio::time::sleep(SYNC_PACE).await;
@@ -3338,6 +3413,20 @@ async fn run_sync(deps: &Deps) {
 
         let mut order_failed = false;
         for key in &order.keys {
+            // #158 shelf-truth audit: record this key's redeemed/expired truth BEFORE the D7
+            // routing ladder below decides where the fresh write lands. A plain tpk's write always
+            // targets game_id(gamekey, machine_name) — the audit will find that row already
+            // corrected by the walk itself. A choice-suffixed tpk whose write D7 diverts onto its
+            // offered sibling is the one case the walk's own write bypasses; the audit is what
+            // catches that frozen tpk-named row.
+            truth.insert(
+                (order.gamekey.clone(), key.machine_name.clone()),
+                TruthEntry {
+                    redeemed: key.redeemed,
+                    expired: key.expired,
+                    key: key.clone(),
+                },
+            );
             // Spec D7: a choice-suffixed tpk may be the post-claim record of a game discovery
             // already surfaced under the OFFERED name — route onto that row so merge_sync flips it
             // (requires_choice true→false), instead of minting a sibling (15 live duplicate pairs
@@ -3400,21 +3489,18 @@ async fn run_sync(deps: &Deps) {
         }
     }
 
-    // ONE full-catalog Scan shared by the title pass and the ownership pass (#47) — they
-    // previously each ran their own. Scanned AFTER the order walk (its upserts must be visible)
-    // and only when a steam client exists (both passes skip without one). The enrichment pass
-    // deliberately keeps its OWN scan: choice discovery writes new games between these passes
-    // and enrichment must see them.
-    let shared_scan: Option<Vec<Game>> = if deps.steam.is_some() {
-        match deps.store.list_all_games().await {
-            Ok(g) => Some(g),
-            Err(e) => {
-                tracing::warn!(error = ?e, "sync: list_all_games failed — skipping title + ownership passes");
-                None
-            }
+    // ONE full-catalog Scan shared by the title pass, the ownership pass (#47), and the
+    // shelf-truth audit (#158) — previously the first two each ran their own. Scanned AFTER
+    // the order walk (its upserts must be visible). The title and ownership passes self-guard
+    // when steam is absent; the audit's every-sync invariant must not inherit a stranger's
+    // off-switch. The enrichment pass deliberately keeps its OWN scan: choice discovery writes
+    // new games between these passes and enrichment must see them.
+    let shared_scan: Option<Vec<Game>> = match deps.store.list_all_games().await {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::warn!(error = ?e, "sync: list_all_games failed — skipping title + ownership passes");
+            None
         }
-    } else {
-        None
     };
 
     // Title-pass: map any still-unmapped steam games by unique exact name match against the Steam
@@ -3458,8 +3544,23 @@ async fn run_sync(deps: &Deps) {
     // never fails the sync.
     enrich_steam_apps(deps, enrich_deadline).await;
 
+    // Shelf-truth audit (#158): the every-sync backstop for the D7 frozen-sibling gap — no listable
+    // row may keep referencing a key humble marks revealed or expired. Deliberately unconditional
+    // (no steam gate), same reasoning as the shared scan above.
+    // scan predates discover_choice_games' writes — harmless: offered names never exact-match tpk
+    // names, and a stale-scan write CCFs into SkippedInFlight; next run re-reads.
+    let pulls = match &shared_scan {
+        Some(scan) => shelf_truth_audit(deps, scan, &truth).await,
+        None => 0,
+    };
+
     let msg = if cookie_ok {
-        format!("sync ok: {games_written} written, {orders_failed} order(s) failed")
+        let base = format!("sync ok: {games_written} written, {orders_failed} order(s) failed");
+        if pulls > 0 {
+            format!("{base}, {pulls} audit-pulled")
+        } else {
+            base
+        }
     } else {
         // Covers both a hard-dead session and a heal whose SSM persist failed — either way the
         // DURABLE cookie can't be trusted; the pings that already fired carry the specifics.
@@ -3478,6 +3579,146 @@ async fn run_sync(deps: &Deps) {
     )
     .await;
     tracing::info!(games_written, orders_failed, cookie_ok, "sync finished");
+}
+
+/// Order-walk truth for one tpk, keyed by (gamekey, machine_name).
+struct TruthEntry {
+    redeemed: bool,
+    expired: bool,
+    key: KeyEntry,
+}
+
+type TruthMap = HashMap<(String, String), TruthEntry>;
+
+/// The shelf-truth audit (#158): the order walk's own write only ever lands on the id its D7
+/// routing ladder picks — for a plain tpk that's the same-id row (already corrected by the walk
+/// itself, minutes before this runs), but for a choice-suffixed tpk whose offered sibling exists,
+/// the routing ladder diverts the fresh write onto the OFFERED row and the tpk-named sibling is
+/// never revisited. That frozen sibling can go on listing a key humble has since marked redeemed
+/// (revealed outside the app) or expired, forever, unless something else corrects it. This pass is
+/// that correction: every listable row whose (gamekey, machine_name) this pass's order walk
+/// actually fetched, cross-checked against the walk's own truth.
+///
+/// Absence is the rule, not a special case: a row whose (gamekey, machine_name) tuple never
+/// appears in `truth` — because its order read failed this pass, or the walk never saw that tuple
+/// at all — is left completely untouched. The audit only ever acts on truth the walk itself
+/// fetched; it never infers anything from a row's absence from the fetched set.
+///
+/// Returns the number of rows pulled (written) this pass, for the sync summary.
+async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 {
+    struct Pulled {
+        title: String,
+        id: String,
+        reason: &'static str,
+        is_gift: Option<bool>,
+    }
+    let mut pulled: Vec<Pulled> = Vec::new();
+
+    for g in scan.iter().filter(|g| g.is_listable()) {
+        let Some(entry) = truth.get(&(g.gamekey.clone(), g.machine_name.clone())) else {
+            // Never seen by this pass's order walk (order failed, or simply a different tuple) —
+            // absence, not evidence. Leave it alone; a future successful fetch re-checks it.
+            continue;
+        };
+        if !(entry.redeemed || entry.expired) {
+            continue; // walk-fetched and still clean — nothing to correct.
+        }
+
+        // Build the fresh row from the EXISTING `g`, updating ONLY the truth fields — this is a
+        // correction of an existing row, not the order-walk's own construction (which needs
+        // order.bundle_name/subproducts that TruthEntry doesn't carry). merge_sync's Available arm
+        // is fresh-wins on bundle/artwork_url/title (domain::merge_sync) — a guessed empty value
+        // here would WIPE real data on every pulled row.
+        let fresh = Game {
+            status: domain::sync_status(entry.redeemed, entry.expired),
+            giftable: entry.key.giftable,
+            key_type: entry.key.key_type.clone(),
+            keyindex: entry.key.keyindex,
+            steam_app_id: entry.key.steam_app_id.or(g.steam_app_id),
+            appid_source: entry
+                .key
+                .steam_app_id
+                .map(|_| AppidSource::Humble)
+                .or(g.appid_source),
+            ..g.clone() // id (own id — NOT the D7 routing ladder: correcting an existing row, not
+                        // minting), title, bundle, artwork_url, gamekey, machine_name, hidden,
+                        // hidden_source, claim_id, requires_choice, owned_by_ben all carry from the
+                        // row being corrected.
+        };
+        let reason = if entry.expired {
+            "expired"
+        } else {
+            "revealed outside the app"
+        };
+
+        match deps.store.upsert_game_from_sync(fresh).await {
+            Ok(SyncWrite::Written) => pulled.push(Pulled {
+                title: g.title.clone(),
+                id: g.id.clone(),
+                reason,
+                is_gift: entry.key.is_gift,
+            }),
+            // Set-driven, not retried: a concurrent claim/write CCFs into SkippedInFlight, and an
+            // already-identical row is Unchanged — both self-correct on the next sync's fresh read.
+            Ok(SyncWrite::SkippedInFlight) | Ok(SyncWrite::Unchanged) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    game_id = %g.id,
+                    "shelf audit: write failed — will retry next sync"
+                );
+            }
+        }
+    }
+
+    if pulled.is_empty() {
+        return 0;
+    }
+
+    if pulled.len() > 3 {
+        let ids: Vec<&str> = pulled.iter().map(|p| p.id.as_str()).collect();
+        let titles: Vec<String> = pulled
+            .iter()
+            .map(|p| {
+                if p.is_gift == Some(true) {
+                    format!("{} (gift)", p.title)
+                } else {
+                    p.title.clone()
+                }
+            })
+            .collect();
+        tracing::warn!(
+            ids = ?ids,
+            "shelf audit: batch-pulled {} listed games whose keys are spent on humble",
+            pulled.len()
+        );
+        ping(
+            deps,
+            &format!(
+                "shelf audit: pulled {} listed games whose keys are spent on humble: {}",
+                pulled.len(),
+                titles.join(", ")
+            ),
+        )
+        .await;
+    } else {
+        for p in &pulled {
+            tracing::warn!(
+                game_id = %p.id,
+                "shelf audit: pulled a listed game whose key is spent on humble"
+            );
+            let mut text = format!(
+                "shelf audit: pulled {} ({}) — key {} on humble",
+                p.title, p.id, p.reason
+            );
+            if p.is_gift == Some(true) {
+                text.push_str(" (humble marks it a gift)");
+            }
+            ping(deps, &text).await;
+        }
+    }
+
+    pulled.len() as u32
 }
 
 /// Choice-discovery ingest — the **sole intended writer** of `requires_choice = true` (see the
@@ -3875,11 +4116,15 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
         };
         // Choice claims reconcile by a DIFFERENT rule (never re-choose): the parked claim's
         // game_id offered-id never equals any tpk machine_name, so the bundle `find` below would
-        // miss it forever and silently skip it every pass. One extra GetItem per parked claim keys
-        // the branch off the durable `requires_choice` flag; a transient game-read miss falls
-        // through to the bundle path unchanged (that path needs no game read).
+        // miss it forever and silently skip it every pass. Routing keys on the CLAIM's own
+        // immutable `choice_pre_tpks` snapshot FIRST — `requires_choice` on the game row is
+        // D7-mutable (a key-sync flips it false the moment a tpk appears), so a claim born choice
+        // must still route choice even after the flip. `game.requires_choice` stays in the OR only
+        // for legacy pre-snapshot choice claims (no snapshot was ever recorded for them). One extra
+        // GetItem per parked claim; a transient game-read miss falls through to the bundle path
+        // unchanged (that path needs no game read).
         if let Ok(Some(game)) = deps.store.get_game(&claim.game_id).await
-            && game.requires_choice
+            && (game.requires_choice || claim.choice_pre_tpks.is_some())
         {
             // reconcile may WRITE now (redeem/compensate) — pace it under the bot-detection floor.
             tokio::time::sleep(SYNC_PACE).await;
@@ -3887,16 +4132,33 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             continue;
         }
         let Some(key) = order.keys.iter().find(|k| k.machine_name == machine_name) else {
-            alert_unreconcilable(
-                deps,
-                &claim,
-                age,
-                &format!(
-                    "machine_name `{machine_name}` is not among order `{gamekey}`'s keys on \
-                     humble, so there is nothing to reconcile it against"
-                ),
-            )
-            .await;
+            let mut reason = format!(
+                "machine_name `{machine_name}` is not among order `{gamekey}`'s keys on \
+                 humble, so there is nothing to reconcile it against"
+            );
+            // Messaging-only probe (#158 task 8): the exact `find` above just missed, but the
+            // order may still carry a choice-shaped tpk whose derived base equals this claim's
+            // machine_name — an out-of-band-redeemed key humble is quietly holding under a name
+            // the exact match can never see. Same grammar rung heal_pairs already uses. This ARMS
+            // NOTHING — no routing change, no write — it only enriches the reason string.
+            if let Some(hit) = order
+                .keys
+                .iter()
+                .find(|k| domain::choice_tpk_matches(&k.machine_name, machine_name))
+            {
+                let mut flags = String::new();
+                if hit.redeemed {
+                    flags.push_str(", already revealed outside the app");
+                }
+                if hit.expired {
+                    flags.push_str(", expired");
+                }
+                let tpk_machine_name = &hit.machine_name;
+                reason.push_str(&format!(
+                    "; NOTE: humble carries a key for this game under `{tpk_machine_name}`{flags}"
+                ));
+            }
+            alert_unreconcilable(deps, &claim, age, &reason).await;
             continue;
         };
         if key.redeemed {
@@ -3908,7 +4170,7 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
                     claim_id = %claim.id,
                     "reconcile: self-claim parked shows redeemed on humble — recovering key from order"
                 );
-                let _ = recover_already_redeemed_key(
+                let resp = recover_already_redeemed_key(
                     deps,
                     &claim.id,
                     &claim.game_id,
@@ -3916,6 +4178,26 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
                     machine_name,
                 )
                 .await;
+                if let FulfillResponse::RevealedKey { .. } = resp {
+                    // The bundle path deliberately never reads the game row (see the routing
+                    // comment above) — there is no `game` in scope here, so the title binding is
+                    // the order's own key name.
+                    let gift_flag = if key.is_gift == Some(true) {
+                        " (humble marks it a gift)"
+                    } else {
+                        ""
+                    };
+                    ping(
+                        deps,
+                        &format!(
+                            "reconcile recovered the already-revealed key for self claim {} ({}) \
+                             from the order — claim completed autonomously; the key was redeemed \
+                             out of band{}.",
+                            claim.id, key.human_name, gift_flag
+                        ),
+                    )
+                    .await;
+                }
             } else {
                 tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
                 // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message
@@ -4285,6 +4567,7 @@ mod tests {
                 keyindex: 0,
                 redeemed_key_val: None,
                 steam_app_id: None,
+                is_gift: None,
             }
         }
         fn order(keys: Vec<KeyEntry>) -> Order {

@@ -1323,6 +1323,106 @@ async fn reconcile_unsplittable_game_id_over_threshold_pings() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// MESSAGE PIN (#158 task 8): the bundle path's absent-from-order park (`alert_unreconcilable`'s
+// `else` site) enriches its reason with domain::choice_tpk_matches — messaging ONLY, arms nothing,
+// changes no routing, causes no writes. Claim's own machine_name never appears among the order's
+// exact keys (that's WHY it parks); the probe additionally checks whether the order carries a
+// choice-shaped tpk whose derived base equals the claim's machine_name — the out-of-band-redeemed
+// key humble is quietly holding under a name the exact `find` above can never see.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn unreconcilable_nag_names_out_of_band_key_when_grammar_finds_one() {
+    let Some(store) = store_or_skip("recon-nag-grammar-hit").await else {
+        return;
+    };
+    // Bundle path: choice_pre_tpks None + requires_choice false (seed_aged_pending's default
+    // shape) — claim's machine_name "mlu" never exact-matches the order's tpk
+    // "mlu_row_choice_steam", so it parks. The grammar probe (domain::choice_tpk_matches) finds
+    // the tpk anyway: base "mlu_row" strips its "_row" region token down to "mlu".
+    let gid = game_id("gkN", "mlu");
+    seed_aged_pending(&store, &gid, "tokN", "cN", hours_ago(30)).await; // > 24h -> loud
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkN"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gkN",
+            serde_json::json!([tpk_json("mlu_row_choice_steam", "My Little Universe", true)]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // Routing/park behavior is UNCHANGED — the probe arms nothing, causes no writes.
+    let claim = deps.store.get_claim("tokN", "cN").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+
+    let reqs = discord.received_requests().await.unwrap();
+    let bodies: Vec<String> = reqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies.iter().any(|b| b.contains(
+            "NOTE: humble carries a key for this game under `mlu_row_choice_steam`, already \
+             revealed outside the app"
+        )),
+        "the stuck-alert names the out-of-band key the grammar can see: {bodies:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MESSAGE PIN (#158 task 8) — the flip side: no grammar hit → the reason stays byte-identical to
+// the pre-existing text, no "NOTE:" suffix appended. Kept as a pin (may already pass pre-Step-3).
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn unreconcilable_nag_stays_generic_without_a_grammar_hit() {
+    let Some(store) = store_or_skip("recon-nag-no-hit").await else {
+        return;
+    };
+    // "mnREAL" is not choice-shaped (no `_choice_`/`_monthly_` infix) — domain::choice_tpk_bases
+    // returns None for it, so the probe can never hit.
+    let gid = game_id("gkP", "mnGHOST");
+    seed_aged_pending(&store, &gid, "tokP", "cP", hours_ago(30)).await; // > 24h -> loud
+
+    let humble = MockServer::start().await;
+    mount_empty_listing(&humble).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkP"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(order_json("gkP", "mnREAL", false)))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tokP", "cP").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending);
+
+    let reqs = discord.received_requests().await.unwrap();
+    let bodies: Vec<String> = reqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies.iter().any(|b| b.contains(
+            "cannot act on it: machine_name `mnGHOST` is not among order `gkP`'s keys on humble, \
+             so there is nothing to reconcile it against."
+        )),
+        "the reason is byte-identical to the pre-existing generic text: {bodies:?}"
+    );
+    assert!(
+        !bodies.iter().any(|b| b.contains("NOTE:")),
+        "no grammar hit must never append a NOTE: {bodies:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // PLACEMENT PIN (gate review B-4): the pending-age sweep is the FIRST statement in run_sync, before
 // even the listing acquisition — so a dead humble session (which makes run_sync ping COOKIE_DEAD and
 // return before reconcile ever runs) must NOT starve the watchdog. If a future refactor adds an
@@ -1790,7 +1890,8 @@ async fn choice_happy_path_chooses_then_redeems() {
 
 // -------------------------------------------------------------------------------------------------
 // MERGE GATE: crash after choose, before redeem → reconcile redeems WITHOUT ever choosing.
-// Also: a parked SELF choice claim reconciles (compensates via B1) WITHOUT any choosecontent POST.
+// Also: a parked SELF choice claim reconciles (parks via B1 — never compensates) WITHOUT any
+// choosecontent POST.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn merge_gate_reconcile_redeems_without_choosing() {
@@ -1825,7 +1926,8 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
         )))
         .mount(&humble)
         .await;
-    // Order for the SELF claim: empty tpks → B1 (snapshot present, no new tpk → compensate).
+    // Order for the SELF claim: empty tpks → B1 (snapshot present, no new tpk → park, never
+    // compensate).
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gkM"))
         .respond_with(
@@ -1861,7 +1963,7 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Gifted);
 
-    // SELF claim reconciled without choosing: B1 → compensate_self_claim → Compensated.
+    // SELF claim reconciled without choosing: B1 never compensates — it parks (stays Pending).
     let self_claim = deps
         .store
         .get_claim(SELF_LINK_TOKEN, "sc-mg1")
@@ -1870,8 +1972,8 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
         .unwrap();
     assert_eq!(
         self_claim.state,
-        ClaimState::Compensated,
-        "self claim must be compensated (B1), not choosing"
+        ClaimState::Pending,
+        "self claim must be parked (B1), never compensated or chosen"
     );
 
     let reqs = humble.received_requests().await.unwrap();
@@ -2275,11 +2377,17 @@ async fn choice_5xx_after_choose_parks_then_reconcile_finishes() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// reconcile: snapshot present but order diff empty (pick not spent) → compensate, no humble writes.
+// reconcile: snapshot present but order diff empty (pick not spent, but a snapshot can hide an
+// out-of-band spend) → NEVER compensate, park + ping. Exercised on both routing halves that reach
+// B1: the game's own `requires_choice: true` (the "native" route), and — via Task 2's widening —
+// `requires_choice: false` with a `Some` snapshot (the claim was born choice, the game since flipped).
 // -------------------------------------------------------------------------------------------------
+const B1_PIN_PING: &str = "has an intent snapshot but no new key on humble — NOT auto-compensating: \
+     a snapshot can hide a pick spent out of band. Left pending for review.";
+
 #[tokio::test]
-async fn reconcile_choice_not_spent_compensates() {
-    let Some(store) = store_or_skip("choice-recon-comp").await else {
+async fn reconcile_choice_not_spent_parks_never_compensates() {
+    let Some(store) = store_or_skip("choice-recon-park").await else {
         return;
     };
     let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
@@ -2287,7 +2395,8 @@ async fn reconcile_choice_not_spent_compensates() {
 
     let humble = MockServer::start().await;
     mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
-    // Empty order — no new tpk vs the empty snapshot → pick provably not spent.
+    // Empty order — no new tpk vs the empty snapshot. Pick LOOKS not spent, but a snapshot can hide
+    // an out-of-band spend — B1 must park, never compensate.
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(
@@ -2306,13 +2415,17 @@ async fn reconcile_choice_not_spent_compensates() {
     handle(&deps, FulfillRequest::Sync).await;
 
     let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Compensated);
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
-    assert_eq!(game.status, GameStatus::Available);
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
     assert_eq!(
         deps.store.list_listable_games().await.unwrap().len(),
-        1,
-        "game re-listed"
+        0,
+        "game does NOT return to listable — no gsi1pk"
     );
     assert_eq!(
         deps.store
@@ -2321,24 +2434,98 @@ async fn reconcile_choice_not_spent_compensates() {
             .unwrap()
             .unwrap()
             .claims_used,
-        0,
-        "slot returned"
+        1,
+        "slot NOT returned"
     );
 
     let reqs = humble.received_requests().await.unwrap();
-    assert_eq!(
-        count_path(&reqs, "/humbler/choosecontent"),
-        0,
-        "compensate does no humble writes"
-    );
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
     assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
-    // A compensate ping fired.
+    // The pinned park ping fired with the exact text.
     let dreqs = discord.received_requests().await.unwrap();
-    assert!(dreqs.iter().any(|r| {
-        String::from_utf8(r.body.clone())
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!("choice claim c1 ({TITLE}) {B1_PIN_PING}");
+    assert!(
+        ping.contains(&expected),
+        "ping must carry the exact pinned park text: {ping}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_choice_not_spent_parks_never_compensates_via_flipped_route() {
+    let Some(store) = store_or_skip("choice-recon-park-flipped").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, Some(vec![])).await;
+    // Flip the game's `requires_choice` to false through the store's normal put path — same shape
+    // as a key-sync flip landing between the claim's birth and this reconcile pass. The claim only
+    // reaches B1 now via Task 2's `claim.choice_pre_tpks.is_some()` widening, not `requires_choice`.
+    let mut game = store.get_game(&gid).await.unwrap().unwrap();
+    game.requires_choice = false;
+    store.put_game(&game).await.unwrap();
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
+        )
+        .mount(&humble)
+        .await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
+    assert_eq!(
+        deps.store.list_listable_games().await.unwrap().len(),
+        0,
+        "game does NOT return to listable — no gsi1pk"
+    );
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
             .unwrap()
-            .contains("compensated choice claim")
-    }));
+            .unwrap()
+            .claims_used,
+        1,
+        "slot NOT returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
+    assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!("choice claim c1 ({TITLE}) {B1_PIN_PING}");
+    assert!(
+        ping.contains(&expected),
+        "identical park via the widened route: {ping}"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -2375,6 +2562,220 @@ async fn reconcile_choice_no_snapshot_compensates() {
     let reqs = humble.received_requests().await.unwrap();
     assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
     assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+}
+
+// -------------------------------------------------------------------------------------------------
+// reconcile: NO snapshot, but humble shows a title-scoped hit → park (never blind-compensate).
+// Title-scoped, NOT find_new_tpk: the probe filters `order.keys` by `human_name == game.title`
+// directly, so it is independent of the (nonexistent, since pre=None) snapshot diff. Contrast with
+// `reconcile_choice_no_snapshot_compensates` above, which seeds one UNRELATED (non-title-matched)
+// tpk and must still compensate — that's the 0-hits shape, this is the 1-hit and 2-hits shapes.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_choice_no_snapshot_found_redeemed_parks() {
+    let Some(store) = store_or_skip("choice-recon-nosnap-redeemed").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, None).await;
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    // Title-matched tpk, already redeemed → a pick was spent out of band; no snapshot means no
+    // arrival-order evidence to attribute it to THIS claim.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gk",
+            serde_json::json!([tpk_json(TPK_MN, TITLE, true)]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        1,
+        "slot NOT returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
+    assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!(
+        "choice claim c1 ({TITLE}) has no intent snapshot, but humble shows a key for this title \
+         (`{TPK_MN}`) already revealed — a pick was spent outside the app's writes. Cannot \
+         attribute it to this claim (no snapshot = no arrival-order evidence). Left pending for \
+         review."
+    );
+    assert!(
+        ping.contains(&expected),
+        "ping must carry the exact pinned park text: {ping}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_choice_no_snapshot_found_clean_parks() {
+    let Some(store) = store_or_skip("choice-recon-nosnap-clean").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, None).await;
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    // Title-matched tpk, NOT redeemed — still can't attribute it to THIS claim without a snapshot.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gk",
+            serde_json::json!([tpk_json(TPK_MN, TITLE, false)]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        1,
+        "slot NOT returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
+    assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!(
+        "choice claim c1 ({TITLE}) has no intent snapshot, but humble shows an unredeemed key for \
+         this title (`{TPK_MN}`). Cannot attribute it to this claim. Left pending for review."
+    );
+    assert!(
+        ping.contains(&expected),
+        "ping must carry the exact pinned park text: {ping}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_choice_no_snapshot_found_ambiguous_parks() {
+    let Some(store) = store_or_skip("choice-recon-nosnap-ambiguous").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, None).await;
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    // TWO tpks, BOTH title-matched (distinct machine_names) — can't single one out.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "gk",
+            serde_json::json!([
+                tpk_json(TPK_MN, TITLE, false),
+                tpk_json("octopathtraveler2_row_choice_steam_2", TITLE, true),
+            ]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        1,
+        "slot NOT returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
+    assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!(
+        "choice claim c1 ({TITLE}) has no intent snapshot and multiple keys on humble could match \
+         the title. Left pending for review."
+    );
+    assert!(
+        ping.contains(&expected),
+        "ping must carry the exact pinned park text: {ping}"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -4534,6 +4935,101 @@ async fn reconcile_self_choice_b2_reveals_never_chooses() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// Task 2 (#158): a claim born choice (snapshot `Some`) must keep routing through
+// `reconcile_choice_claim` even after the game row's `requires_choice` flips false (D7's
+// discriminator widening the moment a key-sync sees the tpk). Routing keys off the claim's OWN
+// immutable snapshot, not the mutable game flag. humble later shows the tpk already revealed →
+// route choice → B3 → autonomous recovery (never the bundle path's "unsplittable game_id" park).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_routes_by_snapshot_when_flip_already_happened() {
+    let Some(store) = store_or_skip("sc-rec-flip").await else {
+        return;
+    };
+    // Game born choice (offered id "mlu"), but requires_choice is ALREADY false — the D7-flipped
+    // shape a key-sync leaves behind once it observes the tpk. The claim's own snapshot (recorded
+    // below) is the only thing left that remembers this claim was born a choice claim.
+    let gid = "GK:mlu";
+    let g = domain::Game {
+        id: gid.into(),
+        title: "My Little Universe".into(),
+        bundle: "Test Bundle".into(),
+        gamekey: "GK".into(),
+        machine_name: "mlu".into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    store.put_game(&g).await.unwrap();
+    store
+        .claim_game_self(gid, "sc-flip", old_enough())
+        .await
+        .unwrap();
+    store
+        .record_choice_intent(SELF_LINK_TOKEN, "sc-flip", vec![])
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    // Order: the tpk already redeemed (humble shows the pick spent AND the key burned) — B3.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GK"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "GK",
+            serde_json::json!([tpk_json("mlu_row_choice_steam", "My Little Universe", true)]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps_val = deps(store.clone(), &humble.uri(), Some(discord.uri()));
+    run_reconcile(&deps_val).await;
+
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-flip")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "a claim born choice must route choice -> B3 -> recovery even after the D7 flip, not \
+         park unreconcilable on the bundle path"
+    );
+    assert_eq!(claim.revealed_key.as_deref(), Some("STEAMKEY-XXXX"));
+
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(
+        pings.len(),
+        1,
+        "the B3 completion ping must fire exactly once"
+    );
+    let body = String::from_utf8(pings[0].body.clone()).unwrap();
+    assert!(body.contains("sc-flip"), "ping carries the claim id");
+    assert!(
+        body.contains("My Little Universe"),
+        "choice-path site binds {{title}} to game.title: {body}"
+    );
+    assert!(
+        body.contains("redeemed out of band"),
+        "ping carries the pinned out-of-band phrase: {body}"
+    );
+    assert!(
+        !body.contains("(humble marks it a gift)"),
+        "the tpk carries no is_gift => no gift flag: {body}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
 // Task 4: structural pre-check — a tpk humble already marks `is_expired` fails terminally without
 // ever spending a redeem/reveal call. Drive path mirrors reconcile_self_choice_b2_reveals_never_chooses
 // above: choice claim + pre=[] snapshot + order carrying the tpk -> reconcile branch B2 ->
@@ -4643,6 +5139,83 @@ async fn reconcile_self_bundle_already_redeemed_recovers_key() {
         claim.state,
         ClaimState::Fulfilled,
         "self bundle already-redeemed must be recovered, not pinged"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Task 2 (#158) – bundle-twin of the choice-path B3 completion ping: the bundle path deliberately
+// never reads the game row (see the routing comment in `reconcile`), so its title binding is
+// `key.human_name`, not `game.title`. SELF bundle claim (snapshot `None`), key redeemed on humble
+// → claim Fulfilled + the ping fires with `key.human_name` in it.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_bundle_self_redeemed_recovers_and_pings() {
+    let Some(store) = store_or_skip("sc-rec-bundle-redeemed-ping").await else {
+        return;
+    };
+    seed_available_game(&store, "gkK:mnK", "Bundle Redeemed Game").await;
+    store
+        .claim_game_self("gkK:mnK", "sc-r5", old_enough())
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    // Order shows the tpk already redeemed with a recoverable key value; human_name matches the
+    // ping's expected title binding for the bundle path.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkK"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "gkK",
+            "product": { "human_name": "Test Bundle" },
+            "tpkd_dict": { "all_tpks": [{
+                "machine_name": "mnK",
+                "human_name": "Bundle Redeemed Game",
+                "key_type": "steam",
+                "is_expired": false,
+                "keyindex": 0,
+                "redeemed_key_val": "NEW-OLD-KEY",
+                "is_gift": true
+            }]},
+            "subproducts": [],
+        })))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps_val = deps(store.clone(), &humble.uri(), Some(discord.uri()));
+    run_reconcile(&deps_val).await;
+
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-r5")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.revealed_key.as_deref(), Some("NEW-OLD-KEY"));
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "self bundle already-redeemed must be recovered autonomously"
+    );
+
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(
+        pings.len(),
+        1,
+        "the B3 completion ping must fire exactly once"
+    );
+    let body = String::from_utf8(pings[0].body.clone()).unwrap();
+    assert!(body.contains("sc-r5"), "ping carries the claim id");
+    assert!(
+        body.contains("Bundle Redeemed Game"),
+        "bundle-path site binds {{title}} to key.human_name (no game row read): {body}"
+    );
+    assert!(
+        body.contains("redeemed out of band"),
+        "ping carries the pinned out-of-band phrase: {body}"
+    );
+    assert!(
+        body.contains("(humble marks it a gift)"),
+        "the recovered tpk's is_gift == Some(true) => the gift flag renders: {body}"
     );
 }
 
@@ -7406,5 +7979,722 @@ async fn gate_parks_terminal_choice_claim_before_order() {
     assert!(
         humble.received_requests().await.unwrap().is_empty(),
         "the gate must refuse before the order() self-heal call — zero Humble requests"
+    );
+}
+
+// =============================================================================================
+// #158 SHELF-TRUTH AUDIT
+// -------------------------------------------------------------------------------------------
+// CRITICAL (see task-6-brief.md): for a PLAIN tpk, the order walk's own write lands on
+// `game_id(gamekey, machine_name)` — the exact row the audit would otherwise pull — so the walk
+// self-corrects it minutes before the audit runs and the audit sees 0 pulls there. The only rows
+// the audit can EVER pull are ones the walk's write BYPASSES: the D7 frozen-sibling shape (an
+// offered row exists at the tpk's base id → the routing ladder diverts the fresh write onto that
+// offered row → the tpk-named sibling starves, forever, absent something else correcting it).
+// Every positive test below seeds that miniature MLU: an offered row (so D7 diverts), a listable
+// sibling row under the raw tpk id, and a choice-suffixed tpk in the order.
+// =============================================================================================
+
+/// Priority-1 remount of one gamekey whose tpks carry explicit redeemed/expired state.
+/// tpks: (machine_name, human_name, redeemed, expired). Mind wiremock first-mounted-wins: this
+/// mounts at higher priority than the `sync_deps` originals, same shape as `remount_order`.
+async fn remount_order_with_states(
+    humble: &MockServer,
+    gamekey: &str,
+    product: &str,
+    tpks: &[(&str, &str, bool, bool)],
+) {
+    let all_tpks: Vec<serde_json::Value> = tpks
+        .iter()
+        .map(|(machine, human, redeemed, expired)| {
+            let mut tpk = serde_json::json!({
+                "machine_name": machine,
+                "human_name": human,
+                "key_type": "steam",
+                "is_expired": expired,
+                "keyindex": 0,
+            });
+            if *redeemed {
+                tpk["redeemed_key_val"] = serde_json::json!("REDEEMED-KEY-VALUE");
+            }
+            tpk
+        })
+        .collect();
+    let body = serde_json::json!({
+        "gamekey": gamekey,
+        "product": { "human_name": "Test Choice Month", "machine_name": product },
+        "tpkd_dict": { "all_tpks": all_tpks },
+        "subproducts": [],
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/order/{gamekey}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .with_priority(1)
+        .mount(humble)
+        .await;
+}
+
+/// Raw dynamodb client — same shape as `dynamo::tests::store_test`'s `raw_client` — used only for
+/// the `gsi1pk` sparse-index assertions the `Store` API can't see (`get_game` only ever reads the
+/// primary key, never the GSI projection).
+async fn raw_client() -> aws_sdk_dynamodb::Client {
+    let url =
+        std::env::var("DYNAMODB_LOCAL_URL").unwrap_or_else(|_| "http://localhost:8000".into());
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(&url)
+        .region("us-east-1")
+        .test_credentials()
+        .load()
+        .await;
+    aws_sdk_dynamodb::Client::new(&config)
+}
+
+/// Fetch the raw DDB item for a game id — panics if absent. `table` follows `store_or_skip`'s
+/// naming convention (`t-fulfill-{test}`).
+async fn raw_game_item(
+    client: &aws_sdk_dynamodb::Client,
+    table: &str,
+    id: &str,
+) -> std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> {
+    client
+        .get_item()
+        .table_name(table)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(format!("GAME#{id}")),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("item must exist")
+}
+
+/// Seed a plain Available+listable row directly under `gk:mn` — the "frozen sibling" shape: a
+/// duplicate row the D7 routing ladder's write never targets once an offered row exists at the
+/// tpk's base id.
+async fn seed_listable_sibling(store: &Store, gk: &str, mn: &str, title: &str) {
+    let g = Game {
+        id: game_id(gk, mn),
+        title: title.into(),
+        bundle: "Seed Month".into(),
+        gamekey: gk.into(),
+        machine_name: mn.into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    store.put_game(&g).await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_delists_frozen_sibling_when_order_shows_key_revealed() {
+    let Some(store) = store_or_skip("audit-frozen-revealed").await else {
+        return;
+    };
+    // Miniature MLU: offered row (D7 diverts here) + a listable sibling under the raw tpk id.
+    seed_offered_game(&store, "GKA", "mlu", |_| {}).await;
+    seed_listable_sibling(&store, "GKA", "mlu_row_choice_steam", "MLU Sibling").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    // sync_deps leaves `steam: None` — the decoupling assertion lilith required. No steam client
+    // set anywhere in this test.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKA", "some_month_choice", &["mlu_row_choice_steam"])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+
+    // Pass 1: clean order (not redeemed/expired) — the walk's write diverts onto the offered row;
+    // the sibling is untouched by the walk and stays listable.
+    handle(&deps, FulfillRequest::Sync).await;
+    let sibling_id = game_id("GKA", "mlu_row_choice_steam");
+    assert_eq!(
+        deps.store
+            .get_game(&sibling_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        GameStatus::Available,
+        "pass 1: sibling stays listable — walk's write went to the offered row, not here"
+    );
+
+    // Pass 2: humble now shows the key revealed (redeemed) out of band.
+    remount_order_with_states(
+        &humble,
+        "GKA",
+        "some_month_choice",
+        &[("mlu_row_choice_steam", "MLU", true, false)],
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let sibling = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+    assert_eq!(
+        sibling.status,
+        GameStatus::BenRedeemed,
+        "audit delisted the frozen sibling"
+    );
+
+    let client = raw_client().await;
+    let raw = raw_game_item(&client, "t-fulfill-audit-frozen-revealed", &sibling_id).await;
+    assert!(
+        !raw.contains_key("gsi1pk"),
+        "delisted row must carry no gsi1pk — sparse index"
+    );
+
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("1 audit-pulled"),
+        "summary must report the pull: {}",
+        st.message
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("shelf audit"))
+        .expect("a shelf-audit ping fired");
+    assert!(
+        ping.contains("MLU Sibling"),
+        "ping carries the title: {ping}"
+    );
+    assert!(ping.contains(&sibling_id), "ping carries the id: {ping}");
+    assert!(
+        ping.contains("revealed outside the app"),
+        "ping carries the reveal reason: {ping}"
+    );
+}
+
+/// THE absence pin. Passes VACUOUSLY before the audit exists (no audit → nothing acts on the row
+/// → every assert holds). Once Step 3 lands it becomes the load-bearing guard that the audit never
+/// infers anything from a row simply being absent from the fetched truth. DO NOT alter this test
+/// to make it fail pre-implementation — a version that fails before the audit exists could only be
+/// greened by an audit that acts on absence, which is exactly the violation the spec bans.
+#[tokio::test]
+async fn audit_never_touches_rows_absent_from_fetched_orders() {
+    let Some(store) = store_or_skip("audit-absence").await else {
+        return;
+    };
+    seed_listable_sibling(&store, "GKB", "solo", "Solo Game").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    // GKB is listed (the walk reaches it) but its order GET 500s — a failed order contributes
+    // NOTHING to the truth map; that absence is the rule, not a special case.
+    let deps = sync_deps(store, &humble, &[], &["GKB"], &[], &[], Some(discord.uri())).await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let gid = game_id("GKB", "solo");
+    let g = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        g.status,
+        GameStatus::Available,
+        "untouched — the order never fetched"
+    );
+    assert!(g.is_listable(), "still listable after run_sync");
+
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        !st.message.contains("audit-pulled"),
+        "summary must not report a pull: {}",
+        st.message
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    assert!(
+        dreqs
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("shelf audit")),
+        "no shelf-audit ping fired"
+    );
+}
+
+#[tokio::test]
+async fn audit_delists_on_expired() {
+    let Some(store) = store_or_skip("audit-expired").await else {
+        return;
+    };
+    seed_offered_game(&store, "GKC", "orn", |_| {}).await;
+    seed_listable_sibling(&store, "GKC", "orn_row_choice_steam", "ORN Sibling").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKC", "some_month_choice", &["orn_row_choice_steam"])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    remount_order_with_states(
+        &humble,
+        "GKC",
+        "some_month_choice",
+        &[("orn_row_choice_steam", "ORN", false, true)],
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let sibling_id = game_id("GKC", "orn_row_choice_steam");
+    let sibling = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+    assert_eq!(
+        sibling.status,
+        GameStatus::Expired,
+        "audit delisted the expired frozen sibling"
+    );
+
+    let client = raw_client().await;
+    let raw = raw_game_item(&client, "t-fulfill-audit-expired", &sibling_id).await;
+    assert!(
+        !raw.contains_key("gsi1pk"),
+        "delisted row must carry no gsi1pk — sparse index"
+    );
+
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("1 audit-pulled"),
+        "summary must report the pull: {}",
+        st.message
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("shelf audit"))
+        .expect("a shelf-audit ping fired");
+    assert!(
+        ping.contains("expired"),
+        "ping carries the expired reason: {ping}"
+    );
+}
+
+#[tokio::test]
+async fn audit_batches_pings_above_three() {
+    let Some(store) = store_or_skip("audit-batch").await else {
+        return;
+    };
+    let names = ["a1", "a2", "a3", "a4", "a5"];
+    for n in names {
+        seed_offered_game(&store, "GKD", n, |_| {}).await;
+        seed_listable_sibling(
+            &store,
+            "GKD",
+            &format!("{n}_row_choice_steam"),
+            &format!("Title {n}"),
+        )
+        .await;
+    }
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let tpk_names: Vec<String> = names
+        .iter()
+        .map(|n| format!("{n}_row_choice_steam"))
+        .collect();
+    let tpk_refs: Vec<&str> = tpk_names.iter().map(String::as_str).collect();
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKD", "some_month_choice", tpk_refs.as_slice())],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await; // pass 1: clean
+
+    // Pass 2: all five revealed on humble — "a3"'s tpk additionally carries is_gift: true, the one
+    // wrinkle remount_order_with_states' fixture doesn't carry (same reason
+    // audit_ping_marks_gift_when_key_is_gift builds its own body instead of using the helper).
+    let all_tpks: Vec<serde_json::Value> = tpk_names
+        .iter()
+        .map(|tpk| {
+            let mut v = serde_json::json!({
+                "machine_name": tpk,
+                "human_name": tpk,
+                "key_type": "steam",
+                "is_expired": false,
+                "keyindex": 0,
+                "redeemed_key_val": "REDEEMED-KEY-VALUE",
+            });
+            if tpk == "a3_row_choice_steam" {
+                v["is_gift"] = serde_json::json!(true);
+            }
+            v
+        })
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GKD"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "GKD",
+            "product": { "human_name": "Test Choice Month", "machine_name": "some_month_choice" },
+            "tpkd_dict": { "all_tpks": all_tpks },
+            "subproducts": [],
+        })))
+        .with_priority(1)
+        .mount(&humble)
+        .await;
+    handle(&deps, FulfillRequest::Sync).await; // pass 2: all five revealed on humble
+
+    for n in names {
+        let sibling_id = game_id("GKD", &format!("{n}_row_choice_steam"));
+        let sibling = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+        assert_eq!(
+            sibling.status,
+            GameStatus::BenRedeemed,
+            "{sibling_id} delisted"
+        );
+    }
+
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("5 audit-pulled"),
+        "summary must report all five pulls: {}",
+        st.message
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let shelf_pings: Vec<String> = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .filter(|b| b.contains("shelf audit"))
+        .collect();
+    assert_eq!(
+        shelf_pings.len(),
+        1,
+        "more than 3 pulls must collapse into exactly ONE batched ping, got {shelf_pings:?}"
+    );
+    let ping = &shelf_pings[0];
+    assert!(
+        ping.contains("pulled 5 listed games"),
+        "batch ping text: {ping}"
+    );
+    for n in names {
+        assert!(
+            ping.contains(&format!("Title {n}")),
+            "batch ping lists every title ({n} missing): {ping}"
+        );
+    }
+    assert!(
+        ping.contains("Title a3 (gift)"),
+        "a3's tpk carries is_gift == Some(true) => the batch ping must append the gift suffix \
+         to its title: {ping}"
+    );
+    assert!(
+        !ping.contains("Title a1 (gift)"),
+        "a1's tpk carries no is_gift => its title must appear without the gift suffix: {ping}"
+    );
+}
+
+/// Precedent: the identical `is_gift == Some(true)` conditional at the reconcile recovery site is
+/// pinned by `reconcile_bundle_self_redeemed_recovers_and_pings` (a dedicated `"is_gift": true` tpk
+/// fixture asserting the ping body ends with the gift suffix). This is that same pin for the
+/// shelf-truth audit's per-row ping — same frozen-sibling shape as the other positive tests, but
+/// the revealed tpk's wire JSON carries `"is_gift": true` (a one-off body, not routed through
+/// `remount_order_with_states`, since none of the other tests need the knob).
+#[tokio::test]
+async fn audit_ping_marks_gift_when_key_is_gift() {
+    let Some(store) = store_or_skip("audit-gift-suffix").await else {
+        return;
+    };
+    seed_offered_game(&store, "GKE", "gyr", |_| {}).await;
+    seed_listable_sibling(&store, "GKE", "gyr_row_choice_steam", "GYR Sibling").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKE", "some_month_choice", &["gyr_row_choice_steam"])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await; // pass 1: clean
+
+    // Pass 2: revealed AND humble marks it a gift — the one wrinkle remount_order_with_states'
+    // fixture doesn't carry.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GKE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "GKE",
+            "product": { "human_name": "Test Choice Month", "machine_name": "some_month_choice" },
+            "tpkd_dict": { "all_tpks": [{
+                "machine_name": "gyr_row_choice_steam",
+                "human_name": "GYR",
+                "key_type": "steam",
+                "is_expired": false,
+                "keyindex": 0,
+                "redeemed_key_val": "REDEEMED-KEY-VALUE",
+                "is_gift": true
+            }]},
+            "subproducts": [],
+        })))
+        .with_priority(1)
+        .mount(&humble)
+        .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let sibling_id = game_id("GKE", "gyr_row_choice_steam");
+    let sibling = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+    assert_eq!(
+        sibling.status,
+        GameStatus::BenRedeemed,
+        "audit delisted the gifted-revealed frozen sibling"
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("shelf audit"))
+        .expect("a shelf-audit ping fired");
+    assert!(
+        ping.contains("on humble (humble marks it a gift)"),
+        "the pulled tpk's is_gift == Some(true) must append the gift suffix after the \
+         pinned \"... on humble\" text: {ping}"
+    );
+    assert!(
+        ping.contains("revealed outside the app"),
+        "still carries the reveal reason ahead of the gift suffix: {ping}"
+    );
+}
+
+// =============================================================================================
+// #158 TASK 9: the MLU end-to-end test — the acceptance criterion in miniature.
+// -------------------------------------------------------------------------------------------
+// THE named known positive the deploy verifies against. Both game rows are seeded exactly as
+// prod's pre-#134 rows look — VERSION-LESS — via `seed_legacy_game_item`, so their first touch
+// this run hits the adopt-at-1 guarded-write arm (dynamo/src/lib.rs:1970-1973), same as the
+// live deploy-day run. One `run_sync` must both (a) have reconcile recover the self claim's key
+// autonomously from the order (Task 2's site) and (b) have the shelf-truth audit delist the
+// frozen tpk-named sibling the D7 routing ladder's own write bypasses (Task 6's site).
+// =============================================================================================
+
+/// Seed a game item exactly as pre-#134 prod rows look: pk/sk/body/status/gsi1pk* (via
+/// `dynamo::schema::game_item`), but with NO `version` attribute. Bypasses `Store` deliberately
+/// (every `Store` game writer stamps `version`) using a raw `aws_sdk_dynamodb` client against
+/// `DYNAMODB_LOCAL_URL` — the deploy-day run hits the adopt-at-1 guarded-write arm
+/// (dynamo/src/lib.rs:1970-1973) on this row's first touch, and so does this test.
+async fn seed_legacy_game_item(table: &str, g: &domain::Game) {
+    let mut item = dynamo::schema::game_item(g, 1);
+    item.remove("version");
+    let client = raw_client().await;
+    client
+        .put_item()
+        .table_name(table)
+        .set_item(Some(item))
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mlu_scenario_first_run_resolves_claim_and_delists_sibling() {
+    let table = "t-fulfill-mlu-e2e";
+    let Some(store) = store_or_skip("mlu-e2e").await else {
+        return;
+    };
+
+    let claim_id = "mlu-claim";
+    let gid = game_id("GK", "mlu");
+    let sibling_id = game_id("GK", "mlu_row_choice_steam");
+
+    // Offered row: already claimed (Pending, claim_id set) and already D7-flipped
+    // (requires_choice false) — the shape a prior sync leaves an in-flight choice claim in.
+    // steam: None throughout (lilith's decoupling assertion — no steam client wired anywhere).
+    let offered = domain::Game {
+        id: gid.clone(),
+        title: "My Little Universe".into(),
+        bundle: "Test Bundle".into(),
+        gamekey: "GK".into(),
+        machine_name: "mlu".into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Pending,
+        claim_id: Some(claim_id.into()),
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    seed_legacy_game_item(table, &offered).await;
+
+    // Frozen sibling: the tpk-named row the D7 routing ladder's fresh write bypasses forever
+    // once the offered row exists — still listable, still carrying the pre-reveal state.
+    let sibling = domain::Game {
+        id: sibling_id.clone(),
+        title: "My Little Universe".into(),
+        bundle: "Test Bundle".into(),
+        gamekey: "GK".into(),
+        machine_name: "mlu_row_choice_steam".into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    seed_legacy_game_item(table, &sibling).await;
+
+    // Claim seeded directly — NOT via claim_game_self (its condition demands the row be
+    // Available, and the offered row above is raw-seeded already-Pending). `put_claim` re-adds
+    // the gsi2 pending marker for Pending state, which is what reconcile's list_pending_claims
+    // reads. Age > RECONCILE_STUCK_ALERT_AGE (24h): the live acceptance scenario is a genuinely
+    // stuck claim, so pending_age_sweep's nag ping ALSO fires this run — expected noise, not
+    // asserted away (see the substring-not-count discipline below).
+    let claim = domain::Claim {
+        id: claim_id.into(),
+        link_token: SELF_LINK_TOKEN.into(),
+        game_id: gid.clone(),
+        state: ClaimState::Pending,
+        gift_url: None,
+        revealed_key: None,
+        created_at: hours_ago(25),
+        choice_pre_tpks: Some(vec![]),
+        failure_reason: None,
+    };
+    store.put_claim(&claim).await.unwrap();
+
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+
+    // Base order is empty; remounted below (priority 1) with the exact out-of-band-revealed
+    // state before `handle` is ever called — ONE run_sync, no pass-1/pass-2 split needed.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GK", "some_month_choice", &[])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+    remount_order_with_states(
+        &humble,
+        "GK",
+        "some_month_choice",
+        &[("mlu_row_choice_steam", "My Little Universe", true, false)],
+    )
+    .await;
+
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // The claim resolved autonomously — reconcile recovered the key straight from the order.
+    let claim = deps
+        .store
+        .get_claim(SELF_LINK_TOKEN, claim_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "the self claim must complete autonomously via reconcile's B3 recovery"
+    );
+    assert_eq!(claim.revealed_key.as_deref(), Some("REDEEMED-KEY-VALUE"));
+
+    // The frozen sibling: shelf-truth audit pulled it — closing the D7 gap this whole task
+    // exists to guard.
+    let sibling_game = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+    assert_eq!(
+        sibling_game.status,
+        GameStatus::BenRedeemed,
+        "shelf audit must delist the frozen sibling"
+    );
+
+    let client = raw_client().await;
+    let raw = raw_game_item(&client, table, &sibling_id).await;
+    assert!(
+        !raw.contains_key("gsi1pk"),
+        "delisted row must carry no gsi1pk — sparse index"
+    );
+    assert_eq!(
+        raw.get("version").unwrap().as_n().unwrap(),
+        "1",
+        "the version-less legacy sibling adopts at version 1 on its first guarded write"
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let bodies: Vec<String> = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("reconcile recovered the already-revealed key for self claim")),
+        "the reconcile recovery ping must fire: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|b| b.contains("shelf audit: pulled")),
+        "the shelf-truth audit ping must fire: {bodies:?}"
     );
 }

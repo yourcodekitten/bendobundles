@@ -292,6 +292,8 @@ pub struct KeyEntry {
     /// Steam App ID for this tpk, when the wire carries it (78% of steam keytypes in HAR capture).
     /// `None` for non-steam keytypes and the ~22% of steam tpks the wire omits it for.
     pub steam_app_id: Option<u32>,
+    /// Gift status from the wire: `Some(true)` = gift, `Some(false)` = not a gift, `None` = field absent.
+    pub is_gift: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -679,6 +681,7 @@ impl HumbleClient {
                         keyindex: t.keyindex,
                         redeemed_key_val: t.redeemed_key_val,
                         steam_app_id: t.steam_app_id,
+                        is_gift: t.is_gift,
                     }
                 })
                 .collect(),

@@ -15,14 +15,46 @@ pub enum Verdict {
 }
 
 /// The pure gate decision for one candidate (sibling, its offered row, the live order's tpks).
-/// Heal only on positive dual evidence AND zero app-owned state on the sibling.
-pub fn pair_verdict(sibling: &Game, offered: Option<&Game>, live_order_tpks: &[String]) -> Verdict {
-    // State-gate the SIBLING: only rows with zero app-owned state auto-heal.
-    if sibling.status != GameStatus::Available {
-        return Verdict::Skip(format!(
-            "sibling status is {:?}, not Available",
-            sibling.status
-        ));
+/// Heal only on positive dual evidence AND zero app-owned state on the sibling — except a
+/// BenRedeemed/Expired sibling may still heal when the LIVE order's own tpk for the sibling
+/// confirms that exact status (out-of-band redemption/expiry, #158): the audit already flipped
+/// the sibling off Available, so gating on Available alone would wedge it forever.
+pub fn pair_verdict(
+    sibling: &Game,
+    offered: Option<&Game>,
+    live_order_tpks: &[humble_client::KeyEntry],
+) -> Verdict {
+    // State-gate the SIBLING: only rows with zero app-owned state auto-heal, widened for
+    // BenRedeemed/Expired iff the live order confirms via the sibling's OWN tpk (exact
+    // machine_name match — the sibling IS the tpk row).
+    match sibling.status {
+        GameStatus::Available => {}
+        GameStatus::BenRedeemed => {
+            let confirmed = live_order_tpks
+                .iter()
+                .any(|e| e.machine_name == sibling.machine_name && e.redeemed);
+            if !confirmed {
+                return Verdict::Skip(
+                    "status BenRedeemed but live order does not confirm redemption".into(),
+                );
+            }
+        }
+        GameStatus::Expired => {
+            let confirmed = live_order_tpks
+                .iter()
+                .any(|e| e.machine_name == sibling.machine_name && e.expired);
+            if !confirmed {
+                return Verdict::Skip(
+                    "status Expired but live order does not confirm expiration".into(),
+                );
+            }
+        }
+        _ => {
+            return Verdict::Skip(format!(
+                "sibling status is {:?}, not Available",
+                sibling.status
+            ));
+        }
     }
     if sibling.claim_id.is_some() {
         return Verdict::Skip("claim-entangled (sibling has a claim_id)".into());
@@ -42,7 +74,7 @@ pub fn pair_verdict(sibling: &Game, offered: Option<&Game>, live_order_tpks: &[S
     }
     if !live_order_tpks
         .iter()
-        .any(|t| domain::choice_tpk_matches(t, &offered.machine_name))
+        .any(|t| domain::choice_tpk_matches(&t.machine_name, &offered.machine_name))
     {
         return Verdict::Skip("order does not corroborate (no matching tpk live)".into());
     }
@@ -109,11 +141,26 @@ mod tests {
         }
     }
 
+    fn key_entry(mn: &str) -> humble_client::KeyEntry {
+        humble_client::KeyEntry {
+            machine_name: mn.into(),
+            human_name: "H".into(),
+            key_type: "steam".into(),
+            redeemed: false,
+            expired: false,
+            giftable: true,
+            keyindex: 0,
+            redeemed_key_val: None,
+            steam_app_id: None,
+            is_gift: None,
+        }
+    }
+
     #[test]
     fn gate_pass_yields_heal() {
         let sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
         let offered = game("GK:omega", "omega"); // requires_choice=false (flipped)
-        let live = vec!["omega_row_choice_steam".to_string()];
+        let live = vec![key_entry("omega_row_choice_steam")];
         assert_eq!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Heal);
     }
 
@@ -123,7 +170,7 @@ mod tests {
         let mut sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
         sibling.status = GameStatus::Gifted;
         let offered = game("GK:omega", "omega");
-        let live = vec!["omega_row_choice_steam".to_string()];
+        let live = vec![key_entry("omega_row_choice_steam")];
         assert!(
             matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("not Available"))
         );
@@ -135,7 +182,7 @@ mod tests {
         let mut sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
         sibling.hidden = true;
         let offered = game("GK:omega", "omega");
-        let live = vec!["omega_row_choice_steam".to_string()];
+        let live = vec![key_entry("omega_row_choice_steam")];
         assert!(
             matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("hidden"))
         );
@@ -146,7 +193,7 @@ mod tests {
         let mut sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
         sibling.claim_id = Some("c1".into());
         let offered = game("GK:omega", "omega");
-        let live = vec!["omega_row_choice_steam".to_string()];
+        let live = vec![key_entry("omega_row_choice_steam")];
         assert!(
             matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("claim-entangled"))
         );
@@ -157,7 +204,7 @@ mod tests {
         let sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
         let mut offered = game("GK:omega", "omega");
         offered.requires_choice = true; // not flipped yet
-        let live = vec!["omega_row_choice_steam".to_string()];
+        let live = vec![key_entry("omega_row_choice_steam")];
         assert!(
             matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("not flipped"))
         );
@@ -167,7 +214,7 @@ mod tests {
     fn order_not_corroborating_skips() {
         let sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
         let offered = game("GK:omega", "omega");
-        let live: Vec<String> = vec![]; // live order carries no matching tpk
+        let live: Vec<humble_client::KeyEntry> = vec![]; // live order carries no matching tpk
         assert!(
             matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("corroborate"))
         );
@@ -178,9 +225,61 @@ mod tests {
         let mut sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
         sibling.appid_source = Some(AppidSource::Manual);
         let offered = game("GK:omega", "omega");
-        let live = vec!["omega_row_choice_steam".to_string()];
+        let live = vec![key_entry("omega_row_choice_steam")];
         assert!(
             matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("Manual"))
+        );
+    }
+
+    #[test]
+    fn benredeemed_sibling_heals_when_order_confirms() {
+        // #158: the audit already flipped this sibling off Available — the live order's own
+        // tpk for it confirms the redemption, so the gate must still let it through.
+        let mut sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
+        sibling.status = GameStatus::BenRedeemed;
+        let offered = game("GK:omega", "omega");
+        let mut entry = key_entry("omega_row_choice_steam");
+        entry.redeemed = true;
+        let live = vec![entry];
+        assert_eq!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Heal);
+    }
+
+    #[test]
+    fn benredeemed_sibling_skips_when_order_does_not_confirm() {
+        let mut sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
+        sibling.status = GameStatus::BenRedeemed;
+        let offered = game("GK:omega", "omega");
+        // live tpk exists but is not redeemed — does not confirm the sibling's status.
+        let live = vec![key_entry("omega_row_choice_steam")];
+        assert!(
+            matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("does not confirm redemption"))
+        );
+    }
+
+    #[test]
+    fn expired_sibling_heals_when_order_confirms() {
+        let mut sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
+        sibling.status = GameStatus::Expired;
+        let offered = game("GK:omega", "omega");
+        let mut entry = key_entry("omega_row_choice_steam");
+        entry.expired = true;
+        let live = vec![entry];
+        assert_eq!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Heal);
+    }
+
+    #[test]
+    fn gifted_sibling_still_skips() {
+        // Behavior pin: the widening covers BenRedeemed/Expired only. Gifted must still hit
+        // the plain "not Available" fallback — do not alter this to make it fail.
+        let mut sibling = game("GK:omega_row_choice_steam", "omega_row_choice_steam");
+        sibling.status = GameStatus::Gifted;
+        let offered = game("GK:omega", "omega");
+        let mut entry = key_entry("omega_row_choice_steam");
+        entry.redeemed = true;
+        entry.expired = true;
+        let live = vec![entry];
+        assert!(
+            matches!(pair_verdict(&sibling, Some(&offered), &live), Verdict::Skip(r) if r.contains("not Available"))
         );
     }
 
