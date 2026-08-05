@@ -2429,3 +2429,76 @@ async fn link_list_carries_tags_from_steam_cache() {
         "empty-tag cache must omit the tags key entirely (genre fallback is client-side)"
     );
 }
+
+// ── #154: game detail must consult link liveness ─────────────────────────────
+
+/// KNOWN POSITIVE for #154: a revoked link must not serve game detail. Byte-identical
+/// to the unknown-token 404 per owned_proxy_404s_without_live_link_byte_identical.
+#[tokio::test]
+async fn game_detail_refuses_revoked_link_154() {
+    let Some(store) = store_or_skip("detail-revoked-154").await else {
+        return;
+    };
+    let g = test_game(1);
+    store.put_game(&g).await.unwrap();
+    let mut lnk = test_link("rev-detail-tok");
+    lnk.revoked = true;
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = plain_router(Arc::clone(&store), mock.clone());
+
+    // Revoked link, real game → must be byte-identical to unknown-token 404.
+    let detail_req = Request::get(format!("/api/l/rev-detail-tok/games/{}/detail", g.id))
+        .body(Body::empty())
+        .unwrap();
+    let detail_resp = app.clone().oneshot(detail_req).await.unwrap();
+    let unknown_req = Request::get(format!("/api/l/{CTX_TOKEN}/games/{}/detail", g.id))
+        .body(Body::empty())
+        .unwrap();
+    let unknown_resp = app.clone().oneshot(unknown_req).await.unwrap();
+
+    assert_eq!(detail_resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(unknown_resp.status(), StatusCode::NOT_FOUND);
+    let detail_bytes = axum::body::to_bytes(detail_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let unknown_bytes = axum::body::to_bytes(unknown_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        detail_bytes, unknown_bytes,
+        "revoked-link detail 404 must be byte-identical to unknown-token 404 (#154)"
+    );
+
+    // Expired link → same refusal. Exhausted link → 200 (grid stays browsable).
+    let mut expired = test_link("exp-detail-tok");
+    expired.expires_at = Some(time::OffsetDateTime::now_utc() - time::Duration::hours(1));
+    store.create_link(&expired).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/exp-detail-tok/games/{}/detail", g.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let mut exhausted = test_link("exh-detail-tok");
+    exhausted.claims_used = exhausted.claims_allowed;
+    store.create_link(&exhausted).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/exh-detail-tok/games/{}/detail", g.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

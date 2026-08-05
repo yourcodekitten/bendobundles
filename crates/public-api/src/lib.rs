@@ -1049,7 +1049,7 @@ async fn handle_game_detail(
     Path((token, game_id)): Path<(String, String)>,
 ) -> Response {
     // 1. Resolve link — same byte-identical 404 for any failure (no oracle).
-    let _link = match s.store.get_link(&token).await {
+    let link = match s.store.get_link(&token).await {
         Ok(Some(l)) => l,
         Ok(None) => return link_not_found_response(),
         Err(_) => {
@@ -1060,6 +1060,21 @@ async fn handle_game_detail(
                 .into_response();
         }
     };
+
+    // 1b. Liveness gate (#154 — this endpoint predated the exhaustive-match socket and
+    //     never consulted can_claim): detail serves iff the games GRID is visible on this
+    //     link — active + exhausted. Refusals reuse the endpoint's byte-identical 404 (no
+    //     oracle: a dead link must not grow a distinguishable "something's here" response),
+    //     and the refusing path does the same link lookup then strictly less work, so the
+    //     404 is indistinguishable from true not-found in timing too (spec §2).
+    //     Pinned by game_detail_refuses_revoked_link_154.
+    let now = OffsetDateTime::now_utc();
+    match link.can_claim(now) {
+        Ok(()) | Err(domain::ClaimRefusal::Exhausted) => {}
+        Err(domain::ClaimRefusal::Revoked | domain::ClaimRefusal::Expired) => {
+            return link_not_found_response();
+        }
+    }
 
     // 2. Fetch the game — unknown game ID → byte-identical 404 (no oracle).
     let game = match s.store.get_game(&game_id).await {
