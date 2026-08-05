@@ -19,6 +19,7 @@
 - No auto-fail, no new auto-compensate paths. Autonomous claim WRITES are a `Some`-snapshot-only privilege (spec: "`Some` is a receipt and `None` is a shrug").
 - The audit de-lists; it never deletes (`Store::delete_game` stays `#[cfg(feature = "heal")]`).
 - Branch: `158-out-of-band-redemption` off `main`. Base commit for spec references: `5c789ff`.
+- **Line numbers are the pre-Task-1 base** — earlier tasks shift later tasks' ranges; anchor on the named symbols, use the numbers only to get close.
 
 ---
 
@@ -31,7 +32,7 @@
 - Test: `crates/humble-client/tests/client_test.rs`
 
 **Interfaces:**
-- Produces: `KeyEntry.is_gift: Option<bool>` — `None` = humble didn't send the field; consumed by Task 6's audit ping and nothing else. NO gate may consult it (spec prong 4: detection-only).
+- Produces: `KeyEntry.is_gift: Option<bool>` — `None` = humble didn't send the field; consumed by Task 2 Step 3b's `{gift_flag}`, Task 6's audit ping, and Task 7's fixtures. NO gate may consult it (spec prong 4: detection-only).
 
 - [ ] **Step 1: Write the failing test.** `TpkWire` is `pub(crate)` — integration tests see only the public API, so pin the three states through `HumbleClient::order()` with wiremock (model on `parses_order_key_states` and its `fixture()` helpers at client_test.rs:5-15):
 
@@ -61,7 +62,7 @@ Expected: FAIL — no field `is_gift` on `KeyEntry` (compile error naming KeyEnt
 - [ ] **Step 4: Run tests + clippy**
 
 Run: `CARGO_BUILD_JOBS=1 cargo test -p humble-client --test client_test && CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --all-features -- -D warnings`
-Expected: PASS, no warnings. (If clippy flags `is_gift` as dead code, it's consumed in Task 6 — silence is NOT allowed; reorder your commit to land with Task 6 or reference it in the audit ping now per Task 6's text.)
+Expected: PASS, no warnings.
 
 - [ ] **Step 5: Commit**
 
@@ -96,7 +97,7 @@ async fn reconcile_routes_by_snapshot_when_flip_already_happened() {
 }
 ```
 
-Write it fully using this file's existing seeding helpers (`sync_deps`, `mount_order_with_redeemed_tpk` at :3657 — note the exact name, there is no `mount_order_with_key`, and the claim/game seeding used by :4447's test); assert `store.get_claim(...).state == ClaimState::Fulfilled`. (The spec's discriminator pins "snapshot-`None` still routes bundle" and "`requires_choice: true` + snapshot-`None` still routes choice" are held by the untouched existing `reconcile_*` tests — Step 4 running the full set IS those pins; no new tests needed for them.)
+Write it fully using this file's existing seeding helpers (`sync_deps`, `mount_order_with_redeemed_tpk` at :3657, and the claim/game seeding used by :4447's test); assert `store.get_claim(...).state == ClaimState::Fulfilled`. (The spec's discriminator pins "snapshot-`None` still routes bundle" and "`requires_choice: true` + snapshot-`None` still routes choice" are held by the untouched existing `reconcile_*` tests — Step 4 running the full set IS those pins; no new tests needed for them.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -119,9 +120,9 @@ if let Ok(Some(game)) = deps.store.get_game(&claim.game_id).await
 
 and the comment above it (:3876-3880) is rewritten to say: routing keys on the claim's own immutable snapshot FIRST — `requires_choice` is D7-mutable (flips false the moment a tpk appears) and stays in the OR only for legacy pre-snapshot choice claims; a transient game-read miss still falls through to the bundle path.
 
-- [ ] **Step 3b: The B3 completion ping (the acceptance criterion's "pings for both" has no producer today).** `recover_already_redeemed_key`'s success is currently silent (`let _ = ...` at :1995 choice-path and :3911 bundle-path; `record_revealed_key`'s Ok arm returns quietly at :1802-1803). At BOTH call sites, match the result instead of discarding it, and on success ping (do NOT ping inside `record_revealed_key` — that path is shared with the ordinary self-claim happy path, which must stay quiet). Pinned copy:
+- [ ] **Step 3b: The B3 completion ping (the acceptance criterion's "pings for both" has no producer today).** `recover_already_redeemed_key`'s success is currently silent (`let _ = ...` at :1995 choice-path and :3911 bundle-path; `record_revealed_key`'s Ok arm returns quietly at :1802-1803). At BOTH call sites, match the result instead of discarding it — the success variant is `FulfillResponse::RevealedKey { .. }`; every other variant stays silent — and on success ping (do NOT ping inside `record_revealed_key` — that path is shared with the ordinary self-claim happy path, which must stay quiet). Pinned copy:
   `"reconcile recovered the already-revealed key for self claim {id} ({title}) from the order — claim completed autonomously; the key was redeemed out of band{gift_flag}."`
-  where `{gift_flag}` is `" (humble marks it a gift)"` when the recovered tpk's `is_gift == Some(true)`, else empty (this is prong 4's redeemed-arm mention; the tpk is in scope at the choice-path site, and at the bundle-path site via `key`). Extend Step 1's test to assert this ping text arrives on the webhook.
+  **`{title}` binding, pinned per site:** choice-path site (:1995) → `game.title` (in scope); bundle-path site (:3911) → `key.human_name` — the bundle path deliberately never reads the game row (comment :3877-3880), so there IS no `game` there. `{gift_flag}` is `" (humble marks it a gift)"` when the recovered tpk's `is_gift == Some(true)`, else empty. Extend Step 1's test to assert this ping text arrives on the webhook, AND add one bundle-twin test: `reconcile_bundle_self_redeemed_recovers_and_pings` — SELF bundle claim (snapshot `None`, game_id machine_name present in the order), key redeemed on humble → claim `Fulfilled` + the ping (with `key.human_name` in it) on the webhook. A ping producer with no test is the no-producer bug wearing its shirt inside out.
 
 - [ ] **Step 4: Run the new test + the full reconcile set**
 
@@ -193,7 +194,7 @@ let hits: Vec<&humble_client::KeyEntry> = order.keys.iter()
   - unique, clean: `"choice claim {id} ({title}) has no intent snapshot, but humble shows an unredeemed key for this title (`{machine_name}`). Cannot attribute it to this claim. Left pending for review."`
   - ambiguous: `"choice claim {id} ({title}) has no intent snapshot and multiple keys on humble could match the title. Left pending for review."`
 
-- [ ] **Step 1: Write the three failing park tests** (`reconcile_choice_no_snapshot_found_redeemed_parks`, `..._found_clean_parks`, `..._found_ambiguous_parks`): seed snapshot `None`, `requires_choice: true` row, order carrying (a) one title-matched redeemed tpk, (b) one title-matched clean tpk, (c) two tpks the title can't split. Assert: claim stays `Pending`, no re-list, exact ping text.
+- [ ] **Step 1: Write the three failing park tests** (`reconcile_choice_no_snapshot_found_redeemed_parks`, `..._found_clean_parks`, `..._found_ambiguous_parks`): seed snapshot `None`, `requires_choice: true` row, order carrying (a) one title-matched redeemed tpk, (b) one title-matched clean tpk, (c) two tpks BOTH title-matched (`human_name` == `game.title`, distinct machine_names — an unmatched pair would seed the 0-hit shape and red forever). Assert: claim stays `Pending`, no re-list, exact ping text.
 
 - [ ] **Step 2: Run to verify they fail** (current arm A compensates blind)
 
@@ -332,7 +333,7 @@ async fn audit_batches_pings_above_three() {
 - [ ] **Step 2: Run to verify all four fail**
 
 Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test handler_test audit_`
-Expected: 4 FAIL (sibling stays listable — no audit exists). Confirm they RAN, not SKIPped.
+Expected: **3 FAIL** (`audit_delists_frozen_sibling_when_order_shows_key_revealed`, `audit_delists_on_expired`, `audit_batches_pings_above_three`) **+ 1 PASS** — `audit_never_touches_rows_absent_from_fetched_orders` passes VACUOUSLY before the audit exists (no audit → row untouched → every assert holds). **DO NOT alter the absence test to make it fail** — an absence test that fails pre-implementation could only be greened by an audit that acts on absence, the exact violation the spec bans; it becomes the load-bearing absence pin once Step 3 lands. Confirm all four RAN, not SKIPped.
 
 - [ ] **Step 3: Implement.**
   1. Declare the map above the orders loop (:3291): `let mut truth: TruthMap = std::collections::HashMap::new();`. In the order walk (:3340), before the D7 routing, insert every key: `truth.insert((order.gamekey.clone(), key.machine_name.clone()), TruthEntry { redeemed: key.redeemed, expired: key.expired, key: key.clone() });` — the map is built from orders that FETCHED; a failed order contributes nothing (that is the absence rule, no special case).
@@ -354,7 +355,8 @@ let fresh = domain::Game {
 ```
 
   then `upsert_game_from_sync(fresh)`. `SyncWrite` variants are `Written`/`SkippedInFlight`/`Unchanged` (dynamo:21-31 — there is NO `Contested`): `Written` counts as a pull; `SkippedInFlight`/`Unchanged` → skip silently (set-driven, next run self-corrects — comment it). Collect (title, id, reason, is_gift) per pull; ping per the pinned texts after the loop (batch rule at >3).
-  3. Call site (after `enrich_steam_apps(...)`, before `msg` at :3461): `let pulls = match &shared_scan { Some(scan) => shelf_truth_audit(deps, scan, &truth).await, None => 0 };` and extend `msg` per the Interfaces pin.
+  3. Call site (after `enrich_steam_apps(...)`, before `msg` at :3461): `let pulls = match &shared_scan { Some(scan) => shelf_truth_audit(deps, scan, &truth).await, None => 0 };` and extend `msg` per the Interfaces pin. Add this comment at the call site (discharges the scan-staleness question honestly): `// scan predates discover_choice_games' writes — harmless: offered names never exact-match tpk names, and a stale-scan write CCFs into SkippedInFlight; next run re-reads.`
+  4. Test observability pins: the summary is read via `store.get_sync_state().await` → `.message` (precedent handler_test.rs:310); raw-client assertions hit the per-test table the harness creates (`t-fulfill-{test}` naming — read it off the `Store` the test built).
 
 - [ ] **Step 4: Run the audit tests + full suite + clippy**
 
@@ -382,10 +384,10 @@ git commit -S -m "sync(#158): shelf-truth audit — no listable row may referenc
 
 - [ ] **Step 1: Write the failing unit tests** in `heal_pairs.rs` `mod tests` (model on `status_not_available_skips` :121): `benredeemed_sibling_heals_when_order_confirms`, `benredeemed_sibling_skips_when_order_does_not_confirm`, `expired_sibling_heals_when_order_confirms`, `gifted_sibling_still_skips`. Build `KeyEntry` fixtures inline (all fields, `is_gift: None`).
 
-- [ ] **Step 2: Run to verify they fail** (signature change → compile fail first, that counts)
+- [ ] **Step 2: Run to verify they fail** — the red sequence, in order: compile FAIL on the changed arity → mechanical migration of the 8 existing `&[String]` fixtures to `KeyEntry` → then **3 behavioral FAILs** (`benredeemed_sibling_heals_when_order_confirms`, `benredeemed_sibling_skips_when_order_does_not_confirm`, `expired_sibling_heals_when_order_confirms`) **+ `gifted_sibling_still_skips` passes VACUOUSLY** pre-implementation (Gifted already skips via the status gate). **DO NOT alter it to make it fail** — it is the behavior pin that the widening stays narrow.
 
 Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --features heal heal_pairs`
-Expected: FAIL.
+Expected: per the sequence above; all four RAN.
 
 - [ ] **Step 3: Implement** the signature + gate change; fix the bin caller (it already fetches the live order — pass the entries instead of the collected names; delete the now-unused name-vec if nothing else reads it).
 
@@ -410,7 +412,7 @@ git commit -S -m "heal(#158): gate accepts audited siblings iff the live order c
 - Test: `crates/fulfillment/tests/handler_test.rs`
 
 **Interfaces:**
-- Consumes: `domain::choice_tpk_bases` (domain:329) — messaging only, arms nothing.
+- Consumes: `domain::choice_tpk_matches` (domain:354; the grammar probe heal_pairs:45 already uses) — messaging only, arms nothing.
 - Produces: enriched `alert_unreconcilable` reason. Exact copy (pin): existing reason + (when a probe hits) `"; NOTE: humble carries a key for this game under `{tpk_machine_name}`{flags}"` where `{flags}` is `", already revealed outside the app"` and/or `", expired"` (both possible). No probe hit → byte-identical current reason (pin that too).
 
 - [ ] **Step 1: Write the two failing message-pin tests**: `unreconcilable_nag_names_out_of_band_key_when_grammar_finds_one` (claim machine_name `mlu`, order tpk `mlu_row_choice_steam` revealed, snapshot `None`, `requires_choice: false` → bundle path → assert webhook text contains the NOTE with the tpk name and "already revealed outside the app") and `unreconcilable_nag_stays_generic_without_a_grammar_hit` (no matching tpk → assert exact current string, no NOTE substring).
@@ -477,11 +479,14 @@ async fn mlu_scenario_first_run_resolves_claim_and_delists_sibling() {
     // ONE run_sync. Assert:
     //   claim Fulfilled, recovered key == "REDEEMED-KEY-VALUE"
     //   sibling raw item: status ben_redeemed, NO gsi1pk, version == 1 (adopt-at-1)
-    //   webhook saw BOTH pings (B3 recovery's + the audit's pinned text)
+    //   webhook saw BOTH pings — assert by greppable substring, NOT by counting POSTs
+    //   (a count passes on the wrong pings, e.g. the pending-age nag):
+    //     one body contains "reconcile recovered the already-revealed key for self claim"
+    //     another body contains "shelf audit: pulled"
 }
 ```
 
-- [ ] **Step 3: Run to verify it fails, then passes** (it should pass already if Tasks 2-6 are correct — a first-try pass is only trustworthy because each component's test failed first; if it fails, the failure names the broken seam)
+- [ ] **Step 3: Run — expected to pass first-try; a failure names the broken seam** (a first-try pass is trustworthy here only because each component's own test failed first)
 
 Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test handler_test mlu_scenario`
 Expected: PASS.
@@ -509,39 +514,99 @@ git commit -S -m "test(#158): MLU end-to-end on prod's version-less shape — th
 **Interfaces:**
 - Produces: the OMBB plan-gate line item — deploy halts unless the pre-press count is exactly `reroute=1 / armA=0 / audit=1`.
 
-- [ ] **Step 1: Write the script** — profiles parameterized (`PROFILE_DB` default `kitten-debug` for table reads, `PROFILE_SSM` default `kitten-deploy` for the cookie), cookie never echoed, key values reduced to presence, explicit `if` blocks (no `[ ] && echo` tails — under `set -e` a false condition kills the run), final line `CHANGELIST: reroute=<n> armA=<n> audit=<n>`, exit 1 unless `1 0 1`. The three clauses, verbatim from the reviewed enumerator (receipt documenting the run: `/home/code-kitten/code-kitten/state/receipts/2026-08-05-158-deploy-day-changelist.json`):
+- [ ] **Step 1: Write the script — this complete body, verbatim** (it is the reviewed enumerator that ran 2026-08-05 returning 1/0/1, plus the armA clause and the gate exit; the gate that guards prod is executable and in-repo, never prose pointing at a receipt):
 
 ```bash
-T=brd-prod-ue1-bendobundles-table; R=us-east-1
+#!/usr/bin/env bash
+# 158-deploy-changelist.sh — deploy-time re-enumeration gate for #158 (read-only).
+# Prints the three-clause changelist and exits 0 IFF it is exactly reroute=1 armA=0 audit=1.
+# ANY order fetch failure => INCONCLUSIVE => exit 1 (an empty terminal is not a passing check).
+# A count is a measurement, not a bound: run this immediately before the first post-deploy
+# sync; on any non-1/0/1 result STOP and take the printed list to ben.
+set -euo pipefail
+PROFILE_DB="${PROFILE_DB:-kitten-debug}"
+PROFILE_SSM="${PROFILE_SSM:-kitten-deploy}"
+T=brd-prod-ue1-bendobundles-table
+R=us-east-1
 SSM_PARAM=/brd-prod-ue1-bendobundles-param/humble-cookie
-# clause (a) reroute set: pending claims (GSI "pending-claims", gsi2pk="PENDINGCLAIM")
-#   with choice_pre_tpks != null, whose game row (pk "GAME#<game_id>", sk "META") has
-#   body.requires_choice == false. Claims: body.S | fromjson | {id, game_id,
-#   link_token, choice_pre_tpks}. Count members; also emit SELF vs gift split.
-aws dynamodb query --profile "$PROFILE_DB" --region "$R" --table-name "$T" \
+
+echo "== clause (a)+(b): pending claims vs their game rows =="
+CLAIMS=$(aws dynamodb query --profile "$PROFILE_DB" --region "$R" --table-name "$T" \
   --index-name pending-claims --key-condition-expression "gsi2pk = :p" \
-  --expression-attribute-values '{":p":{"S":"PENDINGCLAIM"}}'
-# clause (b) armA set: same pending claims with choice_pre_tpks == null AND their game
-#   row requires_choice == true. Count.
-# clause (c) audit pull list: LISTABLE rows (GSI "listable", gsi1pk="LISTABLE"),
-#   body.S | fromjson | {id, gamekey, machine_name, title}; for each DISTINCT gamekey:
+  --expression-attribute-values '{":p":{"S":"PENDINGCLAIM"}}' --output json \
+  | jq -c '[.Items[].body.S | fromjson]')
+REROUTE=0; ARMA=0
+while read -r c; do
+  gid=$(echo "$c" | jq -r '.game_id')
+  has_snap=$(echo "$c" | jq 'has("choice_pre_tpks") and (.choice_pre_tpks != null)')
+  rc=$(aws dynamodb get-item --profile "$PROFILE_DB" --region "$R" --table-name "$T" \
+    --key "{\"pk\":{\"S\":\"GAME#$gid\"},\"sk\":{\"S\":\"META\"}}" --output json \
+    | jq '.Item.body.S | if . then (fromjson | .requires_choice) else null end')
+  if [ "$has_snap" = "true" ] && [ "$rc" = "false" ]; then
+    REROUTE=$((REROUTE+1))
+    echo "REROUTE: $(echo "$c" | jq -c '{id, game_id, self:(.link_token=="SELF")}')"
+  fi
+  if [ "$has_snap" = "false" ] && [ "$rc" = "true" ]; then
+    ARMA=$((ARMA+1))
+    echo "ARM-A: $(echo "$c" | jq -c '{id, game_id, self:(.link_token=="SELF")}')"
+  fi
+done < <(echo "$CLAIMS" | jq -c '.[]')
+
+echo "== clause (c): LISTABLE rows vs live order truth =="
+ROWS=$(aws dynamodb query --profile "$PROFILE_DB" --region "$R" --table-name "$T" \
+  --index-name listable --key-condition-expression "gsi1pk = :p" \
+  --expression-attribute-values '{":p":{"S":"LISTABLE"}}' --output json \
+  | jq -c '[.Items[].body.S | fromjson | {id, gamekey, machine_name, title}]')
 COOKIE=$(aws ssm get-parameter --profile "$PROFILE_SSM" --region "$R" \
   --name "$SSM_PARAM" --with-decryption --query Parameter.Value --output text)
-curl -sfS "https://www.humblebundle.com/api/v1/order/$gk?all_tpkds=true" \
-  -H "Cookie: _simpleauth_sess=$COOKIE"
-#   → per listable row, exact match .tpkd_dict.all_tpks[] on machine_name; pull iff
-#   (redeemed_key_val != null) or is_expired. Pace order fetches: sleep 0.3 between.
-#   Track and print: rows_checked, would_pull, tpk_absent, order_fetch_fail — a fetch
-#   failure makes the run INCONCLUSIVE for that order's rows: print it and exit 1
-#   (an empty terminal is not a passing check).
+PULLS=0; CHECKED=0; FETCH_FAIL=0
+for gk in $(echo "$ROWS" | jq -r '[.[].gamekey] | unique | .[]'); do
+  ORDER=$(curl -sfS "https://www.humblebundle.com/api/v1/order/$gk?all_tpkds=true" \
+    -H "Cookie: _simpleauth_sess=$COOKIE" || echo '{}')
+  if [ "$(echo "$ORDER" | jq 'has("tpkd_dict")')" != "true" ]; then
+    FETCH_FAIL=$((FETCH_FAIL+1)); echo "FETCH-FAIL: $gk"; sleep 0.3; continue
+  fi
+  while read -r row; do
+    mn=$(echo "$row" | jq -r '.machine_name')
+    CHECKED=$((CHECKED+1))
+    verdict=$(echo "$ORDER" | jq -c --arg mn "$mn" \
+      '[.tpkd_dict.all_tpks[]? | select(.machine_name==$mn)]
+       | if length==0 then {absent:true}
+         else (.[0] | {revealed:(.redeemed_key_val != null), expired:.is_expired}) end')
+    if [ "$(echo "$verdict" | jq '.absent // false')" = "true" ]; then
+      continue
+    fi
+    if [ "$(echo "$verdict" | jq '.revealed or .expired')" = "true" ]; then
+      PULLS=$((PULLS+1))
+      echo "AUDIT-WOULD-PULL: $(echo "$row" | jq -c '{id,title}') $verdict"
+    fi
+  done < <(echo "$ROWS" | jq -c --arg gk "$gk" '.[] | select(.gamekey==$gk)')
+  sleep 0.3
+done
+
+echo "rows_checked=$CHECKED order_fetch_fail=$FETCH_FAIL"
+if [ "$FETCH_FAIL" -gt 0 ]; then
+  echo "INCONCLUSIVE: $FETCH_FAIL order(s) unfetched — their rows are UNVERIFIED. Do not press."
+  exit 1
+fi
+echo "CHANGELIST: reroute=$REROUTE armA=$ARMA audit=$PULLS"
+if [ "$REROUTE" -eq 1 ] && [ "$ARMA" -eq 0 ] && [ "$PULLS" -eq 1 ]; then
+  echo "GATE: 1/0/1 — matches the signed changelist. Clear to press."
+  exit 0
+else
+  echo "GATE: MISMATCH vs signed 1/0/1 — STOP. Take the list above to ben before anything runs."
+  exit 1
+fi
 ```
+
+Note the discipline throughout: every condition is an explicit `if` block — never a `[ ] && echo` tail, which under `set -e` kills the run on the first false condition (this exact bug ate the first enumeration run on 2026-08-05).
 
 - [ ] **Step 2: Write the runbook** — deploy sequence: (1) merge PR; (2) `terraform` deploy per `terraform/README.md` (boundary arn + ops_alarm_email mandatory, admin hash verbatim); (3) **run `scripts/158-deploy-changelist.sh` — on anything but `1 0 1`, STOP and take the fresh list to ben before any sync fires** (a count is a measurement, not a bound); (4) trigger/await the first sync; (5) verify: claim `3f46c058` Fulfilled, row `GAME#HAXSVMZHBvK2E7dW:mylittleuniverse_row_choice_steam` de-listed, both pings in discord; (6) ship-green only then.
 
-- [ ] **Step 3: Shellcheck + dry-read**
+- [ ] **Step 3: Syntax check + dry-read** (shellcheck is NOT installed on this box — verified 2026-08-05; do not attempt it)
 
-Run: `shellcheck scripts/158-deploy-changelist.sh`
-Expected: clean (or documented suppressions).
+Run: `bash -n scripts/158-deploy-changelist.sh && echo SYNTAX-OK`
+Expected: `SYNTAX-OK`. Then read the script top to bottom once against the Step 1 body — they must be identical.
 
 - [ ] **Step 4: Commit**
 
