@@ -52,6 +52,14 @@
           "sk",
           "status",
           "version"
+        ],
+        "update_attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "status",
+          "version"
         ]
       }
     ],
@@ -80,6 +88,21 @@
           "pk",
           "revoked",
           "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "body",
+          "claims_allowed",
+          "claims_used",
+          "pk",
+          "revoked",
+          "sk",
+          "unlock_at"
         ]
       }
     ],
@@ -264,6 +287,22 @@
         ]
       }
     ],
+    "remove_link_unlock": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk",
+          "unlock_at"
+        ],
+        "update_attributes": [
+          "unlock_at"
+        ]
+      }
+    ],
     "set_game_hidden": [
       {
         "action": "dynamodb:GetItem",
@@ -345,6 +384,25 @@
           "gift_note",
           "pk",
           "sk"
+        ],
+        "update_attributes": [
+          "gift_note"
+        ]
+      }
+    ],
+    "set_link_unlock": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "pk",
+          "sk",
+          "unlock_at"
+        ],
+        "update_attributes": [
+          "unlock_at"
         ]
       }
     ],
@@ -361,6 +419,12 @@
           "pk",
           "revoked",
           "sk"
+        ],
+        "update_attributes": [
+          "body",
+          "claims_allowed",
+          "expires_at",
+          "revoked"
         ]
       }
     ]
@@ -467,6 +531,14 @@
           "sk",
           "status",
           "version"
+        ],
+        "update_attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "status",
+          "version"
         ]
       },
       {
@@ -479,6 +551,9 @@
           "claims_used",
           "pk",
           "sk"
+        ],
+        "update_attributes": [
+          "claims_used"
         ]
       }
     ],
@@ -529,6 +604,14 @@
           "gsi1sk",
           "pk",
           "sk",
+          "status",
+          "version"
+        ],
+        "update_attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
           "status",
           "version"
         ]
@@ -595,6 +678,14 @@
           "sk",
           "status",
           "version"
+        ],
+        "update_attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "status",
+          "version"
         ]
       },
       {
@@ -607,6 +698,9 @@
           "claims_used",
           "pk",
           "sk"
+        ],
+        "update_attributes": [
+          "claims_used"
         ]
       }
     ],
@@ -659,6 +753,14 @@
           "sk",
           "status",
           "version"
+        ],
+        "update_attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "status",
+          "version"
         ]
       }
     ],
@@ -707,6 +809,11 @@
           "sk",
           "status",
           "version"
+        ],
+        "update_attributes": [
+          "body",
+          "status",
+          "version"
         ]
       }
     ],
@@ -753,6 +860,11 @@
           "claim_id",
           "pk",
           "sk",
+          "status",
+          "version"
+        ],
+        "update_attributes": [
+          "body",
           "status",
           "version"
         ]
@@ -1077,6 +1189,14 @@
           "sk",
           "status",
           "version"
+        ],
+        "update_attributes": [
+          "body",
+          "claim_id",
+          "gsi1pk",
+          "gsi1sk",
+          "status",
+          "version"
         ]
       },
       {
@@ -1094,6 +1214,10 @@
           "revoked",
           "sk",
           "unlock_at"
+        ],
+        "update_attributes": [
+          "body",
+          "claims_used"
         ]
       }
     ],
@@ -1210,6 +1334,10 @@
           "pk",
           "revoked",
           "sk",
+          "thank_note",
+          "thanked_at"
+        ],
+        "update_attributes": [
           "thank_note",
           "thanked_at"
         ]
