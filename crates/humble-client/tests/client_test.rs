@@ -100,7 +100,10 @@ async fn is_gift_models_absence_distinctly() {
     let order = client(&server).await.order("GK").await.unwrap();
     assert_eq!(order.keys[0].is_gift, Some(true));
     assert_eq!(order.keys[1].is_gift, Some(false));
-    assert_eq!(order.keys[2].is_gift, None, "absence must stay None — never default to false");
+    assert_eq!(
+        order.keys[2].is_gift, None,
+        "absence must stay None — never default to false"
+    );
 }
 
 #[tokio::test]

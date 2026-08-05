@@ -2415,7 +2415,11 @@ async fn reconcile_choice_not_spent_parks_never_compensates() {
     handle(&deps, FulfillRequest::Sync).await;
 
     let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Pending, "not re-listed");
     assert_eq!(
@@ -2485,7 +2489,11 @@ async fn reconcile_choice_not_spent_parks_never_compensates_via_flipped_route() 
     handle(&deps, FulfillRequest::Sync).await;
 
     let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Pending, "not re-listed");
     assert_eq!(
@@ -2593,7 +2601,11 @@ async fn reconcile_choice_no_snapshot_found_redeemed_parks() {
     handle(&deps, FulfillRequest::Sync).await;
 
     let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Pending, "not re-listed");
     assert_eq!(
@@ -2658,7 +2670,11 @@ async fn reconcile_choice_no_snapshot_found_clean_parks() {
     handle(&deps, FulfillRequest::Sync).await;
 
     let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Pending, "not re-listed");
     assert_eq!(
@@ -2724,7 +2740,11 @@ async fn reconcile_choice_no_snapshot_found_ambiguous_parks() {
     handle(&deps, FulfillRequest::Sync).await;
 
     let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    assert_eq!(
+        claim.state,
+        ClaimState::Pending,
+        "parked, never compensated"
+    );
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Pending, "not re-listed");
     assert_eq!(
@@ -4965,11 +4985,7 @@ async fn reconcile_routes_by_snapshot_when_flip_already_happened() {
         .and(path("/api/v1/order/GK"))
         .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
             "GK",
-            serde_json::json!([tpk_json(
-                "mlu_row_choice_steam",
-                "My Little Universe",
-                true
-            )]),
+            serde_json::json!([tpk_json("mlu_row_choice_steam", "My Little Universe", true)]),
         )))
         .mount(&humble)
         .await;
@@ -4992,7 +5008,11 @@ async fn reconcile_routes_by_snapshot_when_flip_already_happened() {
     assert_eq!(claim.revealed_key.as_deref(), Some("STEAMKEY-XXXX"));
 
     let pings = discord.received_requests().await.unwrap();
-    assert_eq!(pings.len(), 1, "the B3 completion ping must fire exactly once");
+    assert_eq!(
+        pings.len(),
+        1,
+        "the B3 completion ping must fire exactly once"
+    );
     let body = String::from_utf8(pings[0].body.clone()).unwrap();
     assert!(body.contains("sc-flip"), "ping carries the claim id");
     assert!(
@@ -5178,7 +5198,11 @@ async fn reconcile_bundle_self_redeemed_recovers_and_pings() {
     );
 
     let pings = discord.received_requests().await.unwrap();
-    assert_eq!(pings.len(), 1, "the B3 completion ping must fire exactly once");
+    assert_eq!(
+        pings.len(),
+        1,
+        "the B3 completion ping must fire exactly once"
+    );
     let body = String::from_utf8(pings[0].body.clone()).unwrap();
     assert!(body.contains("sc-r5"), "ping carries the claim id");
     assert!(
@@ -8157,7 +8181,10 @@ async fn audit_delists_frozen_sibling_when_order_shows_key_revealed() {
         .map(|r| String::from_utf8(r.body.clone()).unwrap())
         .find(|b| b.contains("shelf audit"))
         .expect("a shelf-audit ping fired");
-    assert!(ping.contains("MLU Sibling"), "ping carries the title: {ping}");
+    assert!(
+        ping.contains("MLU Sibling"),
+        "ping carries the title: {ping}"
+    );
     assert!(ping.contains(&sibling_id), "ping carries the id: {ping}");
     assert!(
         ping.contains("revealed outside the app"),
@@ -8308,7 +8335,10 @@ async fn audit_batches_pings_above_three() {
         .mount(&discord)
         .await;
 
-    let tpk_names: Vec<String> = names.iter().map(|n| format!("{n}_row_choice_steam")).collect();
+    let tpk_names: Vec<String> = names
+        .iter()
+        .map(|n| format!("{n}_row_choice_steam"))
+        .collect();
     let tpk_refs: Vec<&str> = tpk_names.iter().map(String::as_str).collect();
     let deps = sync_deps(
         store,
