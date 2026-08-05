@@ -13,3 +13,4 @@ terraform-iam/*.tfplan
 # live/annotations/, live/server.json); design.json + live/config.json are tracked
 # source (the design hook reads them). A root-level .impeccable/ rule here would be
 # a no-op-vs-tracked-files contradiction (#80 finding 3).
+.worktrees/
