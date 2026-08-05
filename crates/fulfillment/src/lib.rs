@@ -3470,21 +3470,18 @@ async fn run_sync(deps: &Deps) {
         }
     }
 
-    // ONE full-catalog Scan shared by the title pass and the ownership pass (#47) — they
-    // previously each ran their own. Scanned AFTER the order walk (its upserts must be visible)
-    // and only when a steam client exists (both passes skip without one). The enrichment pass
-    // deliberately keeps its OWN scan: choice discovery writes new games between these passes
-    // and enrichment must see them.
-    let shared_scan: Option<Vec<Game>> = if deps.steam.is_some() {
-        match deps.store.list_all_games().await {
-            Ok(g) => Some(g),
-            Err(e) => {
-                tracing::warn!(error = ?e, "sync: list_all_games failed — skipping title + ownership passes");
-                None
-            }
+    // ONE full-catalog Scan shared by the title pass, the ownership pass (#47), and the
+    // shelf-truth audit (#158) — previously the first two each ran their own. Scanned AFTER
+    // the order walk (its upserts must be visible). The title and ownership passes self-guard
+    // when steam is absent; the audit's every-sync invariant must not inherit a stranger's
+    // off-switch. The enrichment pass deliberately keeps its OWN scan: choice discovery writes
+    // new games between these passes and enrichment must see them.
+    let shared_scan: Option<Vec<Game>> = match deps.store.list_all_games().await {
+        Ok(g) => Some(g),
+        Err(e) => {
+            tracing::warn!(error = ?e, "sync: list_all_games failed — skipping title + ownership passes");
+            None
         }
-    } else {
-        None
     };
 
     // Title-pass: map any still-unmapped steam games by unique exact name match against the Steam
