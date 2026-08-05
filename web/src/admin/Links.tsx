@@ -6,6 +6,8 @@ import {
   adminRevoke,
   adminLinkClaims,
   adminSetLinkNote,
+  adminSetLinkUnlock,
+  adminDeleteLinkUnlock,
   CreateLinkValidationError,
   GIFT_NOTE_MAX,
   type AdminLink,
@@ -48,6 +50,15 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
+function formatDateTime(iso: string): string {
+  return new Date(iso).toLocaleString();
+}
+
+/** Sealed = has an unlock moment that hasn't arrived. Past unlock_at is just open. */
+function isSealed(link: AdminLink): boolean {
+  return link.unlock_at !== undefined && new Date(link.unlock_at).getTime() > Date.now();
+}
+
 export function Links() {
   const navigate = useNavigate();
   const [state, setState] = useState<PageState>({ phase: 'loading' });
@@ -56,6 +67,7 @@ export function Links() {
   const [formLabel, setFormLabel] = useState('');
   const [claimsAllowed, setClaimsAllowed] = useState(1);
   const [expiresDays, setExpiresDays] = useState('');
+  const [unlockAt, setUnlockAt] = useState('');
   const [giftNote, setGiftNote] = useState('');
   const [creating, setCreating] = useState(false);
   // Stored after successful create — separate from page state so reload doesn't clear it
@@ -76,6 +88,10 @@ export function Links() {
 
   // Note editing: token → draft text (key presence = editor open). Saving a
   // blank draft clears the note server-side.
+  // Per-row seal editor (mirrors the note editor's draft/error/saving shape).
+  const [sealDrafts, setSealDrafts] = useState<Record<string, string>>({});
+  const [sealErrors, setSealErrors] = useState<Record<string, string>>({});
+  const [sealBusy, setSealBusy] = useState<Set<string>>(new Set());
   const [noteDrafts, setNoteDrafts] = useState<Record<string, string>>({});
   const [noteSaving, setNoteSaving] = useState<Set<string>>(new Set());
   // Per-token note-save failure — a silent catch would leave ben unsure what
@@ -104,13 +120,21 @@ export function Links() {
     // Blank/whitespace note → omit the field; the server also normalizes, this
     // just keeps the wire clean.
     const note = giftNote.trim() !== '' ? giftNote.trim() : undefined;
-    withAuth(() => adminCreateLink(trimmedLabel, claimsAllowed, expires, note), navigate)
+    // datetime-local is ben's LOCAL wall-clock pick; the browser resolves it to
+    // an absolute instant here, at write time (family review: a bare date is
+    // how a gift opens at 7pm).
+    const unlock = unlockAt !== '' ? new Date(unlockAt).toISOString() : undefined;
+    withAuth(
+      () => adminCreateLink(trimmedLabel, claimsAllowed, expires, note, unlock),
+      navigate,
+    )
       .then((result) => {
         setCreatedInfo({ fullUrl: inviteUrl(result.token), label: trimmedLabel });
         setCreateError(null);
         setFormLabel('');
         setClaimsAllowed(1);
         setExpiresDays('');
+        setUnlockAt('');
         setGiftNote('');
         // Reload to prepend the new link into the list
         load();
@@ -174,6 +198,54 @@ export function Links() {
           return next;
         });
       });
+  };
+
+  const sealBusyOn = (token: string) =>
+    setSealBusy((prev) => new Set(prev).add(token));
+  const sealBusyOff = (token: string) =>
+    setSealBusy((prev) => {
+      const next = new Set(prev);
+      next.delete(token);
+      return next;
+    });
+
+  const handleSaveUnlock = (link: AdminLink) => {
+    const draft = sealDrafts[link.token];
+    if (draft === undefined || draft === '') return;
+    sealBusyOn(link.token);
+    setSealErrors((prev) => omitKey(prev, link.token));
+    // datetime-local → absolute instant, resolved here in ben's browser.
+    const iso = new Date(draft).toISOString();
+    withAuth(() => adminSetLinkUnlock(link.token, iso), navigate)
+      .then(() => {
+        setSealDrafts((prev) => omitKey(prev, link.token));
+        load();
+      })
+      .catch((err: unknown) => {
+        setSealErrors((prev) => ({
+          ...prev,
+          [link.token]: err instanceof Error ? err.message : "couldn't move the moment",
+        }));
+        // A 409 means the seal state changed under us (it opened) — reload so
+        // the row stops offering controls the server will refuse.
+        load();
+      })
+      .finally(() => sealBusyOff(link.token));
+  };
+
+  const handleUnseal = (link: AdminLink) => {
+    sealBusyOn(link.token);
+    setSealErrors((prev) => omitKey(prev, link.token));
+    withAuth(() => adminDeleteLinkUnlock(link.token), navigate)
+      .then(() => load())
+      .catch((err: unknown) => {
+        setSealErrors((prev) => ({
+          ...prev,
+          [link.token]: err instanceof Error ? err.message : "couldn't unseal",
+        }));
+        load();
+      })
+      .finally(() => sealBusyOff(link.token));
   };
 
   const handleRevoke = (link: AdminLink) => {
@@ -292,6 +364,16 @@ export function Links() {
               className="w-24 rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
             />
           </label>
+          <label className="flex flex-col gap-1 text-xs text-dust">
+            unlocks at (optional — wraps the gift until then)
+            <input
+              type="datetime-local"
+              aria-label="unlocks at"
+              value={unlockAt}
+              onChange={(e) => setUnlockAt(e.target.value)}
+              className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
+            />
+          </label>
         </div>
         <label className="flex flex-col gap-1 text-xs text-dust">
           note to your friend (optional — greets them on their page)
@@ -360,6 +442,8 @@ export function Links() {
           const noteDraft = noteDrafts[link.token];
           const noteErr = noteErrors[link.token];
           const savingNote = noteSaving.has(link.token);
+          const sealDraft = sealDrafts[link.token];
+          const sealErr = sealErrors[link.token];
 
           return (
             <div key={link.token} className="rounded bg-floor p-4">
@@ -385,6 +469,12 @@ export function Links() {
                   expires{' '}
                   {link.expires_at !== null ? formatDate(link.expires_at) : 'never'}
                 </span>
+
+                {isSealed(link) && link.unlock_at !== undefined && (
+                  <span className="rounded bg-give-soft px-2 py-0.5 text-xs text-give-ink">
+                    🎁 sealed until {formatDateTime(link.unlock_at)}
+                  </span>
+                )}
 
                 {/* Actions — all accessible-named with the link's label */}
                 <div className="ml-auto flex items-center gap-2">
@@ -415,6 +505,38 @@ export function Links() {
                     >
                       {armed ? 'confirm?' : 'revoke'}
                     </button>
+                  )}
+
+                  {isSealed(link) && (
+                    <>
+                      <button
+                        type="button"
+                        disabled={sealBusy.has(link.token)}
+                        onClick={() => {
+                          // Toggle the seal editor (note-editor shape): closing
+                          // abandons the draft and its stale error.
+                          setSealErrors((prev) => omitKey(prev, link.token));
+                          setSealDrafts((prev) =>
+                            prev[link.token] !== undefined
+                              ? omitKey(prev, link.token)
+                              : { ...prev, [link.token]: '' },
+                          );
+                        }}
+                        aria-label={`move the moment for ${link.label}`}
+                        className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
+                      >
+                        move the moment
+                      </button>
+                      <button
+                        type="button"
+                        disabled={sealBusy.has(link.token)}
+                        onClick={() => handleUnseal(link)}
+                        aria-label={`unseal ${link.label}`}
+                        className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
+                      >
+                        unseal
+                      </button>
+                    </>
                   )}
 
                   <button
@@ -478,6 +600,41 @@ export function Links() {
               )}
 
               {/* Note editor — save persists; a blank save clears the note */}
+              {sealDraft !== undefined && (
+                <div className="mt-2 flex items-end gap-2">
+                  <label className="flex flex-col gap-1 text-xs text-dust">
+                    new unlock moment
+                    <input
+                      type="datetime-local"
+                      aria-label="new unlock moment"
+                      value={sealDraft}
+                      disabled={sealBusy.has(link.token)}
+                      onChange={(e) =>
+                        setSealDrafts((prev) => ({
+                          ...prev,
+                          [link.token]: e.target.value,
+                        }))
+                      }
+                      className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink disabled:opacity-50"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    disabled={sealBusy.has(link.token) || sealDraft === ''}
+                    onClick={() => handleSaveUnlock(link)}
+                    aria-label={`save unlock for ${link.label}`}
+                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
+                  >
+                    {sealBusy.has(link.token) ? 'saving…' : 'save'}
+                  </button>
+                </div>
+              )}
+              {sealErr !== undefined && (
+                <p role="alert" className="mt-1 text-xs text-red-700">
+                  {sealErr}
+                </p>
+              )}
+
               {noteDraft !== undefined && (
                 <div className="mt-2 flex flex-col gap-2">
                   <textarea

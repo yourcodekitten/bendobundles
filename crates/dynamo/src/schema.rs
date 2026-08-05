@@ -96,13 +96,37 @@ pub fn game_item(g: &Game, version: i64) -> HashMap<String, AttributeValue> {
 /// The thanks pair follows the same rule for the same reason (the friend's words
 /// deserve the same no-copy-at-rest guarantee as ben's).
 pub fn link_body(l: &Link) -> String {
-    let noteless = Link {
+    // Exhaustive destructure — a new Link field breaks compilation HERE until its body
+    // fate is decided (2026-08-05 family review, lilith's type-level strip). Fields bound
+    // `_` are the stripped set: authoritative ONLY in top-level attrs, and (for unlock_at,
+    // whose serde skips None) absent from the body even as a null key.
+    let Link {
+        token,
+        label,
+        gift_note: _,
+        thank_note: _,
+        thanked_at: _,
+        claims_allowed,
+        claims_used,
+        revoked,
+        expires_at,
+        unlock_at: _,
+        created_at,
+    } = l;
+    let stripped = Link {
+        token: token.clone(),
+        label: label.clone(),
         gift_note: None,
         thank_note: None,
         thanked_at: None,
-        ..l.clone()
+        claims_allowed: *claims_allowed,
+        claims_used: *claims_used,
+        revoked: *revoked,
+        expires_at: *expires_at,
+        unlock_at: None,
+        created_at: *created_at,
     };
-    serde_json::to_string(&noteless).expect("link serializes")
+    serde_json::to_string(&stripped).expect("link serializes")
 }
 
 pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
@@ -124,6 +148,13 @@ pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
     // Omitted when None (never-expires); update_link_meta REMOVEs it to match.
     if let Some(exp) = l.expires_at {
         item.insert("expires_at".into(), epoch_s(exp));
+    }
+    // unlock_at: expires_at's storage (top-level epoch seconds — the claim transaction's
+    // numeric compare) with the NOTES' body contract (stripped from body; top-level is the
+    // ONLY source). Omitted when None; set_link_unlock/remove_link_unlock REMOVE to unseal
+    // (absent = born open / unsealed — the single representation, never null).
+    if let Some(unlock) = l.unlock_at {
+        item.insert("unlock_at".into(), epoch_s(unlock));
     }
     // Top-level `gift_note` is authoritative, like the enforcer attrs: the note is
     // editable post-creation via `set_link_gift_note`'s single-attribute SET/REMOVE,

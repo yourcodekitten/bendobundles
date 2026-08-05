@@ -88,6 +88,7 @@ fn link(token: &str) -> Link {
         claims_used: 0,
         revoked: false,
         expires_at: None,
+        unlock_at: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }
@@ -1354,6 +1355,7 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
         claims_used: 9,
         revoked: true,
         expires_at: Some(datetime!(2020-01-01 00:00 UTC)),
+        unlock_at: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     };
     // Top-level attrs are the AUTHORITATIVE truth: allowed=5, used=2, revoked=false, no expiry.
@@ -3419,4 +3421,335 @@ async fn session_hash_old_raw_pk_items_do_not_authenticate() {
         None,
         "raw-pk legacy session must not authenticate against hashed lookup"
     );
+}
+
+// ── wrapped gifts: unlock_at storage (spec 2026-08-05 §4) ────────────────────
+
+#[tokio::test]
+async fn link_unlock_at_top_level_only_and_round_trips() {
+    let Some(store) = store_or_skip("link-unlock-roundtrip").await else {
+        return;
+    };
+    let mut l = link("tok-sealed");
+    l.unlock_at = Some(time::OffsetDateTime::now_utc() + time::Duration::hours(24));
+    store.create_link(&l).await.unwrap();
+
+    // Round-trip: unlock_at comes back (truncated to whole seconds by epoch_s).
+    let got = store.get_link("tok-sealed").await.unwrap().unwrap();
+    assert_eq!(
+        got.unlock_at.unwrap().unix_timestamp(),
+        l.unlock_at.unwrap().unix_timestamp()
+    );
+
+    // Raw item: top-level N attr present; body blob lacks the key entirely.
+    let client = raw_client("link-unlock-roundtrip").await;
+    let item = client
+        .get_item()
+        .table_name("t-link-unlock-roundtrip")
+        .key("pk", AttributeValue::S("LINK#tok-sealed".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(
+        item.get("unlock_at").and_then(|v| v.as_n().ok()).is_some(),
+        "unlock_at must be a top-level N attr"
+    );
+    let body = item["body"].as_s().unwrap();
+    assert!(
+        !body.contains("unlock_at"),
+        "body must never carry unlock_at: {body}"
+    );
+}
+
+#[tokio::test]
+async fn link_without_unlock_at_reads_none_and_stores_no_attr() {
+    let Some(store) = store_or_skip("link-unlock-absent").await else {
+        return;
+    };
+    store.create_link(&link("tok-open")).await.unwrap();
+    let got = store.get_link("tok-open").await.unwrap().unwrap();
+    assert_eq!(got.unlock_at, None);
+
+    let client = raw_client("link-unlock-absent").await;
+    let item = client
+        .get_item()
+        .table_name("t-link-unlock-absent")
+        .key("pk", AttributeValue::S("LINK#tok-open".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(
+        !item.contains_key("unlock_at"),
+        "a link born open must store NO unlock_at attr"
+    );
+}
+
+// ── wrapped gifts: the seal verbs + the claim-transaction clause ─────────────
+
+#[tokio::test]
+async fn claim_game_transaction_refuses_sealed_link() {
+    let Some(store) = store_or_skip("claim-sealed").await else {
+        return;
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let mut l = link("tok-sealed-claim");
+    l.unlock_at = Some(now + time::Duration::hours(1));
+    store.create_link(&l).await.unwrap();
+    store.put_game(&game(20, true)).await.unwrap();
+
+    // Direct store call with now < unlock_at — bypasses any handler pre-check;
+    // this pins the DDB condition itself.
+    let res = store
+        .claim_game("tok-sealed-claim", &game(20, true).id, "c-sealed", now)
+        .await;
+    assert!(
+        matches!(res, Err(ClaimTxError::LinkNotClaimable)),
+        "sealed claim must die at the transaction, got {res:?}"
+    );
+
+    // Unlock moment passed → the same link claims fine.
+    let mut l2 = link("tok-past-unlock");
+    l2.unlock_at = Some(now - time::Duration::seconds(1));
+    store.create_link(&l2).await.unwrap();
+    store.put_game(&game(21, true)).await.unwrap();
+    store
+        .claim_game("tok-past-unlock", &game(21, true).id, "c-open", now)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn set_link_unlock_edits_only_while_sealed() {
+    let Some(store) = store_or_skip("set-unlock-edits").await else {
+        return;
+    };
+    let now = time::OffsetDateTime::now_utc();
+
+    // Sealed link: edit lands and reads back.
+    let mut sealed = link("tok-move");
+    sealed.unlock_at = Some(now + time::Duration::hours(1));
+    store.create_link(&sealed).await.unwrap();
+    let moved = store
+        .set_link_unlock("tok-move", now + time::Duration::hours(2), now)
+        .await
+        .unwrap();
+    assert!(moved);
+    let got = store.get_link("tok-move").await.unwrap().unwrap();
+    assert_eq!(
+        got.unlock_at.unwrap().unix_timestamp(),
+        (now + time::Duration::hours(2)).unix_timestamp()
+    );
+
+    // Open link (unlock passed): immutable.
+    let mut open = link("tok-opened");
+    open.unlock_at = Some(now - time::Duration::seconds(1));
+    store.create_link(&open).await.unwrap();
+    assert!(
+        !store
+            .set_link_unlock("tok-opened", now + time::Duration::hours(1), now)
+            .await
+            .unwrap()
+    );
+
+    // Unknown token: refused, same Ok(false).
+    assert!(
+        !store
+            .set_link_unlock("tok-never-existed", now + time::Duration::hours(1), now)
+            .await
+            .unwrap()
+    );
+}
+
+/// THE RULING, with its name on it (family review round 3 — lilith): a link born open
+/// can never gain a seal. State A of the seal machine — the ONE state the complement
+/// test can't see. Pins the argument lilith lost 2026-08-05 (`attribute_exists` vs
+/// `attribute_not_exists ... OR`): if a future reader re-runs that argument and flips
+/// the condition, every other seal test stays green and THIS one goes red. A ruling
+/// without a regression test is a preference.
+#[tokio::test]
+async fn seal_cannot_be_added_to_an_unsealed_link() {
+    let Some(store) = store_or_skip("seal-not-addable").await else {
+        return;
+    };
+    store.create_link(&link("born-open")).await.unwrap();
+
+    let now = time::OffsetDateTime::now_utc();
+    let accepted = store
+        .set_link_unlock("born-open", now + time::Duration::hours(1), now)
+        .await
+        .unwrap();
+    assert!(!accepted, "a link born open must refuse gaining a seal");
+
+    // And the raw item still has NO unlock_at attribute — the refused conditional
+    // write must not have partially applied.
+    let client = raw_client("seal-not-addable").await;
+    let item = client
+        .get_item()
+        .table_name("t-seal-not-addable")
+        .key("pk", AttributeValue::S("LINK#born-open".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(!item.contains_key("unlock_at"));
+}
+
+#[tokio::test]
+async fn remove_link_unlock_unseals_only_while_sealed() {
+    let Some(store) = store_or_skip("remove-unlock").await else {
+        return;
+    };
+    let now = time::OffsetDateTime::now_utc();
+
+    let mut sealed = link("tok-unseal");
+    sealed.unlock_at = Some(now + time::Duration::hours(1));
+    store.create_link(&sealed).await.unwrap();
+    assert!(store.remove_link_unlock("tok-unseal", now).await.unwrap());
+    let got = store.get_link("tok-unseal").await.unwrap().unwrap();
+    assert_eq!(got.unlock_at, None);
+    // Attr REMOVED, not nulled.
+    let client = raw_client("remove-unlock").await;
+    let item = client
+        .get_item()
+        .table_name("t-remove-unlock")
+        .key("pk", AttributeValue::S("LINK#tok-unseal".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(!item.contains_key("unlock_at"));
+
+    // Open / never-sealed / unknown all refuse.
+    let mut opened = link("tok-unseal-late");
+    opened.unlock_at = Some(now - time::Duration::seconds(1));
+    store.create_link(&opened).await.unwrap();
+    assert!(
+        !store
+            .remove_link_unlock("tok-unseal-late", now)
+            .await
+            .unwrap()
+    );
+    store.create_link(&link("tok-unseal-never")).await.unwrap();
+    assert!(
+        !store
+            .remove_link_unlock("tok-unseal-never", now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .remove_link_unlock("tok-unseal-ghost", now)
+            .await
+            .unwrap()
+    );
+}
+
+/// THE COMPLEMENT PROPERTY (family review round 2 — step-5 gate item (b)): once
+/// unlock_at exists, edit (`unlock_at > :now`) and claim (`unlock_at <= :now`) are
+/// exact complements — no instant where both pass, none where neither does. The EXACT
+/// row is the one earning its keep: an off-by-one surfaces there as an overlap (both
+/// pass) or a gap (neither does), which one-sided testing structurally cannot see.
+#[tokio::test]
+async fn seal_conditions_are_exact_complements_at_the_instant() {
+    let Some(store) = store_or_skip("seal-complement").await else {
+        return;
+    };
+    // T pinned to a WHOLE second — epoch_s truncates, and the exact row must be exact.
+    let t = time::OffsetDateTime::from_unix_timestamp(
+        time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+    )
+    .unwrap();
+
+    // Three rows x BOTH verbs. Fresh link + game per row: a successful claim consumes state.
+    for (i, (label, now, edit_ok, claim_ok)) in [
+        ("t-minus-1s", t - time::Duration::seconds(1), true, false),
+        ("t-exact", t, false, true),
+        ("t-plus-1s", t + time::Duration::seconds(1), false, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tok = format!("comp-{label}");
+        let mut l = link(&tok);
+        l.unlock_at = Some(t);
+        store.create_link(&l).await.unwrap();
+        let g = game(30 + i as u32, true);
+        store.put_game(&g).await.unwrap();
+
+        let edited = store
+            .set_link_unlock(&tok, t + time::Duration::hours(2), now)
+            .await
+            .unwrap();
+        assert_eq!(edited, edit_ok, "edit verb at {label}");
+
+        let claim = store
+            .claim_game(&tok, &g.id, &format!("claim-{label}"), now)
+            .await;
+        assert_eq!(claim.is_ok(), claim_ok, "claim verb at {label}: {claim:?}");
+        if !claim_ok {
+            assert!(
+                matches!(claim, Err(ClaimTxError::LinkNotClaimable)),
+                "sealed claim must refuse as LinkNotClaimable, got {claim:?}"
+            );
+        }
+    }
+}
+
+/// Revoking a sealed link must not disturb the seal — update_link_meta rewrites the
+/// whole `body` from a pre-write read, and only link_body's strip + the untouched
+/// top-level attr keep the seal intact. This pins the #69 class (a body-rewriting
+/// write silently clobbering a scoped attribute) for unlock_at specifically.
+#[tokio::test]
+async fn revoke_preserves_seal_attr() {
+    let Some(store) = store_or_skip("revoke-keeps-seal").await else {
+        return;
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let mut l = link("tok-rev-sealed");
+    l.unlock_at = Some(now + time::Duration::hours(1));
+    store.create_link(&l).await.unwrap();
+
+    // Revoke via the same read-modify-update the admin handler uses.
+    let mut got = store.get_link("tok-rev-sealed").await.unwrap().unwrap();
+    got.revoked = true;
+    store.update_link_meta(&got).await.unwrap();
+
+    // Seal survives: readable, and still a top-level attr with a body free of it.
+    let after = store.get_link("tok-rev-sealed").await.unwrap().unwrap();
+    assert!(after.revoked);
+    assert_eq!(
+        after.unlock_at.unwrap().unix_timestamp(),
+        (now + time::Duration::hours(1)).unix_timestamp()
+    );
+    // Refusal order: revoked outranks sealed.
+    assert_eq!(after.can_claim(now), Err(domain::ClaimRefusal::Revoked));
+
+    let client = raw_client("revoke-keeps-seal").await;
+    let item = client
+        .get_item()
+        .table_name("t-revoke-keeps-seal")
+        .key("pk", AttributeValue::S("LINK#tok-rev-sealed".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item()
+        .cloned()
+        .unwrap();
+    assert!(item.get("unlock_at").and_then(|v| v.as_n().ok()).is_some());
+    assert!(!item["body"].as_s().unwrap().contains("unlock_at"));
 }

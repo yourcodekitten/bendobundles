@@ -138,13 +138,21 @@ struct LinkView {
     thank_note: Option<String>,
     claims_allowed: u32,
     claims_used: u32,
-    /// Explicit link state: "active" | "revoked" | "expired" | "exhausted".
+    /// Explicit link state: "active" | "sealed" | "revoked" | "expired" | "exhausted".
     /// The SINGLE liveness representation on the wire — the client renders
     /// banners and gates claim buttons from this; it must never have to infer
     /// the reason from side signals like games.len().
     state: &'static str,
     games: Vec<GameView>,
     claims: Vec<ClaimView>,
+    /// Wrapped gift: seconds until unlock, server-computed and CEILED (never arrives
+    /// early; sealed ⇒ >= 1). Present ONLY while sealed — the client counts down from
+    /// REMAINING, never by comparing wall clocks (spec 2026-08-05 §2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlocks_in_seconds: Option<u64>,
+    /// Wrapped gift: the unlock instant, rfc3339. Present ONLY while sealed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlocks_at: Option<String>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -470,6 +478,7 @@ async fn handle_steam_owned_proxy(
         use domain::ClaimRefusal;
         let msg = match refusal {
             ClaimRefusal::Revoked => "this link has been revoked",
+            ClaimRefusal::Sealed => "this gift is still wrapped",
             ClaimRefusal::Expired => "this link has expired",
             ClaimRefusal::Exhausted => "no claims left on this link",
         };
@@ -550,6 +559,37 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
     let (state, hide_games) = match link.can_claim(now) {
         Ok(()) => ("active", false),
         Err(domain::ClaimRefusal::Revoked) => ("revoked", true),
+        Err(domain::ClaimRefusal::Sealed) => {
+            // Sealed response: no catalog/claims/notes reads AT ALL — the payload is
+            // withheld at the source, not filtered (devtools is not a spoiler channel;
+            // pinned raw-string by sealed_link_view_withholds_everything_and_counts_down).
+            // no-store: a cached sealed 200 outliving the moment would pin a countdown
+            // past midnight (family review). Remaining is ceiled: never early, never 0.
+            let unlock = link.unlock_at.expect("Sealed refusal implies unlock_at");
+            let remaining_ms = (unlock - now).whole_milliseconds().max(1) as u64;
+            let remaining = remaining_ms.div_ceil(1000);
+            return (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(LinkView {
+                    label: link.label,
+                    gift_note: None,
+                    thank_note: None,
+                    claims_allowed: link.claims_allowed,
+                    claims_used: link.claims_used,
+                    state: "sealed",
+                    games: vec![],
+                    claims: vec![],
+                    unlocks_in_seconds: Some(remaining),
+                    unlocks_at: Some(
+                        unlock
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .expect("unlock_at formats rfc3339"),
+                    ),
+                }),
+            )
+                .into_response();
+        }
         Err(domain::ClaimRefusal::Expired) => ("expired", true),
         Err(domain::ClaimRefusal::Exhausted) => ("exhausted", false),
     };
@@ -631,6 +671,8 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             state,
             games,
             claims,
+            unlocks_in_seconds: None,
+            unlocks_at: None,
         }),
     )
         .into_response()
@@ -669,6 +711,7 @@ async fn handle_post_claim(
         use domain::ClaimRefusal;
         let msg = match refusal {
             ClaimRefusal::Revoked => "this link has been revoked",
+            ClaimRefusal::Sealed => "this gift is still wrapped",
             ClaimRefusal::Expired => "this link has expired",
             ClaimRefusal::Exhausted => "no claims left on this link",
         };
@@ -934,6 +977,17 @@ async fn handle_post_thanks(
     let now = OffsetDateTime::now_utc();
     match link.can_claim(now) {
         Ok(()) | Err(domain::ClaimRefusal::Exhausted) => {}
+        // Sealed: refuse, same 409 shape as its neighbors. Unreachable in practice —
+        // sealed ⇒ zero claims, so even without this arm the claims-first guard BELOW
+        // this match would refuse — but pinned anyway: a ruling without an arm is a
+        // guess with a compiler error attached (step-5 gate M1).
+        Err(domain::ClaimRefusal::Sealed) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "this gift is still wrapped"})),
+            )
+                .into_response();
+        }
         Err(domain::ClaimRefusal::Revoked) => {
             return (
                 StatusCode::CONFLICT,
@@ -1049,7 +1103,7 @@ async fn handle_game_detail(
     Path((token, game_id)): Path<(String, String)>,
 ) -> Response {
     // 1. Resolve link — same byte-identical 404 for any failure (no oracle).
-    let _link = match s.store.get_link(&token).await {
+    let link = match s.store.get_link(&token).await {
         Ok(Some(l)) => l,
         Ok(None) => return link_not_found_response(),
         Err(_) => {
@@ -1060,6 +1114,25 @@ async fn handle_game_detail(
                 .into_response();
         }
     };
+
+    // 1b. Liveness gate (#154 — this endpoint predated the exhaustive-match socket and
+    //     never consulted can_claim): detail serves iff the games GRID is visible on this
+    //     link — active + exhausted. Refusals reuse the endpoint's byte-identical 404 (no
+    //     oracle: a dead link must not grow a distinguishable "something's here" response),
+    //     and the refusing path does the same link lookup then strictly less work, so the
+    //     404 is indistinguishable from true not-found in timing too (spec §2).
+    //     Pinned by game_detail_refuses_revoked_link_154.
+    let now = OffsetDateTime::now_utc();
+    match link.can_claim(now) {
+        Ok(()) | Err(domain::ClaimRefusal::Exhausted) => {}
+        Err(
+            domain::ClaimRefusal::Revoked
+            | domain::ClaimRefusal::Expired
+            | domain::ClaimRefusal::Sealed,
+        ) => {
+            return link_not_found_response();
+        }
+    }
 
     // 2. Fetch the game — unknown game ID → byte-identical 404 (no oracle).
     let game = match s.store.get_game(&game_id).await {

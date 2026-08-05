@@ -1355,3 +1355,25 @@
     transition: none;
   }
 }
+
+/* concept: the wrapped present (SealedGift) — a gentle idle sway while the
+   countdown runs. keyed off the box's base so it rocks like it's being
+   shaken very politely. */
+.gift-sway {
+  animation: gift-sway 4s ease-in-out infinite;
+  transform-origin: 50% 90%;
+}
+@keyframes gift-sway {
+  0%,
+  100% {
+    transform: rotate(-1.2deg) translateY(0);
+  }
+  50% {
+    transform: rotate(1.2deg) translateY(-3px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .gift-sway {
+    animation: none;
+  }
+}

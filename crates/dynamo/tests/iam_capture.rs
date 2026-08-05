@@ -145,6 +145,13 @@ struct Op {
     index: Option<String>,
     leading_keys: BTreeSet<String>,
     attributes: BTreeSet<String>,
+    /// Attributes referenced by the UpdateExpression ALONE — the WRITE set. `attributes`
+    /// merges every expression (condition included) because that's what
+    /// `dynamodb:Attributes` matches; this field keeps the write/reference split IAM
+    /// cannot express, so invariants like "public may condition on unlock_at, never set
+    /// it" are pinnable (family gate 2026-08-05). Empty for non-update ops.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    update_attributes: BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     select: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -301,6 +308,10 @@ fn shape(action: &str, via: Option<&str>, v: &Value) -> Op {
             expr_attr_names(expr, &aliases, &mut attributes);
         }
     }
+    let mut update_attributes = BTreeSet::new();
+    if let Some(expr) = v.get("UpdateExpression").and_then(Value::as_str) {
+        expr_attr_names(expr, &aliases, &mut update_attributes);
+    }
     // Query: resolve the partition-key equality to a LeadingKeys context value. Base-table
     // queries key on `pk`; GSI queries key on the index's own partition attribute.
     if let Some(kce) = v.get("KeyConditionExpression").and_then(Value::as_str) {
@@ -335,6 +346,7 @@ fn shape(action: &str, via: Option<&str>, v: &Value) -> Op {
             .map(str::to_string),
         leading_keys,
         attributes,
+        update_attributes,
         select: v.get("Select").and_then(Value::as_str).map(str::to_string),
         return_values: v
             .get("ReturnValues")
@@ -374,6 +386,7 @@ fn ops_from_request(target: &str, body: &str) -> Vec<Op> {
                     index: None,
                     leading_keys,
                     attributes,
+                    update_attributes: BTreeSet::new(),
                     select: None,
                     return_values: None,
                 });
@@ -463,6 +476,7 @@ fn link(token: &str) -> Link {
         claims_used: 0,
         revoked: false,
         expires_at: None,
+        unlock_at: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }
@@ -678,6 +692,30 @@ async fn drive_admin(rig: &Rig) -> MethodOps {
     .await;
     capture(cap, &mut m, "get_sync_run", async {
         s.get_sync_run().await.unwrap();
+    })
+    .await;
+    // wrapped gifts: the seal surface (admin-api lib.rs handle_create_link /
+    // handle_set_link_unlock / handle_delete_link_unlock)
+    capture(cap, &mut m, "create_link", async {
+        let mut sealed = link("atok-sealed");
+        sealed.unlock_at = Some(datetime!(2026-12-25 05:00 UTC));
+        s.create_link(&sealed).await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "set_link_unlock", async {
+        s.set_link_unlock(
+            "atok-sealed",
+            datetime!(2026-12-26 05:00 UTC),
+            datetime!(2026-07-03 00:00 UTC),
+        )
+        .await
+        .unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "remove_link_unlock", async {
+        s.remove_link_unlock("atok-sealed", datetime!(2026-07-03 00:00 UTC))
+            .await
+            .unwrap();
     })
     .await;
     m
@@ -1053,6 +1091,32 @@ async fn iam_corpus_and_policies_match_code() {
     corpus.insert("public-api".into(), drive_public(&rig).await);
     corpus.insert("admin-api".into(), drive_admin(&rig).await);
     corpus.insert("fulfillment".into(), drive_fulfillment(&rig).await);
+
+    // THE SEAL WRITE PIN (family gate 2026-08-05, lilith): the public policy must carry
+    // unlock_at in dynamodb:Attributes (the claim ConditionExpression references it), and
+    // IAM cannot distinguish condition-reference from SET — so the public role CAN write
+    // seals at the policy layer, irreducibly. The invariant that it never DOES lives
+    // here: no public-api request may carry unlock_at in an UpdateExpression.
+    for (method, ops) in &corpus["public-api"] {
+        for op in ops {
+            assert!(
+                !op.update_attributes.contains("unlock_at"),
+                "public-api {method} carries unlock_at in an UpdateExpression — the \
+                 public role may CONDITION on the seal, never write it"
+            );
+        }
+    }
+    // Positive control: the detector demonstrably sees a real seal write — admin's
+    // set_link_unlock leg must show unlock_at in its WRITE set, or the pin above is
+    // vacuously green (a detector is validated against a known positive before its
+    // negatives are trusted).
+    assert!(
+        corpus["admin-api"]["set_link_unlock"]
+            .iter()
+            .any(|op| op.update_attributes.contains("unlock_at")),
+        "positive control failed: admin set_link_unlock leg shows no unlock_at write — \
+         the update_attributes extractor is broken and the public pin proves nothing"
+    );
 
     // partition-hygiene facts the deny statements rest on, asserted from real traffic
     let ful_leading = leading_key_union(&corpus["fulfillment"]);

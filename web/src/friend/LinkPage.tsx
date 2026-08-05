@@ -17,6 +17,7 @@ import {
   type SteamIdentity,
 } from "../steamIdentity";
 import { ClaimDialog } from "./ClaimDialog";
+import { SealedGift } from "./SealedGift";
 import { ClaimsHistory } from "./ClaimsHistory";
 import { ThanksCard } from "./ThanksCard";
 import { GameGrid } from "./GameGrid";
@@ -338,6 +339,24 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   }
 
   const { data } = view;
+
+  // Wrapped gift, pre-unlock: the whole shelf yields to the sealed view. The
+  // server withheld the payload (games/claims/notes are empty/absent), so
+  // there is nothing else to render — and the sealed→active transition after
+  // refetch lands on the shelf's existing boot/typewriter entrance, which IS
+  // the unwrap ceremony beat (spec §3, deliberate reuse). Sits AFTER every
+  // hook above (rules of hooks).
+  if (data.state === "sealed") {
+    return (
+      <SealedGift
+        label={data.label}
+        unlocksInSeconds={data.unlocks_in_seconds ?? 1}
+        unlocksAt={data.unlocks_at ?? ""}
+        onRefetch={refresh}
+      />
+    );
+  }
+
   // Explicit server state — never inferred from side signals like games.length
   const exhausted = data.state === "exhausted";
   const dead = data.state === "revoked" || data.state === "expired";
