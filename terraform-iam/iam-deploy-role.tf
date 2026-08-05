@@ -352,6 +352,16 @@ data "aws_iam_policy_document" "deploy" {
       "cloudfront:GetFunction",
       "cloudfront:PublishFunction",
       "cloudfront:AssociateAlias",
+      # aws_cloudfront_response_headers_policy.site (the #140 CSP policy) refreshes at
+      # EVERY plan via GetResponseHeadersPolicy. The create slipped through 2026-08-04
+      # (create reads its own response; no Get needed) and the FIRST post-create plan
+      # 403'd on 2026-08-05 — the refresh-403 class this file's cache-policy comment
+      # already names; the cure is the grant, never -refresh=false. CUD ride along for
+      # the policy's own lifecycle (it has already been edited once: f782193).
+      "cloudfront:CreateResponseHeadersPolicy",
+      "cloudfront:UpdateResponseHeadersPolicy",
+      "cloudfront:DeleteResponseHeadersPolicy",
+      "cloudfront:GetResponseHeadersPolicy",
     ]
     resources = ["*"]
   }
