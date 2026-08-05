@@ -242,6 +242,14 @@ clause). (c) audit pull list over all 671 listable rows across 93 orders, 0 fetc
 **1** — `GK:mylittleuniverse_row_choice_steam` (revealed, not expired). the acceptance
 criterion covers the entire first-run instance set.
 
+**and the count is a measurement, not a bound (lilith's deploy-time rider):** it was taken at
+`f7f34d7`; ben signs later; deploy is later still, and nothing stops a new member entering a
+set in between. so the enumeration is a **deploy-time step, not a pre-gate artifact**: re-run
+all three clauses immediately before the first post-deploy sync fires. **if it does not still
+return 1 / 0 / 1, stop — the changelist goes back to ben before anything runs.** a count
+decays exactly like an approval does; this converts "we checked and it was one" into "it is
+one, now, as we press."
+
 ## non-goals
 
 - **no auto-fail, no auto-compensate changes.** terminal fates stay human except the
