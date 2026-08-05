@@ -67,7 +67,8 @@
             "revoked",
             "sk",
             "thank_note",
-            "thanked_at"
+            "thanked_at",
+            "unlock_at"
           ]
         },
         "ForAllValues:StringLike": {

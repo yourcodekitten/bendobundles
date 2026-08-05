@@ -1092,7 +1092,8 @@
           "expires_at",
           "pk",
           "revoked",
-          "sk"
+          "sk",
+          "unlock_at"
         ]
       }
     ],

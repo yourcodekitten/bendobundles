@@ -718,6 +718,63 @@ impl Store {
         }
     }
 
+    /// Move a sealed link's unlock moment. ONE storage condition enforces the whole seal
+    /// state machine atomically (spec 2026-08-05 §4 — no read-compare-write; the TOCTOU
+    /// review point): `attribute_exists(unlock_at) AND unlock_at > :now` ⇒ editable while
+    /// sealed, immutable once open, never addable to a link born open (pinned by
+    /// seal_cannot_be_added_to_an_unsealed_link — the condition is deliberately
+    /// `attribute_exists`, NOT `attribute_not_exists ... OR`; flipping it re-runs an
+    /// argument that already lost). Ok(false) = refused; the three refusal causes
+    /// (missing link / never sealed / already open) are deliberately indistinguishable.
+    pub async fn set_link_unlock(
+        &self,
+        token: &str,
+        unlock_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(token), "META");
+        let req = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .condition_expression("attribute_exists(unlock_at) AND unlock_at > :now")
+            .update_expression("SET unlock_at = :u")
+            .expression_attribute_values(":u", schema::epoch_s(unlock_at))
+            .expression_attribute_values(":now", schema::epoch_s(now));
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
+            Err(sdk_err) => Err(StoreError::Aws(format!("{sdk_err:?}"))),
+        }
+    }
+
+    /// Unseal — the seal's own delete verb (never expressed as a null set). Same condition,
+    /// same Ok(false) contract as [`set_link_unlock`]. REMOVE keeps absent-attr = unsealed
+    /// as the single representation.
+    pub async fn remove_link_unlock(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+    ) -> Result<bool, StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(token), "META");
+        let req = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .condition_expression("attribute_exists(unlock_at) AND unlock_at > :now")
+            .update_expression("REMOVE unlock_at")
+            .expression_attribute_values(":now", schema::epoch_s(now));
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
+            Err(sdk_err) => Err(StoreError::Aws(format!("{sdk_err:?}"))),
+        }
+    }
+
     /// Write-once thank-you from the friend — `set_link_gift_note`'s mirror, with one
     /// extra tooth: `attribute_not_exists(thank_note)` makes the first word stand
     /// forever, so two tabs (or a retry) can't overwrite what was already said. Same
@@ -1016,9 +1073,15 @@ impl Store {
             // expires_at is numeric (epoch seconds via schema::epoch_s), so `expires_at > :now` is a
             // true numeric compare — immune to fractional-second width and non-UTC offset bugs that
             // a lexicographic RFC3339 string compare would suffer.
+            // The unlock_at clause is set_link_unlock's exact complement (edit iff `> :now`,
+            // claim iff `<= :now` — no overlap, no gap; pinned by
+            // seal_conditions_are_exact_complements_at_the_instant). A sealed race maps
+            // positionally to LinkNotClaimable — same generic refusal an expired race gets;
+            // the specific "still wrapped" copy comes from the handler pre-check.
             .condition_expression(
                 "revoked = :f AND claims_used < claims_allowed \
-                 AND (attribute_not_exists(expires_at) OR expires_at > :now)",
+                 AND (attribute_not_exists(expires_at) OR expires_at > :now) \
+                 AND (attribute_not_exists(unlock_at) OR unlock_at <= :now)",
             )
             .expression_attribute_values(":b", av_s(&schema::link_body(&bumped)))
             .expression_attribute_values(
