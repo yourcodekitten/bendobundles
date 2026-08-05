@@ -72,17 +72,56 @@ game.requires_choice || claim.choice_pre_tpks.is_some()
   "completed — key recovered from order" instead of a hand-authored "failed". auto-COMPLETE on
   positive evidence for ben's own claim is *already shipped, designed behavior* (B3 + the bundle
   path's identical arm at :3902-3918); this prong only restores its intended reach.
-- **the downgrade rule (ben's edge-case question caught this):** when the choice route is taken
-  *only* via the snapshot half (`!game.requires_choice`), the auto-compensate arms are OFF:
-  arm B1 (snapshot present, no new tpk) parks with a specific ping instead of compensating.
-  B1's inference — "no new tpk ⇒ choose never committed ⇒ pick unspent ⇒ safe to re-list" — is
-  sound only while `requires_choice` is still true (choose semantics live). on a flipped row,
-  "no new tpk vs snapshot" means the tpk that *caused* the flip predates the claim: the world
-  is telling a story the model doesn't cover → human, with the facts in the ping. (arm A is
-  unreachable via this half — it requires snapshot `None`.) via-snapshot arms B2/B3 (a new tpk
-  exists — positive evidence) act exactly as they do today; via-`requires_choice` routing stays
-  byte-for-byte current behavior, auto-compensates included. **net: the widening adds
-  positive-evidence completions and specific parks, and zero new auto-compensates.**
+- **the B1 rule (three reviewers converged; smaller than any first proposal):**
+  **auto-compensate only when `claim.choice_pre_tpks` is `None` — i.e. arm A keeps its
+  compensate; arm B1 parks with a specific ping on EVERY route.** immutable, claim-intrinsic;
+  no order probe, no grammar, no `requires_choice`.
+  the reasoning trail, banked because each step killed a prior proposal:
+  1. the hazard (lilith; severity calibrated by OMBB's rider 2): A/B1's documented backstop —
+     humble refuses a re-choose, "churn + pings, never value" (lib.rs:1925-1929) — proves a
+     *pick* can't double-spend. it says nothing about **re-listing a row whose key exists and
+     is revealed**. stated at its true size: the re-listed offered row is the one D7 routes
+     truth onto, so the same run's order walk flips it `BenRedeemed` minutes later — the
+     hazard is a **minutes-wide window** (plus the fetch-fail case, where the flip doesn't
+     come), not a persistent landmine. a minutes-wide door handing out a spent key is still a
+     door; park closes it.
+  2. the record-vs-world split (OMBB): "no new tpk ⇒ this claim's in-app choose never
+     committed" is true of OUR WRITES regardless of flip timing — but "pick not spent" is a
+     claim about the WORLD, false in a reachable case: a tpk already in the snapshot, revealed
+     by ben out of band after the claim. this issue's founding incident is the existence proof.
+  3. that case does not need the row to have flipped (lilith) — it fires identically on
+     `requires_choice: true`, so keying any safety rule on the flag is wrong in BOTH
+     directions, and the draft's "legacy half stays byte-for-byte" rationale was false.
+  4. an order-evidence gate (probe for a matching redeemed tpk) would need the tpk→game
+     grammar — promoting a heuristic this spec itself demotes to messaging-only (OMBB's tooth,
+     lilith's concession). no gate, then: **B1 simply never re-lists.**
+  **arm A is refit to LOOK before it acts (OMBB's rider 1 found the blindness; lilith's repair):**
+  A's "choose never ran ⇒ genuinely unspent" is record-truth with the same structural hole —
+  an out-of-band spend never touches our choose flow, and A never diffs the order at all
+  (no snapshot, nothing to diff). but `find_new_tpk` needs *a* baseline, not a *recorded* one,
+  and arm A has one: **the empty set.** diff `order.keys` against `&[]` — every tpk is "new,"
+  the existing title match picks this game's out (the same function and trust level MLU's
+  `Some([])` rides to B3; nothing promoted, nothing invented):
+  - any title-matched tpk found (redeemed, clean, or ambiguous) → **park + specific ping**
+    naming what was found — a tpk existing for a claim whose choose never ran IS the
+    out-of-band story, and a None-snapshot claim's provenance is too thin to arm an
+    autonomous write. (if A's set ever grows a live SELF member, promoting unique-redeemed to
+    B3 recovery is the recorded follow-up — decided then, with eyes open.)
+  - genuinely nothing in the order for this game → **compensate — now having actually looked.**
+  why A-compensates-on-nothing while B1-parks-on-nothing is principled, not inconsistent:
+  a `Some` snapshot can HIDE a spent pick (an in-snapshot tpk revealed after the claim — the
+  founding case), so B1's "nothing new" is not "nothing"; A's empty baseline hides nothing —
+  every tpk in the order is visible to its diff. **A's live exposure set is enumerated EMPTY
+  today** (`pending ∧ choice-routed ∧ snapshot None` = 0 — deploy-day changelist below), so
+  the refit's cost is zero live members. grammar stays exactly where the spec put it:
+  **enriching pings, arming nothing.**
+  **the honest cost:** a genuinely-crashed legacy choose (snapshot landed, `choosecontent`
+  never committed, no tpk ever appears) now parks for a human nod instead of self-healing.
+  a nag traded against a re-listed revealed key — taken.
+  arms B2/B3 (positive-evidence completions) act exactly as today.
+  **net: the widening adds completions and specific parks, and removes an unsafe
+  auto-compensate; the only compensates that survive are A's, where humble's re-choose
+  refusal provably bounds the damage to churn.**
 - **alternatives rejected:** (a) grammar-fallback matching in the bundle path
   (`choice_tpk_bases` inference) — heuristic inference where authoritative evidence exists; the
   snapshot IS the record. grammar stays a *messaging* aid (prong 3), never a *routing* authority.
@@ -96,7 +135,12 @@ expired.**
 
 - while walking orders (already fetched — zero extra humble calls), build an in-memory map
   `(gamekey, machine_name) → (redeemed, expired, key-fields)`. after the order walk, sweep the
-  existing shared catalog scan (fulfillment/src/lib.rs:3403): for each row where `is_listable()`
+  full catalog scan — **which becomes unconditional (OMBB caught this): today's shared scan is
+  gated on `deps.steam.is_some()` (fulfillment/src/lib.rs:3408), an unrelated feature's
+  dependency. an "every sync" invariant cannot inherit a stranger's off-switch. hoist the
+  `list_all_games` scan out of the steam gate (the title/ownership passes keep their own
+  steam-gating on their logic, not on the scan; the audit becomes the scan's third consumer —
+  one Scan either way).** for each row where `is_listable()`
   and the map holds its exact `(gamekey, machine_name)` and `(redeemed || expired)` — write the
   fresh truth **to that row's own id**, no D7 routing (we are correcting an existing row, not
   minting; routing exists to prevent minting). `merge_sync`'s Available arm does the rest: fresh
@@ -125,10 +169,13 @@ expired.**
   `Available`, or `BenRedeemed`/`Expired` **when the live order's matching tpk confirms it**
   (redeemed/expired respectively) — the dual-evidence rule gets *stronger*, not weaker. bin
   stays human-gated, dry-run default, unchanged otherwise.
-- **a residual becomes a feature:** the compensate arm's documented worst case (crash-after-gift
-  falsely compensated → burned key re-listed, fulfillment/src/lib.rs:3942-3951) is today a
-  silent landmine of exactly this species. the audit catches it on the next sync: re-listed row,
-  order says redeemed → de-listed + loud ping. the audit is the missing net under that arm.
+- **a residual may become a feature — conditionally (OMBB's downgrade):** the compensate arm's
+  documented worst case (crash-after-gift falsely compensated → burned key re-listed,
+  fulfillment/src/lib.rs:3942-3951) is a silent landmine of exactly this species — **iff a
+  gifted key latches `redeemed_key_val`, which is precisely the open question that arm's own
+  risk note names and prong 4's receipt exists to answer.** if gifts latch, the audit nets it;
+  if they don't, the residual stands as documented. claim no comfort the evidence doesn't back;
+  prong 4 decides.
 - **ping volume:** if one run pulls >3 rows (ben bulk-redeeming out of band), collapse to one
   summary ping listing them; the sync summary string carries the count either way.
 
@@ -144,12 +191,47 @@ which conversation to have instead of "still pending after N days."
 
 ### 4. wire: model `is_gift`, detection-only
 
-one serde line: `is_gift: bool` (`#[serde(default)]`) onto `TpkWire` → `KeyEntry`. consumed
+one serde line: `is_gift: Option<bool>` onto `TpkWire` → `KeyEntry` — **`Option`, not
+`bool + default` (lilith):** this field's entire job is accumulating a receipt about whether
+humble sends it at all; a defaulted `false` would make an order that never carried the field
+indistinguishable from one that said no, and the receipt would report data that never existed.
+`redeemed_key_val` already models absence correctly; follow it. consumed
 nowhere except: the audit's ping and reconcile's existing redeemed-arm logs mention it when
 `true`. this accumulates the "does a gift set `redeemed_key_val`?" live receipt the compensate
 arm's risk note has been waiting for (fulfillment/src/lib.rs:3943-3951) — **no gate consults it
 until a receipt confirms semantics.** (family: strike this if it reads as creep; my defense is
 one field + one log line against an open risk question in a write path.)
+
+### ordering note — reconcile before the audit, and why that's now safe by design
+
+**stated invariant, not an accident of today's function order (OMBB): the audit runs LAST in
+`run_sync`, after every writer** — pending sweep → reconcile → order walk → passes → **audit**.
+with the B1 rule, reconcile's only remaining re-lists are arm A's (choice-flow rows, bounded to
+churn by the re-choose refusal) and the bundle path's existing compensate (unchanged behavior,
+its own documented risk note, conditionally netted by the audit per §2). nothing reconcile can
+re-list carries a key the audit's map could see and miss. (lilith's ④, discharged by the B1
+rule.)
+
+### the deploy-day changelist — enumerate N before the gate (lilith's ③, step-zero applied)
+
+ben's criterion names one row and one claim; prong 1 and the audit act on *sets*. before ben's
+gate, enumerate — read-only, live prod — exactly what the first post-deploy run will touch:
+(a) every pending claim with `choice_pre_tpks: Some(_)` on a flipped row (the re-routed set),
+split SELF vs gift (OMBB: only SELF members auto-*write* via B3; gift members only park
+better); (b) every LISTABLE row whose order tpk shows revealed/expired (the audit's pull
+list). the enumerated list goes in front of ben *with* the spec gate: he signs the instance
+set, not just the method. coverage authorizes the method, never the instance.
+
+**ENUMERATED 2026-08-05 ~18:05Z (read-only sweep, receipt in code-kitten
+`state/receipts/2026-08-05-158-deploy-day-changelist.json`): every set is exactly ben's two
+named objects and nothing else.** (a) pending claims: 2 total; **re-routed set = 1** — claim
+`3f46c058` (MLU, SELF → B3 auto-complete; no gift-flavored members, so the only autonomous
+*writer* on run one is ben's own claim). the other (`3da0c011`, soulcalibur6, SELF) has
+`choice_pre_tpks: None` AND `requires_choice: false` → bundle path, untouched. (b) **arm-A
+exposure set (`pending ∧ choice-routed ∧ snapshot None`) = 0 members** (OMBB's rider 1
+clause). (c) audit pull list over all 671 listable rows across 93 orders, 0 fetch failures:
+**1** — `GK:mylittleuniverse_row_choice_steam` (revealed, not expired). the acceptance
+criterion covers the entire first-run instance set.
 
 ## non-goals
 
@@ -165,6 +247,11 @@ one field + one log line against an open risk question in a write path.)
 
 ## wrong in both directions (dead-key-truth's bar)
 
+- **the audit is a net, not a gate (OMBB's words, lilith cosigned):** it shrinks the landmine
+  window from *forever* to ≤ one sync interval plus a race; it does not close the claim-time
+  door (the `Game` struct carries no redemption field, so the friend-claim condition cannot
+  check one). a friend claiming in the window between reveal and the next audit pass still
+  wins the row; the existing reconcile arms then catch the burned key at fulfillment time.
 - **missed detection** → exactly today's behavior: row stays listed, nag stays generic — and the
   audit re-runs every sync, so a transient miss (fetch failure, contested write) heals on the
   next pass. degraded, never corrupted.
@@ -190,8 +277,13 @@ wiremock + dynamodb-local in `fulfillment/tests/handler_test.rs`, existing helpe
   exactly what the deploy-day run will exercise, so the test exercises it too).
 - discriminator: snapshot-`Some` + `requires_choice: false` routes choice (B3); snapshot-`None`
   still routes bundle; `requires_choice: true` + snapshot-`None` still routes choice.
-- downgrade rule: via-snapshot + no new tpk → parks + specific ping, does NOT compensate;
-  via-`requires_choice` + no new tpk → compensates exactly as today (behavior pin).
+- the B1 rule: snapshot `Some` + no new tpk → parks + specific ping on BOTH routing halves
+  (flipped and unflipped rows — two tests).
+- arm A refit: snapshot `None` + order carries a title-matched tpk (each of: redeemed, clean,
+  ambiguous) → parks + specific ping, does NOT compensate; snapshot `None` + order genuinely
+  empty for this game → compensates (the having-looked pin).
+- audit runs with `steam: None` (lilith: assert the decoupling, or the next person re-couples
+  it and every fixture still passes) — the de-list fires with no steam client configured.
 - heal gate: `BenRedeemed` sibling + order-confirmed redeemed tpk → `Heal`; `BenRedeemed`
   sibling + order tpk NOT redeemed → `Skip` (evidence mismatch); `Gifted` sibling still skips.
 - audit: two-pass remount (clean → redeemed) de-lists on pass 2; absent-from-order row untouched
