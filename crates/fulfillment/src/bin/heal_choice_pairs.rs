@@ -20,7 +20,7 @@
 use domain::Game;
 use dynamo::Store;
 use fulfillment::heal_pairs::{Verdict, find_pairs, pair_verdict};
-use humble_client::{HumbleClient, SessionCookie};
+use humble_client::{HumbleClient, KeyEntry, SessionCookie};
 use std::collections::HashMap;
 
 #[tokio::main]
@@ -45,7 +45,9 @@ async fn main() {
     );
 
     // Fetch each involved gamekey's live order once (the order AUTHORIZES; the scan only scheduled).
-    let mut order_tpks: HashMap<String, Vec<String>> = HashMap::new();
+    // Pass the entries themselves — the widened gate (#158) reads `.redeemed`/`.expired` off them,
+    // not just the machine_name.
+    let mut order_tpks: HashMap<String, Vec<KeyEntry>> = HashMap::new();
     for gk in pairs
         .iter()
         .map(|p| &p.gamekey)
@@ -53,10 +55,7 @@ async fn main() {
     {
         match humble.order(gk).await {
             Ok(o) => {
-                order_tpks.insert(
-                    gk.clone(),
-                    o.keys.iter().map(|k| k.machine_name.clone()).collect(),
-                );
+                order_tpks.insert(gk.clone(), o.keys);
             }
             Err(e) => {
                 eprintln!(
