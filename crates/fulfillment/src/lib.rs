@@ -1992,7 +1992,7 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                         claim_id = %claim.id,
                         "reconcile(choice): self-claim key already redeemed — recovering key from order"
                     );
-                    let _ = recover_already_redeemed_key(
+                    let resp = recover_already_redeemed_key(
                         deps,
                         &claim.id,
                         &claim.game_id,
@@ -2000,6 +2000,23 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                         &tpk.machine_name,
                     )
                     .await;
+                    if let FulfillResponse::RevealedKey { .. } = resp {
+                        let gift_flag = if tpk.is_gift == Some(true) {
+                            " (humble marks it a gift)"
+                        } else {
+                            ""
+                        };
+                        ping(
+                            deps,
+                            &format!(
+                                "reconcile recovered the already-revealed key for self claim {} \
+                                 ({}) from the order — claim completed autonomously; the key was \
+                                 redeemed out of band{}.",
+                                claim.id, game.title, gift_flag
+                            ),
+                        )
+                        .await;
+                    }
                 } else {
                     tracing::warn!(claim_id = %claim.id, "reconcile(choice): key present but already redeemed — human recovery (URL unrecorded)");
                     ping(
@@ -3875,11 +3892,15 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
         };
         // Choice claims reconcile by a DIFFERENT rule (never re-choose): the parked claim's
         // game_id offered-id never equals any tpk machine_name, so the bundle `find` below would
-        // miss it forever and silently skip it every pass. One extra GetItem per parked claim keys
-        // the branch off the durable `requires_choice` flag; a transient game-read miss falls
-        // through to the bundle path unchanged (that path needs no game read).
+        // miss it forever and silently skip it every pass. Routing keys on the CLAIM's own
+        // immutable `choice_pre_tpks` snapshot FIRST — `requires_choice` on the game row is
+        // D7-mutable (a key-sync flips it false the moment a tpk appears), so a claim born choice
+        // must still route choice even after the flip. `game.requires_choice` stays in the OR only
+        // for legacy pre-snapshot choice claims (no snapshot was ever recorded for them). One extra
+        // GetItem per parked claim; a transient game-read miss falls through to the bundle path
+        // unchanged (that path needs no game read).
         if let Ok(Some(game)) = deps.store.get_game(&claim.game_id).await
-            && game.requires_choice
+            && (game.requires_choice || claim.choice_pre_tpks.is_some())
         {
             // reconcile may WRITE now (redeem/compensate) — pace it under the bot-detection floor.
             tokio::time::sleep(SYNC_PACE).await;
@@ -3908,7 +3929,7 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
                     claim_id = %claim.id,
                     "reconcile: self-claim parked shows redeemed on humble — recovering key from order"
                 );
-                let _ = recover_already_redeemed_key(
+                let resp = recover_already_redeemed_key(
                     deps,
                     &claim.id,
                     &claim.game_id,
@@ -3916,6 +3937,26 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
                     machine_name,
                 )
                 .await;
+                if let FulfillResponse::RevealedKey { .. } = resp {
+                    // The bundle path deliberately never reads the game row (see the routing
+                    // comment above) — there is no `game` in scope here, so the title binding is
+                    // the order's own key name.
+                    let gift_flag = if key.is_gift == Some(true) {
+                        " (humble marks it a gift)"
+                    } else {
+                        ""
+                    };
+                    ping(
+                        deps,
+                        &format!(
+                            "reconcile recovered the already-revealed key for self claim {} ({}) \
+                             from the order — claim completed autonomously; the key was redeemed \
+                             out of band{}.",
+                            claim.id, key.human_name, gift_flag
+                        ),
+                    )
+                    .await;
+                }
             } else {
                 tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
                 // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message

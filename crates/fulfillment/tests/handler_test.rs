@@ -4534,6 +4534,101 @@ async fn reconcile_self_choice_b2_reveals_never_chooses() {
 }
 
 // -------------------------------------------------------------------------------------------------
+// Task 2 (#158): a claim born choice (snapshot `Some`) must keep routing through
+// `reconcile_choice_claim` even after the game row's `requires_choice` flips false (D7's
+// discriminator widening the moment a key-sync sees the tpk). Routing keys off the claim's OWN
+// immutable snapshot, not the mutable game flag. humble later shows the tpk already revealed →
+// route choice → B3 → autonomous recovery (never the bundle path's "unsplittable game_id" park).
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_routes_by_snapshot_when_flip_already_happened() {
+    let Some(store) = store_or_skip("sc-rec-flip").await else {
+        return;
+    };
+    // Game born choice (offered id "mlu"), but requires_choice is ALREADY false — the D7-flipped
+    // shape a key-sync leaves behind once it observes the tpk. The claim's own snapshot (recorded
+    // below) is the only thing left that remembers this claim was born a choice claim.
+    let gid = "GK:mlu";
+    let g = domain::Game {
+        id: gid.into(),
+        title: "My Little Universe".into(),
+        bundle: "Test Bundle".into(),
+        gamekey: "GK".into(),
+        machine_name: "mlu".into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    store.put_game(&g).await.unwrap();
+    store
+        .claim_game_self(gid, "sc-flip", old_enough())
+        .await
+        .unwrap();
+    store
+        .record_choice_intent(SELF_LINK_TOKEN, "sc-flip", vec![])
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    // Order: the tpk already redeemed (humble shows the pick spent AND the key burned) — B3.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GK"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(choice_order_json(
+            "GK",
+            serde_json::json!([tpk_json(
+                "mlu_row_choice_steam",
+                "My Little Universe",
+                true
+            )]),
+        )))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps_val = deps(store.clone(), &humble.uri(), Some(discord.uri()));
+    run_reconcile(&deps_val).await;
+
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-flip")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "a claim born choice must route choice -> B3 -> recovery even after the D7 flip, not \
+         park unreconcilable on the bundle path"
+    );
+    assert_eq!(claim.revealed_key.as_deref(), Some("STEAMKEY-XXXX"));
+
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(pings.len(), 1, "the B3 completion ping must fire exactly once");
+    let body = String::from_utf8(pings[0].body.clone()).unwrap();
+    assert!(body.contains("sc-flip"), "ping carries the claim id");
+    assert!(
+        body.contains("My Little Universe"),
+        "choice-path site binds {{title}} to game.title: {body}"
+    );
+    assert!(
+        body.contains("redeemed out of band"),
+        "ping carries the pinned out-of-band phrase: {body}"
+    );
+    assert!(
+        !body.contains("(humble marks it a gift)"),
+        "the tpk carries no is_gift => no gift flag: {body}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
 // Task 4: structural pre-check — a tpk humble already marks `is_expired` fails terminally without
 // ever spending a redeem/reveal call. Drive path mirrors reconcile_self_choice_b2_reveals_never_chooses
 // above: choice claim + pre=[] snapshot + order carrying the tpk -> reconcile branch B2 ->
@@ -4643,6 +4738,79 @@ async fn reconcile_self_bundle_already_redeemed_recovers_key() {
         claim.state,
         ClaimState::Fulfilled,
         "self bundle already-redeemed must be recovered, not pinged"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// Task 2 (#158) – bundle-twin of the choice-path B3 completion ping: the bundle path deliberately
+// never reads the game row (see the routing comment in `reconcile`), so its title binding is
+// `key.human_name`, not `game.title`. SELF bundle claim (snapshot `None`), key redeemed on humble
+// → claim Fulfilled + the ping fires with `key.human_name` in it.
+// -------------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn reconcile_bundle_self_redeemed_recovers_and_pings() {
+    let Some(store) = store_or_skip("sc-rec-bundle-redeemed-ping").await else {
+        return;
+    };
+    seed_available_game(&store, "gkK:mnK", "Bundle Redeemed Game").await;
+    store
+        .claim_game_self("gkK:mnK", "sc-r5", old_enough())
+        .await
+        .unwrap();
+
+    let humble = MockServer::start().await;
+    // Order shows the tpk already redeemed with a recoverable key value; human_name matches the
+    // ping's expected title binding for the bundle path.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gkK"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "gkK",
+            "product": { "human_name": "Test Bundle" },
+            "tpkd_dict": { "all_tpks": [{
+                "machine_name": "mnK",
+                "human_name": "Bundle Redeemed Game",
+                "key_type": "steam",
+                "is_expired": false,
+                "keyindex": 0,
+                "redeemed_key_val": "NEW-OLD-KEY",
+                "is_gift": true
+            }]},
+            "subproducts": [],
+        })))
+        .mount(&humble)
+        .await;
+    let discord = discord_ok().await;
+
+    let deps_val = deps(store.clone(), &humble.uri(), Some(discord.uri()));
+    run_reconcile(&deps_val).await;
+
+    let claim = store
+        .get_claim(SELF_LINK_TOKEN, "sc-r5")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.revealed_key.as_deref(), Some("NEW-OLD-KEY"));
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "self bundle already-redeemed must be recovered autonomously"
+    );
+
+    let pings = discord.received_requests().await.unwrap();
+    assert_eq!(pings.len(), 1, "the B3 completion ping must fire exactly once");
+    let body = String::from_utf8(pings[0].body.clone()).unwrap();
+    assert!(body.contains("sc-r5"), "ping carries the claim id");
+    assert!(
+        body.contains("Bundle Redeemed Game"),
+        "bundle-path site binds {{title}} to key.human_name (no game row read): {body}"
+    );
+    assert!(
+        body.contains("redeemed out of band"),
+        "ping carries the pinned out-of-band phrase: {body}"
+    );
+    assert!(
+        body.contains("(humble marks it a gift)"),
+        "the recovered tpk's is_gift == Some(true) => the gift flag renders: {body}"
     );
 }
 
