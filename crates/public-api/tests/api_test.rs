@@ -2503,3 +2503,191 @@ async fn game_detail_refuses_revoked_link_154() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── wrapped gifts: the sealed view (spec 2026-08-05 §2) ──────────────────────
+
+/// The devtools test: while sealed, the wire carries NOTHING a curious friend can peek
+/// at — asserted on the RAW body string, not the parsed JSON (spec §2).
+#[tokio::test]
+async fn sealed_link_view_withholds_everything_and_counts_down() {
+    let Some(store) = store_or_skip("sealed-view").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap(); // title "Game 1" — must NOT appear
+    let mut lnk = test_link("sealed-tok");
+    lnk.unlock_at = Some(time::OffsetDateTime::now_utc() + time::Duration::seconds(3600));
+    lnk.gift_note = Some("happy birthday maya".into());
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(
+            Request::get("/api/l/sealed-tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("cache-control").unwrap(),
+        "no-store",
+        "a cached sealed 200 would pin a countdown past midnight"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+
+    // RAW-string withholding — devtools is not a spoiler channel.
+    assert!(
+        !raw.contains("gift_note"),
+        "sealed body leaked gift_note key: {raw}"
+    );
+    assert!(
+        !raw.contains("happy birthday"),
+        "sealed body leaked the note text"
+    );
+    assert!(!raw.contains("Game 1"), "sealed body leaked a game title");
+
+    let j: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(j["state"], "sealed");
+    assert_eq!(j["games"], serde_json::json!([]));
+    assert_eq!(j["claims"], serde_json::json!([]));
+    let secs = j["unlocks_in_seconds"].as_u64().unwrap();
+    assert!((3595..=3600).contains(&secs), "ceiled remaining, got {secs}");
+    assert!(
+        j["unlocks_at"].as_str().unwrap().contains('T'),
+        "rfc3339 instant"
+    );
+    assert_eq!(j["claims_allowed"], 1); // the deliberate tease stays
+}
+
+#[tokio::test]
+async fn sealed_link_open_at_boundary() {
+    // unlock_at = now - 1s (the handler derives its own now_utc — the true exact row
+    // lives in the store complement test where `now` is a parameter).
+    let Some(store) = store_or_skip("sealed-boundary").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut lnk = test_link("open-tok");
+    lnk.unlock_at = Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(1));
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(Request::get("/api/l/open-tok").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    let j: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(j["state"], "active");
+    assert_eq!(j["games"].as_array().unwrap().len(), 1);
+    assert!(
+        !raw.contains("unlocks_in_seconds") && !raw.contains("unlocks_at"),
+        "countdown fields must be absent once open: {raw}"
+    );
+}
+
+#[tokio::test]
+async fn claim_and_steam_proxy_refuse_sealed_409() {
+    let Some(store) = store_or_skip("sealed-409s").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut lnk = test_link("sealed-409-tok");
+    lnk.unlock_at = Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(
+            Request::post("/api/l/sealed-409-tok/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    "{{\"game_id\":\"{}\"}}",
+                    test_game(1).id
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"], "this gift is still wrapped");
+
+    // Proxy needs a configured steam client (plain_router's steam: None would 503
+    // before the liveness gate) — same harness as the byte-identical precedent test.
+    let server = wiremock::MockServer::start().await;
+    let resp = steam_router(Arc::clone(&store), mock.clone(), &server.uri())
+        .oneshot(
+            Request::get(format!(
+                "/api/l/sealed-409-tok/steam/owned/{TEST_STEAMID}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"], "this gift is still wrapped");
+}
+
+#[tokio::test]
+async fn game_detail_refuses_sealed_link() {
+    // Task 0 pinned revoked/expired; this pins the new state through the same gate:
+    // sealed link + listable game → 404, byte-identical to the unknown-token 404.
+    let Some(store) = store_or_skip("detail-sealed").await else {
+        return;
+    };
+    let g = test_game(1);
+    store.put_game(&g).await.unwrap();
+    let mut lnk = test_link("sealed-detail-tok");
+    lnk.unlock_at = Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = plain_router(Arc::clone(&store), mock.clone());
+
+    let detail_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/sealed-detail-tok/games/{}/detail", g.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let unknown_resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/{CTX_TOKEN}/games/{}/detail", g.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail_resp.status(), StatusCode::NOT_FOUND);
+    let a = axum::body::to_bytes(detail_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let b = axum::body::to_bytes(unknown_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(a, b, "sealed detail 404 must be byte-identical to not-found");
+}

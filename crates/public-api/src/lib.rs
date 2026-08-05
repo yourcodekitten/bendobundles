@@ -138,13 +138,21 @@ struct LinkView {
     thank_note: Option<String>,
     claims_allowed: u32,
     claims_used: u32,
-    /// Explicit link state: "active" | "revoked" | "expired" | "exhausted".
+    /// Explicit link state: "active" | "sealed" | "revoked" | "expired" | "exhausted".
     /// The SINGLE liveness representation on the wire — the client renders
     /// banners and gates claim buttons from this; it must never have to infer
     /// the reason from side signals like games.len().
     state: &'static str,
     games: Vec<GameView>,
     claims: Vec<ClaimView>,
+    /// Wrapped gift: seconds until unlock, server-computed and CEILED (never arrives
+    /// early; sealed ⇒ >= 1). Present ONLY while sealed — the client counts down from
+    /// REMAINING, never by comparing wall clocks (spec 2026-08-05 §2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlocks_in_seconds: Option<u64>,
+    /// Wrapped gift: the unlock instant, rfc3339. Present ONLY while sealed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unlocks_at: Option<String>,
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -551,9 +559,37 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
     let (state, hide_games) = match link.can_claim(now) {
         Ok(()) => ("active", false),
         Err(domain::ClaimRefusal::Revoked) => ("revoked", true),
-        // Interim arm (Task 1 ripple): hides games+notes; Task 4 replaces this with the
-        // real sealed early-return (countdown fields, no-store, zero reads).
-        Err(domain::ClaimRefusal::Sealed) => ("sealed", true),
+        Err(domain::ClaimRefusal::Sealed) => {
+            // Sealed response: no catalog/claims/notes reads AT ALL — the payload is
+            // withheld at the source, not filtered (devtools is not a spoiler channel;
+            // pinned raw-string by sealed_link_view_withholds_everything_and_counts_down).
+            // no-store: a cached sealed 200 outliving the moment would pin a countdown
+            // past midnight (family review). Remaining is ceiled: never early, never 0.
+            let unlock = link.unlock_at.expect("Sealed refusal implies unlock_at");
+            let remaining_ms = (unlock - now).whole_milliseconds().max(1) as u64;
+            let remaining = remaining_ms.div_ceil(1000);
+            return (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(LinkView {
+                    label: link.label,
+                    gift_note: None,
+                    thank_note: None,
+                    claims_allowed: link.claims_allowed,
+                    claims_used: link.claims_used,
+                    state: "sealed",
+                    games: vec![],
+                    claims: vec![],
+                    unlocks_in_seconds: Some(remaining),
+                    unlocks_at: Some(
+                        unlock
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .expect("unlock_at formats rfc3339"),
+                    ),
+                }),
+            )
+                .into_response();
+        }
         Err(domain::ClaimRefusal::Expired) => ("expired", true),
         Err(domain::ClaimRefusal::Exhausted) => ("exhausted", false),
     };
@@ -635,6 +671,8 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             state,
             games,
             claims,
+            unlocks_in_seconds: None,
+            unlocks_at: None,
         }),
     )
         .into_response()
