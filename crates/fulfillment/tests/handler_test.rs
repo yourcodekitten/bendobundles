@@ -8450,3 +8450,186 @@ async fn audit_ping_marks_gift_when_key_is_gift() {
         "still carries the reveal reason ahead of the gift suffix: {ping}"
     );
 }
+
+// =============================================================================================
+// #158 TASK 9: the MLU end-to-end test — the acceptance criterion in miniature.
+// -------------------------------------------------------------------------------------------
+// THE named known positive the deploy verifies against. Both game rows are seeded exactly as
+// prod's pre-#134 rows look — VERSION-LESS — via `seed_legacy_game_item`, so their first touch
+// this run hits the adopt-at-1 guarded-write arm (dynamo/src/lib.rs:1970-1973), same as the
+// live deploy-day run. One `run_sync` must both (a) have reconcile recover the self claim's key
+// autonomously from the order (Task 2's site) and (b) have the shelf-truth audit delist the
+// frozen tpk-named sibling the D7 routing ladder's own write bypasses (Task 6's site).
+// =============================================================================================
+
+/// Seed a game item exactly as pre-#134 prod rows look: pk/sk/body/status/gsi1pk* (via
+/// `dynamo::schema::game_item`), but with NO `version` attribute. Bypasses `Store` deliberately
+/// (every `Store` game writer stamps `version`) using a raw `aws_sdk_dynamodb` client against
+/// `DYNAMODB_LOCAL_URL` — the deploy-day run hits the adopt-at-1 guarded-write arm
+/// (dynamo/src/lib.rs:1970-1973) on this row's first touch, and so does this test.
+async fn seed_legacy_game_item(table: &str, g: &domain::Game) {
+    let mut item = dynamo::schema::game_item(g, 1);
+    item.remove("version");
+    let client = raw_client().await;
+    client
+        .put_item()
+        .table_name(table)
+        .set_item(Some(item))
+        .send()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mlu_scenario_first_run_resolves_claim_and_delists_sibling() {
+    let table = "t-fulfill-mlu-e2e";
+    let Some(store) = store_or_skip("mlu-e2e").await else {
+        return;
+    };
+
+    let claim_id = "mlu-claim";
+    let gid = game_id("GK", "mlu");
+    let sibling_id = game_id("GK", "mlu_row_choice_steam");
+
+    // Offered row: already claimed (Pending, claim_id set) and already D7-flipped
+    // (requires_choice false) — the shape a prior sync leaves an in-flight choice claim in.
+    // steam: None throughout (lilith's decoupling assertion — no steam client wired anywhere).
+    let offered = domain::Game {
+        id: gid.clone(),
+        title: "My Little Universe".into(),
+        bundle: "Test Bundle".into(),
+        gamekey: "GK".into(),
+        machine_name: "mlu".into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Pending,
+        claim_id: Some(claim_id.into()),
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    seed_legacy_game_item(table, &offered).await;
+
+    // Frozen sibling: the tpk-named row the D7 routing ladder's fresh write bypasses forever
+    // once the offered row exists — still listable, still carrying the pre-reveal state.
+    let sibling = domain::Game {
+        id: sibling_id.clone(),
+        title: "My Little Universe".into(),
+        bundle: "Test Bundle".into(),
+        gamekey: "GK".into(),
+        machine_name: "mlu_row_choice_steam".into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    seed_legacy_game_item(table, &sibling).await;
+
+    // Claim seeded directly — NOT via claim_game_self (its condition demands the row be
+    // Available, and the offered row above is raw-seeded already-Pending). `put_claim` re-adds
+    // the gsi2 pending marker for Pending state, which is what reconcile's list_pending_claims
+    // reads. Age > RECONCILE_STUCK_ALERT_AGE (24h): the live acceptance scenario is a genuinely
+    // stuck claim, so pending_age_sweep's nag ping ALSO fires this run — expected noise, not
+    // asserted away (see the substring-not-count discipline below).
+    let claim = domain::Claim {
+        id: claim_id.into(),
+        link_token: SELF_LINK_TOKEN.into(),
+        game_id: gid.clone(),
+        state: ClaimState::Pending,
+        gift_url: None,
+        revealed_key: None,
+        created_at: hours_ago(25),
+        choice_pre_tpks: Some(vec![]),
+        failure_reason: None,
+    };
+    store.put_claim(&claim).await.unwrap();
+
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+
+    // Base order is empty; remounted below (priority 1) with the exact out-of-band-revealed
+    // state before `handle` is ever called — ONE run_sync, no pass-1/pass-2 split needed.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GK", "some_month_choice", &[])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+    remount_order_with_states(
+        &humble,
+        "GK",
+        "some_month_choice",
+        &[("mlu_row_choice_steam", "My Little Universe", true, false)],
+    )
+    .await;
+
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // The claim resolved autonomously — reconcile recovered the key straight from the order.
+    let claim = deps
+        .store
+        .get_claim(SELF_LINK_TOKEN, claim_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        claim.state,
+        ClaimState::Fulfilled,
+        "the self claim must complete autonomously via reconcile's B3 recovery"
+    );
+    assert_eq!(claim.revealed_key.as_deref(), Some("REDEEMED-KEY-VALUE"));
+
+    // The frozen sibling: shelf-truth audit pulled it — closing the D7 gap this whole task
+    // exists to guard.
+    let sibling_game = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+    assert_eq!(
+        sibling_game.status,
+        GameStatus::BenRedeemed,
+        "shelf audit must delist the frozen sibling"
+    );
+
+    let client = raw_client().await;
+    let raw = raw_game_item(&client, table, &sibling_id).await;
+    assert!(
+        !raw.contains_key("gsi1pk"),
+        "delisted row must carry no gsi1pk — sparse index"
+    );
+    assert_eq!(
+        raw.get("version").unwrap().as_n().unwrap(),
+        "1",
+        "the version-less legacy sibling adopts at version 1 on its first guarded write"
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let bodies: Vec<String> = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains("reconcile recovered the already-revealed key for self claim")),
+        "the reconcile recovery ping must fire: {bodies:?}"
+    );
+    assert!(
+        bodies.iter().any(|b| b.contains("shelf audit: pulled")),
+        "the shelf-truth audit ping must fire: {bodies:?}"
+    );
+}
