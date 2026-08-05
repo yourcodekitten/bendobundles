@@ -44,7 +44,7 @@ that exists TODAY (revoked), not the feature that arrives tomorrow.
 **Interfaces:**
 - Produces: game detail refuses revoked/expired links with the endpoint's existing byte-identical 404. (Task 1's ripple later adds the `Sealed` arm to this match — the gate becomes the feature's fourth compile-forced socket.)
 
-- [ ] **Step 1: Write the failing regression test** — harness facts: `test_link(token)` helper
+- [x] **Step 1: Write the failing regression test** — harness facts: `test_link(token)` helper
 exists at `api_test.rs:76`; the byte-identical-404 assertion pattern to mirror is
 `owned_proxy_404s_without_live_link_byte_identical` (`api_test.rs:1137`) — clone its
 compare-against-unknown-token shape.
@@ -127,9 +127,9 @@ async fn game_detail_refuses_revoked_link_154() {
 neighboring tests use, copy whichever seeding call `revoked_link_active_false_games_empty` :193
 uses verbatim.)
 
-- [ ] **Step 2: Run to verify failure**: `cargo test -p public-api game_detail_refuses_revoked` → FAILS against current code (revoked serves 200 — the test proves it can catch the bug).
+- [x] **Step 2: Run to verify failure**: `cargo test -p public-api game_detail_refuses_revoked` → FAILS against current code (revoked serves 200 — the test proves it can catch the bug).
 
-- [ ] **Step 3: Implement** — in `handle_game_detail`, rename `let _link` → `let link`; insert after the link resolve:
+- [x] **Step 3: Implement** — in `handle_game_detail`, rename `let _link` → `let link`; insert after the link resolve:
 
 ```rust
     // Liveness gate (#154 — this endpoint predates the exhaustive-match socket and never
@@ -146,8 +146,8 @@ uses verbatim.)
     }
 ```
 
-- [ ] **Step 4: Run**: `cargo test -p public-api` → PASS; clippy clean.
-- [ ] **Step 5: Commit (own commit — do not fold into feature commits)** `git commit -S -m "fix(public-api): game detail never consulted link liveness — revoked/expired links served detail (#154)"`
+- [x] **Step 4: Run**: `cargo test -p public-api` → PASS; clippy clean.
+- [x] **Step 5: Commit (own commit — do not fold into feature commits)** `git commit -S -m "fix(public-api): game detail never consulted link liveness — revoked/expired links served detail (#154)"`
 
 ---
 
@@ -160,7 +160,7 @@ uses verbatim.)
 **Interfaces:**
 - Produces: `Link.unlock_at: Option<OffsetDateTime>` — serde is the **`thanked_at` combo** (`default` + `rfc3339::option` + `skip_serializing_if = "Option::is_none"`, in-repo precedent domain :194-199): None ⇒ the key is ABSENT on every serialized wire (body blob, admin list). This is what makes Task 2's `!body.contains("unlock_at")` assertion satisfiable — a no-skip shape would serialize `"unlock_at":null` and that test could never go green (step-5 gate B1). Also: `ClaimRefusal::Sealed`; `can_claim` refusal order revoked → **sealed** → expired → exhausted.
 
-- [ ] **Step 1: Write the failing tests** (domain cfg(test); follow the existing `can_claim` test style)
+- [x] **Step 1: Write the failing tests** (domain cfg(test); follow the existing `can_claim` test style)
 
 ```rust
 #[test]
@@ -208,9 +208,9 @@ fn link_missing_unlock_at_deserializes_none() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**: `cargo test -p domain` → compile errors (field/variant don't exist). That IS the failing state for a compile-checked language.
+- [x] **Step 2: Run to verify failure**: `cargo test -p domain` → compile errors (field/variant don't exist). That IS the failing state for a compile-checked language.
 
-- [ ] **Step 3: Implement domain**
+- [x] **Step 3: Implement domain**
 
 In `Link`, directly after `expires_at`:
 
@@ -249,15 +249,15 @@ In `can_claim`, between the revoked check and the expires check:
         }
 ```
 
-- [ ] **Step 4: Mechanical ripple to green** — every `Link { ... }` literal gains `unlock_at: None` (admin-api `handle_create_link` uses `unlock_at: None` FOR NOW — Task 5 wires the real value); `schema::link_body`'s stripped copy gains `unlock_at: None` (Task 2 replaces this fn wholesale); the FIVE public-api `can_claim` matches gain their arms, each one PINNED here (no site left as an executor's product decision — gate M1):
+- [x] **Step 4: Mechanical ripple to green** — every `Link { ... }` literal gains `unlock_at: None` (admin-api `handle_create_link` uses `unlock_at: None` FOR NOW — Task 5 wires the real value); `schema::link_body`'s stripped copy gains `unlock_at: None` (Task 2 replaces this fn wholesale); the FIVE public-api `can_claim` matches gain their arms, each one PINNED here (no site left as an executor's product decision — gate M1):
   - claim pre-check :668-675 and steam proxy :469-475: `ClaimRefusal::Sealed => "this gift is still wrapped"` (same 409 shape as the neighbors)
   - `handle_get_link` :550-556: `Err(domain::ClaimRefusal::Sealed) => ("sealed", true)` (Task 4 replaces with the real sealed response; this interim leaks nothing — games/notes hidden)
   - **`handle_post_thanks` :935-944**: `Err(domain::ClaimRefusal::Sealed)` refuses, same 409 shape as its Revoked/Expired arms, body `{"error": "this gift is still wrapped"}`. Unreachable in practice (sealed ⇒ zero claims ⇒ the handler's claims-first guard already refused) — pinned anyway: a ruling without an arm is a guess with a compiler error attached. Add that reasoning as the arm's comment.
   - `handle_game_detail` (Task 0's gate): `Sealed` joins the refusing arm alongside `Revoked | Expired` — the gate is now one of the feature's five sockets
 
-- [ ] **Step 5: Run**: `cargo test --workspace` → PASS; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean.
+- [x] **Step 5: Run**: `cargo test --workspace` → PASS; `cargo clippy --workspace --all-targets --all-features -- -D warnings` → clean.
 
-- [ ] **Step 6: Commit** `git commit -S -m "domain: unlock_at + ClaimRefusal::Sealed — a link can be born on a schedule"`
+- [x] **Step 6: Commit** `git commit -S -m "domain: unlock_at + ClaimRefusal::Sealed — a link can be born on a schedule"`
 
 ---
 
@@ -272,7 +272,7 @@ In `can_claim`, between the revoked check and the expires check:
 - Consumes: `Link.unlock_at` with skip-on-None serde (Task 1).
 - Produces: stored links carry top-level `unlock_at` (N, epoch seconds) iff Some; body blob NEVER contains an `unlock_at` key; `link_from_item` unconditionally overrides from the top-level attr (absent ⇒ None).
 
-- [ ] **Step 1: Write failing tests** — HARNESS FACTS (store_test.rs, verified): tests get a
+- [x] **Step 1: Write failing tests** — HARNESS FACTS (store_test.rs, verified): tests get a
 store via `let Some(store) = store_or_skip("test-name").await else { return; };` (dynamodb-local
 skip-guard — never remove the guard, it refuses to forge green when `DYNAMODB_LOCAL_URL` is set
 but dead); raw access via `raw_client(test).await` against table `t-{test}`; link key is
@@ -320,9 +320,9 @@ async fn link_without_unlock_at_reads_none_and_stores_no_attr() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**: `cargo test -p dynamo --test store_test link_unlock` → body-contains assertion fails (Task 1's interim strip already sets None — verify the test failure is the MISSING top-level attr, i.e. the round-trip returns None).
+- [x] **Step 2: Run to verify failure**: `cargo test -p dynamo --test store_test link_unlock` → body-contains assertion fails (Task 1's interim strip already sets None — verify the test failure is the MISSING top-level attr, i.e. the round-trip returns None).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `schema::link_body` — replace wholesale with the exhaustive-destructure strip (family review: adding a `Link` field without deciding its body fate must be a compile error):
 
@@ -389,8 +389,8 @@ pub fn link_body(l: &Link) -> String {
     };
 ```
 
-- [ ] **Step 4: Run**: `cargo test -p dynamo` → PASS (moto).
-- [ ] **Step 5: Commit** `git commit -S -m "dynamo: unlock_at top-level epoch attr, type-level body strip, read override"`
+- [x] **Step 4: Run**: `cargo test -p dynamo` → PASS (moto).
+- [x] **Step 5: Commit** `git commit -S -m "dynamo: unlock_at top-level epoch attr, type-level body strip, read override"`
 
 ---
 
@@ -404,7 +404,7 @@ pub fn link_body(l: &Link) -> String {
 - Consumes: `Link.unlock_at` (Task 1); top-level `unlock_at` storage + `link_from_item` override (Task 2); existing `is_ccf_update`, `schema::key_pair`, `schema::epoch_s` (all pub(crate), in-crate use only).
 - Produces: `pub async fn set_link_unlock(&self, token: &str, unlock_at: OffsetDateTime, now: OffsetDateTime) -> Result<bool, StoreError>` and `pub async fn remove_link_unlock(&self, token: &str, now: OffsetDateTime) -> Result<bool, StoreError>` — `Ok(false)` = condition refused (missing link / never sealed / already open; deliberately indistinguishable). `claim_game` refuses sealed links at the transaction (maps to existing `ClaimTxError::LinkNotClaimable`).
 
-- [ ] **Step 1: Write failing moto tests**
+- [x] **Step 1: Write failing moto tests**
 
 ```rust
 #[tokio::test]
@@ -516,9 +516,9 @@ async fn seal_conditions_are_exact_complements_at_the_instant() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure** — sequencing (gate minor 7): four of five tests red as COMPILE errors (`set_link_unlock`/`remove_link_unlock` don't exist). For the behavioral red on `claim_game_transaction_refuses_sealed_link`, stub the two verbs first (bodies `todo!()`), run ONLY that test: the sealed claim SUCCEEDS pre-clause — the known positive proving the test can catch the missing condition — then implement for green.
+- [x] **Step 2: Run to verify failure** — sequencing (gate minor 7): four of five tests red as COMPILE errors (`set_link_unlock`/`remove_link_unlock` don't exist). For the behavioral red on `claim_game_transaction_refuses_sealed_link`, stub the two verbs first (bodies `todo!()`), run ONLY that test: the sealed claim SUCCEEDS pre-clause — the known positive proving the test can catch the missing condition — then implement for green.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `claim_game` link_update condition (and its doc comment) gains the sibling clause:
 
@@ -592,8 +592,8 @@ New verbs, `set_link_gift_note`'s scoped shape with the seal condition:
     }
 ```
 
-- [ ] **Step 4: Run**: `cargo test -p dynamo` → PASS.
-- [ ] **Step 5: Commit** `git commit -S -m "dynamo: seal clause in the claim transaction + set/remove_link_unlock (one-condition state machine)"`
+- [x] **Step 4: Run**: `cargo test -p dynamo` → PASS.
+- [x] **Step 5: Commit** `git commit -S -m "dynamo: seal clause in the claim transaction + set/remove_link_unlock (one-condition state machine)"`
 
 ---
 
@@ -607,7 +607,7 @@ New verbs, `set_link_gift_note`'s scoped shape with the seal condition:
 - Consumes: `domain::ClaimRefusal::Sealed`, `Link.unlock_at` (Task 1).
 - Produces (wire): `LinkView` gains `unlocks_in_seconds: Option<u64>` + `unlocks_at: Option<String>` (both `skip_serializing_if = "Option::is_none"`, present ONLY while sealed); sealed GET is `no-store`; sealed claim/proxy 409 body `{"error": "this gift is still wrapped"}`; game detail 404s for revoked/expired/sealed.
 
-- [ ] **Step 1: Write failing axum-oneshot tests** (existing api_test.rs harness — moto store + router oneshot)
+- [x] **Step 1: Write failing axum-oneshot tests** (existing api_test.rs harness — moto store + router oneshot)
 
 ```rust
 /// The devtools test: while sealed, the wire carries NOTHING a curious friend can peek
@@ -676,9 +676,9 @@ async fn game_detail_refuses_sealed_link() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**: sealed-view test fails against Task 1's interim arm (plain view without countdown fields / no-store); sealed claim/proxy tests already pass (Task 1 set that copy) — that's expected, they pin it here.
+- [x] **Step 2: Run to verify failure**: sealed-view test fails against Task 1's interim arm (plain view without countdown fields / no-store); sealed claim/proxy tests already pass (Task 1 set that copy) — that's expected, they pin it here.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `LinkView` — add after `claims`:
 
@@ -736,8 +736,8 @@ unlocks_at: None`.) Claim + proxy Sealed arms keep `"this gift is still wrapped"
 ripple); this task only adds the sealed regression test above. Verify the arm reads
 `Err(Revoked | Expired | Sealed) => return link_not_found_response()`.
 
-- [ ] **Step 4: Run**: `cargo test -p public-api` → PASS; clippy clean.
-- [ ] **Step 5: Commit** `git commit -S -m "public-api: sealed link view — withheld payload, ceiled countdown, no-store"`
+- [x] **Step 4: Run**: `cargo test -p public-api` → PASS; clippy clean.
+- [x] **Step 5: Commit** `git commit -S -m "public-api: sealed link view — withheld payload, ceiled countdown, no-store"`
 
 ---
 
@@ -751,7 +751,7 @@ ripple); this task only adds the sealed regression test above. Verify the arm re
 - Consumes: `Store::set_link_unlock` / `Store::remove_link_unlock` (Task 3).
 - Produces (admin wire): `POST /admin/api/links` accepts `unlock_at: Option<String>` (rfc3339 WITH offset — an absolute instant; the browser resolved ben's local pick); `POST /admin/api/links/:token/unlock` body `{"unlock_at": "<rfc3339>"}` (null/absent = 422 — unseal is not a null set); `DELETE /admin/api/links/:token/unlock`; both map store `Ok(false)` → 409 `{"error": "link is not sealed — seals are create-time-only and end at the unlock moment"}`. `handle_list_links` needs NO change (serializes `domain::Link`; `unlock_at` rides as rfc3339-or-ABSENT automatically — skip-on-None serde, gate B1).
 
-- [ ] **Step 1: Write failing tests**
+- [x] **Step 1: Write failing tests**
 
 ```rust
 // create: unlock_at in the past → 422; > 370 days out → 422; not-before computed
@@ -763,9 +763,9 @@ ripple); this task only adds the sealed regression test above. Verify the arm re
 // unseal: DELETE on sealed → 200, list omits unlock_at (absent, not null); DELETE on open/never-sealed → 409.
 ```
 
-- [ ] **Step 2: Run to verify failure.**
+- [x] **Step 2: Run to verify failure.**
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 const UNLOCK_MAX_DAYS: i64 = 370; // a typo'd year must not seal a gift forever
@@ -863,8 +863,8 @@ not-sealed (409) because it already reads the link for the expiry cross-check; D
 read — unknown and not-sealed both mean "nothing to unseal" and collapse into one 409. Admin-only
 surface; no oracle concern. Stated here so nobody "fixes" the symmetry with an extra read.
 
-- [ ] **Step 4: Run**: `cargo test -p admin-api` → PASS; full workspace + clippy → PASS.
-- [ ] **Step 5: Commit** `git commit -S -m "admin-api: create sealed links + edit/unseal verbs (past rejected, null rejected, unseal is DELETE)"`
+- [x] **Step 4: Run**: `cargo test -p admin-api` → PASS; full workspace + clippy → PASS.
+- [x] **Step 5: Commit** `git commit -S -m "admin-api: create sealed links + edit/unseal verbs (past rejected, null rejected, unseal is DELETE)"`
 
 ---
 
@@ -877,11 +877,11 @@ surface; no oracle concern. Stated here so nobody "fixes" the symmetry with an e
 **Interfaces:**
 - Produces: `LinkState` includes `'sealed'`; `LinkView` gains `unlocks_in_seconds?: number; unlocks_at?: string;`; `AdminLink` gains `unlock_at?: string;` (absent when unsealed — matches `thanked_at?`; skip-on-None serde, gate B1); `adminCreateLink(label, claims, expiresDays?, giftNote?, unlockAt?)` sends `unlock_at`; `adminSetLinkUnlock(token: string, unlockAtIso: string): Promise<void>`; `adminDeleteLinkUnlock(token: string): Promise<void>` — both throw the 409 message on conflict, follow `adminSetLinkNote`'s 422 mapping.
 
-- [ ] **Step 1: Failing tests** (api.test.ts, existing fetch-mock style): sealed LinkView parses; adminCreateLink includes `unlock_at` in body when given, omits when not; adminSetLinkUnlock POSTs `{unlock_at}` with CSRF header; adminDeleteLinkUnlock sends DELETE; 409 → thrown message.
-- [ ] **Step 2: Run**: `npx vitest run src/api.test.ts` → FAIL.
-- [ ] **Step 3: Implement** (types + fns per interface block; copy `adminSetLinkNote`'s error mapping. On 409 BOTH verbs throw the server's own `error` string from the JSON body when present, falling back to `"the link isn't sealed anymore — refresh"` — ONE behavior, and Task 8's inline-error test asserts the server-message path).
-- [ ] **Step 4: Run** → PASS; `npm run typecheck` → clean.
-- [ ] **Step 5: Commit** `git commit -S -m "web/api: sealed state, countdown fields, seal verbs"`
+- [x] **Step 1: Failing tests** (api.test.ts, existing fetch-mock style): sealed LinkView parses; adminCreateLink includes `unlock_at` in body when given, omits when not; adminSetLinkUnlock POSTs `{unlock_at}` with CSRF header; adminDeleteLinkUnlock sends DELETE; 409 → thrown message.
+- [x] **Step 2: Run**: `npx vitest run src/api.test.ts` → FAIL.
+- [x] **Step 3: Implement** (types + fns per interface block; copy `adminSetLinkNote`'s error mapping. On 409 BOTH verbs throw the server's own `error` string from the JSON body when present, falling back to `"the link isn't sealed anymore — refresh"` — ONE behavior, and Task 8's inline-error test asserts the server-message path).
+- [x] **Step 4: Run** → PASS; `npm run typecheck` → clean.
+- [x] **Step 5: Commit** `git commit -S -m "web/api: sealed state, countdown fields, seal verbs"`
 
 ---
 
@@ -897,15 +897,15 @@ surface; no oracle concern. Stated here so nobody "fixes" the symmetry with an e
 - Consumes: `LinkView` with `state === 'sealed'`, `unlocks_in_seconds`, `unlocks_at` (Task 6).
 - Produces: `<SealedGift label={string} unlocksInSeconds={number} unlocksAt={string} onRefetch={() => void} />`.
 
-- [ ] **Step 1: Failing tests** (fake timers):
+- [x] **Step 1: Failing tests** (fake timers):
   - renders label on the gift tag + countdown segments from `unlocksInSeconds` (e.g. 90061 → "1d 1h 1m 1s")
   - ticks: advance 1s → seconds decrement
   - at zero → `onRefetch` called exactly once (no self-unseal — component renders whatever the next fetch says)
   - a fresh `unlocksInSeconds` prop RESETS the countdown (this is the still-sealed-refetch backoff: the server hands back ≥1s and the clock simply continues — no error state exists)
   - `visibilitychange` → document visible → `onRefetch` called (tab-left-open drift resync — OMBB)
   - reduced-motion (`prefersReducedMotion() === true`): present art renders static (no `gift-sway` class), countdown text still updates
-- [ ] **Step 2: Run** → FAIL (component doesn't exist).
-- [ ] **Step 3: Implement** `SealedGift.tsx`:
+- [x] **Step 2: Run** → FAIL (component doesn't exist).
+- [x] **Step 3: Implement** `SealedGift.tsx`:
   - pea-soup scene: inline pixel wrapped-present SVG (four palette shades — `--color-pixel` outline, `--color-give` ribbon, `--color-floor`/`--color-shelf` paper; same inline-SVG idiom as Landing's key charm), label on a gift tag, "opens `<local datetime from unlocksAt>`" prose (`toLocaleString`), countdown in the pixel font.
   - countdown: `useState(remaining)` seeded from prop + `useEffect` re-seeding on prop change; 1s `setInterval` decrement, floor at 0 → fire `onRefetch` once (ref-guard against double-fire); `visibilitychange` listener → visible → `onRefetch`.
   - gentle idle sway animation class (`motionOK` gate, like existing motion patterns); reduced-motion = static. In `index.css`, following the file's existing animation conventions (grep `@keyframes` there and match the naming/`prefers-reduced-motion` idiom):
@@ -921,9 +921,9 @@ surface; no oracle concern. Stated here so nobody "fixes" the symmetry with an e
 }
 ```
   - copy (brand voice, lowercase): heading `"a gift is waiting for you ♡"`, sub `"ben wrapped this one — it opens itself when the moment comes"`.
-- [ ] **Step 4: Wire into LinkPage**: in the loaded branch — immediately after `const { data } = view;` (~:340, AFTER every hook): `if (data.state === "sealed") return <SealedGift label={data.label} unlocksInSeconds={data.unlocks_in_seconds ?? 1} unlocksAt={data.unlocks_at ?? ""} onRefetch={refresh} />` — `refresh` is the file's EXISTING refetch mechanism (`const refresh = useCallback(() => setRefreshTick((t) => t + 1), [])` at LinkPage.tsx:180); do not invent a new one. CEREMONY DECISION (gate open-question 1, decided): the sealed→active transition renders the normal shelf, whose existing boot/typewriter entrance IS the unwrap ceremony beat — deliberate reuse, no bespoke crossfade; the spec's "soft ceremony beat" language is satisfied by that entrance (spec updated to match).
-- [ ] **Step 5: Run**: `npx vitest run src/friend` → PASS; typecheck clean.
-- [ ] **Step 6: Commit** `git commit -S -m "friend: SealedGift — the wrapped present, countdown from remaining, refetch-never-self-unseal"`
+- [x] **Step 4: Wire into LinkPage**: in the loaded branch — immediately after `const { data } = view;` (~:340, AFTER every hook): `if (data.state === "sealed") return <SealedGift label={data.label} unlocksInSeconds={data.unlocks_in_seconds ?? 1} unlocksAt={data.unlocks_at ?? ""} onRefetch={refresh} />` — `refresh` is the file's EXISTING refetch mechanism (`const refresh = useCallback(() => setRefreshTick((t) => t + 1), [])` at LinkPage.tsx:180); do not invent a new one. CEREMONY DECISION (gate open-question 1, decided): the sealed→active transition renders the normal shelf, whose existing boot/typewriter entrance IS the unwrap ceremony beat — deliberate reuse, no bespoke crossfade; the spec's "soft ceremony beat" language is satisfied by that entrance (spec updated to match).
+- [x] **Step 5: Run**: `npx vitest run src/friend` → PASS; typecheck clean.
+- [x] **Step 6: Commit** `git commit -S -m "friend: SealedGift — the wrapped present, countdown from remaining, refetch-never-self-unseal"`
 
 ---
 
@@ -936,15 +936,15 @@ surface; no oracle concern. Stated here so nobody "fixes" the symmetry with an e
 **Interfaces:**
 - Consumes: `adminCreateLink(..., unlockAt?)`, `adminSetLinkUnlock`, `adminDeleteLinkUnlock`, `AdminLink.unlock_at` (Task 6).
 
-- [ ] **Step 1: Failing tests**:
+- [x] **Step 1: Failing tests**:
   - create form has a `datetime-local` input labeled "unlocks at (optional)"; submitting with a value calls `adminCreateLink` with an ISO **instant** (assert the arg matches `new Date(value).toISOString()` — the browser-resolves-ben's-zone rule)
   - a row whose `unlock_at` is future shows a `sealed until <local datetime>` chip; past or ABSENT (the field is omitted when unsealed — gate B1) shows none
   - sealed row exposes "move the moment" (datetime-local + save → `adminSetLinkUnlock` with ISO instant) and "unseal" (→ `adminDeleteLinkUnlock`); neither renders on open links
   - a 409 from either verb surfaces the server message inline (the link opened under him — the row then refreshes)
-- [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** (follow the file's existing form-state + per-row editor patterns, e.g. the note editor; `formatDate` exists — add a `formatDateTime` using `toLocaleString` for unlock display; refresh the list after either verb resolves, matching existing post-mutation reload).
-- [ ] **Step 4: Run**: `npx vitest run src/admin` → PASS; `npm run typecheck && npm run lint` → clean.
-- [ ] **Step 5: Commit** `git commit -S -m "admin: wrap links at create, move or unseal the moment from the row"`
+- [x] **Step 2: Run** → FAIL.
+- [x] **Step 3: Implement** (follow the file's existing form-state + per-row editor patterns, e.g. the note editor; `formatDate` exists — add a `formatDateTime` using `toLocaleString` for unlock display; refresh the list after either verb resolves, matching existing post-mutation reload).
+- [x] **Step 4: Run**: `npx vitest run src/admin` → PASS; `npm run typecheck && npm run lint` → clean.
+- [x] **Step 5: Commit** `git commit -S -m "admin: wrap links at create, move or unseal the moment from the row"`
 
 ---
 

@@ -2558,7 +2558,10 @@ async fn sealed_link_view_withholds_everything_and_counts_down() {
     assert_eq!(j["games"], serde_json::json!([]));
     assert_eq!(j["claims"], serde_json::json!([]));
     let secs = j["unlocks_in_seconds"].as_u64().unwrap();
-    assert!((3595..=3600).contains(&secs), "ceiled remaining, got {secs}");
+    assert!(
+        (3595..=3600).contains(&secs),
+        "ceiled remaining, got {secs}"
+    );
     assert!(
         j["unlocks_at"].as_str().unwrap().contains('T'),
         "rfc3339 instant"
@@ -2633,11 +2636,9 @@ async fn claim_and_steam_proxy_refuse_sealed_409() {
     let server = wiremock::MockServer::start().await;
     let resp = steam_router(Arc::clone(&store), mock.clone(), &server.uri())
         .oneshot(
-            Request::get(format!(
-                "/api/l/sealed-409-tok/steam/owned/{TEST_STEAMID}"
-            ))
-            .body(Body::empty())
-            .unwrap(),
+            Request::get(format!("/api/l/sealed-409-tok/steam/owned/{TEST_STEAMID}"))
+                .body(Body::empty())
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -2689,5 +2690,8 @@ async fn game_detail_refuses_sealed_link() {
     let b = axum::body::to_bytes(unknown_resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(a, b, "sealed detail 404 must be byte-identical to not-found");
+    assert_eq!(
+        a, b,
+        "sealed detail 404 must be byte-identical to not-found"
+    );
 }

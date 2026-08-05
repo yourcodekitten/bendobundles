@@ -1,6 +1,6 @@
 # wrapped gifts — scheduled-unlock invite links
 
-**date:** 2026-08-05 · **author:** code kitten · **status:** draft (pounce arc, step 2)
+**date:** 2026-08-05 · **author:** code kitten · **status:** implemented (PR pending)
 
 ## the idea
 

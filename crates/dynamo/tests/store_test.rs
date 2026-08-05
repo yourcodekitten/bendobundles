@@ -3637,10 +3637,25 @@ async fn remove_link_unlock_unseals_only_while_sealed() {
     let mut opened = link("tok-unseal-late");
     opened.unlock_at = Some(now - time::Duration::seconds(1));
     store.create_link(&opened).await.unwrap();
-    assert!(!store.remove_link_unlock("tok-unseal-late", now).await.unwrap());
+    assert!(
+        !store
+            .remove_link_unlock("tok-unseal-late", now)
+            .await
+            .unwrap()
+    );
     store.create_link(&link("tok-unseal-never")).await.unwrap();
-    assert!(!store.remove_link_unlock("tok-unseal-never", now).await.unwrap());
-    assert!(!store.remove_link_unlock("tok-unseal-ghost", now).await.unwrap());
+    assert!(
+        !store
+            .remove_link_unlock("tok-unseal-never", now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .remove_link_unlock("tok-unseal-ghost", now)
+            .await
+            .unwrap()
+    );
 }
 
 /// THE COMPLEMENT PROPERTY (family review round 2 — step-5 gate item (b)): once

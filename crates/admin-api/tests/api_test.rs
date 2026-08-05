@@ -2747,7 +2747,10 @@ async fn create_link_unlock_at_validation_and_roundtrip() {
 
     // Past instant → 422.
     let resp = post_create_link(
-        &store, &invoker, &admin_hash, &session,
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
         serde_json::json!({"label": "P", "claims_allowed": 1, "unlock_at": future(-1)}),
     )
     .await;
@@ -2755,7 +2758,10 @@ async fn create_link_unlock_at_validation_and_roundtrip() {
 
     // Beyond the 370-day bound → 422.
     let resp = post_create_link(
-        &store, &invoker, &admin_hash, &session,
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
         serde_json::json!({"label": "F", "claims_allowed": 1, "unlock_at": future(24 * 371)}),
     )
     .await;
@@ -2771,7 +2777,10 @@ async fn create_link_unlock_at_validation_and_roundtrip() {
 
     // Bare local datetime (no offset) → 422: the browser must resolve the instant.
     let resp = post_create_link(
-        &store, &invoker, &admin_hash, &session,
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
         serde_json::json!({"label": "B", "claims_allowed": 1, "unlock_at": "2026-12-25T00:00:00"}),
     )
     .await;
@@ -2779,7 +2788,10 @@ async fn create_link_unlock_at_validation_and_roundtrip() {
 
     // Valid future instant → 200, and the list serves it back as rfc3339.
     let resp = post_create_link(
-        &store, &invoker, &admin_hash, &session,
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
         serde_json::json!({"label": "Sealed ok", "claims_allowed": 1, "unlock_at": future(48)}),
     )
     .await;
@@ -2787,8 +2799,13 @@ async fn create_link_unlock_at_validation_and_roundtrip() {
     let token = body_json(resp).await["token"].as_str().unwrap().to_string();
 
     let resp = admin_request(
-        &store, &invoker, &admin_hash, &session,
-        "GET", "/admin/api/links", None,
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        "GET",
+        "/admin/api/links",
+        None,
     )
     .await;
     let links = body_json(resp).await;
@@ -2816,7 +2833,8 @@ async fn set_link_unlock_endpoint_moves_only_sealed() {
     let session = admin_login(&store, &invoker, &admin_hash, password).await;
     let now = time::OffsetDateTime::now_utc();
     let iso = |t: time::OffsetDateTime| {
-        t.format(&time::format_description::well_known::Rfc3339).unwrap()
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
     };
 
     let mut sealed = test_link("adm-sealed");
@@ -2825,8 +2843,12 @@ async fn set_link_unlock_endpoint_moves_only_sealed() {
 
     // Move the moment → 200, list reflects.
     let resp = admin_request(
-        &store, &invoker, &admin_hash, &session,
-        "POST", "/admin/api/links/adm-sealed/unlock",
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        "POST",
+        "/admin/api/links/adm-sealed/unlock",
         Some(serde_json::json!({"unlock_at": iso(now + time::Duration::hours(3))})),
     )
     .await;
@@ -2839,8 +2861,12 @@ async fn set_link_unlock_endpoint_moves_only_sealed() {
 
     // Past instant → 422 BEFORE the store (fat-finger guard).
     let resp = admin_request(
-        &store, &invoker, &admin_hash, &session,
-        "POST", "/admin/api/links/adm-sealed/unlock",
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        "POST",
+        "/admin/api/links/adm-sealed/unlock",
         Some(serde_json::json!({"unlock_at": iso(now - time::Duration::hours(1))})),
     )
     .await;
@@ -2848,8 +2874,12 @@ async fn set_link_unlock_endpoint_moves_only_sealed() {
 
     // Null → 422 (unseal is DELETE, never a null set).
     let resp = admin_request(
-        &store, &invoker, &admin_hash, &session,
-        "POST", "/admin/api/links/adm-sealed/unlock",
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        "POST",
+        "/admin/api/links/adm-sealed/unlock",
         Some(serde_json::json!({"unlock_at": null})),
     )
     .await;
@@ -2860,18 +2890,29 @@ async fn set_link_unlock_endpoint_moves_only_sealed() {
     opened.unlock_at = Some(now - time::Duration::seconds(1));
     store.create_link(&opened).await.unwrap();
     let resp = admin_request(
-        &store, &invoker, &admin_hash, &session,
-        "POST", "/admin/api/links/adm-opened/unlock",
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        "POST",
+        "/admin/api/links/adm-opened/unlock",
         Some(serde_json::json!({"unlock_at": iso(now + time::Duration::hours(1))})),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
     // Never-sealed link → 409 (create-time-only).
-    store.create_link(&test_link("adm-open-born")).await.unwrap();
+    store
+        .create_link(&test_link("adm-open-born"))
+        .await
+        .unwrap();
     let resp = admin_request(
-        &store, &invoker, &admin_hash, &session,
-        "POST", "/admin/api/links/adm-open-born/unlock",
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        "POST",
+        "/admin/api/links/adm-open-born/unlock",
         Some(serde_json::json!({"unlock_at": iso(now + time::Duration::hours(1))})),
     )
     .await;
@@ -2894,20 +2935,38 @@ async fn delete_link_unlock_unseals_only_sealed() {
     store.create_link(&sealed).await.unwrap();
 
     let resp = admin_request(
-        &store, &invoker, &admin_hash, &session,
-        "DELETE", "/admin/api/links/adm-unseal/unlock", None,
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        "DELETE",
+        "/admin/api/links/adm-unseal/unlock",
+        None,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(store.get_link("adm-unseal").await.unwrap().unwrap().unlock_at, None);
+    assert_eq!(
+        store
+            .get_link("adm-unseal")
+            .await
+            .unwrap()
+            .unwrap()
+            .unlock_at,
+        None
+    );
 
     // Open link → 409 (deliberate: unknown/not-sealed collapse — DELETE does no read).
     let mut opened = test_link("adm-unseal-late");
     opened.unlock_at = Some(now - time::Duration::seconds(1));
     store.create_link(&opened).await.unwrap();
     let resp = admin_request(
-        &store, &invoker, &admin_hash, &session,
-        "DELETE", "/admin/api/links/adm-unseal-late/unlock", None,
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        "DELETE",
+        "/admin/api/links/adm-unseal-late/unlock",
+        None,
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
