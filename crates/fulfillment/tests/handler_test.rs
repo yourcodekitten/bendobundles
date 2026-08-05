@@ -8269,3 +8269,84 @@ async fn audit_batches_pings_above_three() {
         );
     }
 }
+
+/// Precedent: the identical `is_gift == Some(true)` conditional at the reconcile recovery site is
+/// pinned by `reconcile_bundle_self_redeemed_recovers_and_pings` (a dedicated `"is_gift": true` tpk
+/// fixture asserting the ping body ends with the gift suffix). This is that same pin for the
+/// shelf-truth audit's per-row ping — same frozen-sibling shape as the other positive tests, but
+/// the revealed tpk's wire JSON carries `"is_gift": true` (a one-off body, not routed through
+/// `remount_order_with_states`, since none of the other tests need the knob).
+#[tokio::test]
+async fn audit_ping_marks_gift_when_key_is_gift() {
+    let Some(store) = store_or_skip("audit-gift-suffix").await else {
+        return;
+    };
+    seed_offered_game(&store, "GKE", "gyr", |_| {}).await;
+    seed_listable_sibling(&store, "GKE", "gyr_row_choice_steam", "GYR Sibling").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKE", "some_month_choice", &["gyr_row_choice_steam"])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await; // pass 1: clean
+
+    // Pass 2: revealed AND humble marks it a gift — the one wrinkle remount_order_with_states'
+    // fixture doesn't carry.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GKE"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "GKE",
+            "product": { "human_name": "Test Choice Month", "machine_name": "some_month_choice" },
+            "tpkd_dict": { "all_tpks": [{
+                "machine_name": "gyr_row_choice_steam",
+                "human_name": "GYR",
+                "key_type": "steam",
+                "is_expired": false,
+                "keyindex": 0,
+                "redeemed_key_val": "REDEEMED-KEY-VALUE",
+                "is_gift": true
+            }]},
+            "subproducts": [],
+        })))
+        .with_priority(1)
+        .mount(&humble)
+        .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let sibling_id = game_id("GKE", "gyr_row_choice_steam");
+    let sibling = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+    assert_eq!(
+        sibling.status,
+        GameStatus::BenRedeemed,
+        "audit delisted the gifted-revealed frozen sibling"
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("shelf audit"))
+        .expect("a shelf-audit ping fired");
+    assert!(
+        ping.contains("on humble (humble marks it a gift)"),
+        "the pulled tpk's is_gift == Some(true) must append the gift suffix after the \
+         pinned \"... on humble\" text: {ping}"
+    );
+    assert!(
+        ping.contains("revealed outside the app"),
+        "still carries the reveal reason ahead of the gift suffix: {ping}"
+    );
+}
