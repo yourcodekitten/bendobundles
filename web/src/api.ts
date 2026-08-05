@@ -19,7 +19,7 @@ export type ClaimView = {
   gift_url: string | null;
 };
 
-export type LinkState = 'active' | 'revoked' | 'expired' | 'exhausted';
+export type LinkState = 'active' | 'sealed' | 'revoked' | 'expired' | 'exhausted';
 
 export type LinkView = {
   label: string;
@@ -33,6 +33,11 @@ export type LinkView = {
   state: LinkState;
   games: GameView[];
   claims: ClaimView[];
+  /** Wrapped gift: ceiled seconds until unlock; present ONLY while sealed. The client
+   * counts down from REMAINING — it never compares wall clocks. */
+  unlocks_in_seconds?: number;
+  /** Wrapped gift: the unlock instant (rfc3339); present ONLY while sealed. */
+  unlocks_at?: string;
 };
 
 export type ThanksResult =
@@ -123,6 +128,9 @@ export type AdminLink = {
   claims_used: number;
   revoked: boolean;
   expires_at: string | null;
+  /** Wrapped gift: the unlock instant (rfc3339); ABSENT when unsealed (skip-on-None
+   * serde, the thanked_at shape — never null). */
+  unlock_at?: string;
   created_at: string;
 };
 
@@ -367,6 +375,7 @@ export async function adminCreateLink(
   claims: number,
   expiresDays?: number,
   giftNote?: string,
+  unlockAt?: string,
 ): Promise<{ token: string; url_path: string }> {
   const response = await fetch('/admin/api/links', {
     method: 'POST',
@@ -376,6 +385,7 @@ export async function adminCreateLink(
       claims_allowed: claims,
       expires_days: expiresDays,
       gift_note: giftNote,
+      unlock_at: unlockAt,
     }),
   });
 
@@ -433,6 +443,46 @@ export async function adminSetLinkNote(token: string, note: string): Promise<voi
   if (!response.ok) {
     await throwIfValidation422(response, 'invalid note');
     throw new Error("couldn't save the note — it may not have changed");
+  }
+}
+
+/** Read the server's {"error": msg} off a failed response, or null. */
+async function serverError(response: Response): Promise<string | null> {
+  try {
+    const j = (await response.json()) as { error?: unknown };
+    return typeof j.error === 'string' ? j.error : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Move a sealed link's unlock moment. 409 = the link isn't sealed (anymore). */
+export async function adminSetLinkUnlock(token: string, unlockAtIso: string): Promise<void> {
+  const response = await fetch(`/admin/api/links/${token}/unlock`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
+    body: JSON.stringify({ unlock_at: unlockAtIso }),
+  });
+  await checkUnauthorized(response);
+  if (!response.ok) {
+    await throwIfValidation422(response, 'invalid unlock time');
+    throw new Error(
+      (await serverError(response)) ?? "the link isn't sealed anymore — refresh",
+    );
+  }
+}
+
+/** Unseal — the seal's own delete verb. 409 = nothing to unseal. */
+export async function adminDeleteLinkUnlock(token: string): Promise<void> {
+  const response = await fetch(`/admin/api/links/${token}/unlock`, {
+    method: 'DELETE',
+    headers: ADMIN_CSRF_HEADER,
+  });
+  await checkUnauthorized(response);
+  if (!response.ok) {
+    throw new Error(
+      (await serverError(response)) ?? "the link isn't sealed anymore — refresh",
+    );
   }
 }
 

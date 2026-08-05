@@ -14,6 +14,8 @@ import {
   adminSelfClaim,
   adminSelfClaims,
   adminSetLinkNote,
+  adminSetLinkUnlock,
+  adminDeleteLinkUnlock,
   adminSetSteamIdentity,
   adminClearSteamIdentity,
   adminSetAppId,
@@ -783,5 +785,88 @@ describe('CSRF header coverage — all mutating admin calls carry X-Admin-Reques
       '/admin/api/games/gk%3Amn/self-claim',
       csrf,
     );
+  });
+});
+
+describe('seal verbs (wrapped gifts)', () => {
+  it('adminCreateLink includes unlock_at when given, omits when not', async () => {
+    const ok = () => ({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ token: 't', url_path: '/l/t' }),
+    });
+    mockFetch.mockResolvedValueOnce(ok());
+    await adminCreateLink('lbl', 1, undefined, undefined, '2026-12-25T05:00:00.000Z');
+    let body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.unlock_at).toBe('2026-12-25T05:00:00.000Z');
+
+    mockFetch.mockResolvedValueOnce(ok());
+    await adminCreateLink('lbl', 1);
+    body = JSON.parse(mockFetch.mock.calls[1][1].body);
+    expect(body.unlock_at).toBeUndefined();
+  });
+
+  it('adminSetLinkUnlock POSTs the instant with the CSRF header', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ ok: true }),
+    });
+    await adminSetLinkUnlock('tok1', '2026-12-25T05:00:00.000Z');
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/links/tok1/unlock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
+      body: JSON.stringify({ unlock_at: '2026-12-25T05:00:00.000Z' }),
+    });
+  });
+
+  it('adminDeleteLinkUnlock sends DELETE', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ ok: true }),
+    });
+    await adminDeleteLinkUnlock('tok1');
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/links/tok1/unlock', {
+      method: 'DELETE',
+      headers: { 'X-Admin-Request': '1' },
+    });
+  });
+
+  it('both verbs surface the server 409 message', async () => {
+    const conflict = () => ({
+      ok: false,
+      status: 409,
+      json: vi.fn().mockResolvedValue({
+        error: 'link is not sealed — seals are create-time-only and end at the unlock moment',
+      }),
+    });
+    mockFetch.mockResolvedValueOnce(conflict());
+    await expect(adminSetLinkUnlock('t', '2026-12-25T05:00:00.000Z')).rejects.toThrow(
+      /create-time-only/,
+    );
+    mockFetch.mockResolvedValueOnce(conflict());
+    await expect(adminDeleteLinkUnlock('t')).rejects.toThrow(/create-time-only/);
+  });
+
+  it('sealed LinkView parses with countdown fields', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({
+        label: 'For Maya',
+        claims_allowed: 1,
+        claims_used: 0,
+        state: 'sealed',
+        games: [],
+        claims: [],
+        unlocks_in_seconds: 3600,
+        unlocks_at: '2026-12-25T05:00:00Z',
+      }),
+    });
+    const view = await fetchLink('tok');
+    expect(view.state).toBe('sealed');
+    expect(view.unlocks_in_seconds).toBe(3600);
+    expect(view.unlocks_at).toBe('2026-12-25T05:00:00Z');
   });
 });
