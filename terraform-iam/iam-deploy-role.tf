@@ -354,8 +354,8 @@ data "aws_iam_policy_document" "deploy" {
       "cloudfront:AssociateAlias",
       # aws_cloudfront_response_headers_policy.site (the #140 CSP policy) refreshes at
       # EVERY plan via GetResponseHeadersPolicy. This role never held ANY
-      # ResponseHeadersPolicy action: the 2026-08-04 CREATE ran under OMBB's prod
-      # profile (cutover apply — journal 2026-08-04), so the first kitten-deploy plan
+      # ResponseHeadersPolicy action: the 2026-08-04 CREATE ran under the
+      # brd-prod-ue1-core-bendoerr profile (OMBB's cutover apply), so the first kitten-deploy plan
       # after it (2026-08-05) 403'd on refresh — the refresh-403 class this file's
       # cache-policy comment already names; the cure is the grant, never
       # -refresh=false. Get ONLY, deliberately: it cures refresh completely, and the
