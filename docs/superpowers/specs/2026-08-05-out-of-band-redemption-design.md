@@ -1,6 +1,6 @@
 # out-of-band redemption — the sync learns what humble already knows (#158)
 
-**date:** 2026-08-05 · **author:** code kitten · **status:** draft — family review, then ben's gate
+**date:** 2026-08-05 · **author:** code kitten · **status:** implemented (PR pending)
 
 ## the incident (all receipts banked, all re-derived post-clear)
 
