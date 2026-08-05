@@ -1790,7 +1790,8 @@ async fn choice_happy_path_chooses_then_redeems() {
 
 // -------------------------------------------------------------------------------------------------
 // MERGE GATE: crash after choose, before redeem → reconcile redeems WITHOUT ever choosing.
-// Also: a parked SELF choice claim reconciles (compensates via B1) WITHOUT any choosecontent POST.
+// Also: a parked SELF choice claim reconciles (parks via B1 — never compensates) WITHOUT any
+// choosecontent POST.
 // -------------------------------------------------------------------------------------------------
 #[tokio::test]
 async fn merge_gate_reconcile_redeems_without_choosing() {
@@ -1825,7 +1826,8 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
         )))
         .mount(&humble)
         .await;
-    // Order for the SELF claim: empty tpks → B1 (snapshot present, no new tpk → compensate).
+    // Order for the SELF claim: empty tpks → B1 (snapshot present, no new tpk → park, never
+    // compensate).
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gkM"))
         .respond_with(
@@ -1861,7 +1863,7 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Gifted);
 
-    // SELF claim reconciled without choosing: B1 → compensate_self_claim → Compensated.
+    // SELF claim reconciled without choosing: B1 never compensates — it parks (stays Pending).
     let self_claim = deps
         .store
         .get_claim(SELF_LINK_TOKEN, "sc-mg1")
@@ -1870,8 +1872,8 @@ async fn merge_gate_reconcile_redeems_without_choosing() {
         .unwrap();
     assert_eq!(
         self_claim.state,
-        ClaimState::Compensated,
-        "self claim must be compensated (B1), not choosing"
+        ClaimState::Pending,
+        "self claim must be parked (B1), never compensated or chosen"
     );
 
     let reqs = humble.received_requests().await.unwrap();
@@ -2275,11 +2277,17 @@ async fn choice_5xx_after_choose_parks_then_reconcile_finishes() {
 }
 
 // -------------------------------------------------------------------------------------------------
-// reconcile: snapshot present but order diff empty (pick not spent) → compensate, no humble writes.
+// reconcile: snapshot present but order diff empty (pick not spent, but a snapshot can hide an
+// out-of-band spend) → NEVER compensate, park + ping. Exercised on both routing halves that reach
+// B1: the game's own `requires_choice: true` (the "native" route), and — via Task 2's widening —
+// `requires_choice: false` with a `Some` snapshot (the claim was born choice, the game since flipped).
 // -------------------------------------------------------------------------------------------------
+const B1_PIN_PING: &str = "has an intent snapshot but no new key on humble — NOT auto-compensating: \
+     a snapshot can hide a pick spent out of band. Left pending for review.";
+
 #[tokio::test]
-async fn reconcile_choice_not_spent_compensates() {
-    let Some(store) = store_or_skip("choice-recon-comp").await else {
+async fn reconcile_choice_not_spent_parks_never_compensates() {
+    let Some(store) = store_or_skip("choice-recon-park").await else {
         return;
     };
     let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
@@ -2287,7 +2295,8 @@ async fn reconcile_choice_not_spent_compensates() {
 
     let humble = MockServer::start().await;
     mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
-    // Empty order — no new tpk vs the empty snapshot → pick provably not spent.
+    // Empty order — no new tpk vs the empty snapshot. Pick LOOKS not spent, but a snapshot can hide
+    // an out-of-band spend — B1 must park, never compensate.
     Mock::given(method("GET"))
         .and(path("/api/v1/order/gk"))
         .respond_with(
@@ -2306,13 +2315,13 @@ async fn reconcile_choice_not_spent_compensates() {
     handle(&deps, FulfillRequest::Sync).await;
 
     let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
-    assert_eq!(claim.state, ClaimState::Compensated);
+    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
-    assert_eq!(game.status, GameStatus::Available);
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
     assert_eq!(
         deps.store.list_listable_games().await.unwrap().len(),
-        1,
-        "game re-listed"
+        0,
+        "game does NOT return to listable — no gsi1pk"
     );
     assert_eq!(
         deps.store
@@ -2321,24 +2330,94 @@ async fn reconcile_choice_not_spent_compensates() {
             .unwrap()
             .unwrap()
             .claims_used,
-        0,
-        "slot returned"
+        1,
+        "slot NOT returned"
     );
 
     let reqs = humble.received_requests().await.unwrap();
-    assert_eq!(
-        count_path(&reqs, "/humbler/choosecontent"),
-        0,
-        "compensate does no humble writes"
-    );
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
     assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
-    // A compensate ping fired.
+    // The pinned park ping fired with the exact text.
     let dreqs = discord.received_requests().await.unwrap();
-    assert!(dreqs.iter().any(|r| {
-        String::from_utf8(r.body.clone())
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!("choice claim c1 ({TITLE}) {B1_PIN_PING}");
+    assert!(
+        ping.contains(&expected),
+        "ping must carry the exact pinned park text: {ping}"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_choice_not_spent_parks_never_compensates_via_flipped_route() {
+    let Some(store) = store_or_skip("choice-recon-park-flipped").await else {
+        return;
+    };
+    let aged = OffsetDateTime::now_utc() - time::Duration::minutes(16);
+    let gid = seed_pending_choice_claim(&store, "gk", OFFERED_ID, TITLE, aged, Some(vec![])).await;
+    // Flip the game's `requires_choice` to false through the store's normal put path — same shape
+    // as a key-sync flip landing between the claim's birth and this reconcile pass. The claim only
+    // reaches B1 now via Task 2's `claim.choice_pre_tpks.is_some()` widening, not `requires_choice`.
+    let mut game = store.get_game(&gid).await.unwrap().unwrap();
+    game.requires_choice = false;
+    store.put_game(&game).await.unwrap();
+
+    let humble = MockServer::start().await;
+    mount_gamekeys(&humble, serde_json::json!([{ "gamekey": "gk" }])).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/gk"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(choice_order_json("gk", serde_json::json!([]))),
+        )
+        .mount(&humble)
+        .await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = deps(store, &humble.uri(), Some(discord.uri()));
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let claim = deps.store.get_claim("tok1", "c1").await.unwrap().unwrap();
+    assert_eq!(claim.state, ClaimState::Pending, "parked, never compensated");
+    let game = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(game.status, GameStatus::Pending, "not re-listed");
+    assert_eq!(
+        deps.store.list_listable_games().await.unwrap().len(),
+        0,
+        "game does NOT return to listable — no gsi1pk"
+    );
+    assert_eq!(
+        deps.store
+            .get_link("tok1")
+            .await
             .unwrap()
-            .contains("compensated choice claim")
-    }));
+            .unwrap()
+            .claims_used,
+        1,
+        "slot NOT returned"
+    );
+
+    let reqs = humble.received_requests().await.unwrap();
+    assert_eq!(count_path(&reqs, "/humbler/choosecontent"), 0);
+    assert_eq!(count_path(&reqs, "/humbler/redeemkey"), 0);
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("c1"))
+        .expect("a ping mentioning the claim id");
+    let expected = format!("choice claim c1 ({TITLE}) {B1_PIN_PING}");
+    assert!(
+        ping.contains(&expected),
+        "identical park via the widened route: {ping}"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------

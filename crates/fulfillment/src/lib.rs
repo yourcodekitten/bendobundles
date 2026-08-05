@@ -1921,21 +1921,22 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
             .await;
         }
         Some(pre) => match find_new_tpk(order, pre, &game.title) {
-            // B1. Snapshot present but no new tpk (and no exact-title match) ⇒ the choose did not
-            // commit ⇒ pick NOT spent ⇒ compensate. Hard backstop against a mis-decided ambiguous
-            // choose: a re-list → re-claim → re-choose of the same game is REFUSED by humble
-            // ("already chosen" → ChooseFailed → park), so no pick is ever double-spent — the
-            // residual is churn + pings, never value. SELF uses compensate_self_claim (no link-meta).
+            // B1. Snapshot present but no new tpk (and no exact-title match) ⇒ NEVER compensate, on
+            // ANY route. The re-choose backstop (humble refuses "already chosen") only covers a
+            // second PICK — it does nothing for re-LISTING a key that was already revealed: a
+            // `Some` snapshot can hide a pick spent out of band (redeemed straight on humble,
+            // outside this app, between the snapshot write and this reconcile pass), and
+            // compensating would re-list a game whose key is already gone. Park + ping instead —
+            // stays Pending for a human to look at the order directly. SELF and gift both park
+            // identically; no store write at all.
             TpkPick::None => {
-                tracing::info!(claim_id = %claim.id, "reconcile(choice): snapshot present, no new tpk — choose did not commit, compensating (no pick spent)");
-                let _ = compensate_any(deps, claim).await;
+                tracing::warn!(claim_id = %claim.id, "reconcile(choice): snapshot present, no new tpk — NOT auto-compensating (a snapshot can hide an out-of-band spend), parking");
                 ping(
                     deps,
                     &format!(
-                        "reconcile compensated choice claim {} ({}) — a choose intent was recorded \
-                         but no new key ever appeared, so the pick was NOT spent — slot returned, \
-                         game re-listed. (If humble later shows the pick spent, its re-choose \
-                         refusal is the backstop — no double-spend.)",
+                        "choice claim {} ({}) has an intent snapshot but no new key on humble — \
+                         NOT auto-compensating: a snapshot can hide a pick spent out of band. Left \
+                         pending for review.",
                         claim.id, game.title
                     ),
                 )
