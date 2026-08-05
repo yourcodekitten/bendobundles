@@ -40,6 +40,19 @@ ROWS=$(aws dynamodb query --profile "$PROFILE_DB" --region "$R" --table-name "$T
   | jq -c '[.Items[].body.S | fromjson | {id, gamekey, machine_name, title}]')
 COOKIE=$(aws ssm get-parameter --profile "$PROFILE_SSM" --region "$R" \
   --name "$SSM_PARAM" --with-decryption --query Parameter.Value --output text)
+# The curl config below is built by interpolating $COOKIE into a printf'd "header = ..." line
+# fed to `curl -K -`. A CR/LF would inject a second config line; a `"` would break out of the
+# quoted value. Refuse loudly rather than build a broken/mis-scoped config.
+case "$COOKIE" in
+  *$'\n'*|*$'\r'*)
+    echo "FATAL: humble-cookie SSM value contains a newline/CR — refusing to build curl config. Take this to ben." >&2
+    exit 1
+    ;;
+  *'"'*)
+    echo "FATAL: humble-cookie SSM value contains a double-quote — refusing to build curl config. Take this to ben." >&2
+    exit 1
+    ;;
+esac
 PULLS=0; CHECKED=0; FETCH_FAIL=0
 for gk in $(echo "$ROWS" | jq -r '[.[].gamekey] | unique | .[]'); do
   ORDER=$(printf 'header = "Cookie: _simpleauth_sess=%s"\n' "$COOKIE" \

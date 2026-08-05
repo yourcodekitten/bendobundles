@@ -10,17 +10,22 @@ Deploy sequence for #158 (out-of-band redemption). Follow each step in order. A 
 ## Deploy Steps
 
 ### Step 1: Terraform Deploy
-Run terraform deploy per `terraform/README.md`.
+Run terraform deploy per `terraform/README.md` ("Deploying as kitten" → "Full deploy"). `boundary_arn`
+and `admin_hash` are not real variable names — the real ones are `lambda_permissions_boundary_arn` and
+`admin_password_hash`, and both are already carried in `production.tfvars` (the boundary ARN is a
+constant; the admin hash is the live value pulled verbatim — see the README, never re-hash it).
+`ops_alarm_email` is also in `production.tfvars`. Run from repo root:
 
-**Required parameters:**
-- `boundary_arn` — supply verbatim (no modifications)
-- `ops_alarm_email` — mandatory
-- `admin_hash` — supply verbatim as given
-
-Example:
 ```bash
-cd terraform/
-terraform apply -var="boundary_arn=<value>" -var="ops_alarm_email=<value>" -var="admin_hash=<value>"
+git checkout main && git pull        # post-merge
+cd terraform
+AWS_PROFILE=kitten-deploy terraform plan -var-file=production.tfvars -out=tf.plan
+# READ every resource line of the plan. Expected: ONLY the lambda code/hash updates.
+# ANY admin_password_hash line, ANY IAM/boundary line, ANY destroy — STOP, take the
+# plan output to ben before touching apply. NEVER pass admin_password_hash by hand;
+# never re-hash it — production.tfvars carries the verbatim stored hash.
+AWS_PROFILE=kitten-deploy terraform apply tf.plan
+cd ..
 ```
 
 ### Step 2: Pre-Press Gate (Changelist Verification)
@@ -47,7 +52,13 @@ GATE: 1/0/1 — matches the signed changelist. Clear to press.
 - Exit 1: Any other count, or any order fetch failure (INCONCLUSIVE) — do not proceed
 
 ### Step 3: Trigger First Sync
-Once gate passes with `1/0/1`, trigger the first post-deploy sync and await completion.
+Once gate passes with `1/0/1`, trigger the first post-deploy sync from repo root (still at repo root
+after Step 2 — no `cd` needed) and await completion.
+
+Trigger it one of two ways:
+- **Admin UI**: log in, hit the "sync now" button on the Ops page (`web/src/admin/Ops.tsx`).
+- **API directly**: `POST /admin/api/sync` with an authenticated admin session (route registered in
+  `crates/admin-api/src/lib.rs`; fire-and-forget — a full backfill runs in the background).
 
 Monitor sync progress:
 - Check logs for claim processing
