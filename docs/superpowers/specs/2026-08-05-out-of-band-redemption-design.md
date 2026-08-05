@@ -95,13 +95,17 @@ game.requires_choice || claim.choice_pre_tpks.is_some()
   4. an order-evidence gate (probe for a matching redeemed tpk) would need the tpk→game
      grammar — promoting a heuristic this spec itself demotes to messaging-only (OMBB's tooth,
      lilith's concession). no gate, then: **B1 simply never re-lists.**
-  **arm A is refit to LOOK before it acts (OMBB's rider 1 found the blindness; lilith's repair):**
-  A's "choose never ran ⇒ genuinely unspent" is record-truth with the same structural hole —
-  an out-of-band spend never touches our choose flow, and A never diffs the order at all
-  (no snapshot, nothing to diff). but `find_new_tpk` needs *a* baseline, not a *recorded* one,
-  and arm A has one: **the empty set.** diff `order.keys` against `&[]` — every tpk is "new,"
-  the existing title match picks this game's out (the same function and trust level MLU's
-  `Some([])` rides to B3; nothing promoted, nothing invented):
+  **arm A is refit to LOOK before it acts (OMBB's rider 1 found the blindness; lilith's repair;
+  mechanism corrected by the plan review):** A's "choose never ran ⇒ genuinely unspent" is
+  record-truth with the same structural hole — an out-of-band spend never touches our choose
+  flow, and A never diffs the order at all (no snapshot, nothing to diff). the LOOK is a
+  **title-scoped probe over `order.keys`** (`human_name` equals `game.title`,
+  case-insensitive — the same title-match trust level `find_new_tpk`'s disambiguation
+  already carries; nothing promoted, nothing invented). the plan review caught that this
+  spec originally prescribed `find_new_tpk(order, &[], title)` here, which returns a lone
+  UNRELATED tpk as `Unique` without any title check — contradicting this spec's own
+  "genuinely nothing in the order for this game" one sentence later. "for this game" is
+  the signed intent; the probe implements it:
   - any title-matched tpk found (redeemed, clean, or ambiguous) → **park + specific ping**
     naming what was found — never an autonomous write, SELF included, permanently (OMBB):
     `None` and `Some([])` are not the same world state — **`Some([])` is a measurement of
@@ -303,8 +307,15 @@ wiremock + dynamodb-local in `fulfillment/tests/handler_test.rs`, existing helpe
   it and every fixture still passes) — the de-list fires with no steam client configured.
 - heal gate: `BenRedeemed` sibling + order-confirmed redeemed tpk → `Heal`; `BenRedeemed`
   sibling + order tpk NOT redeemed → `Skip` (evidence mismatch); `Gifted` sibling still skips.
-- audit: two-pass remount (clean → redeemed) de-lists on pass 2; absent-from-order row untouched
-  (absence pin); expired variant; contested-write row de-lists on the following sync.
+- audit: two-pass remount (clean → redeemed) de-lists on pass 2 — seeded as the frozen-sibling
+  shape, the only shape the audit can ever pull (the order walk fixes same-id rows itself);
+  absent-from-order row untouched (absence pin); expired variant. (the "contested-write"
+  case is consciously struck from handler_test — a mid-upsert race isn't deterministically
+  orchestrable without test hooks; the guarded write is pinned in store_test and the
+  audit's every-sync retry covers the outcome. plan-review decision.)
+- the B3 completion ping (the acceptance criterion's second ping) exists: recover-arm success
+  pings at both call sites (choice B3 + bundle twin), never inside `record_revealed_key`
+  (shared with the quiet happy path).
 - enrichment: message text pin for the grammar-hit case; no-hit stays generic (exact current
   string).
 - wire: `is_gift` parse + default pins in `humble-client/tests/client_test.rs`.
