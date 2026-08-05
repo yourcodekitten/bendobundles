@@ -7857,3 +7857,415 @@ async fn gate_parks_terminal_choice_claim_before_order() {
         "the gate must refuse before the order() self-heal call — zero Humble requests"
     );
 }
+
+// =============================================================================================
+// #158 SHELF-TRUTH AUDIT
+// -------------------------------------------------------------------------------------------
+// CRITICAL (see task-6-brief.md): for a PLAIN tpk, the order walk's own write lands on
+// `game_id(gamekey, machine_name)` — the exact row the audit would otherwise pull — so the walk
+// self-corrects it minutes before the audit runs and the audit sees 0 pulls there. The only rows
+// the audit can EVER pull are ones the walk's write BYPASSES: the D7 frozen-sibling shape (an
+// offered row exists at the tpk's base id → the routing ladder diverts the fresh write onto that
+// offered row → the tpk-named sibling starves, forever, absent something else correcting it).
+// Every positive test below seeds that miniature MLU: an offered row (so D7 diverts), a listable
+// sibling row under the raw tpk id, and a choice-suffixed tpk in the order.
+// =============================================================================================
+
+/// Priority-1 remount of one gamekey whose tpks carry explicit redeemed/expired state.
+/// tpks: (machine_name, human_name, redeemed, expired). Mind wiremock first-mounted-wins: this
+/// mounts at higher priority than the `sync_deps` originals, same shape as `remount_order`.
+async fn remount_order_with_states(
+    humble: &MockServer,
+    gamekey: &str,
+    product: &str,
+    tpks: &[(&str, &str, bool, bool)],
+) {
+    let all_tpks: Vec<serde_json::Value> = tpks
+        .iter()
+        .map(|(machine, human, redeemed, expired)| {
+            let mut tpk = serde_json::json!({
+                "machine_name": machine,
+                "human_name": human,
+                "key_type": "steam",
+                "is_expired": expired,
+                "keyindex": 0,
+            });
+            if *redeemed {
+                tpk["redeemed_key_val"] = serde_json::json!("REDEEMED-KEY-VALUE");
+            }
+            tpk
+        })
+        .collect();
+    let body = serde_json::json!({
+        "gamekey": gamekey,
+        "product": { "human_name": "Test Choice Month", "machine_name": product },
+        "tpkd_dict": { "all_tpks": all_tpks },
+        "subproducts": [],
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("/api/v1/order/{gamekey}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .with_priority(1)
+        .mount(humble)
+        .await;
+}
+
+/// Raw dynamodb client — same shape as `dynamo::tests::store_test`'s `raw_client` — used only for
+/// the `gsi1pk` sparse-index assertions the `Store` API can't see (`get_game` only ever reads the
+/// primary key, never the GSI projection).
+async fn raw_client() -> aws_sdk_dynamodb::Client {
+    let url =
+        std::env::var("DYNAMODB_LOCAL_URL").unwrap_or_else(|_| "http://localhost:8000".into());
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(&url)
+        .region("us-east-1")
+        .test_credentials()
+        .load()
+        .await;
+    aws_sdk_dynamodb::Client::new(&config)
+}
+
+/// Fetch the raw DDB item for a game id — panics if absent. `table` follows `store_or_skip`'s
+/// naming convention (`t-fulfill-{test}`).
+async fn raw_game_item(
+    client: &aws_sdk_dynamodb::Client,
+    table: &str,
+    id: &str,
+) -> std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> {
+    client
+        .get_item()
+        .table_name(table)
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S(format!("GAME#{id}")),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("item must exist")
+}
+
+/// Seed a plain Available+listable row directly under `gk:mn` — the "frozen sibling" shape: a
+/// duplicate row the D7 routing ladder's write never targets once an offered row exists at the
+/// tpk's base id.
+async fn seed_listable_sibling(store: &Store, gk: &str, mn: &str, title: &str) {
+    let g = Game {
+        id: game_id(gk, mn),
+        title: title.into(),
+        bundle: "Seed Month".into(),
+        gamekey: gk.into(),
+        machine_name: mn.into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    };
+    store.put_game(&g).await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_delists_frozen_sibling_when_order_shows_key_revealed() {
+    let Some(store) = store_or_skip("audit-frozen-revealed").await else {
+        return;
+    };
+    // Miniature MLU: offered row (D7 diverts here) + a listable sibling under the raw tpk id.
+    seed_offered_game(&store, "GKA", "mlu", |_| {}).await;
+    seed_listable_sibling(&store, "GKA", "mlu_row_choice_steam", "MLU Sibling").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    // sync_deps leaves `steam: None` — the decoupling assertion lilith required. No steam client
+    // set anywhere in this test.
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKA", "some_month_choice", &["mlu_row_choice_steam"])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+
+    // Pass 1: clean order (not redeemed/expired) — the walk's write diverts onto the offered row;
+    // the sibling is untouched by the walk and stays listable.
+    handle(&deps, FulfillRequest::Sync).await;
+    let sibling_id = game_id("GKA", "mlu_row_choice_steam");
+    assert_eq!(
+        deps.store
+            .get_game(&sibling_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        GameStatus::Available,
+        "pass 1: sibling stays listable — walk's write went to the offered row, not here"
+    );
+
+    // Pass 2: humble now shows the key revealed (redeemed) out of band.
+    remount_order_with_states(
+        &humble,
+        "GKA",
+        "some_month_choice",
+        &[("mlu_row_choice_steam", "MLU", true, false)],
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let sibling = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+    assert_eq!(
+        sibling.status,
+        GameStatus::BenRedeemed,
+        "audit delisted the frozen sibling"
+    );
+
+    let client = raw_client().await;
+    let raw = raw_game_item(&client, "t-fulfill-audit-frozen-revealed", &sibling_id).await;
+    assert!(
+        !raw.contains_key("gsi1pk"),
+        "delisted row must carry no gsi1pk — sparse index"
+    );
+
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("1 audit-pulled"),
+        "summary must report the pull: {}",
+        st.message
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("shelf audit"))
+        .expect("a shelf-audit ping fired");
+    assert!(ping.contains("MLU Sibling"), "ping carries the title: {ping}");
+    assert!(ping.contains(&sibling_id), "ping carries the id: {ping}");
+    assert!(
+        ping.contains("revealed outside the app"),
+        "ping carries the reveal reason: {ping}"
+    );
+}
+
+/// THE absence pin. Passes VACUOUSLY before the audit exists (no audit → nothing acts on the row
+/// → every assert holds). Once Step 3 lands it becomes the load-bearing guard that the audit never
+/// infers anything from a row simply being absent from the fetched truth. DO NOT alter this test
+/// to make it fail pre-implementation — a version that fails before the audit exists could only be
+/// greened by an audit that acts on absence, which is exactly the violation the spec bans.
+#[tokio::test]
+async fn audit_never_touches_rows_absent_from_fetched_orders() {
+    let Some(store) = store_or_skip("audit-absence").await else {
+        return;
+    };
+    seed_listable_sibling(&store, "GKB", "solo", "Solo Game").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    // GKB is listed (the walk reaches it) but its order GET 500s — a failed order contributes
+    // NOTHING to the truth map; that absence is the rule, not a special case.
+    let deps = sync_deps(store, &humble, &[], &["GKB"], &[], &[], Some(discord.uri())).await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let gid = game_id("GKB", "solo");
+    let g = deps.store.get_game(&gid).await.unwrap().unwrap();
+    assert_eq!(
+        g.status,
+        GameStatus::Available,
+        "untouched — the order never fetched"
+    );
+    assert!(g.is_listable(), "still listable after run_sync");
+
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        !st.message.contains("audit-pulled"),
+        "summary must not report a pull: {}",
+        st.message
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    assert!(
+        dreqs
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("shelf audit")),
+        "no shelf-audit ping fired"
+    );
+}
+
+#[tokio::test]
+async fn audit_delists_on_expired() {
+    let Some(store) = store_or_skip("audit-expired").await else {
+        return;
+    };
+    seed_offered_game(&store, "GKC", "orn", |_| {}).await;
+    seed_listable_sibling(&store, "GKC", "orn_row_choice_steam", "ORN Sibling").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKC", "some_month_choice", &["orn_row_choice_steam"])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    remount_order_with_states(
+        &humble,
+        "GKC",
+        "some_month_choice",
+        &[("orn_row_choice_steam", "ORN", false, true)],
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    let sibling_id = game_id("GKC", "orn_row_choice_steam");
+    let sibling = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+    assert_eq!(
+        sibling.status,
+        GameStatus::Expired,
+        "audit delisted the expired frozen sibling"
+    );
+
+    let client = raw_client().await;
+    let raw = raw_game_item(&client, "t-fulfill-audit-expired", &sibling_id).await;
+    assert!(
+        !raw.contains_key("gsi1pk"),
+        "delisted row must carry no gsi1pk — sparse index"
+    );
+
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("1 audit-pulled"),
+        "summary must report the pull: {}",
+        st.message
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let ping = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .find(|b| b.contains("shelf audit"))
+        .expect("a shelf-audit ping fired");
+    assert!(
+        ping.contains("expired"),
+        "ping carries the expired reason: {ping}"
+    );
+}
+
+#[tokio::test]
+async fn audit_batches_pings_above_three() {
+    let Some(store) = store_or_skip("audit-batch").await else {
+        return;
+    };
+    let names = ["a1", "a2", "a3", "a4", "a5"];
+    for n in names {
+        seed_offered_game(&store, "GKD", n, |_| {}).await;
+        seed_listable_sibling(
+            &store,
+            "GKD",
+            &format!("{n}_row_choice_steam"),
+            &format!("Title {n}"),
+        )
+        .await;
+    }
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let tpk_names: Vec<String> = names.iter().map(|n| format!("{n}_row_choice_steam")).collect();
+    let tpk_refs: Vec<&str> = tpk_names.iter().map(String::as_str).collect();
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKD", "some_month_choice", tpk_refs.as_slice())],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+    handle(&deps, FulfillRequest::Sync).await; // pass 1: clean
+
+    let states: Vec<(&str, &str, bool, bool)> = tpk_names
+        .iter()
+        .map(|tpk| (tpk.as_str(), "Revealed", true, false))
+        .collect();
+    remount_order_with_states(&humble, "GKD", "some_month_choice", &states).await;
+    handle(&deps, FulfillRequest::Sync).await; // pass 2: all five revealed on humble
+
+    for n in names {
+        let sibling_id = game_id("GKD", &format!("{n}_row_choice_steam"));
+        let sibling = deps.store.get_game(&sibling_id).await.unwrap().unwrap();
+        assert_eq!(
+            sibling.status,
+            GameStatus::BenRedeemed,
+            "{sibling_id} delisted"
+        );
+    }
+
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("5 audit-pulled"),
+        "summary must report all five pulls: {}",
+        st.message
+    );
+
+    let dreqs = discord.received_requests().await.unwrap();
+    let shelf_pings: Vec<String> = dreqs
+        .iter()
+        .map(|r| String::from_utf8(r.body.clone()).unwrap())
+        .filter(|b| b.contains("shelf audit"))
+        .collect();
+    assert_eq!(
+        shelf_pings.len(),
+        1,
+        "more than 3 pulls must collapse into exactly ONE batched ping, got {shelf_pings:?}"
+    );
+    let ping = &shelf_pings[0];
+    assert!(
+        ping.contains("pulled 5 listed games"),
+        "batch ping text: {ping}"
+    );
+    for n in names {
+        assert!(
+            ping.contains(&format!("Title {n}")),
+            "batch ping lists every title ({n} missing): {ping}"
+        );
+    }
+}

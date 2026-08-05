@@ -3357,6 +3357,11 @@ async fn run_sync(deps: &Deps) {
     // Built as the order walk reads orders; handed to choice discovery for order-authoritative
     // claimed-sets (spec D3) and the D2 gamekey ladder. Lives past the loop.
     let mut order_index = OrderIndex::default();
+    // Order-walk truth for every key this pass actually FETCHED (#158 shelf-truth audit) — keyed
+    // by (gamekey, machine_name) so it matches a row regardless of which id the D7 routing ladder
+    // wrote its fresh copy under. A gamekey whose order read failed never inserts here: absence is
+    // the rule, not a special case — see `shelf_truth_audit`.
+    let mut truth: TruthMap = std::collections::HashMap::new();
 
     'orders: for gamekey in gamekeys {
         tokio::time::sleep(SYNC_PACE).await;
@@ -3408,6 +3413,20 @@ async fn run_sync(deps: &Deps) {
 
         let mut order_failed = false;
         for key in &order.keys {
+            // #158 shelf-truth audit: record this key's redeemed/expired truth BEFORE the D7
+            // routing ladder below decides where the fresh write lands. A plain tpk's write always
+            // targets game_id(gamekey, machine_name) — the audit will find that row already
+            // corrected by the walk itself. A choice-suffixed tpk whose write D7 diverts onto its
+            // offered sibling is the one case the walk's own write bypasses; the audit is what
+            // catches that frozen tpk-named row.
+            truth.insert(
+                (order.gamekey.clone(), key.machine_name.clone()),
+                TruthEntry {
+                    redeemed: key.redeemed,
+                    expired: key.expired,
+                    key: key.clone(),
+                },
+            );
             // Spec D7: a choice-suffixed tpk may be the post-claim record of a game discovery
             // already surfaced under the OFFERED name — route onto that row so merge_sync flips it
             // (requires_choice true→false), instead of minting a sibling (15 live duplicate pairs
@@ -3525,8 +3544,23 @@ async fn run_sync(deps: &Deps) {
     // never fails the sync.
     enrich_steam_apps(deps, enrich_deadline).await;
 
+    // Shelf-truth audit (#158): the every-sync backstop for the D7 frozen-sibling gap — no listable
+    // row may keep referencing a key humble marks revealed or expired. Deliberately unconditional
+    // (no steam gate), same reasoning as the shared scan above.
+    // scan predates discover_choice_games' writes — harmless: offered names never exact-match tpk
+    // names, and a stale-scan write CCFs into SkippedInFlight; next run re-reads.
+    let pulls = match &shared_scan {
+        Some(scan) => shelf_truth_audit(deps, scan, &truth).await,
+        None => 0,
+    };
+
     let msg = if cookie_ok {
-        format!("sync ok: {games_written} written, {orders_failed} order(s) failed")
+        let base = format!("sync ok: {games_written} written, {orders_failed} order(s) failed");
+        if pulls > 0 {
+            format!("{base}, {pulls} audit-pulled")
+        } else {
+            base
+        }
     } else {
         // Covers both a hard-dead session and a heal whose SSM persist failed — either way the
         // DURABLE cookie can't be trusted; the pings that already fired carry the specifics.
@@ -3545,6 +3579,137 @@ async fn run_sync(deps: &Deps) {
     )
     .await;
     tracing::info!(games_written, orders_failed, cookie_ok, "sync finished");
+}
+
+/// Order-walk truth for one tpk, keyed by (gamekey, machine_name).
+struct TruthEntry {
+    redeemed: bool,
+    expired: bool,
+    key: KeyEntry,
+}
+
+type TruthMap = HashMap<(String, String), TruthEntry>;
+
+/// The shelf-truth audit (#158): the order walk's own write only ever lands on the id its D7
+/// routing ladder picks — for a plain tpk that's the same-id row (already corrected by the walk
+/// itself, minutes before this runs), but for a choice-suffixed tpk whose offered sibling exists,
+/// the routing ladder diverts the fresh write onto the OFFERED row and the tpk-named sibling is
+/// never revisited. That frozen sibling can go on listing a key humble has since marked redeemed
+/// (revealed outside the app) or expired, forever, unless something else corrects it. This pass is
+/// that correction: every listable row whose (gamekey, machine_name) this pass's order walk
+/// actually fetched, cross-checked against the walk's own truth.
+///
+/// Absence is the rule, not a special case: a row whose (gamekey, machine_name) tuple never
+/// appears in `truth` — because its order read failed this pass, or the walk never saw that tuple
+/// at all — is left completely untouched. The audit only ever acts on truth the walk itself
+/// fetched; it never infers anything from a row's absence from the fetched set.
+///
+/// Returns the number of rows pulled (written) this pass, for the sync summary.
+async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 {
+    struct Pulled {
+        title: String,
+        id: String,
+        reason: &'static str,
+        is_gift: Option<bool>,
+    }
+    let mut pulled: Vec<Pulled> = Vec::new();
+
+    for g in scan.iter().filter(|g| g.is_listable()) {
+        let Some(entry) = truth.get(&(g.gamekey.clone(), g.machine_name.clone())) else {
+            // Never seen by this pass's order walk (order failed, or simply a different tuple) —
+            // absence, not evidence. Leave it alone; a future successful fetch re-checks it.
+            continue;
+        };
+        if !(entry.redeemed || entry.expired) {
+            continue; // walk-fetched and still clean — nothing to correct.
+        }
+
+        // Build the fresh row from the EXISTING `g`, updating ONLY the truth fields — this is a
+        // correction of an existing row, not the order-walk's own construction (which needs
+        // order.bundle_name/subproducts that TruthEntry doesn't carry). merge_sync's Available arm
+        // is fresh-wins on bundle/artwork_url/title (domain::merge_sync) — a guessed empty value
+        // here would WIPE real data on every pulled row.
+        let fresh = Game {
+            status: domain::sync_status(entry.redeemed, entry.expired),
+            giftable: entry.key.giftable,
+            key_type: entry.key.key_type.clone(),
+            keyindex: entry.key.keyindex,
+            steam_app_id: entry.key.steam_app_id.or(g.steam_app_id),
+            appid_source: entry
+                .key
+                .steam_app_id
+                .map(|_| AppidSource::Humble)
+                .or(g.appid_source),
+            ..g.clone() // id (own id — NOT the D7 routing ladder: correcting an existing row, not
+                        // minting), title, bundle, artwork_url, gamekey, machine_name, hidden,
+                        // hidden_source, claim_id, requires_choice, owned_by_ben all carry from the
+                        // row being corrected.
+        };
+        let reason = if entry.expired {
+            "expired"
+        } else {
+            "revealed outside the app"
+        };
+
+        match deps.store.upsert_game_from_sync(fresh).await {
+            Ok(SyncWrite::Written) => pulled.push(Pulled {
+                title: g.title.clone(),
+                id: g.id.clone(),
+                reason,
+                is_gift: entry.key.is_gift,
+            }),
+            // Set-driven, not retried: a concurrent claim/write CCFs into SkippedInFlight, and an
+            // already-identical row is Unchanged — both self-correct on the next sync's fresh read.
+            Ok(SyncWrite::SkippedInFlight) | Ok(SyncWrite::Unchanged) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    game_id = %g.id,
+                    "shelf audit: write failed — will retry next sync"
+                );
+            }
+        }
+    }
+
+    if pulled.is_empty() {
+        return 0;
+    }
+
+    if pulled.len() > 3 {
+        let ids: Vec<&str> = pulled.iter().map(|p| p.id.as_str()).collect();
+        let titles: Vec<&str> = pulled.iter().map(|p| p.title.as_str()).collect();
+        tracing::warn!(
+            ids = ?ids,
+            "shelf audit: batch-pulled {} listed games whose keys are spent on humble",
+            pulled.len()
+        );
+        ping(
+            deps,
+            &format!(
+                "shelf audit: pulled {} listed games whose keys are spent on humble: {}",
+                pulled.len(),
+                titles.join(", ")
+            ),
+        )
+        .await;
+    } else {
+        for p in &pulled {
+            tracing::warn!(
+                game_id = %p.id,
+                "shelf audit: pulled a listed game whose key is spent on humble"
+            );
+            let mut text = format!(
+                "shelf audit: pulled {} ({}) — key {} on humble",
+                p.title, p.id, p.reason
+            );
+            if p.is_gift == Some(true) {
+                text.push_str(" (humble marks it a gift)");
+            }
+            ping(deps, &text).await;
+        }
+    }
+
+    pulled.len() as u32
 }
 
 /// Choice-discovery ingest — the **sole intended writer** of `requires_choice = true` (see the
