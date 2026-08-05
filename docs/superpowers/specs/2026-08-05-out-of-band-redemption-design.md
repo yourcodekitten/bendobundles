@@ -103,15 +103,21 @@ game.requires_choice || claim.choice_pre_tpks.is_some()
   the existing title match picks this game's out (the same function and trust level MLU's
   `Some([])` rides to B3; nothing promoted, nothing invented):
   - any title-matched tpk found (redeemed, clean, or ambiguous) → **park + specific ping**
-    naming what was found — a tpk existing for a claim whose choose never ran IS the
-    out-of-band story, and a None-snapshot claim's provenance is too thin to arm an
-    autonomous write. (if A's set ever grows a live SELF member, promoting unique-redeemed to
-    B3 recovery is the recorded follow-up — decided then, with eyes open.)
+    naming what was found — never an autonomous write, SELF included, permanently (OMBB):
+    `None` and `Some([])` are not the same world state — **`Some([])` is a measurement of
+    emptiness; `None` is the absence of a measurement.** on a `None` claim a found tpk cannot
+    be attributed: the MLU story (provisioned after claim) and the stale-legacy story (existed
+    all along) are indistinguishable, and auto-fulfilling would bind an old key to this
+    claim's record and grow the autonomous-write set past the `Some`-only bound enumerated
+    for ben. **auto-recovery is a `Some`-only privilege, because `Some` is a receipt and
+    `None` is a shrug.** the ping carries everything found; the human does the attributing.
   - genuinely nothing in the order for this game → **compensate — now having actually looked.**
   why A-compensates-on-nothing while B1-parks-on-nothing is principled, not inconsistent:
   a `Some` snapshot can HIDE a spent pick (an in-snapshot tpk revealed after the claim — the
-  founding case), so B1's "nothing new" is not "nothing"; A's empty baseline hides nothing —
-  every tpk in the order is visible to its diff. **A's live exposure set is enumerated EMPTY
+  founding case), so B1's "nothing new" is not "nothing"; A's verified-nothing is about the
+  order as it exists NOW — zero tpks present for this game means zero keys anyone could have
+  revealed, whatever the unmeasured claim-time state was. on an unmeasured baseline,
+  automation gets exactly two moves: compensate on verified-nothing, park on anything-found. **A's live exposure set is enumerated EMPTY
   today** (`pending ∧ choice-routed ∧ snapshot None` = 0 — deploy-day changelist below), so
   the refit's cost is zero live members. grammar stays exactly where the spec put it:
   **enriching pings, arming nothing.**
