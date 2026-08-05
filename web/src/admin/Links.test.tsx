@@ -17,6 +17,8 @@ vi.mock('../api', async (importOriginal) => {
     adminRevoke: vi.fn(),
     adminLinkClaims: vi.fn(),
     adminSetLinkNote: vi.fn(),
+    adminSetLinkUnlock: vi.fn(),
+    adminDeleteLinkUnlock: vi.fn(),
   };
 });
 import {
@@ -25,6 +27,8 @@ import {
   adminRevoke,
   adminLinkClaims,
   adminSetLinkNote,
+  adminSetLinkUnlock,
+  adminDeleteLinkUnlock,
   CreateLinkValidationError,
 } from '../api';
 
@@ -316,7 +320,7 @@ describe('Links', () => {
       // Wait for both: api called AND full URL in DOM (after reload settles)
       const expectedUrl = `${window.location.origin}/l/tok-new`;
       await waitFor(() => {
-        expect(adminCreateLink).toHaveBeenCalledWith('Charlie', 1, undefined, undefined);
+        expect(adminCreateLink).toHaveBeenCalledWith('Charlie', 1, undefined, undefined, undefined);
         expect(screen.getByText(expectedUrl)).toBeInTheDocument();
       });
 
@@ -348,6 +352,7 @@ describe('Links', () => {
           1,
           undefined,
           'enjoy the trove!',
+          undefined,
         );
       });
       // Field resets with the rest of the form
@@ -707,5 +712,88 @@ describe('Links', () => {
 
       expect(screen.queryByText('game-hollow-knight')).not.toBeInTheDocument();
     });
+  });
+});
+
+// ── wrapped gifts: seal controls (spec 2026-08-05 §4) ────────────────────────
+
+describe('seal controls', () => {
+  const FUTURE = '2099-12-25T05:00:00Z';
+  const sealedLink: AdminLink = {
+    token: 'tok-sealed',
+    label: 'Maya',
+    claims_allowed: 1,
+    claims_used: 0,
+    revoked: false,
+    expires_at: null,
+    unlock_at: FUTURE,
+    created_at: '2026-07-01T00:00:00Z',
+  };
+
+  it('create form sends the datetime-local pick as an absolute ISO instant', async () => {
+    vi.mocked(adminLinks).mockResolvedValue([]);
+    vi.mocked(adminCreateLink).mockResolvedValue({ token: 't', url_path: '/l/t' });
+    renderLinks();
+    await screen.findByText('new invite link');
+
+    await userEvent.type(screen.getByLabelText('label'), 'Maya');
+    const dt = screen.getByLabelText('unlocks at');
+    fireEvent.change(dt, { target: { value: '2099-12-25T00:00' } });
+    await userEvent.click(screen.getByRole('button', { name: 'create invite link' }));
+
+    await waitFor(() => expect(adminCreateLink).toHaveBeenCalled());
+    const args = vi.mocked(adminCreateLink).mock.calls[0]!;
+    // The browser resolves ben's local wall-clock pick to an instant at write
+    // time (family review: a bare date is how a gift opens at 7pm).
+    expect(args[4]).toBe(new Date('2099-12-25T00:00').toISOString());
+  });
+
+  it('a sealed row shows the chip; an open row shows none and no seal controls', async () => {
+    const openLink: AdminLink = { ...sealedLink, token: 'tok-open', label: 'Dave' };
+    delete (openLink as { unlock_at?: string }).unlock_at;
+    vi.mocked(adminLinks).mockResolvedValue([sealedLink, openLink]);
+    renderLinks();
+
+    await screen.findByText('Maya');
+    expect(screen.getByText(/sealed until/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'unseal Maya' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'unseal Dave' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /move the moment for Dave/ })).toBeNull();
+  });
+
+  it('move-the-moment saves an ISO instant via adminSetLinkUnlock', async () => {
+    vi.mocked(adminLinks).mockResolvedValue([sealedLink]);
+    vi.mocked(adminSetLinkUnlock).mockResolvedValue(undefined);
+    renderLinks();
+    await screen.findByText('Maya');
+
+    await userEvent.click(
+      screen.getByRole('button', { name: 'move the moment for Maya' }),
+    );
+    const dt = screen.getByLabelText('new unlock moment');
+    fireEvent.change(dt, { target: { value: '2099-12-31T00:00' } });
+    await userEvent.click(screen.getByRole('button', { name: 'save unlock for Maya' }));
+
+    await waitFor(() =>
+      expect(adminSetLinkUnlock).toHaveBeenCalledWith(
+        'tok-sealed',
+        new Date('2099-12-31T00:00').toISOString(),
+      ),
+    );
+  });
+
+  it('unseal calls the DELETE verb and surfaces a 409 message inline', async () => {
+    vi.mocked(adminLinks).mockResolvedValue([sealedLink]);
+    vi.mocked(adminDeleteLinkUnlock).mockRejectedValue(
+      new Error('link is not sealed — seals are create-time-only and end at the unlock moment'),
+    );
+    renderLinks();
+    await screen.findByText('Maya');
+
+    await userEvent.click(screen.getByRole('button', { name: 'unseal Maya' }));
+    await waitFor(() =>
+      expect(adminDeleteLinkUnlock).toHaveBeenCalledWith('tok-sealed'),
+    );
+    expect(await screen.findByText(/create-time-only/)).toBeInTheDocument();
   });
 });
