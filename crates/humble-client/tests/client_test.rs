@@ -2079,3 +2079,65 @@ async fn reveal_expired_key_maps_to_key_expired() {
         Err(humble_client::HumbleError::KeyExpired { .. })
     ));
 }
+
+#[tokio::test]
+async fn absent_tpkd_dict_is_a_wire_error_not_an_empty_order() {
+    // #160: a 200 with NO tpkd_dict at all is humble failing to send key truth, not an order
+    // with zero keys. Parsing it Ok(keys: []) made it indistinguishable from genuinely-empty —
+    // the audit then silently skipped every row of the gamekey while the summary read clean.
+    // The deploy-gate script already treats has("tpkd_dict")==false as FETCH-FAIL; this is the
+    // same rule at the parser. Err (not a flag) so every consumer inherits its Err-arm behavior:
+    // the order walk counts orders_failed, reconcile parks, arm A can never see "verified
+    // nothing" from a degraded read — compensate requires Ok, Ok requires the dict.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GK"))
+        .and(query_param("all_tpkds", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "GK",
+            "product": { "human_name": "Test Bundle", "machine_name": "test_bundle" },
+            "subproducts": []
+        })))
+        .mount(&server)
+        .await;
+
+    let err = client(&server).await.order("GK").await.unwrap_err();
+    assert!(
+        matches!(&err, humble_client::HumbleError::TpkdDictAbsent(gk) if gk == "GK"),
+        "absent tpkd_dict must be TpkdDictAbsent, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn present_but_empty_tpkd_dict_is_a_legitimate_empty_order() {
+    // The boundary #160 must NOT move: a tpkd_dict that IS present but holds no tpks (or omits
+    // all_tpks entirely) is humble affirmatively saying "no keys here" — ebook/DRM-free orders
+    // are real. Ok(keys: []) stays the contract for that shape.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/EMPTY1"))
+        .and(query_param("all_tpkds", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "EMPTY1",
+            "product": { "human_name": "Book Bundle", "machine_name": "book_bundle" },
+            "tpkd_dict": {},
+            "subproducts": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/EMPTY2"))
+        .and(query_param("all_tpkds", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "EMPTY2",
+            "product": { "human_name": "Book Bundle 2", "machine_name": "book_bundle_2" },
+            "tpkd_dict": { "all_tpks": [] },
+            "subproducts": []
+        })))
+        .mount(&server)
+        .await;
+
+    let c = client(&server).await;
+    assert!(c.order("EMPTY1").await.unwrap().keys.is_empty());
+    assert!(c.order("EMPTY2").await.unwrap().keys.is_empty());
+}
