@@ -8698,3 +8698,99 @@ async fn mlu_scenario_first_run_resolves_claim_and_delists_sibling() {
         "the shelf-truth audit ping must fire: {bodies:?}"
     );
 }
+
+/// #160: a 200 whose body carries NO `tpkd_dict` is humble failing to send key truth — not an
+/// order with zero keys. Before the fix it parsed `Ok(keys: [])`, so the walk recorded no truth
+/// for the gamekey, the audit skipped every one of its rows, and the summary still read
+/// `0 order(s) failed` — a fetch failure wearing a success's clothes. The two halves asserted
+/// here are the whole point: the failure becomes VISIBLE (counted + reported), and the degraded
+/// read still touches NOTHING (positive-evidence rule: only fetched truth may move a row).
+#[tokio::test]
+async fn absent_tpkd_dict_is_counted_failed_and_delists_nothing() {
+    let Some(store) = store_or_skip("absent-tpkd-dict").await else {
+        return;
+    };
+    // Same miniature MLU shape the audit tests use: offered row + listable sibling under the raw
+    // tpk id — the one row the walk's own write bypasses, so it is exactly the row a silently
+    // skipped audit would strand.
+    seed_offered_game(&store, "GKA", "mlu", |_| {}).await;
+    seed_listable_sibling(&store, "GKA", "mlu_row_choice_steam", "MLU Sibling").await;
+
+    let humble = MockServer::start().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+
+    let deps = sync_deps(
+        store,
+        &humble,
+        &[("GKA", "some_month_choice", &["mlu_row_choice_steam"])],
+        &[],
+        &[],
+        &[],
+        Some(discord.uri()),
+    )
+    .await;
+
+    // Pass 1: healthy order — establishes the sibling is listable and the summary is clean.
+    handle(&deps, FulfillRequest::Sync).await;
+    let sibling_id = game_id("GKA", "mlu_row_choice_steam");
+    assert_eq!(
+        deps.store
+            .get_game(&sibling_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        GameStatus::Available,
+        "pass 1: sibling listable"
+    );
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("0 order(s) failed"),
+        "pass 1 baseline must be a clean summary: {}",
+        st.message
+    );
+
+    // Pass 2: humble returns 200 with the tpkd_dict MISSING ENTIRELY (product/subproducts intact,
+    // so nothing else about the response looks wrong — which is what made this silent).
+    Mock::given(method("GET"))
+        .and(path("/api/v1/order/GKA"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gamekey": "GKA",
+            "product": { "human_name": "Test Choice Month", "machine_name": "some_month_choice" },
+            "subproducts": [],
+        })))
+        .with_priority(1)
+        .mount(&humble)
+        .await;
+    handle(&deps, FulfillRequest::Sync).await;
+
+    // Half one — VISIBLE: the read is counted as a failure and says so in the durable summary.
+    let st: SyncState = deps.store.get_sync_state().await.unwrap().unwrap();
+    assert!(
+        st.message.contains("1 order(s) failed"),
+        "a dict-less 200 must count as a failed order, not a clean pass: {}",
+        st.message
+    );
+    assert!(
+        !st.message.contains("audit-pulled"),
+        "nothing may be audit-pulled from a read that fetched no truth: {}",
+        st.message
+    );
+
+    // Half two — INERT: no row moved. Degraded evidence is not evidence; the sibling stays exactly
+    // as pass 1 left it, waiting for a sync that can actually see humble's answer.
+    assert_eq!(
+        deps.store
+            .get_game(&sibling_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        GameStatus::Available,
+        "a wire-degraded read must never de-list: absence of truth is not truth of absence"
+    );
+}

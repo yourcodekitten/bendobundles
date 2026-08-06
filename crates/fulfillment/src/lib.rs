@@ -246,6 +246,11 @@ fn gift_error_decision(err: &HumbleError) -> Decision {
         HumbleError::Api(_) => Decision::Park,
         HumbleError::Network(_) => Decision::Park,
         HumbleError::Parse(_) => Decision::Park,
+        // #160: only `order()` constructs this — a redeem-write never can — but the match is
+        // exhaustive by design. Park is the only safe classification anyway: a missing
+        // `tpkd_dict` means humble's key truth is UNREADABLE, and unreadable is the one thing
+        // that must never be mistaken for the definite "key is gone" that Compensate requires.
+        HumbleError::TpkdDictAbsent(_) => Decision::Park,
     }
 }
 
@@ -317,6 +322,10 @@ pub fn choose_decision(outcome: &Result<(), HumbleError>) -> Decision {
             // keys) -- classified conservatively as Park; reconcile's order diff decides.
             HumbleError::KeyExpired { .. } => Decision::Park,
             HumbleError::AmbiguousRedeem => Decision::Park,
+            // #160: an order-read failure, never a `choosecontent` outcome — classified for
+            // exhaustiveness. Park regardless: unreadable key truth resolves by reconcile's
+            // diff on a later sync, never by acting on the gap.
+            HumbleError::TpkdDictAbsent(_) => Decision::Park,
         },
     }
 }
@@ -3385,7 +3394,12 @@ async fn run_sync(deps: &Deps) {
                 ping(deps, COOKIE_DEAD_MSG).await;
                 break 'orders;
             }
-            Err(_) => {
+            Err(e) => {
+                // #160 named "no warn" as half the silence: the count told an operator THAT an
+                // order failed but never which one or why, so a systematic wire change (every
+                // order arriving dict-less) read the same as one flaky fetch. The gamekey and
+                // the error are the two facts that separate those.
+                tracing::warn!(gamekey = %gamekey, error = ?e, "order read failed — skipping this gamekey (no truth recorded; audit will not act on it)");
                 orders_failed += 1;
                 continue;
             }
