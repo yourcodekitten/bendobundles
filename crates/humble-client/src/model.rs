@@ -10,8 +10,13 @@ pub(crate) struct GamekeyEntry {
 pub(crate) struct OrderWire {
     pub gamekey: String,
     pub product: ProductWire,
+    /// `None` = the wire omitted the field entirely (#160: humble failed to send key truth →
+    /// `HumbleError::TpkdDictAbsent`). `Some` = humble affirmatively answered, even when the
+    /// dict is empty — that is a legitimately key-less order and still parses to zero keys.
+    /// The distinction is the whole point: `Default`-ing this to an empty dict made a broken
+    /// response indistinguishable from an honest one.
     #[serde(default)]
-    pub tpkd_dict: TpkdDict,
+    pub tpkd_dict: Option<TpkdDict>,
     #[serde(default)]
     pub subproducts: Vec<SubproductWire>,
 }

@@ -264,6 +264,18 @@ pub enum HumbleError {
     Network(#[from] wreq::Error),
     #[error("could not parse humble response: {0}")]
     Parse(serde_json::Error),
+    /// A 200 whose body carries no `tpkd_dict` at all (#160). Humble failed to send key truth
+    /// for this order — which is NOT the same as an order that truthfully has no keys (that
+    /// arrives as a present-but-empty dict and still parses `Ok(keys: [])`; ebook/DRM-free
+    /// orders are real). Modeled as an error, not a flag, so every existing call site inherits
+    /// the correct behavior from its Err arm without new branching: the order walk counts
+    /// `orders_failed` and never inserts the gamekey into the truth map, reconcile parks, and
+    /// the compensate arms — which require positive, fetched evidence — can never see a
+    /// degraded read as "verified nothing." Mirrors the deploy-gate script's rule
+    /// (`has("tpkd_dict")` false → FETCH-FAIL → INCONCLUSIVE), so wire and gate agree.
+    /// Transient by assumption: retried on the next sync like any other read failure.
+    #[error("humble sent order {0} with no tpkd_dict — key truth unavailable, not an empty order")]
+    TpkdDictAbsent(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,12 +672,17 @@ impl HumbleClient {
         let wire: OrderWire = self
             .get_json(&format!("/api/v1/order/{gamekey}?all_tpkds=true"))
             .await?;
+        // #160: absence of the dict is a failed read, not an empty order. Fail here at the client
+        // edge so no caller can mistake missing key truth for verified-nothing — every consumer
+        // already has an Err arm that parks / counts / skips, and those are the right behaviors.
+        let tpkd_dict = wire
+            .tpkd_dict
+            .ok_or_else(|| HumbleError::TpkdDictAbsent(gamekey.to_string()))?;
         Ok(Order {
             gamekey: wire.gamekey,
             bundle_name: wire.product.human_name,
             product_machine_name: wire.product.machine_name,
-            keys: wire
-                .tpkd_dict
+            keys: tpkd_dict
                 .all_tpks
                 .into_iter()
                 .map(|t| {
