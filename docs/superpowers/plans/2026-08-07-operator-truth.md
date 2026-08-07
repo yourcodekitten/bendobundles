@@ -705,25 +705,44 @@ does not compile, not why.** Two things bound the damage, and neither is the doc
 1. **The private-module class specifically cannot silently green it.** `operator_message` is `pub`
    and Step 4 already compiles and runs the module's unit tests through it — a private, renamed or
    moved module breaks **the build** at Step 4, loudly, before the doctest is ever consulted.
-2. **GATE FIX M5 — the check is made CONTINUOUS, not one-time.** OMBB's point, and it is my own
-   ①/② distinction aimed at my own test: *trybuild's `.stderr` is a committed artifact that
-   regresses loudly; a manual read during execution is a single sample.* Make the module private
-   again in a year and a bare doctest still passes. **So pin the error code:**
+2. **GATE FIX M5 — MEASURED, and it KILLS the proposed fix. The error-code pin is DECORATIVE.**
+
+   OMBB proposed ` ```compile_fail,E0XXX ` to convert the one-time manual read into a continuous
+   assertion, flagging that he had not verified it and had no rustc. **I have rustc. I ran the
+   dirty-side experiment — pin the RIGHT code on one doctest and a deliberately WRONG one on an
+   identical doctest:**
 
    ```
-   ```compile_fail,E0XXX
+   /// ```compile_fail,E0308   (correct code)      → test A
+   /// ```compile_fail,E0599   (deliberately wrong) → test B
+   ...
+   test src/lib.rs - B (line 7) - compile fail ... ok      ← WRONG CODE, STILL PASSES
+   test src/lib.rs - A (line 1) - compile fail ... ok
+   test result: ok. 2 passed; 0 failed
    ```
 
-   **Do not guess `E0XXX`.** Step 6 flips the block to a normal doctest, reads the actual
-   diagnostic, and *then* annotates the code it saw. The manual read becomes the way the pin is
-   chosen, and the pin makes it permanent.
+   **A guard that cannot fail is worse than no guard, because it reports.** The annotation is
+   accepted and ignored: `compile_fail` asserts only that compilation failed, and the code is
+   decorative. **Do not add it — it would look like the `.stderr` comparison it replaced.**
 
-   **Residual risk, stated because it is inherited either way:** rustdoc documents error codes as
-   unstable. If a future rustc renumbers or merges the diagnostic, the pin stops matching and the
-   block degrades toward a bare `compile_fail` — i.e. **the guarantee weakens quietly rather than
-   failing loudly.** That is strictly better than no pin (which is quiet from day one) and strictly
-   worse than trybuild's committed `.stderr`. **Recorded so the next reader knows which trade they
-   are standing on.**
+   **So, verbatim, the honest statement (Lilith's wording):** *this pins that it does not compile,
+   not why; the private-module class is not caught.*
+
+   **And rustdoc's own warning adds a second, worse degradation path** (OMBB, from the docs):
+   *"code failing with the current Rust release may work in a future release."* **A bare
+   `compile_fail` can go green because the COMPILER got more permissive** — no code change, no
+   signal. For a security guarantee that is a guard which can retire itself on a toolchain bump.
+
+   **What actually bounds the damage, since the doctest does not:**
+   - the fixture is three lines with no imports, so *any* error ≈ the right error — **except**
+     the private-module class, which is the exact one that bit us;
+   - and that class is separately caught: `operator_message` is `pub` and Step 4 compiles and runs
+     the module's unit tests through it, so a private/renamed/moved module breaks **the build**,
+     loudly, before the doctest is consulted.
+
+   **This is a real reduction from trybuild's committed `.stderr`, recorded rather than papered
+   over.** If it ever matters more than the dependency costs, trybuild is the answer and this
+   paragraph is why.
 
 - [ ] **Step 6: Run it, then verify it fails for the RIGHT reason**
 
