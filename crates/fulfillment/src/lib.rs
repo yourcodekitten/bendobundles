@@ -4432,13 +4432,16 @@ async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     let body = serde_json::json!({ "content": content });
     match http.post(url).json(&body).send().await {
         Ok(r) if r.status().is_success() => 0,
-        // DIRTY-SIDE PROBE — THIS COMMIT IS DELIBERATELY BROKEN AND IS REVERTED BY THE NEXT ONE.
-        // The real arm is deleted and replaced with the bug it exists to prevent: a non-2xx
-        // response routed into the success path. `Ok(_) => 0` rather than removing the arm outright
-        // BECAUSE a missing arm is a non-exhaustive-match COMPILE ERROR, and a compile error would
-        // prove only that the code stopped building — not that the test can observe the defect.
-        // The dirty side has to fail as a BEHAVIOUR.
-        Ok(_) => 0,
+        // The status IS inspected. Without this arm a 400/401/404/429 is `Ok(response)` and
+        // vanishes into the success path.
+        Ok(r) => {
+            tracing::error!(
+                outcome = "discord_non_2xx",
+                status = r.status().as_u16(),
+                "operator notification rejected"
+            );
+            1
+        }
         Err(e) => {
             // GATE BLOCKER (OMBB, #171): `without_url()` is load-bearing, not tidying.
             // `reqwest::Error`'s `Display` APPENDS the request URL, unredacted —
