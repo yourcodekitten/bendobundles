@@ -143,36 +143,65 @@ var*. Twenty silent no-ops a day become one loud event at boot.
 
 **Interfaces:**
 - Consumes: `deliver` from Task 1.
-- Produces: `pub enum Notify { Webhook(String), Disabled }` and
-  `pub fn Notify::from_env(url: Option<String>, disabled: bool) -> Result<Notify, &'static str>`.
+- Produces: `pub enum Notify { Webhook(String), Disabled, Unresolved }` and
+  `pub fn Notify::resolve(url: Option<String>, disabled: bool) -> Notify` (**infallible**).
   `Deps.webhook_url: Option<String>` is **replaced** by `Deps.notify: Notify`.
+
+**GATE RULING (OMBB, reversed after Lilith's challenge — SOFT-START, DO NOT EXIT):** an earlier
+draft of this task exited the process on unresolvable config. **That is wrong in this runtime and
+I measured why:** `crates/fulfillment/src/main.rs:84` resolves the webhook **before**
+`lambda_runtime::run(...)` at `:90` — i.e. in the **init phase**. In Lambda a cold start is *caused
+by an invocation*, so init and request are the same instant: an init failure fails the order that
+woke the container, and the next order creates a new container and fails identically. **Exit-at-boot
+here is a total fulfilment outage caused by a monitoring misconfiguration.**
+
+The two axes both survive and answer different questions:
+- *transient/external vs permanent/internal* → **should this be LOUD?** A missing env var is a
+  deployment defect, not weather. **Yes.**
+- *safety gate vs observability channel* → **should this HALT?** Ben not hearing about an order is
+  bad; the order not being fulfilled is worse. **No.**
+
+**Synthesis: fail LOUD, not CLOSED.** `Unresolved` is a third state — it behaves like `Disabled` at
+runtime (sends nothing, breaks nothing) and is **loud and distinct at init**, which preserves the
+whole point of defect (A): *deliberately off* and *misconfigured* must never collapse into one
+state. `NOTIFY_DISABLED=1` is now mere alarm suppression, **not a safety valve**, so it is no longer
+a blocking requirement — which also retires the "flag someone must remember to set" hazard.
 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
-fn notify_missing_url_and_not_disabled_is_a_construction_error() {
-    assert!(Notify::from_env(None, false).is_err());
+fn missing_url_is_unresolved_not_disabled() {
+    // The whole point of defect (A): these two must never collapse into one state.
+    assert!(matches!(Notify::resolve(None, false), Notify::Unresolved));
 }
 
 #[test]
-fn notify_disabled_flag_is_explicit_and_ok() {
-    assert!(matches!(Notify::from_env(None, true), Ok(Notify::Disabled)));
+fn explicit_disable_is_disabled_not_unresolved() {
+    assert!(matches!(Notify::resolve(None, true), Notify::Disabled));
 }
 
 #[test]
-fn notify_url_present_is_ok() {
-    assert!(matches!(Notify::from_env(Some("https://x".into()), false), Ok(Notify::Webhook(_))));
+fn url_present_is_webhook() {
+    assert!(matches!(Notify::resolve(Some("https://x".into()), false), Notify::Webhook(_)));
+}
+
+#[test]
+fn resolve_never_halts_the_process() {
+    // Pins the gate ruling: config resolution is INFALLIBLE. If this ever returns Result or
+    // panics, a monitoring misconfiguration can take Ben's fulfilment down. See the gate note.
+    let _ = Notify::resolve(None, false);
 }
 ```
 
-**GATE BLOCKING CONDITION (OMBB, 2026-08-07): the disabled path is the safety valve and must be
-tested, because its failure mode is Ben's orders stopping.** Three distinct states, each pinned:
+**GATE (OMBB, downgraded from blocking after the reversal): with soft-start, `NOTIFY_DISABLED=1`
+is alarm suppression, not a safety valve — so it is no longer load-bearing. The "sends nothing"
+test is kept anyway, because it is cheap and it pins the runtime behaviour of BOTH silent states.**
 
 ```
-unset / malformed  → EXIT           (misconfiguration)
-NOTIFY_DISABLED=1  → boot, log once (deliberate)
-valid              → boot           (normal)
+unset / malformed  → boot, LOUD error log (Unresolved)  — alarm target, fulfilment unaffected
+NOTIFY_DISABLED=1  → boot, warn once     (Disabled)     — deliberate, alarm suppressed
+valid              → boot                (Webhook)      — normal
 ```
 
 Add to Task 8's wiremock suite (it needs a server to assert "sent nothing"):
@@ -203,21 +232,31 @@ Expected: FAIL — `Notify` not found.
 - [ ] **Step 3: Implement**
 
 ```rust
-/// How this process reaches the operator. Resolved ONCE at startup so a missing webhook is one
-/// loud event at boot instead of twenty silent no-ops a day. A use-time `else { return; }` can
-/// never distinguish "deliberately off" from "someone dropped the env var".
+/// How this process reaches the operator. Resolved ONCE at init so a missing webhook is one loud
+/// event per cold start instead of twenty silent no-ops a day.
+///
+/// A use-time `else { return; }` can never distinguish "deliberately off" from "someone dropped
+/// the env var" — that collapse IS defect (A). Three states keep them apart.
+///
+/// INFALLIBLE BY DESIGN. This runs in the Lambda init phase, and a cold start is caused by an
+/// invocation — so init and request are the same instant. Halting here fails the order that woke
+/// the container, and every order after it. Notification config is OBSERVABILITY, not a safety
+/// gate: fail LOUD, never CLOSED. Do not change this to return Result.
 #[derive(Clone, Debug)]
 pub enum Notify {
     Webhook(String),
+    /// Deliberately off (NOTIFY_DISABLED=1). Silent by request; suppresses the alarm.
     Disabled,
+    /// Misconfigured. Behaves like Disabled at runtime, but is LOUD at init and distinct in logs.
+    Unresolved,
 }
 
 impl Notify {
-    pub fn from_env(url: Option<String>, disabled: bool) -> Result<Notify, &'static str> {
+    pub fn resolve(url: Option<String>, disabled: bool) -> Notify {
         match (url, disabled) {
-            (Some(u), _) => Ok(Notify::Webhook(u)),
-            (None, true) => Ok(Notify::Disabled),
-            (None, false) => Err("no DISCORD_WEBHOOK_PARAM value and NOTIFY_DISABLED is not set"),
+            (Some(u), _) => Notify::Webhook(u),
+            (None, true) => Notify::Disabled,
+            (None, false) => Notify::Unresolved,
         }
     }
 }
@@ -227,21 +266,28 @@ In `main.rs`, after the existing `webhook_url` resolution:
 
 ```rust
 let notify_disabled = std::env::var("NOTIFY_DISABLED").as_deref() == Ok("1");
-let notify = match Notify::from_env(webhook_url, notify_disabled) {
-    Ok(n) => n,
-    Err(why) => {
-        tracing::error!(reason = why, "operator notifications unresolvable — refusing to start");
-        std::process::exit(1);
-    }
-};
-if matches!(notify, Notify::Disabled) {
-    tracing::warn!("operator notifications are EXPLICITLY DISABLED (NOTIFY_DISABLED=1)");
+let notify = Notify::resolve(webhook_url, notify_disabled);
+match notify {
+    // LOUD, not CLOSED. This structured line is the metric-filter/alarm target: it pages
+    // "this deploy is running with notifications unresolvable" without coupling fulfilment
+    // to monitoring. The process continues; orders are never held hostage to a missing var.
+    Notify::Unresolved => tracing::error!(
+        outcome = "notify_unresolved",
+        "operator notifications UNRESOLVABLE — running blind; fulfilment continues"
+    ),
+    Notify::Disabled => tracing::warn!(
+        outcome = "notify_disabled",
+        "operator notifications explicitly disabled (NOTIFY_DISABLED=1)"
+    ),
+    Notify::Webhook(_) => {}
 }
 ```
 
 Change `Deps.webhook_url: Option<String>` to `pub notify: Notify`, and `ping`'s guard to:
 
 ```rust
+// Both non-Webhook states send nothing. They are distinguished at INIT, not here — that
+// separation is defect (A)'s fix.
 let Notify::Webhook(url) = &deps.notify else { return; };
 ```
 
