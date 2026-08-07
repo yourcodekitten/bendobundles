@@ -137,7 +137,10 @@ var*. Twenty silent no-ops a day become one loud event at boot.
 **Files:**
 - Modify: `crates/fulfillment/src/main.rs:84-88` (webhook resolution), `:206-210` (`Deps`)
 - Modify: `crates/fulfillment/src/lib.rs` (`Deps.webhook_url` → `Deps.notify`)
-- **Modify (REVIEW FIX B2 — every `Deps { … }` construction site, 7 total across 3 files):**
+- **Modify: `crates/fulfillment/src/main.rs:15-33` (`get_secret` → returns `SecretRead`).**
+  **GATE FIX B2: this file was missing from the list, so the four-state finding was documented and
+  then dropped — a filed finding is not a fixed one, inside the task that files it.**
+- **Modify (GATE/REVIEW FIX B2 — every `Deps { … }` construction site, 7 total across 3 files):**
   `crates/fulfillment/src/lib.rs`, `crates/fulfillment/src/main.rs`,
   `crates/fulfillment/tests/handler_test.rs`. Substitution is mechanical and exact:
   `webhook_url: None` → `notify: Notify::Disabled`;
@@ -147,8 +150,13 @@ var*. Twenty silent no-ops a day become one loud event at boot.
 
 **Interfaces:**
 - Consumes: `deliver` from Task 1.
-- Produces: `pub enum Notify { Webhook(String), Disabled, Unresolved }` and
-  `pub fn Notify::resolve(url: Option<String>, disabled: bool) -> Notify` (**infallible**).
+- Produces:
+  - `pub enum SecretRead { Resolved(String), DeliberatelyOff, ReadFailed }`
+  - `async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> SecretRead` (**changed from
+    `Option<String>`** — this is the four-state fix, GATE FIX B2)
+  - `pub enum Notify { Webhook(String), Disabled, Unresolved }`
+  - `pub fn Notify::resolve(read: SecretRead, disabled: bool) -> Notify` (**infallible**; takes
+    `SecretRead`, **not** `Option`, or `ReadFailed` can never reach it)
   `Deps.webhook_url: Option<String>` is **replaced** by `Deps.notify: Notify`.
 
 **GATE RULING (OMBB, reversed after Lilith's challenge — SOFT-START, DO NOT EXIT):** an earlier
@@ -275,27 +283,37 @@ a blocking requirement — which also retires the "flag someone must remember to
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
+// GATE FIX B2: these now exercise SecretRead's THREE states. The old versions passed
+// Option, which meant ReadFailed could never reach resolve() and the whole four-state
+// finding was unreachable from any test.
+
 #[test]
-fn missing_url_is_unresolved_not_disabled() {
-    // The whole point of defect (A): these two must never collapse into one state.
-    assert!(matches!(Notify::resolve(None, false), Notify::Unresolved));
+fn ssm_read_failure_is_unresolved_not_disabled() {
+    // THE four-state fix: an SSM error is WEATHER, and must never be recorded as intent.
+    assert!(matches!(Notify::resolve(SecretRead::ReadFailed, false), Notify::Unresolved));
 }
 
 #[test]
-fn explicit_disable_is_disabled_not_unresolved() {
-    assert!(matches!(Notify::resolve(None, true), Notify::Disabled));
+fn deliberately_off_is_disabled_not_unresolved() {
+    assert!(matches!(Notify::resolve(SecretRead::DeliberatelyOff, false), Notify::Disabled));
 }
 
 #[test]
-fn url_present_is_webhook() {
-    assert!(matches!(Notify::resolve(Some("https://x".into()), false), Notify::Webhook(_)));
+fn explicit_disable_flag_also_yields_disabled() {
+    assert!(matches!(Notify::resolve(SecretRead::DeliberatelyOff, true), Notify::Disabled));
+}
+
+#[test]
+fn resolved_value_is_webhook() {
+    let r = SecretRead::Resolved("https://x".into());
+    assert!(matches!(Notify::resolve(r, false), Notify::Webhook(_)));
 }
 
 #[test]
 fn resolve_never_halts_the_process() {
     // Pins the gate ruling: config resolution is INFALLIBLE. If this ever returns Result or
-    // panics, a monitoring misconfiguration can take Ben's fulfilment down. See the gate note.
-    let _ = Notify::resolve(None, false);
+    // panics, a monitoring misconfiguration can take Ben's fulfilment down.
+    let _ = Notify::resolve(SecretRead::ReadFailed, false);
 }
 ```
 
@@ -309,25 +327,10 @@ NOTIFY_DISABLED=1  → boot, warn once     (Disabled)     — deliberate, alarm 
 valid              → boot                (Webhook)      — normal
 ```
 
-Add to Task 8's wiremock suite (it needs a server to assert "sent nothing"):
-
-```rust
-#[tokio::test]
-async fn disabled_notify_posts_absolutely_nothing() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(0)                      // <- the assertion: zero POSTs, verified on drop
-        .mount(&server)
-        .await;
-    let deps = test_deps(Notify::Disabled, &server.uri());
-    ping_msg(&deps, &OperatorMessage::literal("should never be sent")).await;
-    // MockServer::verify() runs on drop and fails the test if expect(0) was violated.
-}
-```
-
-**Untested, the valve is a claim about today's code — and it is the one path whose failure mode is
-an outage.**
+**This test lives in Task 8** (it needs a wiremock server). **GATE FIX B3: an earlier draft had a
+working copy HERE and an empty comments-only copy THERE — two versions, and the one in the task
+that owns it was the empty one.** Task 8 now holds the single working version, with a live control
+server proving the harness can see a POST at all.
 
 - [ ] **Step 2: Run and watch them fail**
 
@@ -357,21 +360,68 @@ pub enum Notify {
 }
 
 impl Notify {
-    pub fn resolve(url: Option<String>, disabled: bool) -> Notify {
-        match (url, disabled) {
-            (Some(u), _) => Notify::Webhook(u),
-            (None, true) => Notify::Disabled,
-            (None, false) => Notify::Unresolved,
+    pub fn resolve(read: SecretRead, disabled: bool) -> Notify {
+        match (read, disabled) {
+            (SecretRead::Resolved(u), _) => Notify::Webhook(u),
+            (SecretRead::DeliberatelyOff, _) => Notify::Disabled,
+            // Weather, never intent. Loud at init, silent at runtime, distinct in logs.
+            (SecretRead::ReadFailed, _) => Notify::Unresolved,
         }
     }
 }
 ```
 
+**And `get_secret` itself — GATE FIX B2, the step that was missing entirely.** In `main.rs`, replace
+lines 15–33:
+
+```rust
+/// What an SSM secret read actually found. `Option<String>` collapsed FOUR states into `None`:
+/// param absent, `UNSET` placeholder, empty value, and an SSM/KMS/IAM **error**. The fourth is
+/// transient external weather being recorded as permanent internal intent — see the design note.
+pub enum SecretRead {
+    Resolved(String),
+    /// Absent, `UNSET`, or empty — all deliberate: terraform's `discord_webhook_enabled = false`
+    /// and the pre-population placeholder both land here.
+    DeliberatelyOff,
+    /// The read FAILED. Throttle, KMS grant, IAM, network. NOT a statement about intent.
+    ReadFailed,
+}
+
+async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> SecretRead {
+    match client.get_parameter().name(param).with_decryption(true).send().await {
+        Ok(out) => match out.parameter().and_then(|p| p.value()) {
+            Some(v) if !v.is_empty() && v != "UNSET" => SecretRead::Resolved(v.to_string()),
+            _ => SecretRead::DeliberatelyOff,
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, param, "SSM get_parameter (secret) failed");
+            SecretRead::ReadFailed
+        }
+    }
+}
+```
+
+**Every other `get_secret` caller must be updated** — `main.rs:75`, `:85`, `:181`, `:182`. Those
+paths want the old behaviour (a value or nothing), so give them an explicit adapter rather than
+letting the distinction leak where it isn't wanted:
+
+```rust
+impl SecretRead {
+    /// For callers that genuinely only need "a value or nothing" (the cookie/password/TOTP
+    /// paths). Explicit, so the collapse is a decision at the call site rather than a default.
+    pub fn value(self) -> Option<String> {
+        match self { SecretRead::Resolved(v) => Some(v), _ => None }
+    }
+}
+```
+Call sites become `get_secret(&ssm_client, param).await.value()`.
+
 In `main.rs`, after the existing `webhook_url` resolution:
 
 ```rust
 let notify_disabled = std::env::var("NOTIFY_DISABLED").as_deref() == Ok("1");
-let notify = Notify::resolve(webhook_url, notify_disabled);
+// NOTE: webhook_read is a SecretRead, NOT an Option — that is the four-state fix.
+let notify = Notify::resolve(webhook_read, notify_disabled);
 match notify {
     // LOUD, not CLOSED. This structured line is the metric-filter/alarm target: it pages
     // "this deploy is running with notifications unresolvable" without coupling fulfilment
@@ -410,8 +460,16 @@ git commit -S -m "fix(notify): resolve notification config at load, not per call
 
 An unconfigured webhook returned success from every call site and every log — a prod deploy
 that lost its URL was indistinguishable from one that notified. Same defect as
-oldmanbendobot/claude-code-infra#44. Now: URL present, or NOTIFY_DISABLED=1 logged once at
-boot, or the process refuses to start."
+oldmanbendobot/claude-code-infra#44.
+
+GATE FIX M1: an earlier draft of this message said 'or the process refuses to start'. That was
+the PRE-REVERSAL ruling and the task implements the opposite. In Lambda a cold start is caused
+by an invocation, so exiting at init fails the order that woke the container and every order
+after it. Notification config is observability, not a safety gate: fail LOUD, not CLOSED.
+
+Now: Resolved -> Webhook; DeliberatelyOff -> Disabled (warn once); ReadFailed -> Unresolved
+(loud structured error, alarm target, fulfilment unaffected). get_secret stops returning
+Option, which collapsed four states -- including an SSM error, which is weather, not intent."
 ```
 
 ---
@@ -459,6 +517,16 @@ mod tests {
         let s = ErrorSummary::of(&Leaky);
         let m = OperatorMessage::with(&[Part::Text("store write failed"), Part::Error(s)]);
         assert!(!m.as_str().contains("SECRET-KEY-abc123"), "payload leaked: {}", m.as_str());
+    }
+
+    // GATE FIX M3: ids must be distinct WITHIN a process. Cross-container distinctness comes
+    // from the log-stream base, which is absent locally — stated so nobody reads this test as
+    // proving more than it does.
+    #[test]
+    fn req_ids_are_distinct_within_a_process() {
+        let a = ErrorSummary::of(&Leaky).req_id().to_string();
+        let b = ErrorSummary::of(&Leaky).req_id().to_string();
+        assert_ne!(a, b, "two summaries minted the same join key");
     }
 
     #[test]
@@ -517,17 +585,38 @@ impl ErrorSummary {
     }
 }
 
-/// 8 hex chars from the process-unique counter + nanos. Not cryptographic; only needs to be
-/// unique enough to join an operator line to a CloudWatch record.
+/// A join key for "operator line ↔ CloudWatch record".
+///
+/// GATE FIX M3 (escalated to blocker by Lilith): the first version was
+/// `format!("{:08x}", (t << 16) ^ n)` over `subsec_nanos`. Three faults, and the third is the
+/// one that matters:
+///   1. `{:08x}` is a MINIMUM width — ~46 bits renders as ~12 chars, not the documented 8.
+///   2. Entropy is bounded by CLOCK GRANULARITY, not by the nanos field's width. A ~1ms tick
+///      gives ~1000 distinct values per second, not 10^9.
+///   3. No container discriminator — and CloudWatch aggregates ACROSS containers. Two cold
+///      starts in the same tick mint the same id.
+///
+/// **A colliding join key is worse than no join key.** With no id you know you cannot join and
+/// you read the window. With a colliding id you grep it at 3am and get two incidents
+/// interleaved with nothing saying so — you debug a composite. And the collision probability
+/// PEAKS during a burst, which is exactly when you would use it.
+///
+/// So: no timestamp entropy at all. Use the identifier the platform already partitions the logs
+/// by. `AWS_LAMBDA_LOG_STREAM_NAME` is unique per container, already present, and is the very
+/// stream an operator opens. Read once, suffixed with a per-process counter.
 fn new_req_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static CONTAINER: OnceLock<String> = OnceLock::new();
     static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
-    format!("{:08x}", (t << 16) ^ n)
+    let base = CONTAINER.get_or_init(|| {
+        std::env::var("AWS_LAMBDA_LOG_STREAM_NAME")
+            .ok()
+            .and_then(|s| s.rsplit(']').next().map(str::to_string))  // the container suffix
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "local".to_string())
+    });
+    format!("{base}-{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
 pub enum Part<'a> {
@@ -596,11 +685,29 @@ where anyone reading the docs also reads the guarantee:
 pub struct OperatorMessage(String);
 ```
 
-**Note the pass condition and why it is safe here:** a `compile_fail` doctest passes when the block
-*fails to compile*, so in principle it could pass for the wrong reason — the same defect the plan
-review caught in the `trybuild` version. It is safe **because the fixture is three lines with no
-imports and no fixture setup**: the only thing that can fail is the constructor call. Verify once
-by hand at Step 6 anyway.
+**🔴 STATED LIMIT (Lilith, gate round) — do not let `compile_fail` look equivalent to what it
+replaced.** The property my review actually bought was *"the `.stderr` names the RIGHT error"*;
+`trybuild` was merely how I got it. **A bare `compile_fail` doctest asserts only THAT compilation
+failed, never WHICH error** — so a typo, a rename, a missing `use`, or a moved module would make it
+green for the wrong reason. **That is the defect I caught, re-opened by my own substitution.**
+
+Pinning the code (` ```compile_fail,E0308 `) is **rejected**: rustdoc treats error codes as
+unstable and discourages relying on them, so a rustc upgrade that renumbers or merges a diagnostic
+turns the guarantee green-for-nothing, silently. **A trade I would be inheriting rather than
+choosing.**
+
+**So the honest statement, in the plan rather than discovered later: this doctest pins that the code
+does not compile, not why.** Two things bound the damage, and neither is the doctest:
+
+1. **The private-module class specifically cannot silently green it.** `operator_message` is `pub`
+   and Step 4 already compiles and runs the module's unit tests through it — a private, renamed or
+   moved module breaks **the build** at Step 4, loudly, before the doctest is ever consulted.
+2. **Step 6 verifies once, by hand, that it fails for the right reason** — and that manual read *is*
+   the test; the `compile_fail` block is scaffolding around it.
+
+*Any test whose pass condition is "something failed" must assert what failed.* Here that assertion
+is performed once by a human instead of continuously by a machine, and **that is a real reduction
+from the trybuild version, recorded rather than papered over.**
 
 - [ ] **Step 6: Run it, then verify it fails for the RIGHT reason**
 
@@ -705,9 +812,16 @@ fn multi_chunk_messages_are_labelled() {
 fn chunks_never_split_inside_a_bold_delimiter() {
     let body = format!("{}\n**bold**\n{}", "a".repeat(1900), "b".repeat(1900));
     let m = OperatorMessage::literal(Box::leak(body.into_boxed_str()));
+    // GATE FIX M2: the original asserted `stars % 2 == 0` UNCONDITIONALLY, which contradicts
+    // the stated precedence — the bound wins, and a forced cut deliberately emits an odd-star
+    // chunk carrying the ` …` marker. It passed only because the fixture never forced a cut:
+    // passing by input luck. The rule is "balanced OR marked".
     for c in m.chunks(PREFIX) {
-        let stars = c.matches("**").count();
-        assert_eq!(stars % 2, 0, "chunk ends inside a ** pair: {c}");
+        let balanced = c.matches("**").count() % 2 == 0;
+        assert!(
+            balanced || c.ends_with(" …"),
+            "chunk ends inside a ** pair with no forced-cut marker: {c}"
+        );
     }
 }
 ```
@@ -1109,13 +1223,32 @@ Three spec tests had no task. #10 is the guarantee the entire design exists to p
 // notification path; this one pins the promise that tightening it must not cost.
 
 // Spec test #10 — THE central guarantee. Nothing else pins it.
+//
+// GATE FIX B1 + B4: the first version called `ping_msg_for_test`, which NO task produces (it
+// would not compile), and it never called `handle` at all despite its own name — it asserted
+// only that a dead webhook produces failures. The guarantee is a COMPARISON: handle's outcome
+// must be identical with a live webhook and with a dead one.
 #[tokio::test]
 async fn a_dead_webhook_does_not_change_handle_outcome() {
-    let dead = "http://127.0.0.1:1/hook"; // nothing listening
-    let failures = fulfillment::ping_chunks_for_test(dead, "anything").await;
-    assert!(failures > 0, "the send must be recorded as failed");
-    // and the guarantee: ping_msg returns (), so no call site can propagate. Pinned by type:
-    let _: () = { async fn _assert_unit(d: &fulfillment::Deps) { fulfillment::ping_msg_for_test(d).await } };
+    let live = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&live)
+        .await;
+
+    // Same event, same store fixture, only the webhook differs.
+    let with_live = handle(&test_deps(Notify::Webhook(live.uri()), &live.uri()), test_event()).await;
+    let with_dead = handle(
+        &test_deps(Notify::Webhook("http://127.0.0.1:1/hook".into()), &live.uri()),
+        test_event(),
+    )
+    .await;
+
+    assert_eq!(
+        format!("{with_live:?}"),
+        format!("{with_dead:?}"),
+        "a dead webhook changed handle's outcome — the guarantee this whole design preserves"
+    );
 }
 
 // Spec test #4 — transport error, distinct from non-2xx (Task 1 covered only non-2xx).
@@ -1126,13 +1259,28 @@ async fn transport_failure_counts_as_failure() {
 }
 
 // Spec test #2 — NOTIFY_DISABLED sends nothing (Task 2 tested construction only).
+//
+// GATE FIX B3: the first version was COMMENTS ONLY — it built the mock and then called
+// nothing, so zero POSTs happened because nothing ran. It passed regardless of the
+// implementation. That is the vacuous shape this plan's own review was written to catch,
+// reintroduced in the task that fixes vacuous tests.
 #[tokio::test]
-async fn disabled_notify_sends_nothing() {
+async fn disabled_notify_posts_absolutely_nothing() {
     let server = MockServer::start().await;
-    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0)
-        .mount(&server).await;
-    // Deps built with notify: Notify::Disabled — ping_msg must not POST at all.
-    // server.verify() on drop asserts expect(0).
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)                       // the assertion; verified on drop
+        .mount(&server)
+        .await;
+
+    let deps = test_deps(Notify::Disabled, &server.uri());
+    ping_msg(&deps, &OperatorMessage::literal("must never be sent")).await;
+    // Guard against the vacuous case itself: prove the harness CAN see a POST.
+    let control = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1)
+        .mount(&control).await;
+    let live = test_deps(Notify::Webhook(control.uri()), &control.uri());
+    ping_msg(&live, &OperatorMessage::literal("control")).await;
 }
 ```
 
