@@ -419,6 +419,38 @@ pub enum Notify {
 }
 
 impl Notify {
+    /// *** `disabled` IS CONSUMED. It used to be a PASSENGER, and that was a real defect. ***
+    ///
+    /// Every arm here matched `_` on the flag, so `NOTIFY_DISABLED=1` did **nothing** whenever the
+    /// SSM read succeeded — the one case an operator actually reaches for it in. The parameter was
+    /// accepted, threaded from `main.rs`, named in the startup log line ("absent/UNSET param, **or
+    /// NOTIFY_DISABLED=1**"), and relied on by this design's own gate ruling — *"NOTIFY_DISABLED=1
+    /// is the one-env-var escape hatch"* — and consumed by nothing. **A flag the code reads, logs
+    /// about, and never branches on.**
+    ///
+    /// That is precisely this change's subject at a third altitude: a value that rides through the
+    /// whole path as a passenger and never reaches the decision. It shipped because the test named
+    /// for the flag — `explicit_disable_flag_also_yields_disabled` — passed via the
+    /// `DeliberatelyOff` arm and would have passed identically with the flag deleted. **A test can
+    /// be named for the thing it does not test.**
+    ///
+    /// ORDER MATTERS AND IS DELIBERATE: the flag is checked FIRST, so it beats a resolved secret.
+    /// `NOTIFY_DISABLED=1` is alarm SUPPRESSION — deliberate, operator-initiated silence — so it
+    /// also silences `Unresolved`; someone who has asked for quiet should not be paged about the
+    /// quiet they asked for. It is NOT a safety valve for fulfilment, which never depends on it.
+    /// *** NO WILDCARD OVER EITHER INPUT. ALL SIX CELLS ARE WRITTEN OUT. ***
+    ///
+    /// My first fix for this was `(_, true) => Disabled` — which is **a wildcard bug fixed with
+    /// another wildcard**. `_` is asking the compiler for permission to ignore an input and being
+    /// granted it silently; that is exactly how the original defect got in. Enumerated, the
+    /// compiler enforces the matrix for me: add a `SecretRead` variant and this **fails to compile**
+    /// until someone decides what it means with the flag on and with it off.
+    ///
+    /// >>> A test asserts the cell you thought of. Exhaustiveness asserts the cells you didn't. <<<
+    ///
+    /// (`clippy::wildcard_enum_match_arm` would enforce this repo-wide. Not turned on in this PR —
+    /// it is a workspace-wide lint change with its own blast radius, and mixing it in here would
+    /// make a behaviour fix hostage to a lint sweep. Filed as a follow-up.)
     pub fn resolve(read: SecretRead, disabled: bool) -> Notify {
         match (read, disabled) {
             (SecretRead::Resolved(u), _) => Notify::Webhook(u),
@@ -4468,6 +4500,18 @@ async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
     }
 }
 
+/// Test seam: drive the REAL `ping_msg` — `Notify` gate, chunking, delivery, failure record — from
+/// an integration test.
+///
+/// `ping_msg` is private and stays private: it takes `&Deps`, and exposing it would make the
+/// notification path callable from anywhere. This seam exists because the `NOTIFY_DISABLED` and
+/// dead-webhook guarantees are only meaningful when tested through the gate a real caller hits —
+/// a test that reimplements the gate proves the test's copy of it, not the code's.
+#[doc(hidden)]
+pub async fn ping_msg_for_test(deps: &Deps, text: &'static str) {
+    ping_msg(deps, &OperatorMessage::literal(text)).await;
+}
+
 /// Test seam: drive the chunked delivery path against a wiremock server.
 #[doc(hidden)]
 pub async fn ping_chunks_for_test(url: &str, msg: &str) -> u32 {
@@ -4512,6 +4556,32 @@ mod tests {
     fn deliberately_off_is_disabled_not_unresolved() {
         assert!(matches!(
             Notify::resolve(SecretRead::DeliberatelyOff, false),
+            Notify::Disabled
+        ));
+    }
+
+    // *** THE FLAG'S OWN TEST DID NOT TEST THE FLAG. ***
+    // `explicit_disable_flag_also_yields_disabled` passed `(DeliberatelyOff, true)` — which is
+    // Disabled because of the READ, not because of the flag, and would have passed identically
+    // with the flag deleted from the signature. The matrix is 3 reads x 2 flag values = 6 cells;
+    // four were covered and the two uncovered ones were exactly the two where the flag is the
+    // ONLY thing that can decide the answer. A hole in a test matrix is not random: it sits where
+    // the redundant cases were easy to write.
+    #[test]
+    fn disable_flag_overrides_a_resolved_secret() {
+        // THE cell the bug lived in. Before the fix this returned Webhook — NOTIFY_DISABLED=1 was
+        // inert in the only situation an operator ever sets it: notifications currently working.
+        assert!(matches!(
+            Notify::resolve(SecretRead::Resolved("https://x".into()), true),
+            Notify::Disabled
+        ));
+    }
+
+    #[test]
+    fn disable_flag_suppresses_the_unresolved_alarm() {
+        // Suppression is the whole job: someone who asked for quiet must not be paged about it.
+        assert!(matches!(
+            Notify::resolve(SecretRead::ReadFailed, true),
             Notify::Disabled
         ));
     }
