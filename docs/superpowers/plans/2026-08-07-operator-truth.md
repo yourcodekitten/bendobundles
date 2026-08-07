@@ -206,8 +206,22 @@ pub enum SecretRead { Resolved(String), DeliberatelyOff, ReadFailed }
    separate change and is **filed as a follow-up issue when the PR opens**, not smuggled into this
    plan. If it is built, it must be a **post-deploy invocation of the function** (execution-role
    identity), not a CI-side variable check.
-2. **Init — LOUD, NOT CLOSED.** Implemented here. Covers what ① cannot: the config that resolves
-   for the deployer and not for the runtime.
+2. **Init — LOUD, NOT CLOSED.** Implemented here. **② is necessary on TWO independent axes, and
+   both belong in writing or someone deletes it as redundant the first time ① goes green:**
+
+   ```
+   ①  deploy-time, deploy-role identity → catches "never worked"    — POINT IN TIME
+   ②  init, execution-role identity     → catches "stopped working" — CONTINUOUS
+   ```
+
+   - **Different principal.** ① runs as the deploy role; the function runs as its execution role.
+     A KMS grant or SSM path that resolves for one and not the other is invisible to ①.
+     *A verification's executing identity is part of its result.*
+   - **Different clock.** ① is a single sample. **The config can break with no deploy at all** — a
+     parameter deleted, a grant revoked, a secret rotated, a policy tightened by somebody else's
+     terraform. Nothing about ① fires again when that happens. *A point is never a trend.*
+
+   **Neither covers the other.**
 3. **`NOTIFY_DISABLED=1` — alarm suppression, not a safety valve.** Not blocking.
 
 *In a daemon, exit-at-boot is caught by the deployment. In Lambda, it is caught by production
