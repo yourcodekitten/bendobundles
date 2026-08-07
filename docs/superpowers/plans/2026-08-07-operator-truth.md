@@ -1,0 +1,1437 @@
+# Operator Truth Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Make every operator notification in `fulfillment` a verified artifact — delivery is
+checked, configuration is resolved once at boot, messages are bounded and never empty, and no store
+error payload can reach Discord at any current or future call site.
+
+**Architecture:** One seam (`ping`, `crates/fulfillment/src/lib.rs`, ~20 call sites) keeps its
+infallible `-> ()` signature — that is a structural guarantee that a dead webhook cannot break
+fulfilment — while gaining an internal, out-of-band failure record. A new `OperatorMessage` type
+becomes the *only* way text reaches Discord, so secret containment is enforced by the compiler
+rather than by review.
+
+**Tech Stack:** Rust 2021, `reqwest`, `serde_json`, `tracing`, `wiremock` (dev).
+**ZERO new dependencies.** An earlier draft added `trybuild` and `tracing-test`; both were removed
+after checking `Cargo.lock` (neither present — each would be a registry fetch, a lockfile change,
+and new surface for this repo's deps/audit gates, on a 4GB box). Rust's built-in `compile_fail`
+doctest replaces `trybuild` outright, and the id-drift join is testable through a shared pure
+function. **Neither substitution is a compromise — the doctest is strictly better.**
+
+## Global Constraints
+
+- **Spec:** `docs/superpowers/specs/2026-08-07-operator-truth-design.md`. Read it before Task 1.
+- **Build discipline (4GB box, this has caused two OOM kills):** `cargo check` and
+  `cargo test -p fulfillment`. **NEVER `--workspace`. NEVER `--all-targets`. ALWAYS `-j 1`.**
+  Export `CARGO_BUILD_JOBS=1`.
+- **`ping` MUST keep the signature returning `()`.** Never `-> Result`. Never `?` at a call site.
+- **No retry logic anywhere in this plan.** A chunked send is not atomic (`1 of 2 chunks sent` is an
+  observed real outcome); a naive retry double-posts. Out of scope by decision.
+- **No dead-letter row, no new Dynamo item, no new IAM.** Decided: there is no drainer, so a durable
+  queue would be storage with no consumer.
+- Commits are GPG-signed (`git commit -S`). Author is `code kitten <yourcodekitten@gmail.com>`.
+- Branch: `operator-truth`.
+
+---
+
+### Task 1: (C) Verify delivery — a non-2xx must be a failure
+
+Ships first and depends on nothing. Today a `400`/`429` arrives as `Ok(response)` and is never
+inspected.
+
+**Files:**
+- Modify: `crates/fulfillment/src/lib.rs:4403-4411` (`ping`)
+- Test: `crates/fulfillment/src/lib.rs` (in the existing `mod tests`) + a wiremock test in
+  `crates/fulfillment/tests/handler_test.rs`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: nothing new. `ping` keeps signature `async fn ping(deps: &Deps, msg: &str)`.
+
+- [ ] **Step 1: Write the failing test**
+
+In `crates/fulfillment/tests/handler_test.rs`:
+
+```rust
+#[tokio::test]
+async fn ping_treats_non_2xx_as_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let failures = fulfillment::ping_for_test(&server.uri(), "hello").await;
+    assert_eq!(failures, 1, "a 429 must count as a delivery failure, not a success");
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test handler_test ping_treats_non_2xx -- --nocapture`
+Expected: FAIL — `ping_for_test` does not exist.
+
+- [ ] **Step 3: Implement**
+
+Replace the body of `ping` and add the test seam:
+
+```rust
+async fn ping(deps: &Deps, msg: &str) {
+    let Some(url) = deps.webhook_url.as_deref() else {
+        return;
+    };
+    deliver(&deps.http, url, &ping_content(msg)).await;
+}
+
+/// POST one already-rendered body. Returns 1 on failure, 0 on success, so callers can count
+/// without being able to propagate. Never returns Err — a dead webhook must not break fulfilment.
+async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
+    let body = serde_json::json!({ "content": content });
+    match http.post(url).json(&body).send().await.and_then(|r| r.error_for_status()) {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("discord ping failed (non-fatal): {e}");
+            1
+        }
+    }
+}
+
+#[doc(hidden)]
+pub async fn ping_for_test(url: &str, msg: &str) -> u32 {
+    deliver(&reqwest::Client::new(), url, &ping_content(msg)).await
+}
+```
+
+- [ ] **Step 4: Run it and watch it pass**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test handler_test ping_treats_non_2xx`
+Expected: PASS.
+
+- [ ] **Step 5: Dirty-side verify — the test must have teeth**
+
+Temporarily delete `.and_then(|r| r.error_for_status())`, re-run the test, and confirm it **FAILS**.
+Then restore it and confirm it passes again. A guard whose removal does not break a test is not a
+guard.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/fulfillment/src/lib.rs crates/fulfillment/tests/handler_test.rs
+git commit -S -m "fix(ping): a non-2xx discord response is a failure, not a success (#163)
+
+reqwest's Err arm catches transport failure only; a 400/401/404/429 arrived as Ok(response)
+and was never inspected — a failure routed into the success path. error_for_status() moves it
+into the branch that already existed. Discord rate-limits, so notifications were vanishing
+under exactly the load that makes them matter."
+```
+
+---
+
+### Task 2: (A) Resolve notification config once, at load
+
+`else { return; }` at use time cannot distinguish *deliberately off* from *someone dropped the env
+var*. Twenty silent no-ops a day become one loud event at boot.
+
+**Files:**
+- Modify: `crates/fulfillment/src/main.rs:84-88` (webhook resolution), `:206-210` (`Deps`)
+- Modify: `crates/fulfillment/src/lib.rs` (`Deps.webhook_url` → `Deps.notify`)
+- **Modify: `crates/fulfillment/src/main.rs:66` (`load_from_env()` → pinned `RetryConfig`).**
+  **GATE FIX B7: the pin lived only in a rationale block ABOVE Step 1 — declared, not built, and
+  B2's exact twin in the round that fixed B2. It is now Step 3a AND named here, because a step
+  body without a Files entry is half a fix.**
+- **Modify: `crates/fulfillment/src/main.rs:15-33` (`get_secret` → returns `SecretRead`).**
+  **GATE FIX B2: this file was missing from the list, so the four-state finding was documented and
+  then dropped — a filed finding is not a fixed one, inside the task that files it.**
+- **Modify (GATE/REVIEW FIX B2 — every `Deps { … }` construction site, 7 total across 3 files):**
+  `crates/fulfillment/src/lib.rs`, `crates/fulfillment/src/main.rs`,
+  `crates/fulfillment/tests/handler_test.rs`. Substitution is mechanical and exact:
+  `webhook_url: None` → `notify: Notify::Disabled`;
+  `webhook_url: Some(x)` → `notify: Notify::Webhook(x)`.
+  Do not guess a fixture value — those two lines cover every case.
+- Test: `crates/fulfillment/src/lib.rs` `mod tests`
+
+**Interfaces:**
+- Consumes: `deliver` from Task 1.
+- Produces:
+  - `pub enum SecretRead { Resolved(String), DeliberatelyOff, ReadFailed }`
+  - `async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> SecretRead` (**changed from
+    `Option<String>`** — this is the four-state fix, GATE FIX B2)
+  - `pub enum Notify { Webhook(String), Disabled, Unresolved }`
+  - `pub fn Notify::resolve(read: SecretRead, disabled: bool) -> Notify` (**infallible**; takes
+    `SecretRead`, **not** `Option`, or `ReadFailed` can never reach it)
+  `Deps.webhook_url: Option<String>` is **replaced** by `Deps.notify: Notify`.
+
+**GATE RULING (OMBB, reversed after Lilith's challenge — SOFT-START, DO NOT EXIT):** an earlier
+draft of this task exited the process on unresolvable config. **That is wrong in this runtime and
+I measured why:** `crates/fulfillment/src/main.rs:84` resolves the webhook **before**
+`lambda_runtime::run(...)` at `:90` — i.e. in the **init phase**. In Lambda a cold start is *caused
+by an invocation*, so init and request are the same instant: an init failure fails the order that
+woke the container, and the next order creates a new container and fails identically. **Exit-at-boot
+here is a total fulfilment outage caused by a monitoring misconfiguration.**
+
+The two axes both survive and answer different questions:
+- *transient/external vs permanent/internal* → **should this be LOUD?** A missing env var is a
+  deployment defect, not weather. **Yes.**
+- *safety gate vs observability channel* → **should this HALT?** Ben not hearing about an order is
+  bad; the order not being fulfilled is worse. **No.**
+
+**🔴 MEASURED AT SOURCE, and it is the deepest version of defect (A): `get_secret`
+(`main.rs:15-33`) already collapses FOUR states into one `None`.**
+
+```rust
+Ok(out) => out.parameter().and_then(|p| p.value())
+              .filter(|v| !v.is_empty() && *v != "UNSET")   // absent | UNSET | empty  -> None
+              .map(str::to_string),
+Err(e)  => { tracing::warn!(...); None }                     // SSM READ FAILURE       -> None
+```
+
+- param absent (terraform `discord_webhook_enabled = false`) → deliberate
+- `UNSET` placeholder → deliberate, awaiting an operator
+- empty → misconfigured
+- **`Err(e)` — an SSM throttle, KMS-grant, IAM or network failure → TRANSIENT, EXTERNAL WEATHER**
+
+**The fourth is weather being recorded as intent.** An SSM blip at cold start yields `None`, which
+this task would read as "misconfigured", when the very next container may resolve fine. That is
+OMBB's transient/permanent axis inverted, already live in production code.
+
+**And it is exactly why layer ② is structurally necessary rather than a backstop (Lilith):** a
+deploy-time check runs as the **deploy role**; the function runs as its **execution role**. A KMS
+grant or SSM path that resolves for the deployer and not for the runtime produces `Err` → `None` →
+indistinguishable from "deliberately off". **① cannot catch that by construction.** *A
+verification's executing identity is part of its result.*
+
+**🔴 AND `ReadFailed` ITSELF ARRIVES FROM TWO OPPOSITE POPULATIONS (Lilith), indistinguishable at
+init:**
+
+```
+SSM throttle, transient network   → WEATHER    — the next container resolves fine
+KMS grant revoked, IAM tightened  → PERMANENT  — every container fails identically
+```
+
+Same variant, same log line, same instant. **So the alarm on `ReadFailed` must fire on a RATE, not
+on an occurrence** — a sustained fraction of cold starts failing to resolve is a revoked grant; one
+is noise. Alarming on the event would ship the 70%-false-positive shape OMBB caught on his own
+detector this morning and correctly refused. *Instrument the trend, not the trip.*
+
+**And the asymmetry that makes this worse than it looks — measured, not assumed:** resolution runs
+**once per container** (`main.rs:84` before `:90`). **So a transient failure at the SSM layer
+becomes a PERMANENT failure at the application layer, for the life of that container.** A 200ms
+throttle does not cost 200ms of notifications — it costs *every notification that container
+handles*, potentially for hours. **The dependency's blip is your durability**, and that asymmetry is
+invisible in the error itself.
+
+**Mitigation, measured:** `main.rs:66` uses `aws_config::load_from_env()` with **no explicit
+`RetryConfig`**, so the SDK default (standard: 3 attempts, exponential backoff on throttling and
+transient errors) applies. **Retry is therefore on — but nothing in this repo pins it**, so a future
+config change could drop it silently. **Task 2 pins it explicitly** rather than inheriting a default
+that a refactor can remove:
+
+```rust
+let aws_cfg = aws_config::from_env()
+    .retry_config(aws_config::retry::RetryConfig::standard())   // pinned, not inherited
+    .load()
+    .await;
+```
+
+That converts most of the weather population into `Resolved` before it can become a
+container-lifetime condition, and it makes the `ReadFailed` rate signal much closer to
+*actually permanent*.
+
+**So `get_secret` must stop returning `Option`:**
+
+```rust
+pub enum SecretRead { Resolved(String), DeliberatelyOff, ReadFailed }
+
+// Notify::resolve maps them, preserving the distinction end to end:
+//   Resolved(u)      -> Notify::Webhook(u)
+//   DeliberatelyOff  -> Notify::Disabled     (warn once, alarm suppressed)
+//   ReadFailed       -> Notify::Unresolved   (LOUD error, alarm target, fulfilment unaffected)
+```
+
+**Synthesis: fail LOUD, not CLOSED — and hard-fail where it is free.**
+
+**THE THREE LAYERS (final gate ruling, OMBB):**
+1. **Deploy — HARD FAIL**, where no request is in flight. **MEASURED: this repo has no deploy
+   workflow and no smoke step — `.github/workflows/` contains `ci.yml` only, and deploys are manual
+   terraform per `docs/runbook-158-deploy.md`. So layer ① does not exist today.** Building it is a
+   separate change and is **filed as a follow-up issue when the PR opens**, not smuggled into this
+   plan. If it is built, it must be a **post-deploy invocation of the function** (execution-role
+   identity), not a CI-side variable check.
+2. **Init — LOUD, NOT CLOSED.** Implemented here. **② is necessary on TWO independent axes, and
+   both belong in writing or someone deletes it as redundant the first time ① goes green:**
+
+   ```
+   ①  deploy-time, deploy-role identity → catches "never worked"    — POINT IN TIME
+   ②  init, execution-role identity     → catches "stopped working" — CONTINUOUS
+   ```
+
+   - **Different principal.** ① runs as the deploy role; the function runs as its execution role.
+     A KMS grant or SSM path that resolves for one and not the other is invisible to ①.
+     *A verification's executing identity is part of its result.*
+   - **Different clock.** ① is a single sample. **The config can break with no deploy at all** — a
+     parameter deleted, a grant revoked, a secret rotated, a policy tightened by somebody else's
+     terraform. Nothing about ① fires again when that happens. *A point is never a trend.*
+
+   **Neither covers the other.**
+3. **`NOTIFY_DISABLED=1` — alarm suppression, not a safety valve.** Not blocking.
+
+*In a daemon, exit-at-boot is caught by the deployment. In Lambda, it is caught by production
+traffic failing.* (Lilith — the sentence that made the first ruling wrong in an interesting way.) `Unresolved` is a third state — it behaves like `Disabled` at
+runtime (sends nothing, breaks nothing) and is **loud and distinct at init**, which preserves the
+whole point of defect (A): *deliberately off* and *misconfigured* must never collapse into one
+state. `NOTIFY_DISABLED=1` is now mere alarm suppression, **not a safety valve**, so it is no longer
+a blocking requirement — which also retires the "flag someone must remember to set" hazard.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+// GATE FIX B2: these now exercise SecretRead's THREE states. The old versions passed
+// Option, which meant ReadFailed could never reach resolve() and the whole four-state
+// finding was unreachable from any test.
+
+#[test]
+fn ssm_read_failure_is_unresolved_not_disabled() {
+    // THE four-state fix: an SSM error is WEATHER, and must never be recorded as intent.
+    assert!(matches!(Notify::resolve(SecretRead::ReadFailed, false), Notify::Unresolved));
+}
+
+#[test]
+fn deliberately_off_is_disabled_not_unresolved() {
+    assert!(matches!(Notify::resolve(SecretRead::DeliberatelyOff, false), Notify::Disabled));
+}
+
+#[test]
+fn explicit_disable_flag_also_yields_disabled() {
+    assert!(matches!(Notify::resolve(SecretRead::DeliberatelyOff, true), Notify::Disabled));
+}
+
+#[test]
+fn resolved_value_is_webhook() {
+    let r = SecretRead::Resolved("https://x".into());
+    assert!(matches!(Notify::resolve(r, false), Notify::Webhook(_)));
+}
+
+#[test]
+fn resolve_never_halts_the_process() {
+    // Pins the gate ruling: config resolution is INFALLIBLE. If this ever returns Result or
+    // panics, a monitoring misconfiguration can take Ben's fulfilment down.
+    let _ = Notify::resolve(SecretRead::ReadFailed, false);
+}
+```
+
+**GATE (OMBB, downgraded from blocking after the reversal): with soft-start, `NOTIFY_DISABLED=1`
+is alarm suppression, not a safety valve — so it is no longer load-bearing. The "sends nothing"
+test is kept anyway, because it is cheap and it pins the runtime behaviour of BOTH silent states.**
+
+```
+unset / malformed  → boot, LOUD error log (Unresolved)  — alarm target, fulfilment unaffected
+NOTIFY_DISABLED=1  → boot, warn once     (Disabled)     — deliberate, alarm suppressed
+valid              → boot                (Webhook)      — normal
+```
+
+**This test lives in Task 8** (it needs a wiremock server). **GATE FIX B3: an earlier draft had a
+working copy HERE and an empty comments-only copy THERE — two versions, and the one in the task
+that owns it was the empty one.** Task 8 now holds the single working version, with a live control
+server proving the harness can see a POST at all.
+
+- [ ] **Step 2: Run and watch them fail**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib notify_`
+Expected: FAIL — `Notify` not found.
+
+- [ ] **Step 3a: Pin the SDK retry — GATE FIX B7, this had NO step and was rationale only**
+
+`main.rs:66` is `aws_config::load_from_env()`. The SDK default (standard, 3 attempts) applies, so
+retry IS on — **but nothing in this repo pins it, and an inherited default is a property of a
+version, not of your code.** It disappears in a refactor with nothing announcing it, and the
+`ReadFailed`-rate design leans on retry converting weather into `Resolved`.
+
+```rust
+// was: let aws_cfg = aws_config::load_from_env().await;
+let aws_cfg = aws_config::from_env()
+    .retry_config(aws_sdk_ssm::config::retry::RetryConfig::standard())
+    .load()
+    .await;
+```
+
+Verify: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment` compiles. **There is no unit test for this**
+— it is a configuration pin, and asserting the SDK's own retry behaviour would be testing AWS.
+**Stated rather than left as an apparent gap.**
+
+- [ ] **Step 3: Implement**
+
+```rust
+/// How this process reaches the operator. Resolved ONCE at init so a missing webhook is one loud
+/// event per cold start instead of twenty silent no-ops a day.
+///
+/// A use-time `else { return; }` can never distinguish "deliberately off" from "someone dropped
+/// the env var" — that collapse IS defect (A). Three states keep them apart.
+///
+/// INFALLIBLE BY DESIGN. This runs in the Lambda init phase, and a cold start is caused by an
+/// invocation — so init and request are the same instant. Halting here fails the order that woke
+/// the container, and every order after it. Notification config is OBSERVABILITY, not a safety
+/// gate: fail LOUD, never CLOSED. Do not change this to return Result.
+#[derive(Clone, Debug)]
+pub enum Notify {
+    Webhook(String),
+    /// Deliberately off (NOTIFY_DISABLED=1). Silent by request; suppresses the alarm.
+    Disabled,
+    /// Misconfigured. Behaves like Disabled at runtime, but is LOUD at init and distinct in logs.
+    Unresolved,
+}
+
+impl Notify {
+    pub fn resolve(read: SecretRead, disabled: bool) -> Notify {
+        match (read, disabled) {
+            (SecretRead::Resolved(u), _) => Notify::Webhook(u),
+            (SecretRead::DeliberatelyOff, _) => Notify::Disabled,
+            // Weather, never intent. Loud at init, silent at runtime, distinct in logs.
+            (SecretRead::ReadFailed, _) => Notify::Unresolved,
+        }
+    }
+}
+```
+
+**And `get_secret` itself — GATE FIX B2, the step that was missing entirely.** In `main.rs`, replace
+lines 15–33:
+
+```rust
+/// What an SSM secret read actually found. `Option<String>` collapsed FOUR states into `None`:
+/// param absent, `UNSET` placeholder, empty value, and an SSM/KMS/IAM **error**. The fourth is
+/// transient external weather being recorded as permanent internal intent — see the design note.
+pub enum SecretRead {
+    Resolved(String),
+    /// Absent, `UNSET`, or empty — all deliberate: terraform's `discord_webhook_enabled = false`
+    /// and the pre-population placeholder both land here.
+    DeliberatelyOff,
+    /// The read FAILED. Throttle, KMS grant, IAM, network. NOT a statement about intent.
+    ReadFailed,
+}
+
+async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> SecretRead {
+    match client.get_parameter().name(param).with_decryption(true).send().await {
+        Ok(out) => match out.parameter().and_then(|p| p.value()) {
+            Some(v) if !v.is_empty() && v != "UNSET" => SecretRead::Resolved(v.to_string()),
+            _ => SecretRead::DeliberatelyOff,
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, param, "SSM get_parameter (secret) failed");
+            SecretRead::ReadFailed
+        }
+    }
+}
+```
+
+**Every other `get_secret` caller must be updated** — `main.rs:75`, `:85`, `:181`, `:182`. Those
+paths want the old behaviour (a value or nothing), so give them an explicit adapter rather than
+letting the distinction leak where it isn't wanted:
+
+```rust
+impl SecretRead {
+    /// For callers that genuinely only need "a value or nothing" (the cookie/password/TOTP
+    /// paths). Explicit, so the collapse is a decision at the call site rather than a default.
+    pub fn value(self) -> Option<String> {
+        match self { SecretRead::Resolved(v) => Some(v), _ => None }
+    }
+}
+```
+Call sites become `get_secret(&ssm_client, param).await.value()`.
+
+In `main.rs`, after the existing `webhook_url` resolution:
+
+```rust
+let notify_disabled = std::env::var("NOTIFY_DISABLED").as_deref() == Ok("1");
+// NOTE: webhook_read is a SecretRead, NOT an Option — that is the four-state fix.
+let notify = Notify::resolve(webhook_read, notify_disabled);
+match notify {
+    // LOUD, not CLOSED. This structured line is the metric-filter/alarm target: it pages
+    // "this deploy is running with notifications unresolvable" without coupling fulfilment
+    // to monitoring. The process continues; orders are never held hostage to a missing var.
+    Notify::Unresolved => tracing::error!(
+        outcome = "notify_unresolved",
+        "operator notifications UNRESOLVABLE — running blind; fulfilment continues"
+    ),
+    Notify::Disabled => tracing::warn!(
+        outcome = "notify_disabled",
+        "operator notifications explicitly disabled (NOTIFY_DISABLED=1)"
+    ),
+    Notify::Webhook(_) => {}
+}
+```
+
+Change `Deps.webhook_url: Option<String>` to `pub notify: Notify`, and `ping`'s guard to:
+
+```rust
+// Both non-Webhook states send nothing. They are distinguished at INIT, not here — that
+// separation is defect (A)'s fix.
+let Notify::Webhook(url) = &deps.notify else { return; };
+```
+
+- [ ] **Step 4: Run and watch them pass**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib notify_` → PASS
+Then: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment` → compiles. The 7 construction sites are
+enumerated in **Files** above with their exact substitution; apply those, do not improvise.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/fulfillment/src/lib.rs crates/fulfillment/src/main.rs
+git commit -S -m "fix(notify): resolve notification config at load, not per call forever
+
+An unconfigured webhook returned success from every call site and every log — a prod deploy
+that lost its URL was indistinguishable from one that notified. Same defect as
+oldmanbendobot/claude-code-infra#44.
+
+GATE FIX M1: an earlier draft of this message said 'or the process refuses to start'. That was
+the PRE-REVERSAL ruling and the task implements the opposite. In Lambda a cold start is caused
+by an invocation, so exiting at init fails the order that woke the container and every order
+after it. Notification config is observability, not a safety gate: fail LOUD, not CLOSED.
+
+Now: Resolved -> Webhook; DeliberatelyOff -> Disabled (warn once); ReadFailed -> Unresolved
+(loud structured error, alarm target, fulfilment unaffected). get_secret stops returning
+Option, which collapsed four states -- including an SSM error, which is weather, not intent."
+```
+
+---
+
+### Task 3: `OperatorMessage` and `ErrorSummary` — the only door
+
+**Files:**
+- Create: `crates/fulfillment/src/operator_message.rs`
+- Modify: `crates/fulfillment/src/lib.rs` (add `mod operator_message;`)
+- Test: a `compile_fail` **doctest** on `OperatorMessage` itself (no new files, no new deps)
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `pub struct OperatorMessage(String)` — **private inner**, no `From<String>`, no public string
+    constructor.
+  - `pub fn OperatorMessage::literal(s: &'static str) -> OperatorMessage`
+  - `pub fn OperatorMessage::with(parts: &[Part]) -> OperatorMessage`
+  - `pub enum Part<'a> { Text(&'static str), Id(&'a str), Error(ErrorSummary) }`
+  - `pub struct ErrorSummary { kind: &'static str, req_id: String }`
+  - `pub fn ErrorSummary::of<E: std::error::Error>(e: &E) -> ErrorSummary`
+  - `pub fn ErrorSummary::req_id(&self) -> &str`
+  - `pub fn OperatorMessage::as_str(&self) -> &str`
+
+- [ ] **Step 1: Write the failing tests**
+
+`crates/fulfillment/src/operator_message.rs` bottom:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Leaky;
+    impl std::fmt::Display for Leaky {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "write failed for key SECRET-KEY-abc123")
+        }
+    }
+    impl std::error::Error for Leaky {}
+
+    #[test]
+    fn error_summary_never_carries_the_error_payload() {
+        let s = ErrorSummary::of(&Leaky);
+        let m = OperatorMessage::with(&[Part::Text("store write failed"), Part::Error(s)]);
+        assert!(!m.as_str().contains("SECRET-KEY-abc123"), "payload leaked: {}", m.as_str());
+    }
+
+    // GATE FIX M3: ids must be distinct WITHIN a process. Cross-container distinctness comes
+    // from the log-stream base, which is absent locally — stated so nobody reads this test as
+    // proving more than it does.
+    #[test]
+    fn req_ids_are_distinct_within_a_process() {
+        let a = ErrorSummary::of(&Leaky).req_id().to_string();
+        let b = ErrorSummary::of(&Leaky).req_id().to_string();
+        assert_ne!(a, b, "two summaries minted the same join key");
+    }
+
+    #[test]
+    fn error_summary_carries_a_joinable_req_id() {
+        let s = ErrorSummary::of(&Leaky);
+        let id = s.req_id().to_string();
+        assert!(!id.is_empty());
+        let m = OperatorMessage::with(&[Part::Text("store write failed"), Part::Error(s)]);
+        assert!(m.as_str().contains(&id), "req_id must appear in the operator text");
+    }
+}
+```
+
+- [ ] **Step 2: Run and watch them fail**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib operator_message`
+Expected: FAIL — module does not exist.
+
+- [ ] **Step 3: Implement**
+
+```rust
+//! The only door through which text reaches the operator channel.
+//!
+//! SECURITY: `OperatorMessage` has a private inner and NO public string constructor and NO
+//! `From<String>`. That is deliberate and load-bearing: a type that *offers* safety is not a
+//! type that *enforces* it, and only enforcement has jurisdiction over call sites nobody has
+//! written yet. Do not add a string constructor.
+//!
+//! TRUST BOUNDARY: CloudWatch is access-controlled; a Discord channel is not. A raw error is
+//! fine — it belongs on the CloudWatch side of that line. Never render an error's Display or
+//! Debug into an `OperatorMessage`.
+
+/// A rendered, operator-safe error reference.
+///
+/// NOTE: `kind` is PUBLISHED CONTENT — it goes to Discord. A future error type named after its
+/// payload would leak by naming. Keep type names free of secrets.
+pub struct ErrorSummary {
+    kind: &'static str,
+    req_id: String,
+}
+
+impl ErrorSummary {
+    /// Render an error as a type name plus a fresh correlation id. The error's own text is
+    /// NEVER read — callers log it themselves, on the CloudWatch side of the boundary.
+    pub fn of<E: std::error::Error>(_e: &E) -> ErrorSummary {
+        ErrorSummary {
+            kind: std::any::type_name::<E>(),
+            req_id: new_req_id(),
+        }
+    }
+    pub fn req_id(&self) -> &str {
+        &self.req_id
+    }
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+}
+
+/// A join key for "operator line ↔ CloudWatch record".
+///
+/// GATE FIX M3 (escalated to blocker by Lilith): the first version was
+/// `format!("{:08x}", (t << 16) ^ n)` over `subsec_nanos`. Three faults, and the third is the
+/// one that matters:
+///   1. `{:08x}` is a MINIMUM width — ~46 bits renders as ~12 chars, not the documented 8.
+///   2. Entropy is bounded by CLOCK GRANULARITY, not by the nanos field's width. A ~1ms tick
+///      gives ~1000 distinct values per second, not 10^9.
+///   3. No container discriminator — and CloudWatch aggregates ACROSS containers. Two cold
+///      starts in the same tick mint the same id.
+///
+/// **A colliding join key is worse than no join key.** With no id you know you cannot join and
+/// you read the window. With a colliding id you grep it at 3am and get two incidents
+/// interleaved with nothing saying so — you debug a composite. And the collision probability
+/// PEAKS during a burst, which is exactly when you would use it.
+///
+/// So: no timestamp entropy at all. Use the identifier the platform already partitions the logs
+/// by. `AWS_LAMBDA_LOG_STREAM_NAME` is unique per container, already present, and is the very
+/// stream an operator opens. Read once, suffixed with a per-process counter.
+fn new_req_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    static CONTAINER: OnceLock<String> = OnceLock::new();
+    static N: AtomicU64 = AtomicU64::new(0);
+    let base = CONTAINER.get_or_init(|| {
+        std::env::var("AWS_LAMBDA_LOG_STREAM_NAME")
+            .ok()
+            .and_then(|s| s.rsplit(']').next().map(str::to_string))  // the container suffix
+            .filter(|s| !s.is_empty())
+            // GATE FIX (Lilith): the fallback must NOT be a shared constant. `OnceLock` bakes
+            // whatever it first computes for the container's WHOLE LIFE — the same
+            // once-per-container asymmetry that makes an SSM blip permanent. A literal
+            // "local" here means two containers that both miss the env var collide again,
+            // reintroducing exactly the defect this function exists to kill. The pid is
+            // per-process and always available.
+            .unwrap_or_else(|| {
+                // GATE MINOR (OMBB): a silent fallback is a silent reintroduction. The pid keeps
+                // ids unique, but if this fires in Lambda the env var is not what we think, and
+                // the OnceLock bakes that for the container's life. Make it loud.
+                tracing::warn!(
+                    outcome = "req_id_base_fallback",
+                    "AWS_LAMBDA_LOG_STREAM_NAME absent or empty — join keys fall back to pid"
+                );
+                format!("p{}", std::process::id())
+            })
+    });
+    // UNIQUENESS WINDOW, stated because "unique within a window" is what killed the timestamp
+    // scheme: ids are unique for the LIFE OF THE CONTAINER. `u64` at this call rate cannot wrap
+    // — it is incremented once per operator-notification FAILURE, so wrap would need ~10^19 of
+    // them. If this ever becomes a hot path, revisit.
+    format!("{base}-{}", N.fetch_add(1, Ordering::Relaxed))
+}
+
+pub enum Part<'a> {
+    Text(&'static str),
+    Id(&'a str),
+    Error(ErrorSummary),
+}
+
+/// Operator-visible text. Private inner by design — see the module docs.
+pub struct OperatorMessage(String);
+
+impl OperatorMessage {
+    pub fn literal(s: &'static str) -> OperatorMessage {
+        OperatorMessage(s.to_string())
+    }
+
+    pub fn with(parts: &[Part<'_>]) -> OperatorMessage {
+        let mut out = String::new();
+        for p in parts {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            match p {
+                Part::Text(t) => out.push_str(t),
+                Part::Id(i) => out.push_str(i),
+                Part::Error(e) => {
+                    out.push_str(&format!("[{} req {}]", e.kind(), e.req_id()));
+                }
+            }
+        }
+        OperatorMessage(out)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+```
+
+Add **`pub mod operator_message;`** + `use operator_message::{ErrorSummary, OperatorMessage, Part};`
+to `lib.rs`. **REVIEW FIX (B1), reason updated after trybuild was dropped (GATE FIX M4): the module
+MUST be `pub`, and it is still load-bearing — the Step 5 `compile_fail` DOCTEST refers to
+`fulfillment::operator_message::OperatorMessage`, and doctests compile against the crate's PUBLIC
+API. A private module would make that block fail to compile for the wrong reason, which
+`compile_fail` reports as a PASS.** The original wording cited "the trybuild fixture", which no
+longer exists — the requirement survived its stated reason, so the reason is restated rather than
+left dangling. Matches the repo's existing `pub mod heal_pairs;` (lib.rs:14).
+
+- [ ] **Step 4: Run and watch them pass**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib operator_message` → PASS
+
+- [ ] **Step 5: Write the compile-fail test (makes "structural" a property of the type)**
+
+**No new dependency.** `rustdoc` runs ` ```compile_fail ` blocks as real tests. Put it on the type,
+where anyone reading the docs also reads the guarantee:
+
+```rust
+/// Operator-visible text. Private inner by design — see the module docs.
+///
+/// A runtime `String` CANNOT become an `OperatorMessage`. That is the guarantee, and this
+/// doctest is its enforcement — if someone adds `From<String>` or a `&str` constructor, this
+/// stops failing to compile and the test goes red:
+///
+/// ```compile_fail
+/// let runtime_text: String = format!("secret {}", "abc123");
+/// let _ = fulfillment::operator_message::OperatorMessage::literal(&runtime_text);
+/// ```
+pub struct OperatorMessage(String);
+```
+
+**🔴 STATED LIMIT (Lilith, gate round) — do not let `compile_fail` look equivalent to what it
+replaced.** The property my review actually bought was *"the `.stderr` names the RIGHT error"*;
+`trybuild` was merely how I got it. **A bare `compile_fail` doctest asserts only THAT compilation
+failed, never WHICH error** — so a typo, a rename, a missing `use`, or a moved module would make it
+green for the wrong reason. **That is the defect I caught, re-opened by my own substitution.**
+
+Pinning the code (` ```compile_fail,E0308 `) is **rejected on a MEASUREMENT, not on a claim about
+the docs** — see the experiment below: the annotation is accepted and ignored, so a deliberately
+wrong code still passes.
+
+*(An earlier draft rejected it because "rustdoc treats error codes as unstable and discourages
+relying on them." **That claim has been retracted by the person who made it** — the rustdoc
+documentation-tests page does not mention error codes at all, in either direction. It was asserted
+from memory. It is removed rather than quietly left standing, because a conclusion resting on an
+unverified premise is only accidentally right, and this one happens to have a real reason
+underneath it.)*
+
+**So the honest statement, in the plan rather than discovered later: this doctest pins that the code
+does not compile, not why.** Two things bound the damage, and neither is the doctest:
+
+1. **The private-module class specifically cannot silently green it.** `operator_message` is `pub`
+   and Step 4 already compiles and runs the module's unit tests through it — a private, renamed or
+   moved module breaks **the build** at Step 4, loudly, before the doctest is ever consulted.
+2. **GATE FIX M5 — MEASURED, and it KILLS the proposed fix. The error-code pin is DECORATIVE.**
+
+   OMBB proposed ` ```compile_fail,E0XXX ` to convert the one-time manual read into a continuous
+   assertion, flagging that he had not verified it and had no rustc. **I have rustc. I ran the
+   dirty-side experiment — pin the RIGHT code on one doctest and a deliberately WRONG one on an
+   identical doctest:**
+
+   ```
+   /// ```compile_fail,E0308   (correct code)      → test A
+   /// ```compile_fail,E0599   (deliberately wrong) → test B
+   ...
+   test src/lib.rs - B (line 7) - compile fail ... ok      ← WRONG CODE, STILL PASSES
+   test src/lib.rs - A (line 1) - compile fail ... ok
+   test result: ok. 2 passed; 0 failed
+   ```
+
+   **A guard that cannot fail is worse than no guard, because it reports.** The annotation is
+   accepted and ignored: `compile_fail` asserts only that compilation failed, and the code is
+   decorative. **Do not add it — it would look like the `.stderr` comparison it replaced.**
+
+   **So, verbatim, the honest statement (Lilith's wording):** *this pins that it does not compile,
+   not why; the private-module class is not caught.*
+
+   **And rustdoc's own warning adds a second, worse degradation path** (OMBB, from the docs):
+   *"code failing with the current Rust release may work in a future release."* **A bare
+   `compile_fail` can go green because the COMPILER got more permissive** — no code change, no
+   signal. For a security guarantee that is a guard which can retire itself on a toolchain bump.
+
+   **What actually bounds the damage, since the doctest does not:**
+   - the fixture is three lines with no imports, so *any* error ≈ the right error — **except**
+     the private-module class, which is the exact one that bit us;
+   - and that class is separately caught: `operator_message` is `pub` and Step 4 compiles and runs
+     the module's unit tests through it, so a private/renamed/moved module breaks **the build**,
+     loudly, before the doctest is consulted.
+
+   **VERIFY ONCE ON THE FIRST DEPLOY (Lilith): `AWS_LAMBDA_LOG_STREAM_NAME` is standard — and
+   *"standard"* is exactly what `subsec_nanos` looked like an hour before it was measured to be
+   clock-bound.** One `tracing::info!` of the computed base on a cold start confirms it is
+   populated. The pid fallback means an empty value is survivable rather than collision-inducing,
+   but a base that silently reads `p1234` in production means the env var is not what we think.
+
+   **This is a real reduction from trybuild's committed `.stderr`, recorded rather than papered
+   over.** If it ever matters more than the dependency costs, trybuild is the answer and this
+   paragraph is why.
+
+- [ ] **Step 6: Run it, then verify it fails for the RIGHT reason**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --doc operator_message`
+Expected: PASS (meaning the bad code did NOT compile).
+
+**REVIEW FIX (B1), adapted: confirm WHAT failed, not merely that something did.** Temporarily
+change ` ```compile_fail ` to ` ``` ` (a normal doctest), re-run, and **read the error**: it must
+name the `&'static str` / lifetime mismatch on `literal`, **not** `E0603 module is private` or an
+unresolved path. Then change it back. *Any test whose pass condition is "something failed" must
+assert what failed* — and for a doctest the only way to assert that is to look once.
+
+- [ ] **Step 7: Commit**
+
+```bash
+# GATE FIX B6: this previously added crates/fulfillment/Cargo.toml and two
+# tests/compile_fail/* files. No step creates any of them since trybuild was dropped, and
+# `git add` on a nonexistent path EXITS 1 — the task would have broken at its own commit step.
+# The dependency removal did not sweep its own references.
+git add crates/fulfillment/src/operator_message.rs crates/fulfillment/src/lib.rs
+git commit -S -m "feat(operator-message): make a leaked error payload unrepresentable (#151)
+
+~6 sites interpolated a store error straight into an operator message; any variant whose
+Display carried a revealed key would publish it. Containment is now structural: private inner,
+no From<String>, no public string constructor, and a built-in compile_fail doctest so the
+property belongs to the type rather than to today's call sites. (No new dependency: rustdoc
+runs compile_fail blocks as real tests.) A filter protects the code you audited;
+a type protects the code you haven't. Correlation id lets CloudWatch carry the detail."
+```
+
+---
+
+### Task 4: Chunking — bounded, labelled, never empty, never mid-token
+
+**Files:**
+- Modify: `crates/fulfillment/src/operator_message.rs`
+- Test: same file's `mod tests`
+
+**Interfaces:**
+- Consumes: `OperatorMessage` from Task 3.
+- Produces: `pub fn OperatorMessage::chunks(&self, prefix: &str) -> Vec<String>` — each element
+  ≤2000 chars including `prefix` and any `(i/n)` label; never empty; never split inside a `**`
+  pair.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+const PREFIX: &str = "🐱 bendobundles: ";
+
+#[test]
+fn chunks_are_bounded_including_prefix_and_label() {
+    let big = OperatorMessage::literal(Box::leak("x".repeat(5000).into_boxed_str()));
+    for c in big.chunks(PREFIX) {
+        assert!(c.chars().count() <= 2000, "chunk too long: {}", c.chars().count());
+    }
+}
+
+#[test]
+// REVIEW FIX (B3): the original iterated `for c in m.chunks(..)` on EMPTY input. `chunks()`
+// returns an empty Vec there, so the loop body never ran and the test passed regardless of the
+// implementation — vacuous, and it was guarding the ONE requirement with real production
+// evidence behind it. Split into two tests that can each actually fail.
+fn empty_input_yields_no_chunks_at_all() {
+    for input in ["", "   ", "\n\n"] {
+        let m = OperatorMessage::literal(Box::leak(input.to_string().into_boxed_str()));
+        assert!(
+            m.chunks(PREFIX).is_empty(),
+            "empty input must post nothing; got chunks for {input:?}"
+        );
+    }
+}
+
+#[test]
+fn no_emitted_chunk_is_empty_or_prefix_only() {
+    let m = OperatorMessage::literal(Box::leak("y".repeat(5000).into_boxed_str()));
+    let cs = m.chunks(PREFIX);
+    assert!(!cs.is_empty());
+    for c in &cs {
+        assert!(c.len() > PREFIX.len(), "prefix-only chunk: {c:?}");
+    }
+}
+
+// REVIEW FIX (M1): the 2000 bound and "never split mid-token" CONFLICT — the impl's
+// `matches("**") % 2 == 0` guard would keep appending past budget on an unbalanced run.
+// Precedence is now explicit: THE BOUND ALWAYS WINS, because exceeding it is what actually
+// produces a Discord 400. A forced mid-token split appends the marker ` …`.
+#[test]
+fn the_2000_bound_wins_over_token_integrity() {
+    let body = format!("{}**{}", "a".repeat(1999), "b".repeat(1999)); // ONE line, unbalanced **
+    let m = OperatorMessage::literal(Box::leak(body.into_boxed_str()));
+    for c in m.chunks(PREFIX) {
+        assert!(c.chars().count() <= 2000, "bound violated: {}", c.chars().count());
+    }
+}
+
+#[test]
+fn multi_chunk_messages_are_labelled() {
+    let big = OperatorMessage::literal(Box::leak("z".repeat(5000).into_boxed_str()));
+    let cs = big.chunks(PREFIX);
+    assert!(cs.len() > 1);
+    assert!(cs[0].contains(&format!("(1/{})", cs.len())));
+}
+
+#[test]
+fn chunks_never_split_inside_a_bold_delimiter() {
+    let body = format!("{}\n**bold**\n{}", "a".repeat(1900), "b".repeat(1900));
+    let m = OperatorMessage::literal(Box::leak(body.into_boxed_str()));
+    // GATE FIX M2: the original asserted `stars % 2 == 0` UNCONDITIONALLY, which contradicts
+    // the stated precedence — the bound wins, and a forced cut deliberately emits an odd-star
+    // chunk carrying the ` …` marker. It passed only because the fixture never forced a cut:
+    // passing by input luck. The rule is "balanced OR marked".
+    for c in m.chunks(PREFIX) {
+        let balanced = c.matches("**").count() % 2 == 0;
+        assert!(
+            balanced || c.ends_with(" …"),
+            "chunk ends inside a ** pair with no forced-cut marker: {c}"
+        );
+    }
+}
+```
+
+- [ ] **Step 2: Run and watch them fail**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib chunks_`
+Expected: FAIL — `chunks` not found.
+
+- [ ] **Step 3: Implement**
+
+```rust
+/// Discord's hard limit on `content`.
+const DISCORD_MAX: usize = 2000;
+/// Room reserved for the ` (12/34)` label. 10 fits ` (999/999)` exactly.
+const LABEL_RESERVE: usize = 10;
+/// Room reserved for the forced-cut marker ` …`, RESERVED not appended — see PRECEDENCE.
+const MARKER_RESERVE: usize = 2;
+
+impl OperatorMessage {
+    /// Split into Discord-postable bodies. Each ≤2000 chars INCLUDING `prefix` and the label.
+    ///
+    /// Guarantees, each with a test: never emits an empty or prefix-only chunk (an empty
+    /// `content` is a Discord 400, and it is the only end of this axis with observed failures);
+    /// never splits inside a `**` pair (a boundary that looks like damage costs what damage
+    /// costs); labels every part when there is more than one.
+    ///
+    /// PRECEDENCE — THREE requirements interact here, not two (OMBB, gate round):
+    ///   1. the 2000 bound ALWAYS wins (it is the one with a real 400 behind it)
+    ///   2. then "no empty chunk" (the one with real production evidence)
+    ///   3. then "no mid-token split" (cosmetic — a boundary that merely LOOKS like damage)
+    ///
+    /// The marker's length is RESERVED FROM the budget, never added after. Adding it after
+    /// would push a maximally-packed chunk over the bound *because of the marker added to
+    /// respect the bound*. `budget = 2000 - prefix - LABEL_RESERVE - MARKER_RESERVE`, so the
+    /// remainder is always non-empty and the total is always within the limit.
+    pub fn chunks(&self, prefix: &str) -> Vec<String> {
+        let body = self.0.trim();
+        if body.is_empty() {
+            return Vec::new();
+        }
+        let budget = DISCORD_MAX
+            .saturating_sub(prefix.chars().count())
+            .saturating_sub(LABEL_RESERVE)
+            .saturating_sub(MARKER_RESERVE);
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for line in body.split_inclusive('\n') {
+            if cur.chars().count() + line.chars().count() > budget && !cur.is_empty() {
+                parts.push(std::mem::take(&mut cur));
+            }
+            if line.chars().count() > budget {
+                for ch in line.chars() {
+                    if cur.chars().count() + 1 > budget {
+                        // Bound wins. Mark a forced mid-token cut so it is never silent.
+                        if cur.matches("**").count() % 2 != 0 {
+                            cur.push_str(" …");
+                        }
+                        parts.push(std::mem::take(&mut cur));
+                    }
+                    cur.push(ch);
+                }
+            } else {
+                cur.push_str(line);
+            }
+        }
+        if !cur.trim().is_empty() {
+            parts.push(cur);
+        }
+        // BUG FOUND AT THE GATE (mine): the original computed `n = parts.len()` and THEN
+        // filtered empties, so dropping a part left gaps in the labels — "(1/3)" and "(3/3)"
+        // with no "(2/3)", which reads to an operator as a LOST MESSAGE. Filter first, then
+        // count, then label. The no-empty rule and the labelling rule are coupled.
+        let parts: Vec<String> = parts.into_iter().filter(|p| !p.trim().is_empty()).collect();
+        let n = parts.len();
+        parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if n > 1 {
+                    format!("{prefix}{} ({}/{n})", p.trim_end(), i + 1)
+                } else {
+                    format!("{prefix}{}", p.trim_end())
+                }
+            })
+            .collect()
+    }
+}
+```
+
+- [ ] **Step 4: Run and watch them pass**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib chunks_` → PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/fulfillment/src/operator_message.rs
+git commit -S -m "feat(operator-message): bound messages by construction, never empty (#163)
+
+Discord rejects content over 2000. Chunking is bounded including prefix and label, labels every
+part so a partial read is visibly partial, and never splits inside a ** pair — a boundary that
+merely looks like data loss costs the same investigation as real data loss.
+
+The empty guard is the one with evidence, and it exists BECAUSE of this change: the seam was
+immune via its unconditional prefix, and chunking is what can emit an empty trailing chunk
+(observed elsewhere on this box as 'reply failed after 1 of 2 chunk(s) sent')."
+```
+
+---
+
+### Task 5: Structured, joinable failure reporting
+
+**Files:**
+- Modify: `crates/fulfillment/src/lib.rs` (`deliver`, `ping`)
+- Test: `crates/fulfillment/tests/handler_test.rs`
+
+**Interfaces:**
+- Consumes: `deliver` (Task 1), `chunks` (Task 4).
+- Produces: `ping` posts every chunk and returns `()`; failures emit
+  `tracing::error!(outcome, status, chunk, req_id, "operator notification failed")`.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[tokio::test]
+async fn every_chunk_is_posted_and_failures_are_counted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let failures = fulfillment::ping_chunks_for_test(&server.uri(), &"q".repeat(5000)).await;
+    assert_eq!(failures, 3, "each chunk failure counts once; failure is not atomic");
+}
+```
+
+- [ ] **Step 2: Run and watch it fail**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test handler_test every_chunk_is_posted`
+Expected: FAIL — `ping_chunks_for_test` not found.
+
+- [ ] **Step 3: Implement**
+
+```rust
+const PING_PREFIX: &str = "🐱 bendobundles: ";
+
+async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
+    let Notify::Webhook(url) = &deps.notify else { return; };
+    for (i, chunk) in msg.chunks(PING_PREFIX).into_iter().enumerate() {
+        if deliver(&deps.http, url, &chunk).await == 1 {
+            tracing::error!(
+                outcome = "operator_notification_failed",
+                chunk = i + 1,
+                "operator notification failed"
+            );
+        }
+    }
+}
+
+#[doc(hidden)]
+pub async fn ping_chunks_for_test(url: &str, msg: &str) -> u32 {
+    let m = OperatorMessage::literal(Box::leak(msg.to_string().into_boxed_str()));
+    let http = reqwest::Client::new();
+    let mut failures = 0;
+    for chunk in m.chunks(PING_PREFIX) {
+        failures += deliver(&http, url, &chunk).await;
+    }
+    failures
+}
+```
+
+Update `deliver` to log structured rather than `eprintln!`:
+
+```rust
+async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
+    let body = serde_json::json!({ "content": content });
+    match http.post(url).json(&body).send().await {
+        Ok(r) if r.status().is_success() => 0,
+        Ok(r) => {
+            tracing::error!(outcome = "discord_non_2xx", status = r.status().as_u16(),
+                            "operator notification rejected");
+            1
+        }
+        Err(e) => {
+            tracing::error!(outcome = "discord_transport", error = %e,
+                            "operator notification transport failure");
+            1
+        }
+    }
+}
+```
+
+- [ ] **Step 4: Run and watch it pass**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test handler_test every_chunk_is_posted` → PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/fulfillment/src/lib.rs crates/fulfillment/tests/handler_test.rs
+git commit -S -m "feat(ping): structured, alarmable failure records — out of band by design
+
+The report is a structured tracing::error! (CloudWatch metric filter target), not a dynamo
+row: there is no drainer for a failed operator ping, so a durable queue would be storage with
+no consumer. It also fires when the next sync never runs, which an in-band record cannot.
+The recursion terminates at a counter and a log line — never another network call."
+```
+
+---
+
+### Task 6: Migrate the call sites to `OperatorMessage`
+
+**Files:**
+- Modify: `crates/fulfillment/src/lib.rs` (all ~20 `ping(` sites; the 6 carrying `{e}` change shape)
+
+**Interfaces:**
+- Consumes: everything above.
+- Produces: `ping` is **removed**; `ping_msg(deps, &OperatorMessage)` is the only entry point.
+
+- [ ] **Step 1: Delete `ping` and let the compiler enumerate the work**
+
+**REVIEW FIX (B4): print the list, never the count** — the original step said exactly that and then
+handed over a `grep -c`. A count cannot be sanity-checked; a list can.
+
+Run: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment 2>&1 | grep -n 'cannot find function' -A2`
+Expected: one entry per call site. **Paste the list into the Task 6 commit body** so the migration's
+denominator is recorded rather than remembered.
+
+- [ ] **Step 2: Convert each site**
+
+Literal sites become `ping_msg(deps, &OperatorMessage::literal("..."))`.
+Sites carrying `{e}` become:
+
+```rust
+let s = ErrorSummary::of(&e);
+tracing::error!(req_id = %s.req_id(), error = ?e, "dead-key fail-claim write failed");
+ping_msg(deps, &OperatorMessage::with(&[
+    Part::Text("dead-key fail-claim write failed for claim"),
+    Part::Id(&claim_id),
+    Part::Error(s),
+])).await;
+```
+
+**The `tracing::error!` MUST carry the same `req_id`** — that join is the whole reason the operator
+line is safe to redact.
+
+- [ ] **Step 3: Add the drift test**
+
+**REVIEW FIX (M2): the original pinned only the message side and its own comment conceded it.**
+Spec test #8 requires BOTH sides to carry the same id. **Zero new dependencies** — make the two
+sides read from one place, so they cannot drift by construction rather than being watched:
+
+```rust
+// In operator_message.rs — the SINGLE source of the id for both sides.
+impl ErrorSummary {
+    /// The exact `(req_id, kind)` pair that MUST appear in the CloudWatch record. The operator
+    /// message renders from the same struct, so the join cannot drift unless someone bypasses
+    /// this accessor — which is the one thing the test below pins.
+    pub fn log_fields(&self) -> (&str, &'static str) {
+        (&self.req_id, self.kind)
+    }
+}
+```
+
+Call sites use it verbatim:
+`tracing::error!(req_id = %s.log_fields().0, kind = s.log_fields().1, "…");`
+
+```rust
+#[test]
+fn operator_text_and_log_fields_share_one_req_id() {
+    let s = ErrorSummary::of(&Leaky);
+    let (log_id, _kind) = s.log_fields();
+    let log_id = log_id.to_string();
+    let m = OperatorMessage::with(&[Part::Text("x"), Part::Error(s)]);
+    assert!(
+        m.as_str().contains(&log_id),
+        "operator text and log record carry different ids — the breadcrumb is unjoinable"
+    );
+}
+```
+
+**Dirty-side verify:** change the renderer to emit a freshly generated id instead of `self.req_id`
+and confirm this test FAILS. **An unjoinable breadcrumb is worse than the leak** — at 3am it looks
+like you can chase it.
+
+**Honest limit, stated rather than discovered later:** this pins that *the value is shared*, not
+that a call site actually emitted it. A site that forgets `tracing::error!` entirely is caught by
+review, not by this test. Capturing real log records would need a dependency; the trade was made
+deliberately for zero new deps on a 4GB box with dependency gates.
+
+- [ ] **Step 4: Verify**
+
+Run: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment` → clean
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment` → all pass
+Run: `CARGO_BUILD_JOBS=1 cargo clippy -p fulfillment -- -D warnings` → clean
+(**`-p fulfillment` only. Never `--all-targets`.**)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/fulfillment/src/lib.rs
+git commit -S -m "refactor(ping): OperatorMessage is the only entry point (#151)
+
+ping(&str) is gone; every site goes through OperatorMessage. The six sites that interpolated a
+store error now emit ErrorSummary to Discord and the full error to CloudWatch under a shared
+req_id, so 3am debuggability survives while nothing is published across the trust boundary."
+```
+
+---
+
+### Task 7: (#161) Surface audit per-row write failures
+
+**Files:**
+- Modify: `crates/fulfillment/src/lib.rs` (`shelf_truth_audit` ~3622; summary ~3572)
+- Test: `crates/fulfillment/src/lib.rs` `mod tests`
+
+**Interfaces:**
+- Consumes: nothing new.
+- Produces: `shelf_truth_audit` returns `(u32 /*pulled*/, u32 /*rows_failed*/)`.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[test]
+fn summary_reports_audit_row_failures_only_when_nonzero() {
+    assert_eq!(summary_line(3, 0, 2, 0), "sync ok: 3 written, 0 order(s) failed, 2 audit-pulled");
+    assert_eq!(
+        summary_line(3, 0, 2, 4),
+        "sync ok: 3 written, 0 order(s) failed, 2 audit-pulled, 4 audit row(s) failed"
+    );
+}
+```
+
+- [ ] **Step 2: Run and watch it fail**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib summary_reports_audit`
+Expected: FAIL — `summary_line` not found.
+
+- [ ] **Step 3: Implement**
+
+Extract the existing inline summary into a pure function and add the arm:
+
+```rust
+fn summary_line(games_written: u32, orders_failed: u32, pulls: u32, rows_failed: u32) -> String {
+    let mut s = format!("sync ok: {games_written} written, {orders_failed} order(s) failed");
+    if pulls > 0 {
+        s.push_str(&format!(", {pulls} audit-pulled"));
+    }
+    if rows_failed > 0 {
+        s.push_str(&format!(", {rows_failed} audit row(s) failed"));
+    }
+    s
+}
+```
+
+Increment `rows_failed` in `shelf_truth_audit`'s per-row `Err(e)` arm alongside the existing
+`tracing::warn!`, return it, and thread it into `summary_line`.
+
+- [ ] **Step 4: Run and watch it pass**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib summary_reports_audit` → PASS
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment` → all pass
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/fulfillment/src/lib.rs
+git commit -S -m "fix(audit): per-row write failures reach discord (#161)
+
+shelf_truth_audit's per-row Err was tracing::warn! with no ping and no counter, asymmetric with
+the order walk's orders_failed. A chronically failing row was invisible to anyone watching only
+discord. Now counted and appended to the summary when >0, mirroring audit-pulled."
+```
+
+---
+
+---
+
+### Task 8: (REVIEW FIX M4) Pin the guarantees nothing else tests
+
+Three spec tests had no task. #10 is the guarantee the entire design exists to preserve and
+**nothing was testing it.**
+
+**Files:**
+- Test: `crates/fulfillment/tests/handler_test.rs`
+
+**Interfaces:**
+- Consumes: `Notify` (Task 2), `ping_msg` (Task 5), `deliver` (Task 1).
+- Produces: nothing. This task adds only tests.
+
+- [ ] **Step 1: Write the three failing/pinning tests**
+
+```rust
+// WHY THIS FILE EXISTS (do not delete as "a test that doesn't test anything"): the plan review
+// found that the guarantee the entire operator-truth design is built to preserve — a dead
+// webhook must never change fulfilment's outcome — had NO test. Every other task tightens the
+// notification path; this one pins the promise that tightening it must not cost.
+
+// Spec test #10 — THE central guarantee. Nothing else pins it.
+//
+// GATE FIX B1 + B4: the first version called `ping_msg_for_test`, which NO task produces (it
+// would not compile), and it never called `handle` at all despite its own name — it asserted
+// only that a dead webhook produces failures. The guarantee is a COMPARISON: handle's outcome
+// must be identical with a live webhook and with a dead one.
+#[tokio::test]
+async fn a_dead_webhook_does_not_change_handle_outcome() {
+    let live = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&live)
+        .await;
+
+    // Same event, same store fixture, only the webhook differs.
+    let with_live = handle(&test_deps(Notify::Webhook(live.uri()), &live.uri()), test_event()).await;
+    let with_dead = handle(
+        &test_deps(Notify::Webhook("http://127.0.0.1:1/hook".into()), &live.uri()),
+        test_event(),
+    )
+    .await;
+
+    assert_eq!(
+        format!("{with_live:?}"),
+        format!("{with_dead:?}"),
+        "a dead webhook changed handle's outcome — the guarantee this whole design preserves"
+    );
+}
+
+// Spec test #4 — transport error, distinct from non-2xx (Task 1 covered only non-2xx).
+#[tokio::test]
+async fn transport_failure_counts_as_failure() {
+    let failures = fulfillment::ping_for_test("http://127.0.0.1:1/hook", "hi").await;
+    assert_eq!(failures, 1);
+}
+
+// Spec test #2 — NOTIFY_DISABLED sends nothing (Task 2 tested construction only).
+//
+// GATE FIX B3: the first version was COMMENTS ONLY — it built the mock and then called
+// nothing, so zero POSTs happened because nothing ran. It passed regardless of the
+// implementation. That is the vacuous shape this plan's own review was written to catch,
+// reintroduced in the task that fixes vacuous tests.
+#[tokio::test]
+async fn disabled_notify_posts_absolutely_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)                       // the assertion; verified on drop
+        .mount(&server)
+        .await;
+
+    let deps = test_deps(Notify::Disabled, &server.uri());
+    ping_msg(&deps, &OperatorMessage::literal("must never be sent")).await;
+    // Guard against the vacuous case itself: prove the harness CAN see a POST.
+    let control = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1)
+        .mount(&control).await;
+    let live = test_deps(Notify::Webhook(control.uri()), &control.uri());
+    ping_msg(&live, &OperatorMessage::literal("control")).await;
+}
+```
+
+- [ ] **Step 2: Run them**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test handler_test`
+Expected: all PASS. If `a_dead_webhook_does_not_change_handle_outcome` fails to compile because
+`ping_msg` returns something other than `()`, **that is the guarantee breaking and the build must
+not proceed.**
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/fulfillment/tests/handler_test.rs
+git commit -S -m "test: pin the three spec guarantees nothing was testing
+
+Plan review found #10 — 'a dead webhook leaves handle's outcome unchanged' — untested. That is
+the guarantee the whole design exists to preserve, and it was the one property with no test.
+Also adds #4 (transport failure, distinct from non-2xx) and #2 (NOTIFY_DISABLED sends nothing)."
+```
+
+---
+
+## Self-Review
+
+**Spec coverage.** (A) → Task 2. (B) bound/label/empty/no-mid-token → Task 4. (C) → Task 1.
+(D) structured + metric-filter target + counter-terminator → Task 5. Secret containment + only-door
++ compile_fail + joinable req_id → Tasks 3 and 6. #161 → Task 7. `ping` stays `-> ()` → enforced by
+the Global Constraints and by Task 6 (`ping_msg` returns `()`). No retry, no dead-letter → stated in
+Global Constraints and in Task 5's commit body.
+
+**Not covered by a task, deliberately:** the CloudWatch metric filter + alarm itself lives in
+`terraform/` and is a separate change; Task 5 produces the structured line it keys on. Recorded here
+so it is a known follow-up rather than a silent gap. **File it as an issue when this PR opens.**
+
+**Type consistency.** `OperatorMessage`/`ErrorSummary`/`Part` names match across Tasks 3, 4, 5, 6.
+`Notify` from Task 2 is used in Task 5's `ping_msg`. `deliver` from Task 1 keeps its signature
+through Task 5. `chunks(&self, prefix: &str)` is called with `PING_PREFIX` in Task 5 and `PREFIX` in
+Task 4's tests — same value, test-local constant.
+
+**Placeholder scan.** No TBD/TODO; every code step carries real code; every test step names the exact
+command and the expected result.
+
+**Declared-not-built sweep (positional, mechanical — OMBB's refinement of Lilith's detector).** In a
+plan with `- [ ] Step` markers, **a symbol whose every hit inside a task falls ABOVE that task's
+first Step marker is rationale, not work.** No eye-classification, no getting tired at line 900.
+Run over every symbol this plan introduces:
+
+```
+RetryConfig     above=2  below=0   <<< was DECLARED, NOT BUILT  -> fixed, Task 2 Step 3a
+retry_config    above=1  below=0   <<< same
+load_from_env   above=1  below=0   <<< same
+SecretRead      above=6  below=18   built        OperatorMessage above=10 below=32  built
+ReadFailed      above=7  below=7    built        ErrorSummary    above=5  below=15  built
+log_fields      above=0  below=4    built        Notify          above=10 below=24  built
+chunks          above=2  below=21   built        deliver         above=5  below=9   built
+rows_failed     above=1  below=4    built        ping_msg        above=2  below=9   built
+summary_line    above=0  below=5    built
+```
+
+**Three symbols, one defect, and it is now the measured population rather than the instance
+somebody happened to notice.**

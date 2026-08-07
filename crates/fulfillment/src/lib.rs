@@ -12,7 +12,9 @@
 /// Pure gate logic for the `heal_choice_pairs` operator sweep (spec Q5). Non-gated so the normal
 /// test suite runs it; only the `delete_game` call in the bin is `heal`-feature-gated.
 pub mod heal_pairs;
+pub mod operator_message;
 
+use crate::operator_message::{ErrorSummary, OperatorMessage, Part};
 use domain::{AppidSource, Claim, Game, GameStatus};
 use dynamo::{OwnedWrite, Store, StoreError, SyncBegin, SyncState, SyncWrite};
 use humble_client::{
@@ -377,11 +379,99 @@ pub fn find_new_tpk<'a>(order: &'a Order, pre: &[String], title: &str) -> TpkPic
     }
 }
 
+/// What an SSM secret read actually FOUND.
+///
+/// `Option<String>` collapsed **four** states into one `None`: parameter absent (terraform's
+/// `discord_webhook_enabled = false`), the `UNSET` placeholder, an empty value, and an SSM/KMS/IAM
+/// **error**. The fourth is the dangerous one — transient external *weather* recorded as permanent
+/// internal *intent*. And because config resolves once per container, a 200ms throttle does not
+/// cost 200ms of notifications: it costs every notification that container handles.
+///
+/// NOTE: lives in the library, not the binary, because both the binary's `get_secret` and the
+/// library's `Notify::resolve` need it.
+#[derive(Clone, Debug)]
+pub enum SecretRead {
+    Resolved(String),
+    /// Absent, `UNSET`, or empty — all deliberate.
+    DeliberatelyOff,
+    /// The read FAILED. Throttle, KMS grant, IAM, network. **Not a statement about intent.**
+    ReadFailed,
+}
+
+/// How this process reaches the operator. Resolved ONCE at init, so a missing webhook is one loud
+/// event per cold start instead of twenty silent no-ops a day.
+///
+/// A use-time `else { return; }` can never distinguish *deliberately off* from *someone dropped
+/// the env var* — that collapse IS the defect. Three states keep them apart.
+///
+/// **INFALLIBLE BY DESIGN.** This runs in the Lambda init phase, and a cold start is *caused by* an
+/// invocation, so init and request are the same instant. Halting here fails the order that woke the
+/// container, and every order after it. Notification config is OBSERVABILITY, not a safety gate:
+/// **fail LOUD, never CLOSED.** Do not change this to return `Result`.
+#[derive(Clone, Debug)]
+pub enum Notify {
+    Webhook(String),
+    /// Deliberately off. Silent by request; suppresses the alarm.
+    Disabled,
+    /// Misconfigured or unreadable. Behaves like `Disabled` at runtime, but is LOUD at init and
+    /// distinct in logs — which is the entire point of separating the states.
+    Unresolved,
+}
+
+impl Notify {
+    /// *** `disabled` IS CONSUMED. It used to be a PASSENGER, and that was a real defect. ***
+    ///
+    /// Every arm here matched `_` on the flag, so `NOTIFY_DISABLED=1` did **nothing** whenever the
+    /// SSM read succeeded — the one case an operator actually reaches for it in. The parameter was
+    /// accepted, threaded from `main.rs`, named in the startup log line ("absent/UNSET param, **or
+    /// NOTIFY_DISABLED=1**"), and relied on by this design's own gate ruling — *"NOTIFY_DISABLED=1
+    /// is the one-env-var escape hatch"* — and consumed by nothing. **A flag the code reads, logs
+    /// about, and never branches on.**
+    ///
+    /// That is precisely this change's subject at a third altitude: a value that rides through the
+    /// whole path as a passenger and never reaches the decision. It shipped because the test named
+    /// for the flag — `explicit_disable_flag_also_yields_disabled` — passed via the
+    /// `DeliberatelyOff` arm and would have passed identically with the flag deleted. **A test can
+    /// be named for the thing it does not test.**
+    ///
+    /// ORDER MATTERS AND IS DELIBERATE: the flag is checked FIRST, so it beats a resolved secret.
+    /// `NOTIFY_DISABLED=1` is alarm SUPPRESSION — deliberate, operator-initiated silence — so it
+    /// also silences `Unresolved`; someone who has asked for quiet should not be paged about the
+    /// quiet they asked for. It is NOT a safety valve for fulfilment, which never depends on it.
+    /// *** NO WILDCARD OVER EITHER INPUT. ALL SIX CELLS ARE WRITTEN OUT. ***
+    ///
+    /// My first fix for this was `(_, true) => Disabled` — which is **a wildcard bug fixed with
+    /// another wildcard**. `_` is asking the compiler for permission to ignore an input and being
+    /// granted it silently; that is exactly how the original defect got in. Enumerated, the
+    /// compiler enforces the matrix for me: add a `SecretRead` variant and this **fails to compile**
+    /// until someone decides what it means with the flag on and with it off.
+    ///
+    /// >>> A test asserts the cell you thought of. Exhaustiveness asserts the cells you didn't. <<<
+    ///
+    /// (`clippy::wildcard_enum_match_arm` would enforce this repo-wide. Not turned on in this PR —
+    /// it is a workspace-wide lint change with its own blast radius, and mixing it in here would
+    /// make a behaviour fix hostage to a lint sweep. Filed as a follow-up.)
+    pub fn resolve(read: SecretRead, disabled: bool) -> Notify {
+        match (read, disabled) {
+            // Suppression beats a working webhook. *** THIS IS THE CELL THE BUG LIVED IN *** — and
+            // it is the one a future reader will be most tempted to collapse back into a wildcard.
+            (SecretRead::Resolved(_), true) => Notify::Disabled,
+            (SecretRead::Resolved(u), false) => Notify::Webhook(u),
+            (SecretRead::DeliberatelyOff, true) => Notify::Disabled,
+            (SecretRead::DeliberatelyOff, false) => Notify::Disabled,
+            // Suppression is the job: do not page someone about the quiet they asked for.
+            (SecretRead::ReadFailed, true) => Notify::Disabled,
+            // Weather, never intent.
+            (SecretRead::ReadFailed, false) => Notify::Unresolved,
+        }
+    }
+}
+
 /// Everything `handle` needs to do its job. Constructed once by Task 5's lambda main.
 pub struct Deps {
     pub store: Store,
     pub humble: HumbleClient,
-    pub webhook_url: Option<String>,
+    pub notify: Notify,
     pub http: reqwest::Client,
     /// SSM client + the humble-cookie parameter name, so the app can self-heal its own session:
     /// on a dead session it logs in (via `humble.login()`) and persists the fresh cookie here,
@@ -491,7 +581,7 @@ async fn refresh_session(deps: &Deps) -> Heal {
                     // self-login every dead cookie pinged; now a heal is otherwise invisible, and
                     // the operator would lose the early-warning trend (rate-limit / TOTP drift /
                     // an impending new-device challenge) until self-login finally hard-fails.
-                    ping(deps, SESSION_HEALED_MSG).await;
+                    ping_msg(deps, &OperatorMessage::literal(SESSION_HEALED_MSG)).await;
                     Heal::Persisted
                 }
                 Err(e) => {
@@ -501,7 +591,7 @@ async fn refresh_session(deps: &Deps) -> Heal {
                     // client from SSM per invoke) — a silent "login every invoke" that feeds
                     // humble's bot-detection. Ping so it's not buried in CloudWatch.
                     tracing::warn!(error = %e, "session self-heal: logged in but persisting to SSM failed");
-                    ping(deps, SESSION_PERSIST_FAILED_MSG).await;
+                    ping_msg(deps, &OperatorMessage::literal(SESSION_PERSIST_FAILED_MSG)).await;
                     Heal::Unpersisted
                 }
             }
@@ -512,7 +602,10 @@ async fn refresh_session(deps: &Deps) -> Heal {
             // COOKIE_DEAD_MSG and the root cause lives buried in CloudWatch while the operator
             // flails blind. LoginFailed reasons carry statuses/labels, never secret values.
             tracing::warn!(error = ?e, "session self-heal: login failed");
-            ping(deps, &format!("humble self-login FAILED ({e}) — session still dead; break-glass: update the humble-cookie SSM param directly (AWS console/CLI)")).await;
+            ping_msg(deps, &OperatorMessage::fmt(
+    "humble self-login FAILED ({}) — session still dead; break-glass: update the humble-cookie SSM param directly (AWS console/CLI)",
+    &[Part::Error(logged(&e, "humble self-login failed"))],
+)).await;
             Heal::Failed
         }
     }
@@ -766,14 +859,10 @@ async fn handle_gift(
                     // fulfill lost to compensate = loud Corrupt; the URL exists but the game moved
                     // on. Surface as Error + ping — human decides. NEVER retry the redeem.
                     Err(e) => {
-                        ping(
-                            deps,
-                            &format!(
-                                "fulfill after redeem failed for claim {claim_id}: {e} — \
-                                 gift URL was generated but not recorded — recover it from \
-                                 humble's gift history page (purchases → the order → gift link)"
-                            ),
-                        )
+                        ping_msg(deps, &OperatorMessage::fmt(
+    "fulfill after redeem failed for claim {}: {} — gift URL was generated but not recorded — recover it from humble\'s gift history page (purchases → the order → gift link)",
+    &[Part::Id(claim_id), Part::Error(logged(&e, "fulfill after redeem failed"))],
+))
                         .await;
                         FulfillResponse::Error {
                             message: "gift generated but recording failed — flagged for ben".into(),
@@ -795,9 +884,15 @@ async fn handle_gift(
         {
             Ok(()) => FulfillResponse::AlreadyRedeemed,
             Err(e) => {
-                ping(
+                ping_msg(
                     deps,
-                    &format!("compensate failed for claim {claim_id}: {e}"),
+                    &OperatorMessage::fmt(
+                        "compensate failed for claim {}: {}",
+                        &[
+                            Part::Id(claim_id),
+                            Part::Error(logged(&e, "compensate failed")),
+                        ],
+                    ),
                 )
                 .await;
                 FulfillResponse::Error {
@@ -819,7 +914,7 @@ async fn handle_gift(
             } else {
                 COOKIE_DEAD_MSG
             };
-            ping(deps, msg).await;
+            ping_msg(deps, &OperatorMessage::literal(msg)).await;
             FulfillResponse::Parked {
                 reason: "humble session needs attention".into(),
             }
@@ -839,15 +934,10 @@ async fn handle_gift(
             // failure would otherwise loop silently (park → reconcile → re-list → re-claim →
             // fail). The reason string carries no secret (it names the failure class only).
             if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
-                ping(
-                    deps,
-                    &format!(
-                        "gift redeem for claim {claim_id} ({machine_name}) needed humble's \
-                         secure-area step-up and it did not complete: {reason}. Check the humble \
-                         password + TOTP seed in SSM (or the account may be locked / rate-limited). \
-                         The key was NOT redeemed — the claim is parked and will re-list on reconcile."
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "gift redeem for claim {} ({}) needed humble\'s secure-area step-up and it did not complete: {}. Check the humble password + TOTP seed in SSM (or the account may be locked / rate-limited). The key was NOT redeemed — the claim is parked and will re-list on reconcile.",
+    &[Part::Id(claim_id), Part::Id(machine_name), Part::Id(reason)],
+))
                 .await;
             }
             // A redeem-auth rejection gets its own correctly-labeled ping: without one, a
@@ -864,16 +954,10 @@ async fn handle_gift(
                 } else {
                     "humble rejected its own captured csrf token — the write dance needs a look"
                 };
-                ping(
-                    deps,
-                    &format!(
-                        "gift redeem for claim {claim_id} ({machine_name}) was blocked at \
-                         humble's auth layer (status {status}). {csrf_note}. The session cookie \
-                         is fine (reads work) — refreshing the session won't help. The claim is \
-                         parked; reconcile will re-list the key if unredeemed, so this repeats on \
-                         the next claim until the write path is fixed."
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "gift redeem for claim {} ({}) was blocked at humble\'s auth layer (status {}). {}. The session cookie is fine (reads work) — refreshing the session won\'t help. The claim is parked; reconcile will re-list the key if unredeemed, so this repeats on the next claim until the write path is fixed.",
+    &[Part::Id(claim_id), Part::Id(machine_name), Part::Id(&status.to_string()), Part::Id(csrf_note)],
+))
                 .await;
             }
             FulfillResponse::Parked {
@@ -895,22 +979,20 @@ async fn handle_gift(
             match fail_dead_key_any(deps, link_token, claim_id, game_id, &reason).await {
                 Ok(()) => {
                     tracing::warn!(claim_id, game_id, %reason, "dead key: claim terminally failed, slot returned, game retired");
-                    ping(
-                        deps,
-                        &format!(
-                            "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
-                             \"{reason}\". The claim is failed (reason recorded on the \
-                             claim), the game is retired as expired and will not re-list, \
-                             and the slot was returned. Nothing retries this.",
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "claim {} ({}) hit a DEAD key — humble says: \"{}\". The claim is failed (reason recorded on the claim), the game is retired as expired and will not re-list, and the slot was returned. Nothing retries this.",
+    &[Part::Id(claim_id), Part::Id(game_id), Part::Id(&reason)],
+))
                     .await;
                     FulfillResponse::KeyDead
                 }
                 Err(e) => {
                     // The store write failed — the claim is STILL pending; reconcile
                     // will re-detect the dead key next pass and retry this transition.
-                    ping(deps, &format!("dead-key fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "dead-key fail-claim write for {} failed: {} — still pending, reconcile retries",
+    &[Part::Id(claim_id), Part::Error(logged(&e, "dead-key fail-claim write failed"))],
+)).await;
                     FulfillResponse::Parked {
                         reason: "dead key detected but recording failed — will retry".into(),
                     }
@@ -1039,14 +1121,10 @@ async fn handle_choice_claim(
                         claim_id,
                         "choice pre-check: game already claimed AND redeemed on humble — human recovery"
                     );
-                    ping(
-                        deps,
-                        &format!(
-                            "choice claim {claim_id} ({title}): this game's pick appears already \
-                             claimed AND redeemed on humble — no re-choose was attempted. Recover \
-                             the gift URL from humble's gift-history page; the claim is parked."
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}): this game\'s pick appears already claimed AND redeemed on humble — no re-choose was attempted. Recover the gift URL from humble\'s gift-history page; the claim is parked.",
+    &[Part::Id(claim_id), Part::Id(&title)],
+))
                     .await;
                     parked_choice("already-claimed-redeemed")
                 }
@@ -1170,14 +1248,10 @@ async fn handle_choice_claim(
                 claim_id,
                 "choose committed but no new tpk in the re-read — parking; reconcile finishes (no re-choose)"
             );
-            ping(
-                deps,
-                &format!(
-                    "choice claim {claim_id} ({title}): the monthly pick was spent but the new key \
-                     hasn't appeared in the order yet — parked, reconcile will finish it. No pick \
-                     will be spent twice."
-                ),
-            )
+            ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}): the monthly pick was spent but the new key hasn\'t appeared in the order yet — parked, reconcile will finish it. No pick will be spent twice.",
+    &[Part::Id(claim_id), Part::Id(&title)],
+))
             .await;
             return parked_choice("no-tpk-yet");
         }
@@ -1186,14 +1260,10 @@ async fn handle_choice_claim(
                 claim_id,
                 "ambiguous new tpks after choose — parking for human review"
             );
-            ping(
-                deps,
-                &format!(
-                    "choice claim {claim_id} ({title}): several new keys appeared after the choose \
-                     and the title can't single one out (a concurrent sibling claim on this month?) \
-                     — parked for review. No key was burned."
-                ),
-            )
+            ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}): several new keys appeared after the choose and the title can\'t single one out (a concurrent sibling claim on this month?) — parked for review. No key was burned.",
+    &[Part::Id(claim_id), Part::Id(&title)],
+))
             .await;
             return parked_choice("ambiguous-tpk");
         }
@@ -1259,21 +1329,18 @@ async fn claimed_tpk_terminal(
         return match fail_dead_key_any(deps, link_token, claim_id, game_id, &reason).await {
             Ok(()) => {
                 tracing::warn!(claim_id, game_id, %reason, "dead key (structural): claim terminally failed");
-                ping(
-                    deps,
-                    &format!(
-                        "claim {claim_id} ({game_id}) sits on a key humble marks expired \
-                         ({}) — failed terminally without a redeem attempt. Reason recorded, \
-                         slot returned, game retired. If this was a choice claim, its spent \
-                         pick is stranded.",
-                        tpk.machine_name
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "claim {} ({}) sits on a key humble marks expired ({}) — failed terminally without a redeem attempt. Reason recorded, slot returned, game retired. If this was a choice claim, its spent pick is stranded.",
+    &[Part::Id(claim_id), Part::Id(game_id), Part::Id(&tpk.machine_name)],
+))
                 .await;
                 FulfillResponse::KeyDead
             }
             Err(e) => {
-                ping(deps, &format!("dead-key (structural) fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                ping_msg(deps, &OperatorMessage::fmt(
+    "dead-key (structural) fail-claim write for {} failed: {} — still pending, reconcile retries",
+    &[Part::Id(claim_id), Part::Error(logged(&e, "dead-key (structural) fail-claim write failed"))],
+)).await;
                 FulfillResponse::Parked {
                     reason: "dead key detected but recording failed — will retry".into(),
                 }
@@ -1342,14 +1409,10 @@ async fn redeem_claimed_tpk(
                 {
                     Ok(()) => FulfillResponse::GiftUrl { url },
                     Err(e) => {
-                        ping(
-                            deps,
-                            &format!(
-                                "fulfill after choice redeem failed for claim {claim_id}: {e} — \
-                                 gift URL was generated but not recorded — recover it from humble's \
-                                 gift history page (purchases → the order → gift link)"
-                            ),
-                        )
+                        ping_msg(deps, &OperatorMessage::fmt(
+    "fulfill after choice redeem failed for claim {}: {} — gift URL was generated but not recorded — recover it from humble\'s gift history page (purchases → the order → gift link)",
+    &[Part::Id(claim_id), Part::Error(logged(&e, "fulfill after choice redeem failed"))],
+))
                         .await;
                         FulfillResponse::Error {
                             message: "gift generated but recording failed — flagged for ben".into(),
@@ -1370,14 +1433,10 @@ async fn redeem_claimed_tpk(
                 game_id,
                 "choice redeem returned AlreadyRedeemed — pick already spent, NOT compensating; human recovery"
             );
-            ping(
-                deps,
-                &format!(
-                    "choice claim {claim_id} redeem returned already-redeemed — the monthly pick was \
-                     already spent, so this claim was NOT compensated (re-listing would strand the \
-                     pick). Recover the gift URL from humble's gift-history page; claim parked."
-                ),
-            )
+            ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} redeem returned already-redeemed — the monthly pick was already spent, so this claim was NOT compensated (re-listing would strand the pick). Recover the gift URL from humble\'s gift-history page; claim parked.",
+    &[Part::Id(claim_id)],
+))
             .await;
             FulfillResponse::Parked {
                 reason: "choice key already redeemed — parked for human recovery".into(),
@@ -1396,15 +1455,10 @@ async fn redeem_claimed_tpk(
                 _ => "transient",
             };
             if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
-                ping(
-                    deps,
-                    &format!(
-                        "choice gift redeem for claim {claim_id} ({}) needed humble's secure-area \
-                         step-up and it did not complete: {reason}. The key was NOT redeemed — the \
-                         claim is parked and reconcile will finish it.",
-                        tpk.machine_name
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "choice gift redeem for claim {} ({}) needed humble\'s secure-area step-up and it did not complete: {}. The key was NOT redeemed — the claim is parked and reconcile will finish it.",
+    &[Part::Id(claim_id), Part::Id(&tpk.machine_name), Part::Id(reason)],
+))
                 .await;
             }
             if let Err(HumbleError::RedeemAuthRejected {
@@ -1417,16 +1471,10 @@ async fn redeem_claimed_tpk(
                 } else {
                     "humble rejected its own captured csrf token — the write dance needs a look"
                 };
-                ping(
-                    deps,
-                    &format!(
-                        "choice gift redeem for claim {claim_id} ({}) was blocked at humble's auth \
-                         layer (status {status}). {csrf_note}. The session cookie is fine (reads \
-                         work). The claim is parked; reconcile will finish it once the write path is \
-                         fixed.",
-                        tpk.machine_name
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "choice gift redeem for claim {} ({}) was blocked at humble\'s auth layer (status {}). {}. The session cookie is fine (reads work). The claim is parked; reconcile will finish it once the write path is fixed.",
+    &[Part::Id(claim_id), Part::Id(&tpk.machine_name), Part::Id(&status.to_string()), Part::Id(csrf_note)],
+))
                 .await;
             }
             FulfillResponse::Parked {
@@ -1444,22 +1492,18 @@ async fn redeem_claimed_tpk(
             match fail_dead_key_any(deps, link_token, claim_id, game_id, &reason).await {
                 Ok(()) => {
                     tracing::warn!(claim_id, game_id, %reason, "dead key: claim terminally failed, slot returned, game retired");
-                    ping(
-                        deps,
-                        &format!(
-                            "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
-                             \"{reason}\". The claim is failed (reason recorded on the \
-                             claim), the game is retired as expired and will not re-list, \
-                             and the slot was returned. Nothing retries this. The monthly \
-                             pick was already spent and is stranded -- the dead key was the \
-                             pick's product.",
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "claim {} ({}) hit a DEAD key — humble says: \"{}\". The claim is failed (reason recorded on the claim), the game is retired as expired and will not re-list, and the slot was returned. Nothing retries this. The monthly pick was already spent and is stranded -- the dead key was the pick\'s product.",
+    &[Part::Id(claim_id), Part::Id(game_id), Part::Id(&reason)],
+))
                     .await;
                     FulfillResponse::KeyDead
                 }
                 Err(e) => {
-                    ping(deps, &format!("dead-key fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "dead-key fail-claim write for {} failed: {} — still pending, reconcile retries",
+    &[Part::Id(claim_id), Part::Error(logged(&e, "dead-key fail-claim write failed"))],
+)).await;
                     FulfillResponse::Parked {
                         reason: "dead key detected but recording failed — will retry".into(),
                     }
@@ -1534,15 +1578,10 @@ async fn reveal_claimed_tpk(
                 _ => "transient",
             };
             if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
-                ping(
-                    deps,
-                    &format!(
-                        "choice self-claim reveal for claim {claim_id} ({}) needed humble's \
-                         secure-area step-up and it did not complete: {reason}. The key was NOT \
-                         revealed — the claim is parked and reconcile will finish it.",
-                        tpk.machine_name
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "choice self-claim reveal for claim {} ({}) needed humble\'s secure-area step-up and it did not complete: {}. The key was NOT revealed — the claim is parked and reconcile will finish it.",
+    &[Part::Id(claim_id), Part::Id(&tpk.machine_name), Part::Id(reason)],
+))
                 .await;
             }
             if let Err(HumbleError::RedeemAuthRejected {
@@ -1555,16 +1594,10 @@ async fn reveal_claimed_tpk(
                 } else {
                     "humble rejected its own captured csrf token — the write dance needs a look"
                 };
-                ping(
-                    deps,
-                    &format!(
-                        "choice self-claim reveal for claim {claim_id} ({}) was blocked at \
-                         humble's auth layer (status {status}). {csrf_note}. The session cookie \
-                         is fine (reads work). The claim is parked; reconcile will finish it once \
-                         the write path is fixed.",
-                        tpk.machine_name
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "choice self-claim reveal for claim {} ({}) was blocked at humble\'s auth layer (status {}). {}. The session cookie is fine (reads work). The claim is parked; reconcile will finish it once the write path is fixed.",
+    &[Part::Id(claim_id), Part::Id(&tpk.machine_name), Part::Id(&status.to_string()), Part::Id(csrf_note)],
+))
                 .await;
             }
             FulfillResponse::Parked {
@@ -1583,21 +1616,18 @@ async fn reveal_claimed_tpk(
             {
                 Ok(()) => {
                     tracing::warn!(claim_id, game_id, %reason, "dead key: claim terminally failed, slot returned, game retired");
-                    ping(
-                        deps,
-                        &format!(
-                            "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
-                             \"{reason}\". The claim is failed (reason recorded on the \
-                             claim), the game is retired as expired and will not re-list, \
-                             and the slot was returned. Nothing retries this. If this was a \
-                             choice claim, its spent pick is stranded.",
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "claim {} ({}) hit a DEAD key — humble says: \"{}\". The claim is failed (reason recorded on the claim), the game is retired as expired and will not re-list, and the slot was returned. Nothing retries this. If this was a choice claim, its spent pick is stranded.",
+    &[Part::Id(claim_id), Part::Id(game_id), Part::Id(&reason)],
+))
                     .await;
                     FulfillResponse::KeyDead
                 }
                 Err(e) => {
-                    ping(deps, &format!("dead-key fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "dead-key fail-claim write for {} failed: {} — still pending, reconcile retries",
+    &[Part::Id(claim_id), Part::Error(logged(&e, "dead-key fail-claim write failed"))],
+)).await;
                     FulfillResponse::Parked {
                         reason: "dead key detected but recording failed — will retry".into(),
                     }
@@ -1618,7 +1648,7 @@ async fn choice_cookie_dead(deps: &Deps) -> FulfillResponse {
     } else {
         COOKIE_DEAD_MSG
     };
-    ping(deps, msg).await;
+    ping_msg(deps, &OperatorMessage::literal(msg)).await;
     FulfillResponse::Parked {
         reason: "humble session needs attention".into(),
     }
@@ -1644,24 +1674,17 @@ async fn choose_park(
         _ => "transient",
     };
     if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = outcome {
-        ping(
-            deps,
-            &format!(
-                "choice claim {claim_id} ({title}): choosecontent needed humble's secure-area \
-                 step-up and it did not complete: {reason}. No pick was spent — the claim is parked."
-            ),
-        )
+        ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}): choosecontent needed humble\'s secure-area step-up and it did not complete: {}. No pick was spent — the claim is parked.",
+    &[Part::Id(claim_id), Part::Id(title), Part::Id(reason)],
+))
         .await;
     }
     if let Err(HumbleError::ChooseFailed { reason }) = outcome {
-        ping(
-            deps,
-            &format!(
-                "choice claim {claim_id} ({title}): humble refused the pick (choosecontent \
-                 success=false): {reason}. No pick was spent this attempt — the claim is parked \
-                 (reconcile will compensate if the order confirms nothing was claimed)."
-            ),
-        )
+        ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}): humble refused the pick (choosecontent success=false): {}. No pick was spent this attempt — the claim is parked (reconcile will compensate if the order confirms nothing was claimed).",
+    &[Part::Id(claim_id), Part::Id(title), Part::Id(reason)],
+))
         .await;
     }
     FulfillResponse::Parked {
@@ -1736,7 +1759,7 @@ async fn handle_self_claim(
             } else {
                 COOKIE_DEAD_MSG
             };
-            ping(deps, msg).await;
+            ping_msg(deps, &OperatorMessage::literal(msg)).await;
             FulfillResponse::Parked {
                 reason: "humble session needs attention".into(),
             }
@@ -1751,14 +1774,10 @@ async fn handle_self_claim(
                 _ => "transient",
             };
             if let Err(HumbleError::SecureAreaStepUpFailed { reason }) = &outcome {
-                ping(
-                    deps,
-                    &format!(
-                        "self-claim reveal for claim {claim_id} ({machine_name}) needed humble's \
-                     secure-area step-up and it did not complete: {reason}. The key was NOT \
-                     revealed — the claim is parked and reconcile will finish it."
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "self-claim reveal for claim {} ({}) needed humble\'s secure-area step-up and it did not complete: {}. The key was NOT revealed — the claim is parked and reconcile will finish it.",
+    &[Part::Id(claim_id), Part::Id(machine_name), Part::Id(reason)],
+))
                 .await;
             }
             FulfillResponse::Parked {
@@ -1777,20 +1796,18 @@ async fn handle_self_claim(
             {
                 Ok(()) => {
                     tracing::warn!(claim_id, game_id, %reason, "dead key: claim terminally failed, slot returned, game retired");
-                    ping(
-                        deps,
-                        &format!(
-                            "claim {claim_id} ({game_id}) hit a DEAD key — humble says: \
-                             \"{reason}\". The claim is failed (reason recorded on the \
-                             claim), the game is retired as expired and will not re-list, \
-                             and the slot was returned. Nothing retries this.",
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "claim {} ({}) hit a DEAD key — humble says: \"{}\". The claim is failed (reason recorded on the claim), the game is retired as expired and will not re-list, and the slot was returned. Nothing retries this.",
+    &[Part::Id(claim_id), Part::Id(game_id), Part::Id(&reason)],
+))
                     .await;
                     FulfillResponse::KeyDead
                 }
                 Err(e) => {
-                    ping(deps, &format!("dead-key fail-claim write for {claim_id} failed: {e} — still pending, reconcile retries")).await;
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "dead-key fail-claim write for {} failed: {} — still pending, reconcile retries",
+    &[Part::Id(claim_id), Part::Error(logged(&e, "dead-key fail-claim write failed"))],
+)).await;
                     FulfillResponse::Parked {
                         reason: "dead key detected but recording failed — will retry".into(),
                     }
@@ -1813,10 +1830,10 @@ async fn record_revealed_key(
         Err(e) => {
             // Key exists but recording failed — loud, human decides. NEVER retry the reveal.
             // The ping names the claim, NEVER the key value.
-            ping(deps, &format!(
-                "self-claim fulfill failed for claim {claim_id}: {e} — the key was revealed but \
-                 not recorded; it is still readable in humble's library keys page."
-            )).await;
+            ping_msg(deps, &OperatorMessage::fmt(
+    "self-claim fulfill failed for claim {}: {} — the key was revealed but not recorded; it is still readable in humble\'s library keys page.",
+    &[Part::Id(claim_id), Part::Error(logged(&e, "self-claim fulfill failed"))],
+)).await;
             FulfillResponse::Error {
                 message: "key revealed but recording failed — flagged for ben".into(),
             }
@@ -1854,14 +1871,10 @@ async fn recover_already_redeemed_key(
             record_revealed_key(deps, claim_id, game_id, val).await
         }
         None => {
-            ping(
-                deps,
-                &format!(
-                    "self-claim {claim_id} ({machine_name}): humble says already-redeemed but the \
-                 order carries no key value — it may have been gifted out-of-band. Parked for \
-                 review; nothing was compensated."
-                ),
-            )
+            ping_msg(deps, &OperatorMessage::fmt(
+    "self-claim {} ({}): humble says already-redeemed but the order carries no key value — it may have been gifted out-of-band. Parked for review; nothing was compensated.",
+    &[Part::Id(claim_id), Part::Id(machine_name)],
+))
             .await;
             FulfillResponse::Parked {
                 reason: "already-redeemed with no recoverable key value".into(),
@@ -1933,14 +1946,10 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                     // "not redeemed → compensate" arm. SELF uses compensate_self_claim (no link-meta).
                     tracing::info!(claim_id = %claim.id, "reconcile(choice): no intent snapshot, no title-matched key anywhere in the order — compensating (verified nothing for this game)");
                     let _ = compensate_any(deps, claim).await;
-                    ping(
-                        deps,
-                        &format!(
-                            "reconcile compensated choice claim {} ({}) — no choose intent was ever \
-                             recorded, so the monthly pick was NOT spent — slot returned, game re-listed.",
-                            claim.id, game.title
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "reconcile compensated choice claim {} ({}) — no choose intent was ever recorded, so the monthly pick was NOT spent — slot returned, game re-listed.",
+    &[Part::Id(&claim.id), Part::Id(&game.title)],
+))
                     .await;
                 }
                 [tpk] => {
@@ -1950,33 +1959,37 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                     // a Some-only privilege.
                     tracing::warn!(claim_id = %claim.id, machine_name = %tpk.machine_name, redeemed = tpk.redeemed, "reconcile(choice): no intent snapshot, but a title-matched key exists on humble — NOT auto-compensating, parking");
                     let msg = if tpk.redeemed {
-                        format!(
+                        OperatorMessage::fmt(
                             "choice claim {} ({}) has no intent snapshot, but humble shows a key for \
                              this title (`{}`) already revealed — a pick was spent outside the app's \
                              writes. Cannot attribute it to this claim (no snapshot = no \
                              arrival-order evidence). Left pending for review.",
-                            claim.id, game.title, tpk.machine_name
+                            &[
+                                Part::Id(&claim.id),
+                                Part::Id(&game.title),
+                                Part::Id(&tpk.machine_name),
+                            ],
                         )
                     } else {
-                        format!(
+                        OperatorMessage::fmt(
                             "choice claim {} ({}) has no intent snapshot, but humble shows an \
                              unredeemed key for this title (`{}`). Cannot attribute it to this \
                              claim. Left pending for review.",
-                            claim.id, game.title, tpk.machine_name
+                            &[
+                                Part::Id(&claim.id),
+                                Part::Id(&game.title),
+                                Part::Id(&tpk.machine_name),
+                            ],
                         )
                     };
-                    ping(deps, &msg).await;
+                    ping_msg(deps, &msg).await;
                 }
                 _ => {
                     tracing::warn!(claim_id = %claim.id, "reconcile(choice): no intent snapshot, multiple title-matched keys on humble — NOT auto-compensating, parking ambiguous");
-                    ping(
-                        deps,
-                        &format!(
-                            "choice claim {} ({}) has no intent snapshot and multiple keys on \
-                             humble could match the title. Left pending for review.",
-                            claim.id, game.title
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}) has no intent snapshot and multiple keys on humble could match the title. Left pending for review.",
+    &[Part::Id(&claim.id), Part::Id(&game.title)],
+))
                     .await;
                 }
             }
@@ -1992,15 +2005,10 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
             // identically; no store write at all.
             TpkPick::None => {
                 tracing::warn!(claim_id = %claim.id, "reconcile(choice): snapshot present, no new tpk — NOT auto-compensating (a snapshot can hide an out-of-band spend), parking");
-                ping(
-                    deps,
-                    &format!(
-                        "choice claim {} ({}) has an intent snapshot but no new key on humble — \
-                         NOT auto-compensating: a snapshot can hide a pick spent out of band. Left \
-                         pending for review.",
-                        claim.id, game.title
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}) has an intent snapshot but no new key on humble — NOT auto-compensating: a snapshot can hide a pick spent out of band. Left pending for review.",
+    &[Part::Id(&claim.id), Part::Id(&game.title)],
+))
                 .await;
             }
             // B2. Unique new tpk, NOT redeemed ⇒ pick SPENT, key not yet burned (crash between the
@@ -2068,28 +2076,18 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                         } else {
                             ""
                         };
-                        ping(
-                            deps,
-                            &format!(
-                                "reconcile recovered the already-revealed key for self claim {} \
-                                 ({}) from the order — claim completed autonomously; the key was \
-                                 redeemed out of band{}.",
-                                claim.id, game.title, gift_flag
-                            ),
-                        )
+                        ping_msg(deps, &OperatorMessage::fmt(
+    "reconcile recovered the already-revealed key for self claim {} ({}) from the order — claim completed autonomously; the key was redeemed out of band{}.",
+    &[Part::Id(&claim.id), Part::Id(&game.title), Part::Id(gift_flag)],
+))
                         .await;
                     }
                 } else {
                     tracing::warn!(claim_id = %claim.id, "reconcile(choice): key present but already redeemed — human recovery (URL unrecorded)");
-                    ping(
-                        deps,
-                        &format!(
-                            "choice claim {} ({}) shows its key already redeemed on humble but no gift \
-                             URL was recorded — recover it manually from humble's gift-history page. \
-                             Claim left pending.",
-                            claim.id, game.title
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}) shows its key already redeemed on humble but no gift URL was recorded — recover it manually from humble\'s gift-history page. Claim left pending.",
+    &[Part::Id(&claim.id), Part::Id(&game.title)],
+))
                     .await;
                 }
             }
@@ -2098,14 +2096,10 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
             // sibling fulfills. NEVER a key value in the ping.
             TpkPick::Ambiguous => {
                 tracing::warn!(claim_id = %claim.id, "reconcile(choice): ambiguous new tpks — leaving pending, human decides");
-                ping(
-                    deps,
-                    &format!(
-                        "choice claim {} ({}) has multiple new keys on humble that the title can't \
-                         disambiguate (a concurrent claim on this month?) — left pending for review.",
-                        claim.id, game.title
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "choice claim {} ({}) has multiple new keys on humble that the title can\'t disambiguate (a concurrent claim on this month?) — left pending for review.",
+    &[Part::Id(&claim.id), Part::Id(&game.title)],
+))
                 .await;
             }
         },
@@ -2334,11 +2328,7 @@ async fn refresh_ben_ownership(deps: &Deps, games: &[Game], already_pinged: bool
             let prev_success = cached.is_some();
             let should_ping = prev_success && !already_pinged;
             if should_ping {
-                ping(
-                    deps,
-                    "your steam 'game details' privacy or the key's account changed \
-                     — owned badges are frozen until fixed",
-                )
+                ping_msg(deps, &OperatorMessage::literal("your steam \'game details\' privacy or the key\'s account changed — owned badges are frozen until fixed"))
                 .await;
             }
             already_pinged || should_ping
@@ -3328,7 +3318,7 @@ async fn run_sync(deps: &Deps) {
         Ok(k) => k,
         // Dead AND self-login couldn't fix it (or isn't configured) → genuine attention needed.
         Err(HumbleError::Unauthorized) => {
-            ping(deps, COOKIE_DEAD_MSG).await;
+            ping_msg(deps, &OperatorMessage::literal(COOKIE_DEAD_MSG)).await;
             persist_sync(
                 deps,
                 false,
@@ -3391,7 +3381,7 @@ async fn run_sync(deps: &Deps) {
             // (the failure reason was already pinged inside refresh_session).
             Err(HumbleError::Unauthorized) => {
                 cookie_ok = false;
-                ping(deps, COOKIE_DEAD_MSG).await;
+                ping_msg(deps, &OperatorMessage::literal(COOKIE_DEAD_MSG)).await;
                 break 'orders;
             }
             Err(e) => {
@@ -3563,18 +3553,13 @@ async fn run_sync(deps: &Deps) {
     // (no steam gate), same reasoning as the shared scan above.
     // scan predates discover_choice_games' writes — harmless: offered names never exact-match tpk
     // names, and a stale-scan write CCFs into SkippedInFlight; next run re-reads.
-    let pulls = match &shared_scan {
+    let (pulls, audit_rows_failed) = match &shared_scan {
         Some(scan) => shelf_truth_audit(deps, scan, &truth).await,
-        None => 0,
+        None => (0, 0),
     };
 
     let msg = if cookie_ok {
-        let base = format!("sync ok: {games_written} written, {orders_failed} order(s) failed");
-        if pulls > 0 {
-            format!("{base}, {pulls} audit-pulled")
-        } else {
-            base
-        }
+        summary_line(games_written, orders_failed, pulls, audit_rows_failed)
     } else {
         // Covers both a hard-dead session and a heal whose SSM persist failed — either way the
         // DURABLE cookie can't be trusted; the pings that already fired carry the specifics.
@@ -3604,6 +3589,29 @@ struct TruthEntry {
 
 type TruthMap = HashMap<(String, String), TruthEntry>;
 
+/// The sync summary, extracted from an inline `format!` so it can be tested without a sync.
+///
+/// `audit_rows_failed` is NOT nested under `pulls` (#161). That nesting is the tempting shape —
+/// both are audit numbers — and it is wrong in the one run that matters: rows that all FAIL to
+/// write pull nothing, so `pulls` is 0 and a nested counter would go silent in exactly the sync
+/// where every audit write broke. Pinned by
+/// `summary_reports_audit_row_failures_even_when_nothing_was_pulled`.
+fn summary_line(
+    games_written: u32,
+    orders_failed: u32,
+    pulls: u32,
+    audit_rows_failed: u32,
+) -> String {
+    let mut s = format!("sync ok: {games_written} written, {orders_failed} order(s) failed");
+    if pulls > 0 {
+        s.push_str(&format!(", {pulls} audit-pulled"));
+    }
+    if audit_rows_failed > 0 {
+        s.push_str(&format!(", {audit_rows_failed} audit row(s) failed"));
+    }
+    s
+}
+
 /// The shelf-truth audit (#158): the order walk's own write only ever lands on the id its D7
 /// routing ladder picks — for a plain tpk that's the same-id row (already corrected by the walk
 /// itself, minutes before this runs), but for a choice-suffixed tpk whose offered sibling exists,
@@ -3618,8 +3626,14 @@ type TruthMap = HashMap<(String, String), TruthEntry>;
 /// at all — is left completely untouched. The audit only ever acts on truth the walk itself
 /// fetched; it never infers anything from a row's absence from the fetched set.
 ///
-/// Returns the number of rows pulled (written) this pass, for the sync summary.
-async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 {
+/// Returns `(rows pulled, rows whose write FAILED)` this pass, both for the sync summary.
+///
+/// The second number exists because it did not (#161): the per-row `Err` arm below was a
+/// `tracing::warn!` and nothing more, while the order walk two hundred lines up has always
+/// surfaced `orders_failed`. Same run, two loops, one of them counted — so a row that failed to
+/// write on every single sync was invisible to anyone watching Discord, which is the only surface
+/// Ben watches.
+async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> (u32, u32) {
     struct Pulled {
         title: String,
         id: String,
@@ -3627,6 +3641,7 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
         is_gift: Option<bool>,
     }
     let mut pulled: Vec<Pulled> = Vec::new();
+    let mut rows_failed: u32 = 0;
 
     for g in scan.iter().filter(|g| g.is_listable()) {
         let Some(entry) = truth.get(&(g.gamekey.clone(), g.machine_name.clone())) else {
@@ -3676,6 +3691,7 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
             // already-identical row is Unchanged — both self-correct on the next sync's fresh read.
             Ok(SyncWrite::SkippedInFlight) | Ok(SyncWrite::Unchanged) => {}
             Err(e) => {
+                rows_failed += 1;
                 tracing::warn!(
                     error = ?e,
                     game_id = %g.id,
@@ -3686,7 +3702,9 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
     }
 
     if pulled.is_empty() {
-        return 0;
+        // Still return `rows_failed` — an all-failures pass pulls nothing, and returning a bare 0
+        // here is precisely how the count would stay invisible in its worst run.
+        return (0, rows_failed);
     }
 
     if pulled.len() > 3 {
@@ -3706,12 +3724,14 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
             "shelf audit: batch-pulled {} listed games whose keys are spent on humble",
             pulled.len()
         );
-        ping(
+        ping_msg(
             deps,
-            &format!(
+            &OperatorMessage::fmt(
                 "shelf audit: pulled {} listed games whose keys are spent on humble: {}",
-                pulled.len(),
-                titles.join(", ")
+                &[
+                    Part::Id(&pulled.len().to_string()),
+                    Part::Id(&titles.join(", ")),
+                ],
             ),
         )
         .await;
@@ -3721,18 +3741,28 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
                 game_id = %p.id,
                 "shelf audit: pulled a listed game whose key is spent on humble"
             );
-            let mut text = format!(
-                "shelf audit: pulled {} ({}) — key {} on humble",
-                p.title, p.id, p.reason
+            // The conditional tail is a `&'static str` on BOTH branches, so it goes through
+            // `Part::Text` rather than being appended to a runtime String — appending would have
+            // meant a String constructor, which is the one door this type does not have.
+            let gift_note = if p.is_gift == Some(true) {
+                " (humble marks it a gift)"
+            } else {
+                ""
+            };
+            let text = OperatorMessage::fmt(
+                "shelf audit: pulled {} ({}) — key {} on humble{}",
+                &[
+                    Part::Id(&p.title),
+                    Part::Id(&p.id),
+                    Part::Id(p.reason),
+                    Part::Text(gift_note),
+                ],
             );
-            if p.is_gift == Some(true) {
-                text.push_str(" (humble marks it a gift)");
-            }
-            ping(deps, &text).await;
+            ping_msg(deps, &text).await;
         }
     }
 
-    pulled.len() as u32
+    (pulled.len() as u32, rows_failed)
 }
 
 /// Choice-discovery ingest — the **sole intended writer** of `requires_choice = true` (see the
@@ -3823,7 +3853,7 @@ async fn discover_choice_games(
         // is best-effort; the pings already fired carry the specifics.
         Err(HumbleError::Unauthorized) => {
             *cookie_ok = false;
-            ping(deps, COOKIE_DEAD_MSG).await;
+            ping_msg(deps, &OperatorMessage::literal(COOKIE_DEAD_MSG)).await;
             return 0;
         }
         Err(e) => {
@@ -3892,7 +3922,7 @@ async fn discover_choice_games(
             Err(HumbleError::Unauthorized) if *is_probe => continue,
             Err(HumbleError::Unauthorized) => {
                 *cookie_ok = false;
-                ping(deps, COOKIE_DEAD_MSG).await;
+                ping_msg(deps, &OperatorMessage::literal(COOKIE_DEAD_MSG)).await;
                 break;
             }
             Err(e) => {
@@ -4058,15 +4088,10 @@ async fn pending_age_sweep(deps: &Deps) {
                 age_days = days,
                 "pending-age sweep: claim is still pending past the alert age"
             );
-            ping(
-                deps,
-                &format!(
-                    "claim {} ({}) is STILL PENDING after ~{days}d. Reconcile retries \
-                     it every sync (or cannot reach it — see logs for this run). It \
-                     will nag daily until it completes, compensates, or fails.",
-                    claim.id, claim.game_id
-                ),
-            )
+            ping_msg(deps, &OperatorMessage::fmt(
+    "claim {} ({}) is STILL PENDING after ~{}d. Reconcile retries it every sync (or cannot reach it — see logs for this run). It will nag daily until it completes, compensates, or fails.",
+    &[Part::Id(&claim.id), Part::Id(&claim.game_id), Part::Id(&days.to_string())],
+))
             .await;
         }
     }
@@ -4201,29 +4226,20 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
                     } else {
                         ""
                     };
-                    ping(
-                        deps,
-                        &format!(
-                            "reconcile recovered the already-revealed key for self claim {} ({}) \
-                             from the order — claim completed autonomously; the key was redeemed \
-                             out of band{}.",
-                            claim.id, key.human_name, gift_flag
-                        ),
-                    )
+                    ping_msg(deps, &OperatorMessage::fmt(
+    "reconcile recovered the already-revealed key for self claim {} ({}) from the order — claim completed autonomously; the key was redeemed out of band{}.",
+    &[Part::Id(&claim.id), Part::Id(&key.human_name), Part::Id(gift_flag)],
+))
                     .await;
                 }
             } else {
                 tracing::warn!(claim_id = %claim.id, "reconcile: parked claim shows redeemed on humble but no URL recorded — human recovery");
                 // Gift generated but URL unrecorded; leave pending (human-owned recovery). Message
                 // carries claim id + human game context only — NEVER a key value.
-                ping(
-                    deps,
-                    &format!(
-                        "parked claim {} ({} / {}) shows redeemed on humble but no gift URL was \
-                         recorded — recover manually via humble's gift-history page",
-                        claim.id, order.bundle_name, key.human_name
-                    ),
-                )
+                ping_msg(deps, &OperatorMessage::fmt(
+    "parked claim {} ({} / {}) shows redeemed on humble but no gift URL was recorded — recover manually via humble\'s gift-history page",
+    &[Part::Id(&claim.id), Part::Id(&order.bundle_name), Part::Id(&key.human_name)],
+))
                 .await;
             }
         } else if claim.link_token == domain::SELF_LINK_TOKEN {
@@ -4252,16 +4268,10 @@ async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool
             // look is gone. The ping restores that checkpoint: a compensate of a key that was in fact
             // gifted is a recoverable lost URL, and the operator sees it here to recover it from
             // humble's gift-history page.
-            ping(
-                deps,
-                &format!(
-                    "reconcile compensated parked claim {} ({} / {}) as not-redeemed — slot returned, \
-                     game re-listed. No key can be double-spent (humble refuses re-redeem of a burned \
-                     key); but IF this key was actually gifted, its gift URL is lost — recover it from \
-                     humble's gift-history page.",
-                    claim.id, order.bundle_name, key.human_name
-                ),
-            )
+            ping_msg(deps, &OperatorMessage::fmt(
+    "reconcile compensated parked claim {} ({} / {}) as not-redeemed — slot returned, game re-listed. No key can be double-spent (humble refuses re-redeem of a burned key); but IF this key was actually gifted, its gift URL is lost — recover it from humble\'s gift-history page.",
+    &[Part::Id(&claim.id), Part::Id(&order.bundle_name), Part::Id(&key.human_name)],
+))
             .await;
         }
     }
@@ -4294,15 +4304,10 @@ async fn alert_unreconcilable(
         age_hours = hours,
         "reconcile: parked claim is unreconcilable and STUCK — {reason}"
     );
-    ping(
-        deps,
-        &format!(
-            "parked claim {} (game_id {}) has been stuck ~{hours}h and reconcile cannot act on \
-             it: {reason}. Nothing self-heals this — the link slot stays consumed until someone \
-             looks. Fix the claim/game_id by hand (or compensate it) to free the slot.",
-            claim.id, claim.game_id
-        ),
-    )
+    ping_msg(deps, &OperatorMessage::fmt(
+    "parked claim {} (game_id {}) has been stuck ~{}h and reconcile cannot act on it: {}. Nothing self-heals this — the link slot stays consumed until someone looks. Fix the claim/game_id by hand (or compensate it) to free the slot.",
+    &[Part::Id(&claim.id), Part::Id(&claim.game_id), Part::Id(&hours.to_string()), Part::Id(reason)],
+))
     .await;
 }
 
@@ -4406,27 +4411,239 @@ async fn persist_sync(
     let _ = deps.store.put_sync_state(&st).await;
 }
 
-/// Build the discord ping body. Pure so the message shape is unit-testable without a webhook.
-/// Callers must never pass a cookie or gift URL into `msg`.
-fn ping_content(msg: &str) -> String {
-    format!("🐱 bendobundles: {msg}")
-}
-
-/// POST a discord webhook ping if a webhook is configured. Never fails the caller — a dead webhook
-/// must not break fulfillment. `msg` must never contain cookie/URL secrets.
-async fn ping(deps: &Deps, msg: &str) {
-    let Some(url) = deps.webhook_url.as_deref() else {
-        return;
-    };
-    let body = serde_json::json!({ "content": ping_content(msg) });
-    if let Err(e) = deps.http.post(url).json(&body).send().await {
-        eprintln!("discord ping failed (non-fatal): {e}");
+/// POST one already-rendered body. Returns 1 on failure, 0 on success, so callers can COUNT
+/// without being able to PROPAGATE.
+///
+/// Never returns `Err` — a dead webhook must not break fulfilment, and the `-> u32` keeps that a
+/// structural guarantee rather than a convention every call site must honour. But infallible is
+/// not the same as silent: the doc comment on `ping` licensed not *propagating* a failure, and
+/// never licensed not *recording* one.
+///
+/// **The `Ok(r)` non-success arm below is the load-bearing one.** `reqwest`'s `Err` arm catches
+/// TRANSPORT failure only; a 400/401/404/429 arrives as `Ok(response)` with a non-success status.
+/// Without that arm, such a response is a silent success — a failure routed into the success path.
+/// Discord rate-limits, so those are the notifications that vanish under exactly the load that
+/// makes them matter. Pinned by `ping_treats_non_2xx_as_failure`; delete the arm and that test
+/// goes red. (This paragraph said "`.error_for_status()` is the load-bearing call" until the #171
+/// gate — there is no `error_for_status()` in this function and there never was in this shape. The
+/// arm does that job. A doc naming a call the code does not make sends the next reader looking for
+/// a guard that isn't there, and — worse — invites them to "restore" it on top of the one that is.)
+async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
+    let body = serde_json::json!({ "content": content });
+    match http.post(url).json(&body).send().await {
+        Ok(r) if r.status().is_success() => 0,
+        // The status IS inspected. Without this arm a 400/401/404/429 is `Ok(response)` and
+        // vanishes into the success path.
+        Ok(r) => {
+            tracing::error!(
+                outcome = "discord_non_2xx",
+                status = r.status().as_u16(),
+                "operator notification rejected"
+            );
+            1
+        }
+        Err(e) => {
+            // GATE BLOCKER (OMBB, #171): `without_url()` is load-bearing, not tidying.
+            // `reqwest::Error`'s `Display` APPENDS the request URL, unredacted —
+            // `reqwest-0.12.28/src/error.rs:267-269`, `write!(f, " for url ({url})")` — and the URL
+            // IS attached on exactly the failures this arm catches (`async_impl/client.rs:3071`
+            // for request errors, `:3048`/`:3056` for timeouts). A Discord webhook URL carries its
+            // token in the path, and THIS CODEBASE ALREADY CLASSIFIES IT AS A CREDENTIAL
+            // (`main.rs:109-112`: SecureString, "#81 … and never logs the value"). So the value was
+            // decrypted under KMS, deliberately kept out of the read-side logs, and then printed in
+            // full by the one line that reports a dead webhook — on every connection reset.
+            //
+            // PRE-EXISTING, NOT INTRODUCED HERE: `origin/main`'s `ping()` had
+            // `eprintln!("discord ping failed (non-fatal): {e}")` — same `Display`, same leak. What
+            // this PR did was PROMOTE it from unstructured stderr into a structured, indexed,
+            // metric-filterable field. More durable and more greppable is worse, for a credential.
+            //
+            // `without_url()` (`error.rs:88`) drops the url and keeps the kind, which is the half
+            // that has diagnostic value. Do not swap this back to `%e` for a "better message".
+            tracing::error!(
+                outcome = "discord_transport",
+                error = %e.without_url(),
+                "operator notification transport failure"
+            );
+            1
+        }
     }
 }
+
+/// The prefix every operator message carries. Counted against the 2000 budget by `chunks`.
+const PING_PREFIX: &str = "🐱 bendobundles: ";
+
+/// Record an error on the CloudWatch side of the trust boundary and hand back the operator-safe
+/// reference to it. **This is the only shape a call site should use.**
+///
+/// The join is the whole point: the full error (payload, chain, whatever it carries) goes to
+/// CloudWatch, which is access-controlled; the operator channel, which is not, gets
+/// `[kind req id]`. Both sides read the id from the SAME `ErrorSummary` via `log_fields`, in the
+/// same call, so they cannot drift.
+///
+/// STATED LIMIT: `ErrorSummary::of` remains public, so this is the *convenient* door, not the
+/// *only* one — a site that mints a summary without logging it produces an unjoinable id, and that
+/// is caught by review, not by the type. Capturing emitted log records to test it would need a
+/// dependency; the trade was made deliberately (zero new deps, 4GB box).
+fn logged<E: std::error::Error>(e: &E, what: &'static str) -> ErrorSummary {
+    let s = ErrorSummary::of(e);
+    let (req_id, kind) = s.log_fields();
+    tracing::error!(
+        outcome = "operator_reported_error",
+        req_id = %req_id,
+        kind = kind,
+        error = ?e,
+        "{what}"
+    );
+    s
+}
+
+/// Post an `OperatorMessage`, chunked and bounded, recording each chunk's outcome OUT OF BAND.
+///
+/// Returns `()`. That is the structural guarantee — a dead webhook cannot break fulfilment, and no
+/// call site can propagate. The failure record is a structured `tracing::error!`, which is a
+/// CloudWatch metric-filter target: it survives the invocation and fires even if the next sync
+/// never runs, which an in-band record cannot. **No dead-letter row** — there is no drainer, so a
+/// durable queue would be storage with no consumer. **No retry** — a chunked send is not atomic
+/// (`1 of 2 chunk(s) sent` is a real observed outcome), so a naive retry double-posts.
+async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
+    let Notify::Webhook(url) = &deps.notify else {
+        return;
+    };
+    let chunks = msg.chunks(PING_PREFIX);
+    // GATE MAJOR 2 (OMBB, #171): `of` is not decoration. The no-retry ruling three lines up rests
+    // on "`1 of 2 chunk(s) sent` is a real observed outcome" — but a record carrying only
+    // `chunk = 1` cannot express it. An operator reading `chunk=1` with no total cannot tell
+    // 1-of-1 (the notification FAILED) from 1-of-5 (the notification is TORN, and four other posts
+    // may have landed). That is the exact distinction the ruling is built on, and it was the one
+    // field the record dropped. Bound before the loop so it is the real total, not a running count.
+    let n = chunks.len();
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        if deliver(&deps.http, url, &chunk).await == 1 {
+            tracing::error!(
+                outcome = "operator_notification_failed",
+                chunk = i + 1,
+                of = n,
+                "operator notification failed"
+            );
+        }
+    }
+}
+
+/// Test seam: drive the REAL `ping_msg` — `Notify` gate, chunking, delivery, failure record — from
+/// an integration test.
+///
+/// `ping_msg` is private and stays private: it takes `&Deps`, and exposing it would make the
+/// notification path callable from anywhere. This seam exists because the `NOTIFY_DISABLED` and
+/// dead-webhook guarantees are only meaningful when tested through the gate a real caller hits —
+/// a test that reimplements the gate proves the test's copy of it, not the code's.
+#[doc(hidden)]
+pub async fn ping_msg_for_test(deps: &Deps, text: &'static str) {
+    ping_msg(deps, &OperatorMessage::literal(text)).await;
+}
+
+/// Test seam: drive the chunked delivery path against a wiremock server.
+#[doc(hidden)]
+pub async fn ping_chunks_for_test(url: &str, msg: &str) -> u32 {
+    let m = operator_message::OperatorMessage::literal(Box::leak(msg.to_string().into_boxed_str()));
+    let http = reqwest::Client::new();
+    let mut failures = 0;
+    for chunk in m.chunks(PING_PREFIX) {
+        failures += deliver(&http, url, &chunk).await;
+    }
+    failures
+}
+
+// GATE MINOR m2 (OMBB, #171): `ping_content` and `ping_for_test` USED TO LIVE HERE, and both are
+// deleted rather than repaired. `ping_content` was production-dead — its only non-test caller was
+// `ping_for_test` — and it held a FOURTH hardcoded copy of `"🐱 bendobundles: "` while production
+// read `PING_PREFIX`. Change the const and the seam plus its green unit test would have drifted
+// silently, which is this arc's own defect class wearing a test's clothes. It also bypassed
+// `chunks()` entirely, so the seam had no 2000-char bound — a test seam that is SAFER than
+// production proves the wrong thing.
+//
+// `ping_chunks_for_test` above already has the identical signature and routes through the real
+// `PING_PREFIX` + `chunks()`, so the two integration callers moved to it and the divergence is now
+// impossible BY CONSTRUCTION rather than by remembering to update four literals. One seam, one
+// prefix, one bound.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------------------------
+    // Notify / SecretRead — operator-truth (A). An unconfigured webhook used to return success
+    // from every call site and every log: a prod deploy that lost its URL was indistinguishable
+    // from one that notified. The states are separated ONCE at init instead of collapsed forever
+    // at each use.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn ssm_read_failure_is_unresolved_not_disabled() {
+        // THE four-state fix. An SSM error is WEATHER — a throttle, a KMS grant, a network blip —
+        // and must never be recorded as INTENT. `Option<String>` collapsed them.
+        assert!(matches!(
+            Notify::resolve(SecretRead::ReadFailed, false),
+            Notify::Unresolved
+        ));
+    }
+
+    #[test]
+    fn deliberately_off_is_disabled_not_unresolved() {
+        assert!(matches!(
+            Notify::resolve(SecretRead::DeliberatelyOff, false),
+            Notify::Disabled
+        ));
+    }
+
+    // *** THE FLAG'S OWN TEST DID NOT TEST THE FLAG. ***
+    // `explicit_disable_flag_also_yields_disabled` passed `(DeliberatelyOff, true)` — which is
+    // Disabled because of the READ, not because of the flag, and would have passed identically
+    // with the flag deleted from the signature. The matrix is 3 reads x 2 flag values = 6 cells;
+    // four were covered and the two uncovered ones were exactly the two where the flag is the
+    // ONLY thing that can decide the answer. A hole in a test matrix is not random: it sits where
+    // the redundant cases were easy to write.
+    #[test]
+    fn disable_flag_overrides_a_resolved_secret() {
+        // THE cell the bug lived in. Before the fix this returned Webhook — NOTIFY_DISABLED=1 was
+        // inert in the only situation an operator ever sets it: notifications currently working.
+        assert!(matches!(
+            Notify::resolve(SecretRead::Resolved("https://x".into()), true),
+            Notify::Disabled
+        ));
+    }
+
+    #[test]
+    fn disable_flag_suppresses_the_unresolved_alarm() {
+        // Suppression is the whole job: someone who asked for quiet must not be paged about it.
+        assert!(matches!(
+            Notify::resolve(SecretRead::ReadFailed, true),
+            Notify::Disabled
+        ));
+    }
+
+    #[test]
+    fn explicit_disable_flag_also_yields_disabled() {
+        assert!(matches!(
+            Notify::resolve(SecretRead::DeliberatelyOff, true),
+            Notify::Disabled
+        ));
+    }
+
+    #[test]
+    fn resolved_value_is_webhook() {
+        let r = SecretRead::Resolved("https://x".into());
+        assert!(matches!(Notify::resolve(r, false), Notify::Webhook(_)));
+    }
+
+    #[test]
+    fn resolve_never_halts_the_process() {
+        // Pins the gate ruling. Config resolution runs in the Lambda INIT phase, and a cold start
+        // is CAUSED by an invocation — so init and request are the same instant. If this ever
+        // returns Result or panics, a monitoring misconfiguration takes fulfilment down with it.
+        // Notification config is observability, not a safety gate: fail LOUD, never CLOSED.
+        let _ = Notify::resolve(SecretRead::ReadFailed, false);
+    }
 
     // -----------------------------------------------------------------------------------------
     // compute_enrich_deadline
@@ -4458,11 +4675,63 @@ mod tests {
         assert_eq!(d, std::time::Duration::ZERO);
     }
 
+    // -----------------------------------------------------------------------------------------
+    // (#161) Audit per-row write failures. The order walk has always counted its failures
+    // (`orders_failed`); the audit's per-row `Err` was a `tracing::warn!` and nothing else — so a
+    // row failing to write on EVERY sync was invisible to anyone watching only Discord, forever.
+    // The asymmetry was the defect: two loops in the same run, one counted, one not.
+    // -----------------------------------------------------------------------------------------
+
     #[test]
-    fn ping_content_is_prefixed_and_carries_message() {
-        let c = ping_content("cookie is DEAD");
-        assert!(c.starts_with("🐱 bendobundles: "));
-        assert!(c.contains("cookie is DEAD"));
+    fn summary_reports_audit_row_failures_only_when_nonzero() {
+        assert_eq!(
+            summary_line(3, 0, 2, 0),
+            "sync ok: 3 written, 0 order(s) failed, 2 audit-pulled"
+        );
+        assert_eq!(
+            summary_line(3, 0, 2, 4),
+            "sync ok: 3 written, 0 order(s) failed, 2 audit-pulled, 4 audit row(s) failed"
+        );
+    }
+
+    #[test]
+    fn summary_reports_audit_row_failures_even_when_nothing_was_pulled() {
+        // THE CASE THAT MATTERS MOST, and the one an `if pulls > 0` wrapper would have swallowed:
+        // rows that all FAIL to write pull nothing, so a failure count nested under the pulled
+        // count would be silent in exactly the run where every write broke.
+        assert_eq!(
+            summary_line(3, 0, 0, 4),
+            "sync ok: 3 written, 0 order(s) failed, 4 audit row(s) failed"
+        );
+        assert_eq!(
+            summary_line(3, 0, 0, 0),
+            "sync ok: 3 written, 0 order(s) failed"
+        );
+    }
+
+    // Replaces `ping_content_is_prefixed_and_carries_message` (gate minor m2). The old test pinned
+    // a hardcoded prefix literal inside a production-dead helper, so it stayed green while drifting
+    // from `PING_PREFIX`. This one drives the SAME call production makes, and reads the const
+    // rather than restating it — so it cannot pass while the two disagree.
+    #[test]
+    fn operator_body_is_prefixed_from_the_const_and_carries_the_message() {
+        let m = OperatorMessage::literal("cookie is DEAD");
+        let chunks = m.chunks(PING_PREFIX);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "short message should be one chunk: {chunks:?}"
+        );
+        assert!(
+            chunks[0].starts_with(PING_PREFIX),
+            "prefix missing: {}",
+            chunks[0]
+        );
+        assert!(
+            chunks[0].contains("cookie is DEAD"),
+            "message missing: {}",
+            chunks[0]
+        );
     }
 
     #[test]

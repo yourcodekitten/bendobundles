@@ -1,18 +1,31 @@
 use dynamo::Store;
 use fulfillment::{
-    Deps, FulfillRequest, FulfillResponse, SessionStore, compute_enrich_deadline, handle,
+    Deps, FulfillRequest, FulfillResponse, Notify, SecretRead, SessionStore,
+    compute_enrich_deadline, handle,
 };
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
 use steam_client::SteamClient;
 
-/// Fetch one decrypted SSM SecureString. Returns `None` (with a warn) on any error, an empty value,
-/// or the `"UNSET"` placeholder that terraform seeds these containers with — so a param that exists
-/// but was never given a real value out-of-band reads as unconfigured, NOT as a credential. Without
-/// this, `Some("UNSET")` would attach as the password and every gated redeem would POST a wrong
-/// password + bogus TOTP to the live account (lockout / rate-limit risk). The value is a secret:
-/// never logged, only the param NAME.
-async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
+/// Read one decrypted SSM SecureString and say **what was found**, not merely whether a value came
+/// back.
+///
+/// This used to return `Option<String>`, collapsing FOUR states into one `None`: parameter absent,
+/// the `"UNSET"` placeholder, an empty value, and an SSM/KMS/IAM **error**. The fourth is transient
+/// external weather being recorded as permanent internal intent — and because config resolves once
+/// per container, a momentary throttle became a container-lifetime condition. See `SecretRead`.
+///
+/// `"UNSET"` and empty are `DeliberatelyOff`, not values: terraform seeds these params with the
+/// placeholder, so a param that exists but was never given a real value out-of-band must read as
+/// unconfigured and NOT as a credential. Without that, `Some("UNSET")` would attach as the password
+/// and every gated redeem would POST a wrong password + bogus TOTP at the live account (lockout /
+/// rate-limit risk). The value is a secret: never logged, only the param NAME.
+///
+/// (The previous doc-comment's own summary line read *"Returns `None` (with a warn) on any error"* —
+/// **a precise description of the four-state collapse, left standing as the first thing a reader
+/// sees, directly above the code written to remove it.** A stale doc does not merely fail to help;
+/// it actively teaches the contract that was just retired.)
+async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> SecretRead {
     match client
         .get_parameter()
         .name(param)
@@ -20,15 +33,23 @@ async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> Option<String>
         .send()
         .await
     {
-        Ok(out) => out
-            .parameter()
-            .and_then(|p| p.value())
-            .filter(|v| !v.is_empty() && *v != "UNSET")
-            .map(str::to_string),
+        Ok(out) => match out.parameter().and_then(|p| p.value()) {
+            Some(v) if !v.is_empty() && v != "UNSET" => SecretRead::Resolved(v.to_string()),
+            _ => SecretRead::DeliberatelyOff,
+        },
         Err(e) => {
             tracing::warn!(error = %e, param, "SSM get_parameter (secret) failed");
-            None
+            SecretRead::ReadFailed
         }
+    }
+}
+
+/// For callers that genuinely only need "a value or nothing" — the cookie/password/TOTP paths.
+/// Explicit, so collapsing the distinction is a DECISION at the call site rather than a default.
+fn secret_value(r: SecretRead) -> Option<String> {
+    match r {
+        SecretRead::Resolved(v) => Some(v),
+        _ => None,
     }
 }
 
@@ -63,7 +84,15 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     let steam_enrich_disabled = std::env::var("STEAM_ENRICH_DISABLED").as_deref() == Ok("1");
     tracing::info!(steam_enrich_disabled, "steam enrichment configuration");
 
-    let aws_cfg = aws_config::load_from_env().await;
+    // Retry PINNED, not inherited. The SDK default (standard, 3 attempts) already applies — but an
+    // inherited default is a property of a VERSION, not of this code, and it disappears in a
+    // refactor with nothing announcing it. The ReadFailed design leans on retry converting the
+    // transient-weather population into Resolved BEFORE it can become a container-lifetime
+    // condition, so the pin is load-bearing rather than tidy.
+    let aws_cfg = aws_config::from_env()
+        .retry_config(aws_config::retry::RetryConfig::standard())
+        .load()
+        .await;
     let dynamo_client = aws_sdk_dynamodb::Client::new(&aws_cfg);
     let ssm_client = aws_sdk_ssm::Client::new(&aws_cfg);
     let http_client = reqwest::Client::builder()
@@ -72,7 +101,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         .expect("reqwest client");
 
     let steam_key = match &steam_key_param {
-        Some(param) => get_secret(&ssm_client, param).await,
+        Some(param) => secret_value(get_secret(&ssm_client, param).await),
         None => None,
     };
     let steam = SteamClient::configure(steam_key);
@@ -81,11 +110,27 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     // URL is itself the post-access credential, #81) seeded with the UNSET placeholder until an
     // operator PutParameters the real value: get_secret decrypts, reads UNSET/empty/error as
     // webhooks-off, and never logs the value. Never crash over it.
-    let webhook_url: Option<String> = if let Some(ref param) = webhook_param {
+    let webhook_read: SecretRead = if let Some(ref param) = webhook_param {
         get_secret(&ssm_client, param).await
     } else {
-        None
+        SecretRead::DeliberatelyOff
     };
+    let notify_disabled = std::env::var("NOTIFY_DISABLED").as_deref() == Ok("1");
+    let notify = Notify::resolve(webhook_read, notify_disabled);
+    match notify {
+        // LOUD, not CLOSED. This structured line is the metric-filter/alarm target: it pages
+        // "this deploy is running with notifications unresolvable" WITHOUT coupling fulfilment to
+        // monitoring. The process continues; orders are never held hostage to a missing var.
+        Notify::Unresolved => tracing::error!(
+            outcome = "notify_unresolved",
+            "operator notifications UNRESOLVABLE — running blind; fulfilment continues"
+        ),
+        Notify::Disabled => tracing::warn!(
+            outcome = "notify_disabled",
+            "operator notifications are off (absent/UNSET param, or NOTIFY_DISABLED=1)"
+        ),
+        Notify::Webhook(_) => {}
+    }
 
     lambda_runtime::run(service_fn(|event: LambdaEvent<serde_json::Value>| {
         // Clone cheap Arc-backed handles; reconstruct Store per-invoke (not Clone).
@@ -94,7 +139,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let http_client = http_client.clone();
         let table = table.clone();
         let cookie_param = cookie_param.clone();
-        let webhook_url = webhook_url.clone();
+        let notify = notify.clone();
         let base_url = base_url.clone();
         let step_up_username = step_up_username.clone();
         let password_param = password_param.clone();
@@ -178,8 +223,8 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                         // The two fetches are independent and run on every invoke (including the
                         // synchronous admin-validate and friend-facing gift paths) — overlap them.
                         match tokio::join!(
-                            get_secret(&ssm_client, pw_param),
-                            get_secret(&ssm_client, totp_p),
+                            async { secret_value(get_secret(&ssm_client, pw_param).await) },
+                            async { secret_value(get_secret(&ssm_client, totp_p).await) },
                         ) {
                             (Some(password), Some(totp_secret)) => (
                                 humble.with_step_up(StepUpCredentials::new(
@@ -206,7 +251,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                 let deps = Deps {
                     store: Store::new(dynamo_client, table),
                     humble,
-                    webhook_url,
+                    notify,
                     http: http_client,
                     session_store,
                     steam: steam.clone(),
