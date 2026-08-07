@@ -161,7 +161,57 @@ The two axes both survive and answer different questions:
 - *safety gate vs observability channel* → **should this HALT?** Ben not hearing about an order is
   bad; the order not being fulfilled is worse. **No.**
 
-**Synthesis: fail LOUD, not CLOSED.** `Unresolved` is a third state — it behaves like `Disabled` at
+**🔴 MEASURED AT SOURCE, and it is the deepest version of defect (A): `get_secret`
+(`main.rs:15-33`) already collapses FOUR states into one `None`.**
+
+```rust
+Ok(out) => out.parameter().and_then(|p| p.value())
+              .filter(|v| !v.is_empty() && *v != "UNSET")   // absent | UNSET | empty  -> None
+              .map(str::to_string),
+Err(e)  => { tracing::warn!(...); None }                     // SSM READ FAILURE       -> None
+```
+
+- param absent (terraform `discord_webhook_enabled = false`) → deliberate
+- `UNSET` placeholder → deliberate, awaiting an operator
+- empty → misconfigured
+- **`Err(e)` — an SSM throttle, KMS-grant, IAM or network failure → TRANSIENT, EXTERNAL WEATHER**
+
+**The fourth is weather being recorded as intent.** An SSM blip at cold start yields `None`, which
+this task would read as "misconfigured", when the very next container may resolve fine. That is
+OMBB's transient/permanent axis inverted, already live in production code.
+
+**And it is exactly why layer ② is structurally necessary rather than a backstop (Lilith):** a
+deploy-time check runs as the **deploy role**; the function runs as its **execution role**. A KMS
+grant or SSM path that resolves for the deployer and not for the runtime produces `Err` → `None` →
+indistinguishable from "deliberately off". **① cannot catch that by construction.** *A
+verification's executing identity is part of its result.*
+
+**So `get_secret` must stop returning `Option`:**
+
+```rust
+pub enum SecretRead { Resolved(String), DeliberatelyOff, ReadFailed }
+
+// Notify::resolve maps them, preserving the distinction end to end:
+//   Resolved(u)      -> Notify::Webhook(u)
+//   DeliberatelyOff  -> Notify::Disabled     (warn once, alarm suppressed)
+//   ReadFailed       -> Notify::Unresolved   (LOUD error, alarm target, fulfilment unaffected)
+```
+
+**Synthesis: fail LOUD, not CLOSED — and hard-fail where it is free.**
+
+**THE THREE LAYERS (final gate ruling, OMBB):**
+1. **Deploy — HARD FAIL**, where no request is in flight. **MEASURED: this repo has no deploy
+   workflow and no smoke step — `.github/workflows/` contains `ci.yml` only, and deploys are manual
+   terraform per `docs/runbook-158-deploy.md`. So layer ① does not exist today.** Building it is a
+   separate change and is **filed as a follow-up issue when the PR opens**, not smuggled into this
+   plan. If it is built, it must be a **post-deploy invocation of the function** (execution-role
+   identity), not a CI-side variable check.
+2. **Init — LOUD, NOT CLOSED.** Implemented here. Covers what ① cannot: the config that resolves
+   for the deployer and not for the runtime.
+3. **`NOTIFY_DISABLED=1` — alarm suppression, not a safety valve.** Not blocking.
+
+*In a daemon, exit-at-boot is caught by the deployment. In Lambda, it is caught by production
+traffic failing.* (Lilith — the sentence that made the first ruling wrong in an interesting way.) `Unresolved` is a third state — it behaves like `Disabled` at
 runtime (sends nothing, breaks nothing) and is **loud and distinct at init**, which preserves the
 whole point of defect (A): *deliberately off* and *misconfigured* must never collapse into one
 state. `NOTIFY_DISABLED=1` is now mere alarm suppression, **not a safety valve**, so it is no longer
