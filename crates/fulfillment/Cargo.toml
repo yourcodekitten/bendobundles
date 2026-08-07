@@ -43,3 +43,7 @@ required-features = ["backfill"]
 [[bin]]
 name = "heal_choice_pairs"
 required-features = ["heal"]
+
+[[bin]]
+name = "fail_stuck_self_claim"
+required-features = ["heal"]
