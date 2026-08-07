@@ -8823,7 +8823,7 @@ async fn ping_treats_non_2xx_as_failure() {
         .mount(&server)
         .await;
 
-    let failures = fulfillment::ping_for_test(&server.uri(), "hello").await;
+    let failures = fulfillment::ping_chunks_for_test(&server.uri(), "hello").await;
     assert_eq!(
         failures, 1,
         "a 429 must count as a delivery failure, not a success"
@@ -8937,7 +8937,7 @@ async fn a_dead_webhook_does_not_change_handle_outcome() {
 // where no response exists at all. Both must count as 1, and only one of them was tested.
 #[tokio::test]
 async fn transport_failure_counts_as_failure() {
-    let failures = fulfillment::ping_for_test("http://127.0.0.1:1/hook", "hi").await;
+    let failures = fulfillment::ping_chunks_for_test("http://127.0.0.1:1/hook", "hi").await;
     assert_eq!(
         failures, 1,
         "a connection that never completed must count as a delivery failure"

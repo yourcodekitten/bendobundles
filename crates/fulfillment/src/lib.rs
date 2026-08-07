@@ -4411,12 +4411,6 @@ async fn persist_sync(
     let _ = deps.store.put_sync_state(&st).await;
 }
 
-/// Build the discord ping body. Pure so the message shape is unit-testable without a webhook.
-/// Callers must never pass a cookie or gift URL into `msg`.
-fn ping_content(msg: &str) -> String {
-    format!("🐱 bendobundles: {msg}")
-}
-
 /// POST one already-rendered body. Returns 1 on failure, 0 on success, so callers can COUNT
 /// without being able to PROPAGATE.
 ///
@@ -4425,11 +4419,15 @@ fn ping_content(msg: &str) -> String {
 /// not the same as silent: the doc comment on `ping` licensed not *propagating* a failure, and
 /// never licensed not *recording* one.
 ///
-/// `.error_for_status()` is the load-bearing call. `reqwest`'s `Err` arm catches TRANSPORT
-/// failure only; a 400/401/404/429 arrives as `Ok(response)` with a non-success status. Without
-/// this, that response is a silent success — a failure routed into the success path. Discord
-/// rate-limits, so those are the notifications that vanish under exactly the load that makes them
-/// matter. Pinned by `ping_treats_non_2xx_as_failure`; delete this and that test goes red.
+/// **The `Ok(r)` non-success arm below is the load-bearing one.** `reqwest`'s `Err` arm catches
+/// TRANSPORT failure only; a 400/401/404/429 arrives as `Ok(response)` with a non-success status.
+/// Without that arm, such a response is a silent success — a failure routed into the success path.
+/// Discord rate-limits, so those are the notifications that vanish under exactly the load that
+/// makes them matter. Pinned by `ping_treats_non_2xx_as_failure`; delete the arm and that test
+/// goes red. (This paragraph said "`.error_for_status()` is the load-bearing call" until the #171
+/// gate — there is no `error_for_status()` in this function and there never was in this shape. The
+/// arm does that job. A doc naming a call the code does not make sends the next reader looking for
+/// a guard that isn't there, and — worse — invites them to "restore" it on top of the one that is.)
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     let body = serde_json::json!({ "content": content });
     match http.post(url).json(&body).send().await {
@@ -4445,9 +4443,26 @@ async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
             1
         }
         Err(e) => {
+            // GATE BLOCKER (OMBB, #171): `without_url()` is load-bearing, not tidying.
+            // `reqwest::Error`'s `Display` APPENDS the request URL, unredacted —
+            // `reqwest-0.12.28/src/error.rs:267-269`, `write!(f, " for url ({url})")` — and the URL
+            // IS attached on exactly the failures this arm catches (`async_impl/client.rs:3071`
+            // for request errors, `:3048`/`:3056` for timeouts). A Discord webhook URL carries its
+            // token in the path, and THIS CODEBASE ALREADY CLASSIFIES IT AS A CREDENTIAL
+            // (`main.rs:109-112`: SecureString, "#81 … and never logs the value"). So the value was
+            // decrypted under KMS, deliberately kept out of the read-side logs, and then printed in
+            // full by the one line that reports a dead webhook — on every connection reset.
+            //
+            // PRE-EXISTING, NOT INTRODUCED HERE: `origin/main`'s `ping()` had
+            // `eprintln!("discord ping failed (non-fatal): {e}")` — same `Display`, same leak. What
+            // this PR did was PROMOTE it from unstructured stderr into a structured, indexed,
+            // metric-filterable field. More durable and more greppable is worse, for a credential.
+            //
+            // `without_url()` (`error.rs:88`) drops the url and keeps the kind, which is the half
+            // that has diagnostic value. Do not swap this back to `%e` for a "better message".
             tracing::error!(
                 outcome = "discord_transport",
-                error = %e,
+                error = %e.without_url(),
                 "operator notification transport failure"
             );
             1
@@ -4495,11 +4510,20 @@ async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
     let Notify::Webhook(url) = &deps.notify else {
         return;
     };
-    for (i, chunk) in msg.chunks(PING_PREFIX).into_iter().enumerate() {
+    let chunks = msg.chunks(PING_PREFIX);
+    // GATE MAJOR 2 (OMBB, #171): `of` is not decoration. The no-retry ruling three lines up rests
+    // on "`1 of 2 chunk(s) sent` is a real observed outcome" — but a record carrying only
+    // `chunk = 1` cannot express it. An operator reading `chunk=1` with no total cannot tell
+    // 1-of-1 (the notification FAILED) from 1-of-5 (the notification is TORN, and four other posts
+    // may have landed). That is the exact distinction the ruling is built on, and it was the one
+    // field the record dropped. Bound before the loop so it is the real total, not a running count.
+    let n = chunks.len();
+    for (i, chunk) in chunks.into_iter().enumerate() {
         if deliver(&deps.http, url, &chunk).await == 1 {
             tracing::error!(
                 outcome = "operator_notification_failed",
                 chunk = i + 1,
+                of = n,
                 "operator notification failed"
             );
         }
@@ -4530,12 +4554,18 @@ pub async fn ping_chunks_for_test(url: &str, msg: &str) -> u32 {
     failures
 }
 
-/// Test seam for the delivery path. Exposed so an integration test can drive `deliver` against a
-/// wiremock server without constructing a whole `Deps`.
-#[doc(hidden)]
-pub async fn ping_for_test(url: &str, msg: &str) -> u32 {
-    deliver(&reqwest::Client::new(), url, &ping_content(msg)).await
-}
+// GATE MINOR m2 (OMBB, #171): `ping_content` and `ping_for_test` USED TO LIVE HERE, and both are
+// deleted rather than repaired. `ping_content` was production-dead — its only non-test caller was
+// `ping_for_test` — and it held a FOURTH hardcoded copy of `"🐱 bendobundles: "` while production
+// read `PING_PREFIX`. Change the const and the seam plus its green unit test would have drifted
+// silently, which is this arc's own defect class wearing a test's clothes. It also bypassed
+// `chunks()` entirely, so the seam had no 2000-char bound — a test seam that is SAFER than
+// production proves the wrong thing.
+//
+// `ping_chunks_for_test` above already has the identical signature and routes through the real
+// `PING_PREFIX` + `chunks()`, so the two integration callers moved to it and the divergence is now
+// impossible BY CONSTRUCTION rather than by remembering to update four literals. One seam, one
+// prefix, one bound.
 
 #[cfg(test)]
 mod tests {
@@ -4679,11 +4709,29 @@ mod tests {
         );
     }
 
+    // Replaces `ping_content_is_prefixed_and_carries_message` (gate minor m2). The old test pinned
+    // a hardcoded prefix literal inside a production-dead helper, so it stayed green while drifting
+    // from `PING_PREFIX`. This one drives the SAME call production makes, and reads the const
+    // rather than restating it — so it cannot pass while the two disagree.
     #[test]
-    fn ping_content_is_prefixed_and_carries_message() {
-        let c = ping_content("cookie is DEAD");
-        assert!(c.starts_with("🐱 bendobundles: "));
-        assert!(c.contains("cookie is DEAD"));
+    fn operator_body_is_prefixed_from_the_const_and_carries_the_message() {
+        let m = OperatorMessage::literal("cookie is DEAD");
+        let chunks = m.chunks(PING_PREFIX);
+        assert_eq!(
+            chunks.len(),
+            1,
+            "short message should be one chunk: {chunks:?}"
+        );
+        assert!(
+            chunks[0].starts_with(PING_PREFIX),
+            "prefix missing: {}",
+            chunks[0]
+        );
+        assert!(
+            chunks[0].contains("cookie is DEAD"),
+            "message missing: {}",
+            chunks[0]
+        );
     }
 
     #[test]

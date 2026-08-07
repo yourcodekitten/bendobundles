@@ -5,10 +5,28 @@
 //! that *enforces* it, and only enforcement has jurisdiction over call sites nobody has written
 //! yet. **Do not add a string constructor.**
 //!
-//! TRUST BOUNDARY: CloudWatch is access-controlled; a Discord channel is not. A raw error is fine —
-//! it belongs on the CloudWatch side of that line. Never render an error's `Display` or `Debug`
-//! into an `OperatorMessage`. A filter protects the code you audited; a type protects the code you
-//! haven't.
+//! TRUST BOUNDARY: CloudWatch is access-controlled; a Discord channel is not. Never render an
+//! error's `Display` or `Debug` into an `OperatorMessage`. A filter protects the code you audited;
+//! a type protects the code you haven't.
+//!
+//! **THE PRIVILEGED SIDE IS NOT A SAFE HARBOUR, AND THIS PARAGRAPH USED TO SAY IT WAS.** It read
+//! *"A raw error is fine — it belongs on the CloudWatch side of that line."* That sentence is
+//! false, and it was load-bearing in the wrong direction: `deliver`'s transport arm logged
+//! `error = %e` on a `reqwest::Error`, whose `Display` appends the request URL unredacted — and a
+//! Discord webhook URL *is* its own bearer token (#81, which is why it is a KMS `SecureString` that
+//! `get_secret` deliberately never logs). So the doctrine written here to protect the operator
+//! channel was simultaneously **licensing the credential's disclosure to CloudWatch**. Anyone who
+//! later tried to fix that line would have found this file telling them it was fine.
+//!
+//! The class is not "error payloads are safe on the privileged side." It is **"error payloads that
+//! are not themselves credentials."** An error carrying a bearer token has NO safe side, and no
+//! access-control tier makes it one.
+//!
+//! Keep the direction in view: this module was built to stop a payload leaking OUT to the
+//! unprivileged channel, and the leak nobody was looking for went the other way — IN, to the side
+//! already declared safe. A trust boundary has two sides and both of them need auditing.
+//! (Found by OMBB at the #171 gate. The bug was pre-existing; the doctrine that would have
+//! protected it was not.)
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,7 +100,10 @@ fn new_req_id() -> String {
             })
     });
     // Uniqueness window: the LIFE OF THE CONTAINER. `u64` cannot wrap here — it increments once per
-    // operator-notification FAILURE.
+    // `ErrorSummary::of`, i.e. once per error RENDERED into an operator message, whether the send
+    // then succeeds or fails. (Gate minor m3: this said "once per operator-notification FAILURE",
+    // which is a different and smaller quantity. Nothing threatens the `u64` either way — the point
+    // is that a future reader must not mine this counter as a failure count.)
     format!("{base}-{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -105,7 +126,14 @@ impl OperatorMessage {
     ///   3. then "no mid-token split" (cosmetic — but a boundary that merely LOOKS like damage
     ///      costs the same investigation as real damage)
     ///
-    /// A forced mid-token cut carries ` …` so it is visible rather than silent.
+    /// A forced mid-token cut **that would otherwise leave an unbalanced `**`** carries ` …`, so
+    /// that damage is visible rather than silent. A forced cut in plain prose is SILENT, and that
+    /// is deliberate: the marker's job is to stop Discord rendering the remainder of the message as
+    /// bold, not to annotate every boundary. (Gate minor m1: this read "a forced mid-token cut
+    /// carries ` …`" unconditionally, which the code at the odd-`**` check does not do — and the
+    /// common case, which both 5000-char fixtures produce, is the silent one. `MARKER_RESERVE` is
+    /// spent from the budget unconditionally either way, because the budget is fixed before the
+    /// scan and cannot depend on a decision the scan has not made yet.)
     pub fn chunks(&self, prefix: &str) -> Vec<String> {
         // REDUNDANT #1 of 3 — see the map below before deleting this `.trim()`.
         let body = self.0.trim();
@@ -389,23 +417,80 @@ mod tests {
         }
     }
 
+    // GATE MAJOR 1 (OMBB, #171). The old version of this test asserted a flat universal —
+    // `assert_eq!(joined, input, "chunking lost or altered content")` — that the implementation
+    // does NOT hold, and it passed only because the single fixture `"q".repeat(5000)` excluded both
+    // counterexamples:
+    //   (a) `p.trim_end()` in the labelling map drops a chunk-boundary `\n`;
+    //   (b) the ` …` forced-cut marker inserts characters that were never in the input.
+    // `"q"*5000` is single-line and marker-free, so neither could fire. THE FALSIFYING INPUT WAS
+    // ALREADY IN THIS FILE, eight lines up in `chunks_are_balanced_or_carry_the_forced_cut_marker`.
+    // Same class as the M2 fix above and as this arc's B3: passing by input luck, and stating a
+    // guarantee stronger than the code's.
+    //
+    // `chunks` is NOT changed to satisfy the old assertion. Chunks are separate Discord posts, so a
+    // dropped boundary newline is cosmetically invisible and the marker is the point. The DEFECT
+    // WAS THE ASSERTION. So this now states exactly what the code promises — nothing is altered
+    // except (a) and (b) — and, critically, BOUNDS (a) so the normalisation cannot be mistaken for
+    // a licence to drop newlines generally.
     #[test]
     fn chunk_bodies_concatenate_back_to_the_input() {
-        let input = "q".repeat(5000);
-        let m = OperatorMessage::literal(Box::leak(input.clone().into_boxed_str()));
-        let joined: String = m
-            .chunks(PREFIX)
-            .iter()
-            .map(|c| {
-                let body = c.strip_prefix(PREFIX).unwrap_or(c);
-                let body = match body.rfind(" (") {
-                    Some(i) if body.ends_with(')') => &body[..i],
-                    _ => body,
-                };
-                body.to_string()
-            })
-            .collect();
-        assert_eq!(joined, input, "chunking lost or altered content");
+        // Each fixture is chosen to EXERCISE an allowance rather than dodge it.
+        let fixtures = [
+            ("single-line, no marker", "q".repeat(5000)),
+            (
+                "boundary newline (allowance a)",
+                format!("{}\n{}", "a".repeat(1900), "b".repeat(1900)),
+            ),
+            (
+                "boundary newline + forced cut inside ** (allowances a and b)",
+                format!("{}\n**bold**\n{}", "a".repeat(1900), "b".repeat(1900)),
+            ),
+        ];
+
+        for (name, input) in fixtures {
+            let m = OperatorMessage::literal(Box::leak(input.clone().into_boxed_str()));
+            let chunks = m.chunks(PREFIX);
+            let bodies: Vec<String> = chunks
+                .iter()
+                .map(|c| {
+                    let body = c.strip_prefix(PREFIX).unwrap_or(c);
+                    let body = match body.rfind(" (") {
+                        Some(i) if body.ends_with(')') => &body[..i],
+                        _ => body,
+                    };
+                    body.to_string()
+                })
+                .collect();
+            let joined: String = bodies.concat();
+
+            // Allowance (b): the marker is inserted text, so remove it before comparing. Allowance
+            // (a): a boundary newline may be trimmed away, so compare modulo newlines.
+            let normalise = |s: &str| s.replace(" …", "").replace('\n', "");
+            assert_eq!(
+                normalise(&joined),
+                normalise(&input),
+                "[{name}] chunking lost or altered content beyond a boundary newline or a marker"
+            );
+
+            // ...AND THIS IS THE HALF THAT KEEPS THE NORMALISATION HONEST. Stripping `\n` from both
+            // sides would, on its own, also excuse a `chunks` that dropped EVERY newline in the
+            // body. The loss is bounded to the seams: at most one per chunk boundary, which is the
+            // only place `trim_end()` can reach. Without this, the assertion above is weaker than
+            // the one it replaced.
+            let (had, kept) = (input.matches('\n').count(), joined.matches('\n').count());
+            assert!(
+                kept <= had,
+                "[{name}] chunking INVENTED a newline: {had} in, {kept} out"
+            );
+            let lost = had - kept;
+            let seams = chunks.len().saturating_sub(1);
+            assert!(
+                lost <= seams,
+                "[{name}] {lost} newline(s) lost across {seams} seam(s) — \
+                 newlines are only allowed to vanish AT a chunk boundary"
+            );
+        }
     }
 
     #[derive(Debug)]
