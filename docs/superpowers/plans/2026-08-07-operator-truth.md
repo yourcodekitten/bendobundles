@@ -657,10 +657,13 @@ impl OperatorMessage {
 ```
 
 Add **`pub mod operator_message;`** + `use operator_message::{ErrorSummary, OperatorMessage, Part};`
-to `lib.rs`. **REVIEW FIX (B1): the module MUST be `pub`** — the trybuild fixture in Step 5 refers to
-`fulfillment::operator_message::OperatorMessage`, and a private module would fail to compile for the
-WRONG reason, which `trybuild` would report as the compile_fail test PASSING. Matches the repo's
-existing `pub mod heal_pairs;` (lib.rs:14).
+to `lib.rs`. **REVIEW FIX (B1), reason updated after trybuild was dropped (GATE FIX M4): the module
+MUST be `pub`, and it is still load-bearing — the Step 5 `compile_fail` DOCTEST refers to
+`fulfillment::operator_message::OperatorMessage`, and doctests compile against the crate's PUBLIC
+API. A private module would make that block fail to compile for the wrong reason, which
+`compile_fail` reports as a PASS.** The original wording cited "the trybuild fixture", which no
+longer exists — the requirement survived its stated reason, so the reason is restated rather than
+left dangling. Matches the repo's existing `pub mod heal_pairs;` (lib.rs:14).
 
 - [ ] **Step 4: Run and watch them pass**
 
@@ -702,12 +705,25 @@ does not compile, not why.** Two things bound the damage, and neither is the doc
 1. **The private-module class specifically cannot silently green it.** `operator_message` is `pub`
    and Step 4 already compiles and runs the module's unit tests through it — a private, renamed or
    moved module breaks **the build** at Step 4, loudly, before the doctest is ever consulted.
-2. **Step 6 verifies once, by hand, that it fails for the right reason** — and that manual read *is*
-   the test; the `compile_fail` block is scaffolding around it.
+2. **GATE FIX M5 — the check is made CONTINUOUS, not one-time.** OMBB's point, and it is my own
+   ①/② distinction aimed at my own test: *trybuild's `.stderr` is a committed artifact that
+   regresses loudly; a manual read during execution is a single sample.* Make the module private
+   again in a year and a bare doctest still passes. **So pin the error code:**
 
-*Any test whose pass condition is "something failed" must assert what failed.* Here that assertion
-is performed once by a human instead of continuously by a machine, and **that is a real reduction
-from the trybuild version, recorded rather than papered over.**
+   ```
+   ```compile_fail,E0XXX
+   ```
+
+   **Do not guess `E0XXX`.** Step 6 flips the block to a normal doctest, reads the actual
+   diagnostic, and *then* annotates the code it saw. The manual read becomes the way the pin is
+   chosen, and the pin makes it permanent.
+
+   **Residual risk, stated because it is inherited either way:** rustdoc documents error codes as
+   unstable. If a future rustc renumbers or merges the diagnostic, the pin stops matching and the
+   block degrades toward a bare `compile_fail` — i.e. **the guarantee weakens quietly rather than
+   failing loudly.** That is strictly better than no pin (which is quiet from day one) and strictly
+   worse than trybuild's committed `.stderr`. **Recorded so the next reader knows which trade they
+   are standing on.**
 
 - [ ] **Step 6: Run it, then verify it fails for the RIGHT reason**
 
@@ -723,15 +739,18 @@ assert what failed* — and for a doctest the only way to assert that is to look
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/fulfillment/src/operator_message.rs crates/fulfillment/src/lib.rs \
-        crates/fulfillment/Cargo.toml crates/fulfillment/tests/compile_fail_test.rs \
-        crates/fulfillment/tests/compile_fail/raw_string.rs
+# GATE FIX B6: this previously added crates/fulfillment/Cargo.toml and two
+# tests/compile_fail/* files. No step creates any of them since trybuild was dropped, and
+# `git add` on a nonexistent path EXITS 1 — the task would have broken at its own commit step.
+# The dependency removal did not sweep its own references.
+git add crates/fulfillment/src/operator_message.rs crates/fulfillment/src/lib.rs
 git commit -S -m "feat(operator-message): make a leaked error payload unrepresentable (#151)
 
 ~6 sites interpolated a store error straight into an operator message; any variant whose
 Display carried a revealed key would publish it. Containment is now structural: private inner,
-no From<String>, no public string constructor, and a trybuild compile_fail test so the property
-belongs to the type rather than to today's call sites. A filter protects the code you audited;
+no From<String>, no public string constructor, and a built-in compile_fail doctest so the
+property belongs to the type rather than to today's call sites. (No new dependency: rustdoc
+runs compile_fail blocks as real tests.) A filter protects the code you audited;
 a type protects the code you haven't. Correlation id lets CloudWatch carry the detail."
 ```
 
