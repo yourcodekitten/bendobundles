@@ -137,6 +137,10 @@ var*. Twenty silent no-ops a day become one loud event at boot.
 **Files:**
 - Modify: `crates/fulfillment/src/main.rs:84-88` (webhook resolution), `:206-210` (`Deps`)
 - Modify: `crates/fulfillment/src/lib.rs` (`Deps.webhook_url` → `Deps.notify`)
+- **Modify: `crates/fulfillment/src/main.rs:66` (`load_from_env()` → pinned `RetryConfig`).**
+  **GATE FIX B7: the pin lived only in a rationale block ABOVE Step 1 — declared, not built, and
+  B2's exact twin in the round that fixed B2. It is now Step 3a AND named here, because a step
+  body without a Files entry is half a fix.**
 - **Modify: `crates/fulfillment/src/main.rs:15-33` (`get_secret` → returns `SecretRead`).**
   **GATE FIX B2: this file was missing from the list, so the four-state finding was documented and
   then dropped — a filed finding is not a fixed one, inside the task that files it.**
