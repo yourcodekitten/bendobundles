@@ -453,10 +453,16 @@ impl Notify {
     /// make a behaviour fix hostage to a lint sweep. Filed as a follow-up.)
     pub fn resolve(read: SecretRead, disabled: bool) -> Notify {
         match (read, disabled) {
-            (SecretRead::Resolved(u), _) => Notify::Webhook(u),
-            (SecretRead::DeliberatelyOff, _) => Notify::Disabled,
+            // Suppression beats a working webhook. *** THIS IS THE CELL THE BUG LIVED IN *** — and
+            // it is the one a future reader will be most tempted to collapse back into a wildcard.
+            (SecretRead::Resolved(_), true) => Notify::Disabled,
+            (SecretRead::Resolved(u), false) => Notify::Webhook(u),
+            (SecretRead::DeliberatelyOff, true) => Notify::Disabled,
+            (SecretRead::DeliberatelyOff, false) => Notify::Disabled,
+            // Suppression is the job: do not page someone about the quiet they asked for.
+            (SecretRead::ReadFailed, true) => Notify::Disabled,
             // Weather, never intent.
-            (SecretRead::ReadFailed, _) => Notify::Unresolved,
+            (SecretRead::ReadFailed, false) => Notify::Unresolved,
         }
     }
 }
