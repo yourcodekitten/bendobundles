@@ -86,6 +86,88 @@ fn new_req_id() -> String {
     format!("{base}-{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
+
+/// Discord's hard limit on `content`.
+const DISCORD_MAX: usize = 2000;
+/// Room reserved for the ` (12/34)` label. 10 fits ` (999/999)` exactly.
+const LABEL_RESERVE: usize = 10;
+/// Room reserved for the forced-cut marker ` …`, RESERVED not appended — appending it after would
+/// push a maximally-packed chunk over the bound BECAUSE of the marker added to respect the bound.
+const MARKER_RESERVE: usize = 2;
+
+impl OperatorMessage {
+    /// Split into Discord-postable bodies, each ≤2000 chars INCLUDING `prefix` and the label.
+    ///
+    /// PRECEDENCE — three requirements interact here, not two:
+    ///   1. the 2000 bound ALWAYS wins (it is the one with a real 400 behind it)
+    ///   2. then "no empty chunk" (the only end of this axis with observed production failures —
+    ///      an empty `content` is a Discord 400, and this seam was immune via its unconditional
+    ///      prefix until chunking was added, so the guard exists BECAUSE of this change)
+    ///   3. then "no mid-token split" (cosmetic — but a boundary that merely LOOKS like damage
+    ///      costs the same investigation as real damage)
+    ///
+    /// A forced mid-token cut carries ` …` so it is visible rather than silent.
+    pub fn chunks(&self, prefix: &str) -> Vec<String> {
+        let body = self.0.trim();
+        // FAST PATH ONLY — and this comment exists because the dirty side proved it. Removing
+        // this early return does NOT break `empty_input_yields_no_chunks_at_all`, and neither
+        // does removing the empty-part filter below: for wholly-empty input the property is
+        // STRUCTURAL (trim → `split_inclusive` yields no lines → no parts → empty Vec). Kept as
+        // an explicit statement of intent, but do not read it as the guarantee — a guard that
+        // provides nothing while looking like it does is exactly the class this module fights.
+        if body.is_empty() {
+            return Vec::new();
+        }
+        let budget = DISCORD_MAX
+            .saturating_sub(prefix.chars().count())
+            .saturating_sub(LABEL_RESERVE)
+            .saturating_sub(MARKER_RESERVE);
+
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for line in body.split_inclusive('\n') {
+            if !cur.is_empty() && cur.chars().count() + line.chars().count() > budget {
+                parts.push(std::mem::take(&mut cur));
+            }
+            if line.chars().count() > budget {
+                for ch in line.chars() {
+                    if cur.chars().count() + 1 > budget {
+                        // Bound wins. Mark a forced mid-token cut so it is never silent.
+                        if cur.matches("**").count() % 2 != 0 {
+                            cur.push_str(" …");
+                        }
+                        parts.push(std::mem::take(&mut cur));
+                    }
+                    cur.push(ch);
+                }
+            } else {
+                cur.push_str(line);
+            }
+        }
+        if !cur.trim().is_empty() {
+            parts.push(cur);
+        }
+
+        // Filter FIRST, then count, then label. (This filter's real job is a whitespace-only
+        // INTERMEDIATE part, not the wholly-empty input above — see the fast-path note.) Computing `n` before filtering left gaps in the
+        // labels — "(1/3)" and "(3/3)" with no "(2/3)" — which reads to an operator as a LOST
+        // MESSAGE. The no-empty rule and the labelling rule are coupled.
+        let parts: Vec<String> = parts.into_iter().filter(|p| !p.trim().is_empty()).collect();
+        let n = parts.len();
+        parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if n > 1 {
+                    format!("{prefix}{} ({}/{n})", p.trim_end(), i + 1)
+                } else {
+                    format!("{prefix}{}", p.trim_end())
+                }
+            })
+            .collect()
+    }
+}
+
 pub enum Part<'a> {
     Text(&'static str),
     Id(&'a str),
@@ -140,6 +222,96 @@ impl OperatorMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    const PREFIX: &str = "🐱 bendobundles: ";
+
+    // GATE FIX B3: an earlier version iterated `for c in m.chunks(..)` on EMPTY input. `chunks()`
+    // returns an empty Vec there, so the loop body never ran and the test passed regardless of the
+    // implementation — vacuous, and it was guarding the ONE requirement with real production
+    // evidence behind it (an empty Discord `content` is a 400). Split into two that can each fail.
+    #[test]
+    fn empty_input_yields_no_chunks_at_all() {
+        for input in ["", "   ", "\n\n"] {
+            let m = OperatorMessage::literal(Box::leak(input.to_string().into_boxed_str()));
+            assert!(
+                m.chunks(PREFIX).is_empty(),
+                "empty input must post nothing; got chunks for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_emitted_chunk_is_empty_or_prefix_only() {
+        let m = OperatorMessage::literal(Box::leak("y".repeat(5000).into_boxed_str()));
+        let cs = m.chunks(PREFIX);
+        assert!(!cs.is_empty());
+        for c in &cs {
+            assert!(c.len() > PREFIX.len(), "prefix-only chunk: {c:?}");
+        }
+    }
+
+    #[test]
+    fn chunks_are_bounded_including_prefix_and_label() {
+        let m = OperatorMessage::literal(Box::leak("x".repeat(5000).into_boxed_str()));
+        for c in m.chunks(PREFIX) {
+            assert!(c.chars().count() <= 2000, "chunk too long: {}", c.chars().count());
+        }
+    }
+
+    #[test]
+    fn multi_chunk_messages_are_labelled() {
+        let m = OperatorMessage::literal(Box::leak("z".repeat(5000).into_boxed_str()));
+        let cs = m.chunks(PREFIX);
+        assert!(cs.len() > 1);
+        assert!(cs[0].contains(&format!("(1/{})", cs.len())));
+    }
+
+    // GATE FIX M1: the 2000 bound and "never split mid-token" CONFLICT. Precedence is explicit —
+    // THE BOUND ALWAYS WINS, because exceeding it is what actually produces a Discord 400.
+    #[test]
+    fn the_2000_bound_wins_over_token_integrity() {
+        let body = format!("{}**{}", "a".repeat(1999), "b".repeat(1999)); // ONE line, unbalanced **
+        let m = OperatorMessage::literal(Box::leak(body.into_boxed_str()));
+        for c in m.chunks(PREFIX) {
+            assert!(c.chars().count() <= 2000, "bound violated: {}", c.chars().count());
+        }
+    }
+
+    // GATE FIX M2: an earlier version asserted `stars % 2 == 0` UNCONDITIONALLY, contradicting the
+    // stated precedence — a forced cut deliberately emits an odd-star chunk carrying the marker.
+    // It passed only because the fixture never forced a cut: passing by input luck.
+    #[test]
+    fn chunks_are_balanced_or_carry_the_forced_cut_marker() {
+        let body = format!("{}\n**bold**\n{}", "a".repeat(1900), "b".repeat(1900));
+        let m = OperatorMessage::literal(Box::leak(body.into_boxed_str()));
+        for c in m.chunks(PREFIX) {
+            let balanced = c.matches("**").count() % 2 == 0;
+            assert!(
+                balanced || c.contains(" …"),
+                "chunk ends inside a ** pair with no forced-cut marker: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_bodies_concatenate_back_to_the_input() {
+        let input = "q".repeat(5000);
+        let m = OperatorMessage::literal(Box::leak(input.clone().into_boxed_str()));
+        let joined: String = m
+            .chunks(PREFIX)
+            .iter()
+            .map(|c| {
+                let body = c.strip_prefix(PREFIX).unwrap_or(c);
+                let body = match body.rfind(" (") {
+                    Some(i) if body.ends_with(')') => &body[..i],
+                    _ => body,
+                };
+                body.to_string()
+            })
+            .collect();
+        assert_eq!(joined, input, "chunking lost or altered content");
+    }
 
     #[derive(Debug)]
     struct Leaky;
