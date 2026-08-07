@@ -190,6 +190,43 @@ grant or SSM path that resolves for the deployer and not for the runtime produce
 indistinguishable from "deliberately off". **① cannot catch that by construction.** *A
 verification's executing identity is part of its result.*
 
+**🔴 AND `ReadFailed` ITSELF ARRIVES FROM TWO OPPOSITE POPULATIONS (Lilith), indistinguishable at
+init:**
+
+```
+SSM throttle, transient network   → WEATHER    — the next container resolves fine
+KMS grant revoked, IAM tightened  → PERMANENT  — every container fails identically
+```
+
+Same variant, same log line, same instant. **So the alarm on `ReadFailed` must fire on a RATE, not
+on an occurrence** — a sustained fraction of cold starts failing to resolve is a revoked grant; one
+is noise. Alarming on the event would ship the 70%-false-positive shape OMBB caught on his own
+detector this morning and correctly refused. *Instrument the trend, not the trip.*
+
+**And the asymmetry that makes this worse than it looks — measured, not assumed:** resolution runs
+**once per container** (`main.rs:84` before `:90`). **So a transient failure at the SSM layer
+becomes a PERMANENT failure at the application layer, for the life of that container.** A 200ms
+throttle does not cost 200ms of notifications — it costs *every notification that container
+handles*, potentially for hours. **The dependency's blip is your durability**, and that asymmetry is
+invisible in the error itself.
+
+**Mitigation, measured:** `main.rs:66` uses `aws_config::load_from_env()` with **no explicit
+`RetryConfig`**, so the SDK default (standard: 3 attempts, exponential backoff on throttling and
+transient errors) applies. **Retry is therefore on — but nothing in this repo pins it**, so a future
+config change could drop it silently. **Task 2 pins it explicitly** rather than inheriting a default
+that a refactor can remove:
+
+```rust
+let aws_cfg = aws_config::from_env()
+    .retry_config(aws_config::retry::RetryConfig::standard())   // pinned, not inherited
+    .load()
+    .await;
+```
+
+That converts most of the weather population into `Resolved` before it can become a
+container-lifetime condition, and it makes the `ReadFailed` rate signal much closer to
+*actually permanent*.
+
 **So `get_secret` must stop returning `Option`:**
 
 ```rust
