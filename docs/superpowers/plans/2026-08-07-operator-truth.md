@@ -12,8 +12,12 @@ fulfilment — while gaining an internal, out-of-band failure record. A new `Ope
 becomes the *only* way text reaches Discord, so secret containment is enforced by the compiler
 rather than by review.
 
-**Tech Stack:** Rust 2021, `reqwest`, `serde_json`, `tracing`, `wiremock` (dev), `trybuild` (dev,
-added in Task 3).
+**Tech Stack:** Rust 2021, `reqwest`, `serde_json`, `tracing`, `wiremock` (dev).
+**ZERO new dependencies.** An earlier draft added `trybuild` and `tracing-test`; both were removed
+after checking `Cargo.lock` (neither present — each would be a registry fetch, a lockfile change,
+and new surface for this repo's deps/audit gates, on a 4GB box). Rust's built-in `compile_fail`
+doctest replaces `trybuild` outright, and the id-drift join is testable through a shared pure
+function. **Neither substitution is a compromise — the doctest is strictly better.**
 
 ## Global Constraints
 
@@ -380,9 +384,7 @@ boot, or the process refuses to start."
 **Files:**
 - Create: `crates/fulfillment/src/operator_message.rs`
 - Modify: `crates/fulfillment/src/lib.rs` (add `mod operator_message;`)
-- Create: `crates/fulfillment/tests/compile_fail/raw_string.rs`
-- Test: `crates/fulfillment/tests/compile_fail_test.rs`
-- Modify: `crates/fulfillment/Cargo.toml` (`[dev-dependencies] trybuild = "1"`)
+- Test: a `compile_fail` **doctest** on `OperatorMessage` itself (no new files, no new deps)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -540,37 +542,39 @@ Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib operator_message` → P
 
 - [ ] **Step 5: Write the compile-fail test (makes "structural" a property of the type)**
 
-`crates/fulfillment/Cargo.toml` under `[dev-dependencies]`: `trybuild = "1"`
-
-`crates/fulfillment/tests/compile_fail/raw_string.rs`:
-
-```rust
-fn main() {
-    let s: String = format!("secret {}", "abc123");
-    let _ = fulfillment::operator_message::OperatorMessage::literal(&s);
-}
-```
-
-`crates/fulfillment/tests/compile_fail_test.rs`:
+**No new dependency.** `rustdoc` runs ` ```compile_fail ` blocks as real tests. Put it on the type,
+where anyone reading the docs also reads the guarantee:
 
 ```rust
-#[test]
-fn raw_strings_cannot_become_operator_messages() {
-    trybuild::TestCases::new().compile_fail("tests/compile_fail/*.rs");
-}
+/// Operator-visible text. Private inner by design — see the module docs.
+///
+/// A runtime `String` CANNOT become an `OperatorMessage`. That is the guarantee, and this
+/// doctest is its enforcement — if someone adds `From<String>` or a `&str` constructor, this
+/// stops failing to compile and the test goes red:
+///
+/// ```compile_fail
+/// let runtime_text: String = format!("secret {}", "abc123");
+/// let _ = fulfillment::operator_message::OperatorMessage::literal(&runtime_text);
+/// ```
+pub struct OperatorMessage(String);
 ```
 
-(`literal` takes `&'static str`; a runtime `String` cannot coerce, so this fails to compile — which
-is the assertion.)
+**Note the pass condition and why it is safe here:** a `compile_fail` doctest passes when the block
+*fails to compile*, so in principle it could pass for the wrong reason — the same defect the plan
+review caught in the `trybuild` version. It is safe **because the fixture is three lines with no
+imports and no fixture setup**: the only thing that can fail is the constructor call. Verify once
+by hand at Step 6 anyway.
 
-- [ ] **Step 6: Run it**
+- [ ] **Step 6: Run it, then verify it fails for the RIGHT reason**
 
-Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test compile_fail_test`
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --doc operator_message`
 Expected: PASS (meaning the bad code did NOT compile).
 
-**REVIEW FIX (B1): then READ the generated `.stderr` and confirm the error names the `&'static str`
-mismatch — NOT `E0603 module is private`.** A compile_fail test that passes for the wrong reason is
-the vacuous-pass shape: green because the probe was broken.
+**REVIEW FIX (B1), adapted: confirm WHAT failed, not merely that something did.** Temporarily
+change ` ```compile_fail ` to ` ``` ` (a normal doctest), re-run, and **read the error**: it must
+name the `&'static str` / lifetime mismatch on `literal`, **not** `E0603 module is private` or an
+unresolved path. Then change it back. *Any test whose pass condition is "something failed" must
+assert what failed* — and for a doctest the only way to assert that is to look once.
 
 - [ ] **Step 7: Commit**
 
@@ -918,27 +922,46 @@ line is safe to redact.
 - [ ] **Step 3: Add the drift test**
 
 **REVIEW FIX (M2): the original pinned only the message side and its own comment conceded it.**
-Spec test #8 requires BOTH sides to carry the same id; a renamed or dropped log field would pass.
-Add `tracing-test = "0.2"` to `[dev-dependencies]` and capture the log:
+Spec test #8 requires BOTH sides to carry the same id. **Zero new dependencies** — make the two
+sides read from one place, so they cannot drift by construction rather than being watched:
 
 ```rust
-use tracing_test::traced_test;
-
-#[traced_test]
-#[test]
-fn operator_text_and_log_share_one_req_id() {
-    let s = ErrorSummary::of(&Leaky);
-    let id = s.req_id().to_string();
-    tracing::error!(req_id = %id, "dead-key fail-claim write failed");
-    let m = OperatorMessage::with(&[Part::Text("x"), Part::Error(s)]);
-
-    assert!(m.as_str().contains(&id), "operator text lost the req_id");
-    assert!(logs_contain(&id), "log record lost the req_id — the join is broken");
+// In operator_message.rs — the SINGLE source of the id for both sides.
+impl ErrorSummary {
+    /// The exact `(req_id, kind)` pair that MUST appear in the CloudWatch record. The operator
+    /// message renders from the same struct, so the join cannot drift unless someone bypasses
+    /// this accessor — which is the one thing the test below pins.
+    pub fn log_fields(&self) -> (&str, &'static str) {
+        (&self.req_id, self.kind)
+    }
 }
 ```
 
-**Dirty-side verify:** rename the log field to `request_id` and confirm this test FAILS. An
-unjoinable breadcrumb is worse than the leak — at 3am it looks like you can chase it.
+Call sites use it verbatim:
+`tracing::error!(req_id = %s.log_fields().0, kind = s.log_fields().1, "…");`
+
+```rust
+#[test]
+fn operator_text_and_log_fields_share_one_req_id() {
+    let s = ErrorSummary::of(&Leaky);
+    let (log_id, _kind) = s.log_fields();
+    let log_id = log_id.to_string();
+    let m = OperatorMessage::with(&[Part::Text("x"), Part::Error(s)]);
+    assert!(
+        m.as_str().contains(&log_id),
+        "operator text and log record carry different ids — the breadcrumb is unjoinable"
+    );
+}
+```
+
+**Dirty-side verify:** change the renderer to emit a freshly generated id instead of `self.req_id`
+and confirm this test FAILS. **An unjoinable breadcrumb is worse than the leak** — at 3am it looks
+like you can chase it.
+
+**Honest limit, stated rather than discovered later:** this pins that *the value is shared*, not
+that a call site actually emitted it. A site that forgets `tracing::error!` entirely is caught by
+review, not by this test. Capturing real log records would need a dependency; the trade was made
+deliberately for zero new deps on a 4GB box with dependency gates.
 
 - [ ] **Step 4: Verify**
 
