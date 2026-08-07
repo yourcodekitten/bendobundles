@@ -4431,7 +4431,7 @@ async fn persist_sync(
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // `allowed_mentions` is load-bearing, not boilerplate (#174). Without it Discord parses
     // `@everyone` / `@here` / `<@&role>` out of `content` — and THE CONTENT IS NOT OURS. `Part::Id`
-    // carries runtime values at ~50 sites, several of them Humble-authored game titles
+    // carries runtime values at 50 sites, several of them Humble-authored game titles
     // (`human_name` / `title` off the wire response). A bundle titled `@everyone` would mass-ping.
     //
     // `operator_message` closes this trust boundary against DISCLOSURE — an error's text cannot

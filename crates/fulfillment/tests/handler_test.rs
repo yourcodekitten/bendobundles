@@ -8985,10 +8985,17 @@ async fn operator_posts_never_carry_mention_permission() {
 
     // THE GUARANTEE: mentions are disabled explicitly. `{"parse": []}` leaves the text intact and
     // readable while denying it the power to notify.
+    //
+    // Assert the WHOLE OBJECT, not `["parse"]` alone (review pass 1). `parse: []` is not the only
+    // way to permit a mention — `users` and `roles` are INDEPENDENT allow-lists, so
+    // `{"parse": [], "users": ["1234"]}` still pings 1234 and would satisfy a `parse`-only check.
+    // An assertion narrower than the guarantee it is named for is the exact defect this module
+    // exists to fight, and the first draft of this test had one. Pinning the object means any added
+    // key reds the test and forces a deliberate decision instead of widening permission silently.
     assert_eq!(
-        body["allowed_mentions"]["parse"],
-        serde_json::json!([]),
-        "operator posts must disable mention parsing — content carries third-party titles: {body}"
+        body["allowed_mentions"],
+        serde_json::json!({ "parse": [] }),
+        "operator posts must disable ALL mention permission — content carries third-party titles: {body}"
     );
 }
 
