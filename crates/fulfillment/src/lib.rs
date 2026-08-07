@@ -4429,7 +4429,26 @@ async fn persist_sync(
 /// arm does that job. A doc naming a call the code does not make sends the next reader looking for
 /// a guard that isn't there, and — worse — invites them to "restore" it on top of the one that is.)
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
-    let body = serde_json::json!({ "content": content });
+    // `allowed_mentions` is load-bearing, not boilerplate (#174). Without it Discord parses
+    // `@everyone` / `@here` / `<@&role>` out of `content` — and THE CONTENT IS NOT OURS. `Part::Id`
+    // carries runtime values at 50 sites, several of them Humble-authored game titles
+    // (`human_name` / `title` off the wire response). A bundle titled `@everyone` would mass-ping.
+    //
+    // `operator_message` closes this trust boundary against DISCLOSURE — an error's text cannot
+    // reach Discord, enforced by the type. This is the SAME boundary with a different verb: not
+    // what the text reveals, but what the channel DOES with it. A type can keep a secret out of a
+    // string; it cannot stop the receiver treating that string as a command. That half has to be
+    // said here, at the one place the message becomes a request.
+    //
+    // `{"parse": []}` leaves the text intact and readable and denies it the power to notify.
+    // Do not "simplify" this away: the message renders identically with and without it, so its
+    // absence is invisible in every operator channel until the day it isn't.
+    // Pinned by `operator_posts_never_carry_mention_permission`, which asserts on the payload we
+    // send rather than on Discord's behaviour — Discord's behaviour is not ours to test, the field is.
+    let body = serde_json::json!({
+        "content": content,
+        "allowed_mentions": { "parse": [] },
+    });
     match http.post(url).json(&body).send().await {
         Ok(r) if r.status().is_success() => 0,
         // The status IS inspected. Without this arm a 400/401/404/429 is `Ok(response)` and
