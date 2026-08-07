@@ -4489,19 +4489,66 @@ async fn ping(deps: &Deps, msg: &str) {
 /// matter. Pinned by `ping_treats_non_2xx_as_failure`; delete this and that test goes red.
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     let body = serde_json::json!({ "content": content });
-    match http
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-    {
-        Ok(_) => 0,
+    match http.post(url).json(&body).send().await {
+        Ok(r) if r.status().is_success() => 0,
+        // The status IS inspected. Without this arm a 400/401/404/429 is `Ok(response)` and
+        // vanishes into the success path.
+        Ok(r) => {
+            tracing::error!(
+                outcome = "discord_non_2xx",
+                status = r.status().as_u16(),
+                "operator notification rejected"
+            );
+            1
+        }
         Err(e) => {
-            eprintln!("discord ping failed (non-fatal): {e}");
+            tracing::error!(
+                outcome = "discord_transport",
+                error = %e,
+                "operator notification transport failure"
+            );
             1
         }
     }
+}
+
+/// The prefix every operator message carries. Counted against the 2000 budget by `chunks`.
+const PING_PREFIX: &str = "🐱 bendobundles: ";
+
+/// Post an `OperatorMessage`, chunked and bounded, recording each chunk's outcome OUT OF BAND.
+///
+/// Returns `()`. That is the structural guarantee — a dead webhook cannot break fulfilment, and no
+/// call site can propagate. The failure record is a structured `tracing::error!`, which is a
+/// CloudWatch metric-filter target: it survives the invocation and fires even if the next sync
+/// never runs, which an in-band record cannot. **No dead-letter row** — there is no drainer, so a
+/// durable queue would be storage with no consumer. **No retry** — a chunked send is not atomic
+/// (`1 of 2 chunk(s) sent` is a real observed outcome), so a naive retry double-posts.
+#[allow(dead_code)]
+async fn ping_msg(deps: &Deps, msg: &operator_message::OperatorMessage) {
+    let Notify::Webhook(url) = &deps.notify else {
+        return;
+    };
+    for (i, chunk) in msg.chunks(PING_PREFIX).into_iter().enumerate() {
+        if deliver(&deps.http, url, &chunk).await == 1 {
+            tracing::error!(
+                outcome = "operator_notification_failed",
+                chunk = i + 1,
+                "operator notification failed"
+            );
+        }
+    }
+}
+
+/// Test seam: drive the chunked delivery path against a wiremock server.
+#[doc(hidden)]
+pub async fn ping_chunks_for_test(url: &str, msg: &str) -> u32 {
+    let m = operator_message::OperatorMessage::literal(Box::leak(msg.to_string().into_boxed_str()));
+    let http = reqwest::Client::new();
+    let mut failures = 0;
+    for chunk in m.chunks(PING_PREFIX) {
+        failures += deliver(&http, url, &chunk).await;
+    }
+    failures
 }
 
 /// Test seam for the delivery path. Exposed so an integration test can drive `deliver` against a

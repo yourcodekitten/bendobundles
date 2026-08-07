@@ -109,6 +109,16 @@ impl OperatorMessage {
     /// A forced mid-token cut carries ` …` so it is visible rather than silent.
     pub fn chunks(&self, prefix: &str) -> Vec<String> {
         let body = self.0.trim();
+        // THE EMPTY-CHUNK PROPERTY IS HELD BY THREE MECHANISMS JOINTLY. Measured, not assumed —
+        // removing any ONE leaves the suite green; removing ALL THREE turns
+        // `empty_input_yields_no_chunks_at_all` red with `got chunks for "   "`:
+        //   1. `self.0.trim()` here            2. `!cur.trim().is_empty()` at the tail push
+        //   3. `.filter(|p| !p.trim().is_empty())` before labelling
+        // So a partial refactor of any one is SAFE, and a refactor of all three is caught. Stated
+        // because the redundancy is otherwise invisible: a reader who deletes one and sees green
+        // would reasonably conclude it was dead, and deleting the next two would still look safe
+        // until the third. If you are simplifying here, change one at a time.
+        //
         // NOTE (deliberately no early-return guard here): an earlier version had
         // `if body.is_empty() { return Vec::new(); }`. It was DEAD CODE and is deleted rather
         // than re-labelled. `body.is_empty()` implies `split_inclusive('\n')` yields zero items,

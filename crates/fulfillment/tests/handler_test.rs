@@ -8829,3 +8829,23 @@ async fn ping_treats_non_2xx_as_failure() {
         "a 429 must count as a delivery failure, not a success"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Operator-truth: a chunked send is NOT atomic. `1 of 2 chunk(s) sent` is a real observed outcome
+// elsewhere on this box, so each chunk's failure is counted separately and NO retry is added — a
+// naive retry would re-post chunk one and duplicate operator messages.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn every_chunk_is_posted_and_failures_are_counted() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let failures = fulfillment::ping_chunks_for_test(&server.uri(), &"q".repeat(5000)).await;
+    assert_eq!(
+        failures, 3,
+        "each chunk failure counts once; failure is not atomic"
+    );
+}
