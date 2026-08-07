@@ -337,6 +337,25 @@ server proving the harness can see a POST at all.
 Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib notify_`
 Expected: FAIL — `Notify` not found.
 
+- [ ] **Step 3a: Pin the SDK retry — GATE FIX B7, this had NO step and was rationale only**
+
+`main.rs:66` is `aws_config::load_from_env()`. The SDK default (standard, 3 attempts) applies, so
+retry IS on — **but nothing in this repo pins it, and an inherited default is a property of a
+version, not of your code.** It disappears in a refactor with nothing announcing it, and the
+`ReadFailed`-rate design leans on retry converting weather into `Resolved`.
+
+```rust
+// was: let aws_cfg = aws_config::load_from_env().await;
+let aws_cfg = aws_config::from_env()
+    .retry_config(aws_sdk_ssm::config::retry::RetryConfig::standard())
+    .load()
+    .await;
+```
+
+Verify: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment` compiles. **There is no unit test for this**
+— it is a configuration pin, and asserting the SDK's own retry behaviour would be testing AWS.
+**Stated rather than left as an apparent gap.**
+
 - [ ] **Step 3: Implement**
 
 ```rust
@@ -620,7 +639,16 @@ fn new_req_id() -> String {
             // "local" here means two containers that both miss the env var collide again,
             // reintroducing exactly the defect this function exists to kill. The pid is
             // per-process and always available.
-            .unwrap_or_else(|| format!("p{}", std::process::id()))
+            .unwrap_or_else(|| {
+                // GATE MINOR (OMBB): a silent fallback is a silent reintroduction. The pid keeps
+                // ids unique, but if this fires in Lambda the env var is not what we think, and
+                // the OnceLock bakes that for the container's life. Make it loud.
+                tracing::warn!(
+                    outcome = "req_id_base_fallback",
+                    "AWS_LAMBDA_LOG_STREAM_NAME absent or empty — join keys fall back to pid"
+                );
+                format!("p{}", std::process::id())
+            })
     });
     // UNIQUENESS WINDOW, stated because "unique within a window" is what killed the timestamp
     // scheme: ids are unique for the LIFE OF THE CONTAINER. `u64` at this call rate cannot wrap
@@ -1383,3 +1411,23 @@ Task 4's tests — same value, test-local constant.
 
 **Placeholder scan.** No TBD/TODO; every code step carries real code; every test step names the exact
 command and the expected result.
+
+**Declared-not-built sweep (positional, mechanical — OMBB's refinement of Lilith's detector).** In a
+plan with `- [ ] Step` markers, **a symbol whose every hit inside a task falls ABOVE that task's
+first Step marker is rationale, not work.** No eye-classification, no getting tired at line 900.
+Run over every symbol this plan introduces:
+
+```
+RetryConfig     above=2  below=0   <<< was DECLARED, NOT BUILT  -> fixed, Task 2 Step 3a
+retry_config    above=1  below=0   <<< same
+load_from_env   above=1  below=0   <<< same
+SecretRead      above=6  below=18   built        OperatorMessage above=10 below=32  built
+ReadFailed      above=7  below=7    built        ErrorSummary    above=5  below=15  built
+log_fields      above=0  below=4    built        Notify          above=10 below=24  built
+chunks          above=2  below=21   built        deliver         above=5  below=9   built
+rows_failed     above=1  below=4    built        ping_msg        above=2  below=9   built
+summary_line    above=0  below=5    built
+```
+
+**Three symbols, one defect, and it is now the measured population rather than the instance
+somebody happened to notice.**
