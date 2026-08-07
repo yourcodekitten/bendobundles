@@ -8944,6 +8944,54 @@ async fn transport_failure_counts_as_failure() {
     );
 }
 
+// #174 — the operator channel must never treat message content as a COMMAND.
+//
+// `operator_message` closes the trust boundary against DISCLOSURE (an error's text cannot reach
+// Discord). This is the same boundary with a different verb: Discord parses `@everyone`/`@here`/
+// `<@&role>` out of `content` unless `allowed_mentions` says otherwise — and the content is not
+// ours. `Part::Id` carries runtime values at 50 sites, several of them Humble-authored game
+// titles (`human_name`/`title` off the wire response). A bundle titled `@everyone` mass-pings.
+//
+// The assertion is on the POSTED PAYLOAD, not on Discord's behaviour, because Discord's behaviour
+// is not ours to test — what we control is the field we send, so that is what gets pinned.
+#[tokio::test]
+async fn operator_posts_never_carry_mention_permission() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Hostile-but-plausible: exactly the shape a Humble game title could arrive in.
+    let failures =
+        fulfillment::ping_chunks_for_test(&server.uri(), "@everyone claim c1 is stuck").await;
+    assert_eq!(failures, 0, "the 204 should have been a clean delivery");
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "expected exactly one post");
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).expect("body is JSON");
+
+    // ANTI-VACUITY CONTROL. Without this, a body that dropped `content` entirely, or a request that
+    // never carried the hostile text, would satisfy the real assertion below for the wrong reason.
+    assert!(
+        body["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("@everyone"),
+        "control failed — the hostile text never reached the payload, so the check below proves \
+         nothing: {body}"
+    );
+
+    // THE GUARANTEE: mentions are disabled explicitly. `{"parse": []}` leaves the text intact and
+    // readable while denying it the power to notify.
+    assert_eq!(
+        body["allowed_mentions"]["parse"],
+        serde_json::json!([]),
+        "operator posts must disable mention parsing — content carries third-party titles: {body}"
+    );
+}
+
 // Spec test #2 — `Notify::Disabled` posts absolutely nothing.
 //
 // *** THIS TEST HAS BEEN VACUOUS TWICE, FOR TWO DIFFERENT REASONS, AND THE SECOND ONE IS WHY A
