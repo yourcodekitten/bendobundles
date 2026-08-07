@@ -694,10 +694,16 @@ replaced.** The property my review actually bought was *"the `.stderr` names the
 failed, never WHICH error** — so a typo, a rename, a missing `use`, or a moved module would make it
 green for the wrong reason. **That is the defect I caught, re-opened by my own substitution.**
 
-Pinning the code (` ```compile_fail,E0308 `) is **rejected**: rustdoc treats error codes as
-unstable and discourages relying on them, so a rustc upgrade that renumbers or merges a diagnostic
-turns the guarantee green-for-nothing, silently. **A trade I would be inheriting rather than
-choosing.**
+Pinning the code (` ```compile_fail,E0308 `) is **rejected on a MEASUREMENT, not on a claim about
+the docs** — see the experiment below: the annotation is accepted and ignored, so a deliberately
+wrong code still passes.
+
+*(An earlier draft rejected it because "rustdoc treats error codes as unstable and discourages
+relying on them." **That claim has been retracted by the person who made it** — the rustdoc
+documentation-tests page does not mention error codes at all, in either direction. It was asserted
+from memory. It is removed rather than quietly left standing, because a conclusion resting on an
+unverified premise is only accidentally right, and this one happens to have a real reason
+underneath it.)*
 
 **So the honest statement, in the plan rather than discovered later: this doctest pins that the code
 does not compile, not why.** Two things bound the damage, and neither is the doctest:
