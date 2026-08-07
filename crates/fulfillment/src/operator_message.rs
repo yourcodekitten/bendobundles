@@ -109,15 +109,13 @@ impl OperatorMessage {
     /// A forced mid-token cut carries ` …` so it is visible rather than silent.
     pub fn chunks(&self, prefix: &str) -> Vec<String> {
         let body = self.0.trim();
-        // FAST PATH ONLY — and this comment exists because the dirty side proved it. Removing
-        // this early return does NOT break `empty_input_yields_no_chunks_at_all`, and neither
-        // does removing the empty-part filter below: for wholly-empty input the property is
-        // STRUCTURAL (trim → `split_inclusive` yields no lines → no parts → empty Vec). Kept as
-        // an explicit statement of intent, but do not read it as the guarantee — a guard that
-        // provides nothing while looking like it does is exactly the class this module fights.
-        if body.is_empty() {
-            return Vec::new();
-        }
+        // NOTE (deliberately no early-return guard here): an earlier version had
+        // `if body.is_empty() { return Vec::new(); }`. It was DEAD CODE and is deleted rather
+        // than re-labelled. `body.is_empty()` implies `split_inclusive('\n')` yields zero items,
+        // so the loop never runs, `cur` stays empty, nothing is pushed, and the result is empty
+        // anyway — there is no input for which the guard changes behaviour. The empty-chunk
+        // property is STRUCTURAL, and `empty_input_yields_no_chunks_at_all` pins it (verified it
+        // can fail: breaking `chunks` outright turns it red).
         let budget = DISCORD_MAX
             .saturating_sub(prefix.chars().count())
             .saturating_sub(LABEL_RESERVE)
