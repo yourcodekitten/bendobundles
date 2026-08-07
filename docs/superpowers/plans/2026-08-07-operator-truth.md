@@ -133,6 +133,12 @@ var*. Twenty silent no-ops a day become one loud event at boot.
 **Files:**
 - Modify: `crates/fulfillment/src/main.rs:84-88` (webhook resolution), `:206-210` (`Deps`)
 - Modify: `crates/fulfillment/src/lib.rs` (`Deps.webhook_url` → `Deps.notify`)
+- **Modify (REVIEW FIX B2 — every `Deps { … }` construction site, 7 total across 3 files):**
+  `crates/fulfillment/src/lib.rs`, `crates/fulfillment/src/main.rs`,
+  `crates/fulfillment/tests/handler_test.rs`. Substitution is mechanical and exact:
+  `webhook_url: None` → `notify: Notify::Disabled`;
+  `webhook_url: Some(x)` → `notify: Notify::Webhook(x)`.
+  Do not guess a fixture value — those two lines cover every case.
 - Test: `crates/fulfillment/src/lib.rs` `mod tests`
 
 **Interfaces:**
@@ -213,8 +219,8 @@ let Notify::Webhook(url) = &deps.notify else { return; };
 - [ ] **Step 4: Run and watch them pass**
 
 Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib notify_` → PASS
-Then: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment` → compiles (fix any `Deps { webhook_url: .. }`
-construction sites the compiler names, including in tests).
+Then: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment` → compiles. The 7 construction sites are
+enumerated in **Files** above with their exact substitution; apply those, do not improvise.
 
 - [ ] **Step 5: Commit**
 
@@ -383,8 +389,11 @@ impl OperatorMessage {
 }
 ```
 
-Add `mod operator_message;` + `use operator_message::{ErrorSummary, OperatorMessage, Part};` to
-`lib.rs`.
+Add **`pub mod operator_message;`** + `use operator_message::{ErrorSummary, OperatorMessage, Part};`
+to `lib.rs`. **REVIEW FIX (B1): the module MUST be `pub`** — the trybuild fixture in Step 5 refers to
+`fulfillment::operator_message::OperatorMessage`, and a private module would fail to compile for the
+WRONG reason, which `trybuild` would report as the compile_fail test PASSING. Matches the repo's
+existing `pub mod heal_pairs;` (lib.rs:14).
 
 - [ ] **Step 4: Run and watch them pass**
 
@@ -419,6 +428,10 @@ is the assertion.)
 
 Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test compile_fail_test`
 Expected: PASS (meaning the bad code did NOT compile).
+
+**REVIEW FIX (B1): then READ the generated `.stderr` and confirm the error names the `&'static str`
+mismatch — NOT `E0603 module is private`.** A compile_fail test that passes for the wrong reason is
+the vacuous-pass shape: green because the probe was broken.
 
 - [ ] **Step 7: Commit**
 
@@ -463,13 +476,40 @@ fn chunks_are_bounded_including_prefix_and_label() {
 }
 
 #[test]
-fn chunks_are_never_empty() {
-    for input in ["", "   ", "y"] {
+// REVIEW FIX (B3): the original iterated `for c in m.chunks(..)` on EMPTY input. `chunks()`
+// returns an empty Vec there, so the loop body never ran and the test passed regardless of the
+// implementation — vacuous, and it was guarding the ONE requirement with real production
+// evidence behind it. Split into two tests that can each actually fail.
+fn empty_input_yields_no_chunks_at_all() {
+    for input in ["", "   ", "\n\n"] {
         let m = OperatorMessage::literal(Box::leak(input.to_string().into_boxed_str()));
-        for c in m.chunks(PREFIX) {
-            assert!(c.trim() != PREFIX.trim(), "prefix-only chunk emitted for {input:?}");
-            assert!(!c.is_empty());
-        }
+        assert!(
+            m.chunks(PREFIX).is_empty(),
+            "empty input must post nothing; got chunks for {input:?}"
+        );
+    }
+}
+
+#[test]
+fn no_emitted_chunk_is_empty_or_prefix_only() {
+    let m = OperatorMessage::literal(Box::leak("y".repeat(5000).into_boxed_str()));
+    let cs = m.chunks(PREFIX);
+    assert!(!cs.is_empty());
+    for c in &cs {
+        assert!(c.len() > PREFIX.len(), "prefix-only chunk: {c:?}");
+    }
+}
+
+// REVIEW FIX (M1): the 2000 bound and "never split mid-token" CONFLICT — the impl's
+// `matches("**") % 2 == 0` guard would keep appending past budget on an unbalanced run.
+// Precedence is now explicit: THE BOUND ALWAYS WINS, because exceeding it is what actually
+// produces a Discord 400. A forced mid-token split appends the marker ` …`.
+#[test]
+fn the_2000_bound_wins_over_token_integrity() {
+    let body = format!("{}**{}", "a".repeat(1999), "b".repeat(1999)); // ONE line, unbalanced **
+    let m = OperatorMessage::literal(Box::leak(body.into_boxed_str()));
+    for c in m.chunks(PREFIX) {
+        assert!(c.chars().count() <= 2000, "bound violated: {}", c.chars().count());
     }
 }
 
@@ -512,6 +552,10 @@ impl OperatorMessage {
     /// `content` is a Discord 400, and it is the only end of this axis with observed failures);
     /// never splits inside a `**` pair (a boundary that looks like damage costs what damage
     /// costs); labels every part when there is more than one.
+    ///
+    /// PRECEDENCE (REVIEW FIX M1): the 2000 bound and token-integrity CONFLICT on an unbalanced
+    /// `**` run. **The bound always wins** — exceeding it is what actually produces a Discord
+    /// 400. A forced mid-token split appends ` …` so the cut is visible rather than silent.
     pub fn chunks(&self, prefix: &str) -> Vec<String> {
         let body = self.0.trim();
         if body.is_empty() {
@@ -528,9 +572,11 @@ impl OperatorMessage {
             }
             if line.chars().count() > budget {
                 for ch in line.chars() {
-                    if cur.chars().count() + 1 > budget
-                        && cur.matches("**").count() % 2 == 0
-                    {
+                    if cur.chars().count() + 1 > budget {
+                        // Bound wins. Mark a forced mid-token cut so it is never silent.
+                        if cur.matches("**").count() % 2 != 0 {
+                            cur.push_str(" …");
+                        }
                         parts.push(std::mem::take(&mut cur));
                     }
                     cur.push(ch);
@@ -692,9 +738,12 @@ The recursion terminates at a counter and a log line — never another network c
 
 - [ ] **Step 1: Delete `ping` and let the compiler enumerate the work**
 
-Run: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment 2>&1 | grep -c 'cannot find function'`
-Expected: a number equal to the call-site count. **Print the list, do not trust the count** —
-`cargo check -p fulfillment 2>&1 | grep 'cannot find function' -A2`.
+**REVIEW FIX (B4): print the list, never the count** — the original step said exactly that and then
+handed over a `grep -c`. A count cannot be sanity-checked; a list can.
+
+Run: `CARGO_BUILD_JOBS=1 cargo check -p fulfillment 2>&1 | grep -n 'cannot find function' -A2`
+Expected: one entry per call site. **Paste the list into the Task 6 commit body** so the migration's
+denominator is recorded rather than remembered.
 
 - [ ] **Step 2: Convert each site**
 
@@ -716,17 +765,28 @@ line is safe to redact.
 
 - [ ] **Step 3: Add the drift test**
 
+**REVIEW FIX (M2): the original pinned only the message side and its own comment conceded it.**
+Spec test #8 requires BOTH sides to carry the same id; a renamed or dropped log field would pass.
+Add `tracing-test = "0.2"` to `[dev-dependencies]` and capture the log:
+
 ```rust
+use tracing_test::traced_test;
+
+#[traced_test]
 #[test]
 fn operator_text_and_log_share_one_req_id() {
     let s = ErrorSummary::of(&Leaky);
     let id = s.req_id().to_string();
+    tracing::error!(req_id = %id, "dead-key fail-claim write failed");
     let m = OperatorMessage::with(&[Part::Text("x"), Part::Error(s)]);
+
     assert!(m.as_str().contains(&id), "operator text lost the req_id");
-    // The log side is asserted by the call-site convention above; this pins the message side,
-    // which is the half that can silently drift when someone edits the renderer.
+    assert!(logs_contain(&id), "log record lost the req_id — the join is broken");
 }
 ```
+
+**Dirty-side verify:** rename the log field to `request_id` and confirm this test FAILS. An
+unjoinable breadcrumb is worse than the leak — at 3am it looks like you can chase it.
 
 - [ ] **Step 4: Verify**
 
@@ -810,6 +870,71 @@ git commit -S -m "fix(audit): per-row write failures reach discord (#161)
 shelf_truth_audit's per-row Err was tracing::warn! with no ping and no counter, asymmetric with
 the order walk's orders_failed. A chronically failing row was invisible to anyone watching only
 discord. Now counted and appended to the summary when >0, mirroring audit-pulled."
+```
+
+---
+
+---
+
+### Task 8: (REVIEW FIX M4) Pin the guarantees nothing else tests
+
+Three spec tests had no task. #10 is the guarantee the entire design exists to preserve and
+**nothing was testing it.**
+
+**Files:**
+- Test: `crates/fulfillment/tests/handler_test.rs`
+
+**Interfaces:**
+- Consumes: `Notify` (Task 2), `ping_msg` (Task 5), `deliver` (Task 1).
+- Produces: nothing. This task adds only tests.
+
+- [ ] **Step 1: Write the three failing/pinning tests**
+
+```rust
+// Spec test #10 — THE central guarantee. Nothing else pins it.
+#[tokio::test]
+async fn a_dead_webhook_does_not_change_handle_outcome() {
+    let dead = "http://127.0.0.1:1/hook"; // nothing listening
+    let failures = fulfillment::ping_chunks_for_test(dead, "anything").await;
+    assert!(failures > 0, "the send must be recorded as failed");
+    // and the guarantee: ping_msg returns (), so no call site can propagate. Pinned by type:
+    let _: () = { async fn _assert_unit(d: &fulfillment::Deps) { fulfillment::ping_msg_for_test(d).await } };
+}
+
+// Spec test #4 — transport error, distinct from non-2xx (Task 1 covered only non-2xx).
+#[tokio::test]
+async fn transport_failure_counts_as_failure() {
+    let failures = fulfillment::ping_for_test("http://127.0.0.1:1/hook", "hi").await;
+    assert_eq!(failures, 1);
+}
+
+// Spec test #2 — NOTIFY_DISABLED sends nothing (Task 2 tested construction only).
+#[tokio::test]
+async fn disabled_notify_sends_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0)
+        .mount(&server).await;
+    // Deps built with notify: Notify::Disabled — ping_msg must not POST at all.
+    // server.verify() on drop asserts expect(0).
+}
+```
+
+- [ ] **Step 2: Run them**
+
+Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --test handler_test`
+Expected: all PASS. If `a_dead_webhook_does_not_change_handle_outcome` fails to compile because
+`ping_msg` returns something other than `()`, **that is the guarantee breaking and the build must
+not proceed.**
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/fulfillment/tests/handler_test.rs
+git commit -S -m "test: pin the three spec guarantees nothing was testing
+
+Plan review found #10 — 'a dead webhook leaves handle's outcome unchanged' — untested. That is
+the guarantee the whole design exists to preserve, and it was the one property with no test.
+Also adds #4 (transport failure, distinct from non-2xx) and #2 (NOTIFY_DISABLED sends nothing)."
 ```
 
 ---
