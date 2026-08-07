@@ -7,18 +7,24 @@ use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};
 use steam_client::SteamClient;
 
-/// Fetch one decrypted SSM SecureString. Returns `None` (with a warn) on any error, an empty value,
-/// or the `"UNSET"` placeholder that terraform seeds these containers with — so a param that exists
-/// but was never given a real value out-of-band reads as unconfigured, NOT as a credential. Without
-/// this, `Some("UNSET")` would attach as the password and every gated redeem would POST a wrong
-/// password + bogus TOTP to the live account (lockout / rate-limit risk). The value is a secret:
-/// never logged, only the param NAME.
-/// Read an SSM SecureString and say WHAT WAS FOUND, not merely whether a value came back.
+/// Read one decrypted SSM SecureString and say **what was found**, not merely whether a value came
+/// back.
 ///
 /// This used to return `Option<String>`, collapsing FOUR states into one `None`: parameter absent,
-/// the `UNSET` placeholder, an empty value, and an SSM/KMS/IAM **error**. The fourth is transient
+/// the `"UNSET"` placeholder, an empty value, and an SSM/KMS/IAM **error**. The fourth is transient
 /// external weather being recorded as permanent internal intent — and because config resolves once
 /// per container, a momentary throttle became a container-lifetime condition. See `SecretRead`.
+///
+/// `"UNSET"` and empty are `DeliberatelyOff`, not values: terraform seeds these params with the
+/// placeholder, so a param that exists but was never given a real value out-of-band must read as
+/// unconfigured and NOT as a credential. Without that, `Some("UNSET")` would attach as the password
+/// and every gated redeem would POST a wrong password + bogus TOTP at the live account (lockout /
+/// rate-limit risk). The value is a secret: never logged, only the param NAME.
+///
+/// (The previous doc-comment's own summary line read *"Returns `None` (with a warn) on any error"* —
+/// **a precise description of the four-state collapse, left standing as the first thing a reader
+/// sees, directly above the code written to remove it.** A stale doc does not merely fail to help;
+/// it actively teaches the contract that was just retired.)
 async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> SecretRead {
     match client
         .get_parameter()
