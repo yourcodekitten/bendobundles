@@ -3515,18 +3515,13 @@ async fn run_sync(deps: &Deps) {
     // (no steam gate), same reasoning as the shared scan above.
     // scan predates discover_choice_games' writes — harmless: offered names never exact-match tpk
     // names, and a stale-scan write CCFs into SkippedInFlight; next run re-reads.
-    let pulls = match &shared_scan {
+    let (pulls, audit_rows_failed) = match &shared_scan {
         Some(scan) => shelf_truth_audit(deps, scan, &truth).await,
-        None => 0,
+        None => (0, 0),
     };
 
     let msg = if cookie_ok {
-        let base = format!("sync ok: {games_written} written, {orders_failed} order(s) failed");
-        if pulls > 0 {
-            format!("{base}, {pulls} audit-pulled")
-        } else {
-            base
-        }
+        summary_line(games_written, orders_failed, pulls, audit_rows_failed)
     } else {
         // Covers both a hard-dead session and a heal whose SSM persist failed — either way the
         // DURABLE cookie can't be trusted; the pings that already fired carry the specifics.
@@ -3556,6 +3551,29 @@ struct TruthEntry {
 
 type TruthMap = HashMap<(String, String), TruthEntry>;
 
+/// The sync summary, extracted from an inline `format!` so it can be tested without a sync.
+///
+/// `audit_rows_failed` is NOT nested under `pulls` (#161). That nesting is the tempting shape —
+/// both are audit numbers — and it is wrong in the one run that matters: rows that all FAIL to
+/// write pull nothing, so `pulls` is 0 and a nested counter would go silent in exactly the sync
+/// where every audit write broke. Pinned by
+/// `summary_reports_audit_row_failures_even_when_nothing_was_pulled`.
+fn summary_line(
+    games_written: u32,
+    orders_failed: u32,
+    pulls: u32,
+    audit_rows_failed: u32,
+) -> String {
+    let mut s = format!("sync ok: {games_written} written, {orders_failed} order(s) failed");
+    if pulls > 0 {
+        s.push_str(&format!(", {pulls} audit-pulled"));
+    }
+    if audit_rows_failed > 0 {
+        s.push_str(&format!(", {audit_rows_failed} audit row(s) failed"));
+    }
+    s
+}
+
 /// The shelf-truth audit (#158): the order walk's own write only ever lands on the id its D7
 /// routing ladder picks — for a plain tpk that's the same-id row (already corrected by the walk
 /// itself, minutes before this runs), but for a choice-suffixed tpk whose offered sibling exists,
@@ -3570,8 +3588,14 @@ type TruthMap = HashMap<(String, String), TruthEntry>;
 /// at all — is left completely untouched. The audit only ever acts on truth the walk itself
 /// fetched; it never infers anything from a row's absence from the fetched set.
 ///
-/// Returns the number of rows pulled (written) this pass, for the sync summary.
-async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 {
+/// Returns `(rows pulled, rows whose write FAILED)` this pass, both for the sync summary.
+///
+/// The second number exists because it did not (#161): the per-row `Err` arm below was a
+/// `tracing::warn!` and nothing more, while the order walk two hundred lines up has always
+/// surfaced `orders_failed`. Same run, two loops, one of them counted — so a row that failed to
+/// write on every single sync was invisible to anyone watching Discord, which is the only surface
+/// Ben watches.
+async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> (u32, u32) {
     struct Pulled {
         title: String,
         id: String,
@@ -3579,6 +3603,7 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
         is_gift: Option<bool>,
     }
     let mut pulled: Vec<Pulled> = Vec::new();
+    let mut rows_failed: u32 = 0;
 
     for g in scan.iter().filter(|g| g.is_listable()) {
         let Some(entry) = truth.get(&(g.gamekey.clone(), g.machine_name.clone())) else {
@@ -3628,6 +3653,7 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
             // already-identical row is Unchanged — both self-correct on the next sync's fresh read.
             Ok(SyncWrite::SkippedInFlight) | Ok(SyncWrite::Unchanged) => {}
             Err(e) => {
+                rows_failed += 1;
                 tracing::warn!(
                     error = ?e,
                     game_id = %g.id,
@@ -3638,7 +3664,9 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
     }
 
     if pulled.is_empty() {
-        return 0;
+        // Still return `rows_failed` — an all-failures pass pulls nothing, and returning a bare 0
+        // here is precisely how the count would stay invisible in its worst run.
+        return (0, rows_failed);
     }
 
     if pulled.len() > 3 {
@@ -3696,7 +3724,7 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> u32 
         }
     }
 
-    pulled.len() as u32
+    (pulled.len() as u32, rows_failed)
 }
 
 /// Choice-discovery ingest — the **sole intended writer** of `requires_choice = true` (see the
@@ -4539,6 +4567,40 @@ mod tests {
         let deadline_ms = now_ms + 60_000;
         let d = compute_enrich_deadline(deadline_ms, now_ms);
         assert_eq!(d, std::time::Duration::ZERO);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // (#161) Audit per-row write failures. The order walk has always counted its failures
+    // (`orders_failed`); the audit's per-row `Err` was a `tracing::warn!` and nothing else — so a
+    // row failing to write on EVERY sync was invisible to anyone watching only Discord, forever.
+    // The asymmetry was the defect: two loops in the same run, one counted, one not.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn summary_reports_audit_row_failures_only_when_nonzero() {
+        assert_eq!(
+            summary_line(3, 0, 2, 0),
+            "sync ok: 3 written, 0 order(s) failed, 2 audit-pulled"
+        );
+        assert_eq!(
+            summary_line(3, 0, 2, 4),
+            "sync ok: 3 written, 0 order(s) failed, 2 audit-pulled, 4 audit row(s) failed"
+        );
+    }
+
+    #[test]
+    fn summary_reports_audit_row_failures_even_when_nothing_was_pulled() {
+        // THE CASE THAT MATTERS MOST, and the one an `if pulls > 0` wrapper would have swallowed:
+        // rows that all FAIL to write pull nothing, so a failure count nested under the pulled
+        // count would be silent in exactly the run where every write broke.
+        assert_eq!(
+            summary_line(3, 0, 0, 4),
+            "sync ok: 3 written, 0 order(s) failed, 4 audit row(s) failed"
+        );
+        assert_eq!(
+            summary_line(3, 0, 0, 0),
+            "sync ok: 3 written, 0 order(s) failed"
+        );
     }
 
     #[test]
