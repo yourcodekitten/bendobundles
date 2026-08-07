@@ -377,11 +377,61 @@ pub fn find_new_tpk<'a>(order: &'a Order, pre: &[String], title: &str) -> TpkPic
     }
 }
 
+/// What an SSM secret read actually FOUND.
+///
+/// `Option<String>` collapsed **four** states into one `None`: parameter absent (terraform's
+/// `discord_webhook_enabled = false`), the `UNSET` placeholder, an empty value, and an SSM/KMS/IAM
+/// **error**. The fourth is the dangerous one — transient external *weather* recorded as permanent
+/// internal *intent*. And because config resolves once per container, a 200ms throttle does not
+/// cost 200ms of notifications: it costs every notification that container handles.
+///
+/// NOTE: lives in the library, not the binary, because both the binary's `get_secret` and the
+/// library's `Notify::resolve` need it.
+#[derive(Clone, Debug)]
+pub enum SecretRead {
+    Resolved(String),
+    /// Absent, `UNSET`, or empty — all deliberate.
+    DeliberatelyOff,
+    /// The read FAILED. Throttle, KMS grant, IAM, network. **Not a statement about intent.**
+    ReadFailed,
+}
+
+/// How this process reaches the operator. Resolved ONCE at init, so a missing webhook is one loud
+/// event per cold start instead of twenty silent no-ops a day.
+///
+/// A use-time `else { return; }` can never distinguish *deliberately off* from *someone dropped
+/// the env var* — that collapse IS the defect. Three states keep them apart.
+///
+/// **INFALLIBLE BY DESIGN.** This runs in the Lambda init phase, and a cold start is *caused by* an
+/// invocation, so init and request are the same instant. Halting here fails the order that woke the
+/// container, and every order after it. Notification config is OBSERVABILITY, not a safety gate:
+/// **fail LOUD, never CLOSED.** Do not change this to return `Result`.
+#[derive(Clone, Debug)]
+pub enum Notify {
+    Webhook(String),
+    /// Deliberately off. Silent by request; suppresses the alarm.
+    Disabled,
+    /// Misconfigured or unreadable. Behaves like `Disabled` at runtime, but is LOUD at init and
+    /// distinct in logs — which is the entire point of separating the states.
+    Unresolved,
+}
+
+impl Notify {
+    pub fn resolve(read: SecretRead, disabled: bool) -> Notify {
+        match (read, disabled) {
+            (SecretRead::Resolved(u), _) => Notify::Webhook(u),
+            (SecretRead::DeliberatelyOff, _) => Notify::Disabled,
+            // Weather, never intent.
+            (SecretRead::ReadFailed, _) => Notify::Unresolved,
+        }
+    }
+}
+
 /// Everything `handle` needs to do its job. Constructed once by Task 5's lambda main.
 pub struct Deps {
     pub store: Store,
     pub humble: HumbleClient,
-    pub webhook_url: Option<String>,
+    pub notify: Notify,
     pub http: reqwest::Client,
     /// SSM client + the humble-cookie parameter name, so the app can self-heal its own session:
     /// on a dead session it logs in (via `humble.login()`) and persists the fresh cookie here,
@@ -4415,7 +4465,9 @@ fn ping_content(msg: &str) -> String {
 /// POST a discord webhook ping if a webhook is configured. Never fails the caller — a dead webhook
 /// must not break fulfillment. `msg` must never contain cookie/URL secrets.
 async fn ping(deps: &Deps, msg: &str) {
-    let Some(url) = deps.webhook_url.as_deref() else {
+    // Both non-Webhook states send nothing. They are distinguished at INIT, not here — that
+    // separation is the fix, and collapsing them again at the use site would undo it.
+    let Notify::Webhook(url) = &deps.notify else {
         return;
     };
     deliver(&deps.http, url, &ping_content(msg)).await;
@@ -4461,6 +4513,54 @@ pub async fn ping_for_test(url: &str, msg: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------------------------
+    // Notify / SecretRead — operator-truth (A). An unconfigured webhook used to return success
+    // from every call site and every log: a prod deploy that lost its URL was indistinguishable
+    // from one that notified. The states are separated ONCE at init instead of collapsed forever
+    // at each use.
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn ssm_read_failure_is_unresolved_not_disabled() {
+        // THE four-state fix. An SSM error is WEATHER — a throttle, a KMS grant, a network blip —
+        // and must never be recorded as INTENT. `Option<String>` collapsed them.
+        assert!(matches!(
+            Notify::resolve(SecretRead::ReadFailed, false),
+            Notify::Unresolved
+        ));
+    }
+
+    #[test]
+    fn deliberately_off_is_disabled_not_unresolved() {
+        assert!(matches!(
+            Notify::resolve(SecretRead::DeliberatelyOff, false),
+            Notify::Disabled
+        ));
+    }
+
+    #[test]
+    fn explicit_disable_flag_also_yields_disabled() {
+        assert!(matches!(
+            Notify::resolve(SecretRead::DeliberatelyOff, true),
+            Notify::Disabled
+        ));
+    }
+
+    #[test]
+    fn resolved_value_is_webhook() {
+        let r = SecretRead::Resolved("https://x".into());
+        assert!(matches!(Notify::resolve(r, false), Notify::Webhook(_)));
+    }
+
+    #[test]
+    fn resolve_never_halts_the_process() {
+        // Pins the gate ruling. Config resolution runs in the Lambda INIT phase, and a cold start
+        // is CAUSED by an invocation — so init and request are the same instant. If this ever
+        // returns Result or panics, a monitoring misconfiguration takes fulfilment down with it.
+        // Notification config is observability, not a safety gate: fail LOUD, never CLOSED.
+        let _ = Notify::resolve(SecretRead::ReadFailed, false);
+    }
 
     // -----------------------------------------------------------------------------------------
     // compute_enrich_deadline

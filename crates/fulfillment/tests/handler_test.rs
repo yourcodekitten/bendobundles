@@ -133,7 +133,12 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
     Deps {
         store,
         humble: humble_at(humble_uri),
-        webhook_url,
+        // Signature keeps Option<String> so none of the 119 call sites move; the conversion
+        // happens here. None means "deliberately off" for a test fixture, never "read failed".
+        notify: match webhook_url {
+            Some(u) => fulfillment::Notify::Webhook(u),
+            None => fulfillment::Notify::Disabled,
+        },
         http: reqwest::Client::new(),
         // No self-login in these handler tests — a dead session keeps the flag-and-ping path.
         session_store: None,
@@ -515,7 +520,12 @@ async fn deps_with_selfheal(
             "hunter2".into(),
             TOTP_SEED.into(),
         )),
-        webhook_url,
+        // Signature keeps Option<String> so none of the 119 call sites move; the conversion
+        // happens here. None means "deliberately off" for a test fixture, never "read failed".
+        notify: match webhook_url {
+            Some(u) => fulfillment::Notify::Webhook(u),
+            None => fulfillment::Notify::Disabled,
+        },
         http: reqwest::Client::new(),
         session_store: Some(SessionStore {
             ssm: ssm_at(ssm_uri).await,
