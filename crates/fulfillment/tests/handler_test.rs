@@ -8849,3 +8849,156 @@ async fn every_chunk_is_posted_and_failures_are_counted() {
         "each chunk failure counts once; failure is not atomic"
     );
 }
+
+// =============================================================================================
+// THE GUARANTEES NOTHING ELSE TESTS (plan review fix M4).
+//
+// DO NOT DELETE THESE AS "tests that don't test anything". The plan review found that the
+// guarantee the entire operator-truth design exists to preserve — a dead webhook must never
+// change fulfilment's outcome — had NO test at all. Every other task in this change TIGHTENS the
+// notification path; these pin the promise that tightening it must not cost.
+// =============================================================================================
+
+// Spec test #10 — THE central guarantee, and the one with no test before this.
+//
+// The guarantee is a COMPARISON, not an assertion about failures: `handle`'s outcome must be
+// IDENTICAL with a live webhook and with a dead one. An earlier draft of this test never called
+// `handle` at all despite its name, and asserted only that a dead webhook produces failures —
+// which is a fact about `deliver`, not about fulfilment.
+//
+// THE PATH IS CHOSEN, NOT INCIDENTAL: dead-cookie park is a path that actually PINGS. Run this
+// comparison on a path that never notifies and it passes for free, no matter what the code does
+// — the vacuous shape this file's own header warns about. The `expect(1)` on the live server is
+// the positive control that keeps it honest: if the notification stops firing on this path, the
+// test fails rather than quietly becoming meaningless.
+//
+// WHY COMPARING ACROSS TWO STORES IS SOUND (checked, not assumed — this looks wrong at a glance):
+// the two arms necessarily use different `Store`s and different game ids, so an outcome type that
+// echoed either would make this fail for a reason that has nothing to do with the webhook.
+// `FulfillResponse` carries no identity: the variant this path returns is `Parked { reason }`, and
+// no variant holds a claim id, game id, or store handle. If a future variant ever does, this
+// assertion silently becomes a test of id equality — compare the discriminant then, not the value.
+#[tokio::test]
+async fn a_dead_webhook_does_not_change_handle_outcome() {
+    let (Some(live_store), Some(dead_store)) = (
+        store_or_skip("guarantee-live").await,
+        store_or_skip("guarantee-dead").await,
+    ) else {
+        return;
+    };
+    let live_gid = seed_pending_claim(&live_store, "gk1", "mn").await;
+    let dead_gid = seed_pending_claim(&dead_store, "gk1", "mn").await;
+
+    // Same humble fixture for both: the login-page HTML that means "session is dead".
+    let humble = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/humbler/redeemkey"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<!DOCTYPE html><html>login</html>")
+                .append_header("content-type", "text/html"),
+        )
+        .mount(&humble)
+        .await;
+
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1) // positive control — verified on drop
+        .mount(&discord)
+        .await;
+
+    let with_live = handle(
+        &deps(live_store, &humble.uri(), Some(discord.uri())),
+        gift_req(&live_gid, "gk1", "mn"),
+    )
+    .await;
+
+    // Port 1 is reserved and never listening: a genuine TRANSPORT failure, not a mocked one.
+    let with_dead = handle(
+        &deps(
+            dead_store,
+            &humble.uri(),
+            Some("http://127.0.0.1:1/hook".into()),
+        ),
+        gift_req(&dead_gid, "gk1", "mn"),
+    )
+    .await;
+
+    assert_eq!(
+        with_live, with_dead,
+        "a dead webhook changed handle's outcome — this is the guarantee the whole design exists \
+         to preserve, and every other test in this change assumes it"
+    );
+}
+
+// Spec test #4 — TRANSPORT failure, which is a different arm from the non-2xx case above.
+// `ping_treats_non_2xx_as_failure` covers `Ok(response)` with a bad status; this covers `Err(e)`,
+// where no response exists at all. Both must count as 1, and only one of them was tested.
+#[tokio::test]
+async fn transport_failure_counts_as_failure() {
+    let failures = fulfillment::ping_for_test("http://127.0.0.1:1/hook", "hi").await;
+    assert_eq!(
+        failures, 1,
+        "a connection that never completed must count as a delivery failure"
+    );
+}
+
+// Spec test #2 — `Notify::Disabled` posts absolutely nothing.
+//
+// *** THIS TEST HAS BEEN VACUOUS TWICE, FOR TWO DIFFERENT REASONS, AND THE SECOND ONE IS WHY A
+// *** REAL BUG SHIPPED. Read this before simplifying it.
+//
+// Draft 1 built the mock and then called nothing: zero POSTs happened because nothing ran.
+//
+// Draft 2 fixed that — it called the real gate via `ping_msg_for_test` — and was STILL
+// unfalsifiable, because `Notify::Disabled` carries NO URL. The `expect(0)` server was never a
+// candidate destination: delete the gate entirely and there is still nowhere to send. Its
+// anti-vacuity control lived on a DIFFERENT server, so it proved the harness could see a POST
+// somewhere, never that this server was reachable. A control on a different subject is not a
+// control.
+//
+// And the cost was not hypothetical: the sibling guarantee — that `NOTIFY_DISABLED=1` actually
+// disables — was broken in `Notify::resolve` (the flag was a passenger, matched `_` by every arm)
+// and this test could not have caught it at any point.
+//
+// Draft 3: ONE server, both arms. The zero is measured on the exact server that then demonstrably
+// receives a POST, so `0` is a fact about the gate rather than about the absence of an address.
+#[tokio::test]
+async fn disabled_notify_posts_absolutely_nothing() {
+    let (Some(off_store), Some(control_store)) = (
+        store_or_skip("guarantee-disabled").await,
+        store_or_skip("guarantee-control").await,
+    ) else {
+        return;
+    };
+
+    // No `.expect()` — the assertions are made explicitly below off the recorded requests, because
+    // the whole point is to compare TWO counts on ONE server.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    // Arm 1 — disabled. `None` == `Notify::Disabled` in this fixture.
+    let off = deps(off_store, &server.uri(), None);
+    fulfillment::ping_msg_for_test(&off, "must never be sent").await;
+    let after_disabled = server.received_requests().await.unwrap_or_default().len();
+    assert_eq!(
+        after_disabled, 0,
+        "Notify::Disabled sent a request — notifications are off by request and must be silent"
+    );
+
+    // Arm 2 — the SAME server, now wired as the webhook. This is the control, and it is only a
+    // control because it is the same subject: it proves the zero above was a measured zero on a
+    // reachable destination, not the absence of anywhere to send.
+    let live = deps(control_store, &server.uri(), Some(server.uri()));
+    fulfillment::ping_msg_for_test(&live, "control").await;
+    let after_enabled = server.received_requests().await.unwrap_or_default().len();
+    assert_eq!(
+        after_enabled, 1,
+        "the control did not fire — this server never receives POSTs at all, so the assert_eq!(0) \
+         above measured nothing and this test is blind"
+    );
+}
