@@ -166,6 +166,35 @@ fn notify_url_present_is_ok() {
 }
 ```
 
+**GATE BLOCKING CONDITION (OMBB, 2026-08-07): the disabled path is the safety valve and must be
+tested, because its failure mode is Ben's orders stopping.** Three distinct states, each pinned:
+
+```
+unset / malformed  → EXIT           (misconfiguration)
+NOTIFY_DISABLED=1  → boot, log once (deliberate)
+valid              → boot           (normal)
+```
+
+Add to Task 8's wiremock suite (it needs a server to assert "sent nothing"):
+
+```rust
+#[tokio::test]
+async fn disabled_notify_posts_absolutely_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)                      // <- the assertion: zero POSTs, verified on drop
+        .mount(&server)
+        .await;
+    let deps = test_deps(Notify::Disabled, &server.uri());
+    ping_msg(&deps, &OperatorMessage::literal("should never be sent")).await;
+    // MockServer::verify() runs on drop and fails the test if expect(0) was violated.
+}
+```
+
+**Untested, the valve is a claim about today's code — and it is the one path whose failure mode is
+an outage.**
+
 - [ ] **Step 2: Run and watch them fail**
 
 Run: `CARGO_BUILD_JOBS=1 cargo test -p fulfillment --lib notify_`
@@ -542,8 +571,10 @@ Expected: FAIL — `chunks` not found.
 ```rust
 /// Discord's hard limit on `content`.
 const DISCORD_MAX: usize = 2000;
-/// Room reserved for the ` (12/34)` label.
+/// Room reserved for the ` (12/34)` label. 10 fits ` (999/999)` exactly.
 const LABEL_RESERVE: usize = 10;
+/// Room reserved for the forced-cut marker ` …`, RESERVED not appended — see PRECEDENCE.
+const MARKER_RESERVE: usize = 2;
 
 impl OperatorMessage {
     /// Split into Discord-postable bodies. Each ≤2000 chars INCLUDING `prefix` and the label.
@@ -553,9 +584,15 @@ impl OperatorMessage {
     /// never splits inside a `**` pair (a boundary that looks like damage costs what damage
     /// costs); labels every part when there is more than one.
     ///
-    /// PRECEDENCE (REVIEW FIX M1): the 2000 bound and token-integrity CONFLICT on an unbalanced
-    /// `**` run. **The bound always wins** — exceeding it is what actually produces a Discord
-    /// 400. A forced mid-token split appends ` …` so the cut is visible rather than silent.
+    /// PRECEDENCE — THREE requirements interact here, not two (OMBB, gate round):
+    ///   1. the 2000 bound ALWAYS wins (it is the one with a real 400 behind it)
+    ///   2. then "no empty chunk" (the one with real production evidence)
+    ///   3. then "no mid-token split" (cosmetic — a boundary that merely LOOKS like damage)
+    ///
+    /// The marker's length is RESERVED FROM the budget, never added after. Adding it after
+    /// would push a maximally-packed chunk over the bound *because of the marker added to
+    /// respect the bound*. `budget = 2000 - prefix - LABEL_RESERVE - MARKER_RESERVE`, so the
+    /// remainder is always non-empty and the total is always within the limit.
     pub fn chunks(&self, prefix: &str) -> Vec<String> {
         let body = self.0.trim();
         if body.is_empty() {
@@ -563,7 +600,8 @@ impl OperatorMessage {
         }
         let budget = DISCORD_MAX
             .saturating_sub(prefix.chars().count())
-            .saturating_sub(LABEL_RESERVE);
+            .saturating_sub(LABEL_RESERVE)
+            .saturating_sub(MARKER_RESERVE);
         let mut parts: Vec<String> = Vec::new();
         let mut cur = String::new();
         for line in body.split_inclusive('\n') {
@@ -588,11 +626,15 @@ impl OperatorMessage {
         if !cur.trim().is_empty() {
             parts.push(cur);
         }
+        // BUG FOUND AT THE GATE (mine): the original computed `n = parts.len()` and THEN
+        // filtered empties, so dropping a part left gaps in the labels — "(1/3)" and "(3/3)"
+        // with no "(2/3)", which reads to an operator as a LOST MESSAGE. Filter first, then
+        // count, then label. The no-empty rule and the labelling rule are coupled.
+        let parts: Vec<String> = parts.into_iter().filter(|p| !p.trim().is_empty()).collect();
         let n = parts.len();
         parts
             .into_iter()
             .enumerate()
-            .filter(|(_, p)| !p.trim().is_empty())
             .map(|(i, p)| {
                 if n > 1 {
                     format!("{prefix}{} ({}/{n})", p.trim_end(), i + 1)
@@ -891,6 +933,11 @@ Three spec tests had no task. #10 is the guarantee the entire design exists to p
 - [ ] **Step 1: Write the three failing/pinning tests**
 
 ```rust
+// WHY THIS FILE EXISTS (do not delete as "a test that doesn't test anything"): the plan review
+// found that the guarantee the entire operator-truth design is built to preserve — a dead
+// webhook must never change fulfilment's outcome — had NO test. Every other task tightens the
+// notification path; this one pins the promise that tightening it must not cost.
+
 // Spec test #10 — THE central guarantee. Nothing else pins it.
 #[tokio::test]
 async fn a_dead_webhook_does_not_change_handle_outcome() {
