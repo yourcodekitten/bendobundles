@@ -1,7 +1,7 @@
 use dynamo::Store;
 use fulfillment::{
-    Notify, SecretRead,
-    Deps, FulfillRequest, FulfillResponse, SessionStore, compute_enrich_deadline, handle,
+    Deps, FulfillRequest, FulfillResponse, Notify, SecretRead, SessionStore,
+    compute_enrich_deadline, handle,
 };
 use humble_client::{HumbleClient, SessionCookie, StepUpCredentials};
 use lambda_runtime::{LambdaEvent, service_fn};

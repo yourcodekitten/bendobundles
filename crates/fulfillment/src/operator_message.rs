@@ -86,7 +86,6 @@ fn new_req_id() -> String {
     format!("{base}-{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
-
 /// Discord's hard limit on `content`.
 const DISCORD_MAX: usize = 2000;
 /// Room reserved for the ` (12/34)` label. 10 fits ` (999/999)` exactly.
@@ -108,16 +107,28 @@ impl OperatorMessage {
     ///
     /// A forced mid-token cut carries ` …` so it is visible rather than silent.
     pub fn chunks(&self, prefix: &str) -> Vec<String> {
+        // REDUNDANT #1 of 3 — see the map below before deleting this `.trim()`.
         let body = self.0.trim();
-        // THE EMPTY-CHUNK PROPERTY IS HELD BY THREE MECHANISMS JOINTLY. Measured, not assumed —
-        // removing any ONE leaves the suite green; removing ALL THREE turns
-        // `empty_input_yields_no_chunks_at_all` red with `got chunks for "   "`:
-        //   1. `self.0.trim()` here            2. `!cur.trim().is_empty()` at the tail push
+        // THE EMPTY-CHUNK PROPERTY IS HELD BY THREE MECHANISMS JOINTLY, and the SITES ARE LABELLED
+        // `REDUNDANT #n of 3` so the word reaches you at the moment you are deciding to delete one.
+        // An instruction here only helps a reader who has already scrolled to here; the labels do
+        // not rely on anyone remembering anything. (Lilith's point, adopted — it is strictly better
+        // than the paragraph it sits in.)
+        //   1. `self.0.trim()` above          2. `!cur.trim().is_empty()` at the tail push
         //   3. `.filter(|p| !p.trim().is_empty())` before labelling
-        // So a partial refactor of any one is SAFE, and a refactor of all three is caught. Stated
-        // because the redundancy is otherwise invisible: a reader who deletes one and sees green
-        // would reasonably conclude it was dead, and deleting the next two would still look safe
-        // until the third. If you are simplifying here, change one at a time.
+        //
+        // MEASURED, three cells, not assumed:
+        //   remove any ONE                    → green (46/46 then, 50/50 now)
+        //   remove #1 AND #2, keep #3         → GREEN — the filter alone holds the property
+        //   remove ALL THREE                  → RED: `got chunks for "   "`
+        // The middle cell is the one that decides whether "change one at a time" is a real
+        // discipline or a decorative one. It is real: since the all-three state is RED, whatever
+        // order you delete in, the THIRD deletion turns the suite red — so a one-at-a-time deleter
+        // is always caught before shipping, and a batch deleter never is.
+        // THE HAZARD IS THE SEQUENCE, NOT ANY STEP: each deletion is individually justified by a
+        // green run, every one of those runs is honest, and the composition reintroduces the bug.
+        // Single-removal testing is structurally blind to redundancy — "removed it, still green,
+        // therefore dead" is invalid anywhere a second provider might exist.
         //
         // NOTE (deliberately no early-return guard here): an earlier version had
         // `if body.is_empty() { return Vec::new(); }`. It was DEAD CODE and is deleted rather
@@ -141,7 +152,7 @@ impl OperatorMessage {
                 for ch in line.chars() {
                     if cur.chars().count() + 1 > budget {
                         // Bound wins. Mark a forced mid-token cut so it is never silent.
-                        if cur.matches("**").count() % 2 != 0 {
+                        if !cur.matches("**").count().is_multiple_of(2) {
                             cur.push_str(" …");
                         }
                         parts.push(std::mem::take(&mut cur));
@@ -152,6 +163,8 @@ impl OperatorMessage {
                 cur.push_str(line);
             }
         }
+        // REDUNDANT #2 of 3 (siblings: `self.0.trim()` at the top, the empty-part filter below).
+        // Deleting this alone is green and that green result is honest — see the map at the top.
         if !cur.trim().is_empty() {
             parts.push(cur);
         }
@@ -160,6 +173,11 @@ impl OperatorMessage {
         // INTERMEDIATE part, not the wholly-empty input above — see the fast-path note.) Computing `n` before filtering left gaps in the
         // labels — "(1/3)" and "(3/3)" with no "(2/3)" — which reads to an operator as a LOST
         // MESSAGE. The no-empty rule and the labelling rule are coupled.
+        // REDUNDANT #3 of 3 (siblings: `self.0.trim()` at the top, `!cur.trim().is_empty()` above).
+        // MEASURED to be the strongest of the three: with #1 and #2 both removed, this one alone
+        // keeps `empty_input_yields_no_chunks_at_all` green. It is also the only one of the three
+        // with a SECOND job (the label-gap fix, above) — so it is the last one you should reach
+        // for, not the first.
         let parts: Vec<String> = parts.into_iter().filter(|p| !p.trim().is_empty()).collect();
         let n = parts.len();
         parts
@@ -212,10 +230,63 @@ impl OperatorMessage {
             if !out.is_empty() {
                 out.push(' ');
             }
-            match p {
-                Part::Text(t) => out.push_str(t),
-                Part::Id(i) => out.push_str(i),
-                Part::Error(e) => out.push_str(&format!("[{} req {}]", e.kind(), e.req_id())),
+            out.push_str(&render(p));
+        }
+        OperatorMessage(out)
+    }
+
+    /// Substitute `args` into `template`'s `{}` placeholders, in order.
+    ///
+    /// WHY THIS EXISTS (and why it is not a weakening of the module's guarantee): `with` joins its
+    /// parts with a space, which is fine for `text id [err]` shapes and wrong for the ~40 real call
+    /// sites that interpolate a value MID-SENTENCE — `with` renders those as
+    /// `claim abc ( xyz ) hit a DEAD key`. Degrading every operator message is not an acceptable
+    /// price for the trust boundary, so the boundary is held a different way here.
+    ///
+    /// **BOTH doors stay shut, by TYPE, exactly as they are for `literal` and `with`:**
+    ///   - `template` is `&'static str` — it cannot carry a runtime value, so no `format!` result
+    ///     can enter through it.
+    ///   - `args` are `Part` — there is no `Part` that renders an error's `Display`/`Debug`, so an
+    ///     error can only appear as `Part::Error`, i.e. as `[kind req id]`.
+    ///
+    /// There is still **no public `String` constructor**; the `compile_fail` canary above is
+    /// unaffected.
+    ///
+    /// ARITY IS CHECKED AT RUNTIME, LOUDLY — `format!` checks it at compile time and this cannot,
+    /// which is a real capability lost. A silent mismatch (message renders with a value missing,
+    /// nobody notices) is precisely the defect class this module exists to kill, so a mismatch is
+    /// made VISIBLE in the operator text AND recorded out of band. Pinned by
+    /// `fmt_arity_mismatch_is_visible_not_silent`.
+    pub fn fmt(template: &'static str, args: &[Part<'_>]) -> OperatorMessage {
+        let mut out = String::new();
+        let mut rest = template;
+        let mut used = 0usize;
+        while let Some(i) = rest.find("{}") {
+            out.push_str(&rest[..i]);
+            match args.get(used) {
+                Some(p) => out.push_str(&render(p)),
+                // Fewer args than placeholders. Never leave a bare `{}` — an operator reading
+                // `claim {} is stuck` cannot tell a template bug from a genuinely absent id.
+                None => out.push_str("{?}"),
+            }
+            used += 1;
+            rest = &rest[i + 2..];
+        }
+        out.push_str(rest);
+        if used != args.len() {
+            // Out of band on purpose: the operator channel is the thing that just misrendered, so
+            // it is the one place this cannot be reported. Same rule as a failed send.
+            tracing::error!(
+                outcome = "operator_template_arity",
+                placeholders = used,
+                args = args.len(),
+                "operator message template and argument count disagree — message misrendered"
+            );
+            if used < args.len() {
+                // Extra args are otherwise INVISIBLE — the message just quietly loses a value.
+                out.push_str(" [!template dropped ");
+                out.push_str(&(args.len() - used).to_string());
+                out.push_str(" value(s)]");
             }
         }
         OperatorMessage(out)
@@ -226,11 +297,19 @@ impl OperatorMessage {
     }
 }
 
+/// The single rendering of a `Part`. Both `with` and `fmt` go through here so the two constructors
+/// cannot disagree about what an error looks like on the operator side.
+fn render(p: &Part<'_>) -> String {
+    match p {
+        Part::Text(t) => (*t).to_string(),
+        Part::Id(i) => (*i).to_string(),
+        Part::Error(e) => format!("[{} req {}]", e.kind(), e.req_id()),
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     const PREFIX: &str = "🐱 bendobundles: ";
 
@@ -263,7 +342,11 @@ mod tests {
     fn chunks_are_bounded_including_prefix_and_label() {
         let m = OperatorMessage::literal(Box::leak("x".repeat(5000).into_boxed_str()));
         for c in m.chunks(PREFIX) {
-            assert!(c.chars().count() <= 2000, "chunk too long: {}", c.chars().count());
+            assert!(
+                c.chars().count() <= 2000,
+                "chunk too long: {}",
+                c.chars().count()
+            );
         }
     }
 
@@ -282,7 +365,11 @@ mod tests {
         let body = format!("{}**{}", "a".repeat(1999), "b".repeat(1999)); // ONE line, unbalanced **
         let m = OperatorMessage::literal(Box::leak(body.into_boxed_str()));
         for c in m.chunks(PREFIX) {
-            assert!(c.chars().count() <= 2000, "bound violated: {}", c.chars().count());
+            assert!(
+                c.chars().count() <= 2000,
+                "bound violated: {}",
+                c.chars().count()
+            );
         }
     }
 
@@ -370,5 +457,62 @@ mod tests {
             m.as_str().contains(&log_id),
             "operator text and log record carry different ids — the breadcrumb is unjoinable"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // `fmt` — the mid-sentence constructor. Added during Task 6 because the call sites were 53,
+    // not the ~20 the plan assumed, and ~40 of them interpolate a value mid-prose where `with`'s
+    // space-join renders `claim abc ( xyz ) hit a DEAD key`.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn fmt_substitutes_in_order_and_keeps_punctuation() {
+        let m = OperatorMessage::fmt(
+            "claim {} ({}) hit a DEAD key — humble says: \"{}\".",
+            &[Part::Id("c-1"), Part::Id("g-2"), Part::Id("revoked")],
+        );
+        // The whole reason `fmt` exists: `with` would render `claim c-1 ( g-2 ) hit a DEAD key`.
+        assert_eq!(
+            m.as_str(),
+            "claim c-1 (g-2) hit a DEAD key — humble says: \"revoked\"."
+        );
+    }
+
+    #[test]
+    fn fmt_renders_an_error_through_the_same_door_as_with() {
+        // `render` is shared, so the two constructors cannot disagree about what an error looks
+        // like on the operator side — the property that makes ONE audit of `render` sufficient.
+        let s = ErrorSummary::of(&Leaky);
+        let (req, kind) = s.log_fields();
+        let (req, kind) = (req.to_string(), kind);
+        let m = OperatorMessage::fmt("write failed: {}", &[Part::Error(s)]);
+        assert_eq!(m.as_str(), format!("write failed: [{kind} req {req}]"));
+        assert!(
+            !m.as_str().contains("SECRET-KEY-abc123"),
+            "the error's own text reached the operator channel"
+        );
+    }
+
+    #[test]
+    fn fmt_arity_mismatch_is_visible_not_silent() {
+        // TOO FEW ARGS: never leave a bare `{}` — an operator cannot tell a template bug from a
+        // genuinely absent id.
+        let short = OperatorMessage::fmt("claim {} ({}) is stuck", &[Part::Id("c-1")]);
+        assert_eq!(short.as_str(), "claim c-1 ({?}) is stuck");
+
+        // TOO MANY ARGS is the nastier one: without the trailing note the message is perfectly
+        // well-formed prose that has quietly LOST a value, which is exactly this arc's defect.
+        let long = OperatorMessage::fmt("claim {} is stuck", &[Part::Id("c-1"), Part::Id("g-2")]);
+        assert!(
+            long.as_str().contains("dropped 1 value(s)"),
+            "a dropped argument left no trace in the message: {}",
+            long.as_str()
+        );
+    }
+
+    #[test]
+    fn fmt_with_no_placeholders_and_no_args_is_the_template() {
+        let m = OperatorMessage::fmt("nothing to substitute", &[]);
+        assert_eq!(m.as_str(), "nothing to substitute");
     }
 }
