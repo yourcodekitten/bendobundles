@@ -614,8 +614,18 @@ fn new_req_id() -> String {
             .ok()
             .and_then(|s| s.rsplit(']').next().map(str::to_string))  // the container suffix
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "local".to_string())
+            // GATE FIX (Lilith): the fallback must NOT be a shared constant. `OnceLock` bakes
+            // whatever it first computes for the container's WHOLE LIFE — the same
+            // once-per-container asymmetry that makes an SSM blip permanent. A literal
+            // "local" here means two containers that both miss the env var collide again,
+            // reintroducing exactly the defect this function exists to kill. The pid is
+            // per-process and always available.
+            .unwrap_or_else(|| format!("p{}", std::process::id()))
     });
+    // UNIQUENESS WINDOW, stated because "unique within a window" is what killed the timestamp
+    // scheme: ids are unique for the LIFE OF THE CONTAINER. `u64` at this call rate cannot wrap
+    // — it is incremented once per operator-notification FAILURE, so wrap would need ~10^19 of
+    // them. If this ever becomes a hot path, revisit.
     format!("{base}-{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -745,6 +755,12 @@ does not compile, not why.** Two things bound the damage, and neither is the doc
    - and that class is separately caught: `operator_message` is `pub` and Step 4 compiles and runs
      the module's unit tests through it, so a private/renamed/moved module breaks **the build**,
      loudly, before the doctest is consulted.
+
+   **VERIFY ONCE ON THE FIRST DEPLOY (Lilith): `AWS_LAMBDA_LOG_STREAM_NAME` is standard — and
+   *"standard"* is exactly what `subsec_nanos` looked like an hour before it was measured to be
+   clock-bound.** One `tracing::info!` of the computed base on a cold start confirms it is
+   populated. The pid fallback means an empty value is survivable rather than collision-inducing,
+   but a base that silently reads `p1234` in production means the env var is not what we think.
 
    **This is a real reduction from trybuild's committed `.stderr`, recorded rather than papered
    over.** If it ever matters more than the dependency costs, trybuild is the answer and this
