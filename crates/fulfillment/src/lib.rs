@@ -4418,10 +4418,44 @@ async fn ping(deps: &Deps, msg: &str) {
     let Some(url) = deps.webhook_url.as_deref() else {
         return;
     };
-    let body = serde_json::json!({ "content": ping_content(msg) });
-    if let Err(e) = deps.http.post(url).json(&body).send().await {
-        eprintln!("discord ping failed (non-fatal): {e}");
+    deliver(&deps.http, url, &ping_content(msg)).await;
+}
+
+/// POST one already-rendered body. Returns 1 on failure, 0 on success, so callers can COUNT
+/// without being able to PROPAGATE.
+///
+/// Never returns `Err` — a dead webhook must not break fulfilment, and the `-> u32` keeps that a
+/// structural guarantee rather than a convention every call site must honour. But infallible is
+/// not the same as silent: the doc comment on `ping` licensed not *propagating* a failure, and
+/// never licensed not *recording* one.
+///
+/// `.error_for_status()` is the load-bearing call. `reqwest`'s `Err` arm catches TRANSPORT
+/// failure only; a 400/401/404/429 arrives as `Ok(response)` with a non-success status. Without
+/// this, that response is a silent success — a failure routed into the success path. Discord
+/// rate-limits, so those are the notifications that vanish under exactly the load that makes them
+/// matter. Pinned by `ping_treats_non_2xx_as_failure`; delete this and that test goes red.
+async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
+    let body = serde_json::json!({ "content": content });
+    match http
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(_) => 0,
+        Err(e) => {
+            eprintln!("discord ping failed (non-fatal): {e}");
+            1
+        }
     }
+}
+
+/// Test seam for the delivery path. Exposed so an integration test can drive `deliver` against a
+/// wiremock server without constructing a whole `Deps`.
+#[doc(hidden)]
+pub async fn ping_for_test(url: &str, msg: &str) -> u32 {
+    deliver(&reqwest::Client::new(), url, &ping_content(msg)).await
 }
 
 #[cfg(test)]

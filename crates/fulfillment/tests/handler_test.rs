@@ -8794,3 +8794,28 @@ async fn absent_tpkd_dict_is_counted_failed_and_delists_nothing() {
         "a wire-degraded read must never de-list: absence of truth is not truth of absence"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Operator-truth: delivery verification (#163).
+//
+// `reqwest`'s Err arm catches TRANSPORT failure only. A 400 (too long), 401/404 (rotated or
+// deleted webhook) or 429 (rate limited) arrives as `Ok(response)` with a non-success status and
+// was never inspected — a failure routed into the success path, the same shape as a health check
+// reporting a dead gateway as healthy. Discord rate-limits, so notifications were vanishing under
+// exactly the load that makes them matter.
+// ---------------------------------------------------------------------------------------------
+#[tokio::test]
+async fn ping_treats_non_2xx_as_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let failures = fulfillment::ping_for_test(&server.uri(), "hello").await;
+    assert_eq!(
+        failures, 1,
+        "a 429 must count as a delivery failure, not a success"
+    );
+}
