@@ -4452,10 +4452,12 @@ async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // >>> "several", then 31, then 35 — and every miss was an argument that READ like ours. The
     // >>> only method that converges is tracing each form to its CONSTRUCTION SITE, and doing that
     // >>> to the EXCLUDED list, because an undercount can only hide among what you didn't count.
-    // (The other 58 are traced too, not assumed: `claim_id`/`claim.id` are `Uuid::new_v4()`;
-    // `csrf_note`, `gift_flag`, `p.reason` are `&'static str`; the rest are rendered numbers. The
-    // residual risk is no longer a category left unexamined — it is a SECOND producer for one of
-    // those forms that this trace did not find.)
+    // (The other 58 are traced too, not assumed: `csrf_note`, `gift_flag` and `p.reason` are
+    // `&'static str`; four are rendered numbers; the remaining 41 are `claim_id`/`claim.id`, which
+    // has exactly TWO producers workspace-wide — `public-api:726` and `admin-api:908`, both
+    // `Uuid::new_v4()` — with dynamo only propagating the parameter. So the residual risk here is
+    // not a category nobody examined; it is a THIRD producer appearing later. If you add one, it
+    // is this line you are invalidating.)
     //
     // `operator_message` closes this trust boundary against DISCLOSURE — an error's text cannot
     // reach Discord, enforced by the type. This is the SAME boundary with a different verb: not
