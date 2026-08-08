@@ -4431,23 +4431,31 @@ async fn persist_sync(
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // `allowed_mentions` is load-bearing, not boilerplate (#174). Without it Discord parses
     // `@everyone` / `@here` / `<@&role>` out of `content` — and THE CONTENT IS NOT OURS. `Part::Id`
-    // carries runtime values at 50 call sites, and **33 of those 50 pass at least one
-    // Humble-authored string — 35 such arguments in all**, out of 103. A bundle titled
-    // `@everyone` would mass-ping. Two families, and the second is the one that hides:
-    //   - 31 args, obviously wire text: `title`, `game.title`, `key.human_name`,
+    // is the RUNTIME door by type — `Part::Text` takes `&'static str`, `Part::Id` takes `&'a str` —
+    // so all 103 of its arguments across 50 call sites are runtime values, and `allowed_mentions`
+    // has to cover the lot. Of those 103, **45 arguments across 36 of the 50 sites are HUMBLE's
+    // text, not ours**. A bundle titled `@everyone` would mass-ping. Three families:
+    //   - 34 args that LOOK like wire text and are: `title`, `game.title`, `key.human_name`,
     //     `order.bundle_name`, `tpk.machine_name`, `titles.join(", ")`.
-    //   - 4 args at :984, :1497, :1621, :1801, all spelled `Part::Id(&reason)` — which READS like
-    //     one of our own classifier strings and is not. Each is built by a `match &outcome` arm
-    //     that returns `HumbleError::KeyExpired { msg, .. }`'s `msg` **verbatim** (`msg.clone()`,
-    //     or `format!("{msg} [code: {c}]")`). That is Humble's sentence, carried whole from wire to
-    //     dynamo to here — by design, "one truth from wire to dynamo", which is a good property and
-    //     an untrusted one. A NAME IS NOT A PROVENANCE: `&reason` is the giveaway that auditing
-    //     this boundary by variable name undercounts it.
-    // (Counted, not estimated. This comment read "several" until #176 — an order of magnitude out;
-    // then "31 of 50 sites", which was two true numbers with the wrong denominator, 31 being the
-    // ARGUMENT count and 29 the SITE count, and which still missed the `&reason` family above.
-    // Excluded from the 35: claim/game ids, rendered numbers, and fixed literals we author. Those
-    // are unaudited rather than proven safe, so 35 remains a FLOOR.)
+    //   - 8 args that look like OUR identifiers and are not — `game_id`, `claim.game_id`, `p.id`.
+    //     `domain::game_id` is `format!("{gamekey}:{machine_name}")`: two wire values concatenated,
+    //     no hash, no validation. **An id is only trusted if WE minted it.** (`claim.id` really is
+    //     ours — `Uuid::new_v4()` — and a UUID cannot spell `@everyone`. That is the contrast that
+    //     makes the word "id" useless as a safety signal here.)
+    //   - 3 args spelled `reason`, where the SITE decides, not the name. Wire at :984 :1497 :1621
+    //     :1801 (`HumbleError::KeyExpired{msg}` verbatim — "one truth from wire to dynamo", a good
+    //     property and an untrusted one), at :1686 (`ChooseFailed{reason}` ← humble's
+    //     `body.errormsg`), and at :4309 (a `format!` interpolating `hit.machine_name`). Yet the
+    //     SAME name is OURS at :939 :1460 :1583 :1679 :1779 — every one of those is
+    //     `SecureAreaStepUpFailed`, whose reasons are all our own literals.
+    // >>> A NAME IS NOT A PROVENANCE. Three passes at this sentence undercounted it three times —
+    // >>> "several", then 31, then 35 — and every miss was an argument that READ like ours. The
+    // >>> only method that converges is tracing each form to its CONSTRUCTION SITE, and doing that
+    // >>> to the EXCLUDED list, because an undercount can only hide among what you didn't count.
+    // (The other 58 are traced too, not assumed: `claim_id`/`claim.id` are `Uuid::new_v4()`;
+    // `csrf_note`, `gift_flag`, `p.reason` are `&'static str`; the rest are rendered numbers. The
+    // residual risk is no longer a category left unexamined — it is a SECOND producer for one of
+    // those forms that this trace did not find.)
     //
     // `operator_message` closes this trust boundary against DISCLOSURE — an error's text cannot
     // reach Discord, enforced by the type. This is the SAME boundary with a different verb: not
