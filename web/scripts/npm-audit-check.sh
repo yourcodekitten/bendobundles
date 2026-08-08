@@ -8,13 +8,34 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# GHSA-qwww-vcr4-c8h2 — react-router RSC-mode CSRF bypass (affects 7.12.0–8.2.0,
-# no patched 7.x as of 2026-08-03; npm's fix is a downgrade to 7.11.0). This app
-# is a plain Vite SPA: no RSC, no data-router actions — the vulnerable path is
-# unreachable (#81 audit, re-verified). Retire when a patched >=7.18.x lands.
-ALLOWLIST=(
-  "GHSA-qwww-vcr4-c8h2"
-)
+# EMPTY ON PURPOSE — every production advisory now fails this job. Keep it that way
+# for as long as you can; an entry here is a guard you have switched off.
+#
+# READ BEFORE ADDING ONE (#178). The match below is `[ "$adv" = "$ok" ]`: **string
+# equality on the advisory ID, with NO version awareness whatsoever.** So an entry
+# does not suppress "this advisory, in the version we're pinned to" — it suppresses
+# **that advisory ID FOREVER, in every version this repo will ever resolve.**
+#
+# That is not theoretical. The entry removed here was `GHSA-qwww-vcr4-c8h2`
+# (react-router RSC-mode CSRF bypass), parked on 2026-08-03 when its 7.x line had no
+# patch and npm's only "fix" was a downgrade to 7.11.0. Its own note said *"Retire
+# when a patched >=7.18.x lands."* That condition has fired: the advisory's ranges
+# are now `>= 7.12.0, < 7.18.2` (first patched **7.18.2**) and `>= 8.0.0, < 8.3.0`
+# (first patched **8.3.0**), and this repo resolves react-router / react-router-dom
+# at exactly **7.18.2**. Dependabot agrees — its alert for this one is gone.
+#
+# The reason it had to GO rather than sit here inert: **the same advisory has a
+# second, still-unpatched range in 8.x.** #166 proposes upgrading to react-router
+# v8. Had that landed on anything in 8.0.0–8.2.x with this entry still present, the
+# repo would have re-entered this exact CSRF bypass and this script would have
+# reported CLEAN — because the ID matched. The guard most likely to catch a bad v8
+# migration would have been disabled by the very note written to track that
+# migration. Found by @oldmanbendobot.
+#
+# So: an entry must carry a retire condition, and **a retire condition that has
+# fired is not documentation, it is a live hole.** If you park something here,
+# park the smallest thing you can and come back for it.
+ALLOWLIST=()
 
 # npm audit exits 1 when advisories exist — that's data, not failure. But an
 # infra failure (registry down, bad JSON) must fail LOUD, not read as "clean":

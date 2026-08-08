@@ -3,6 +3,20 @@
 # today and what event retires it. CI's audit job fails on anything NOT listed.
 # NOTE: this is one of TWO advisory parking lots — npm advisories live in
 # web/scripts/npm-audit-check.sh's ALLOWLIST. Check both to see the full story.
+#
+# THE HAZARD BOTH LISTS SHARE (#178): `ignore` matches on ADVISORY ID, with no
+# version awareness — same as the npm side. An entry therefore does not suppress
+# "this advisory at the version we're pinned to", it suppresses **that ID for every
+# version this repo will ever resolve**. So a retire condition that has FIRED is not
+# stale documentation, it is a live hole: the advisory can come back through a
+# different version and this list will wave it through silently. The npm side had
+# exactly that happen — its react-router entry was patched-and-inert on 7.x while the
+# SAME advisory stayed unpatched below 8.3.0, so an 8.x upgrade would have re-entered
+# the bug against a green check. Re-check the conditions below whenever you touch
+# these deps; do not assume a parked entry is still earning its place.
+# Verified unfired 2026-08-08: hyper-rustls 0.24.2, rustls 0.21.12 and
+# rustls-webpki 0.101.7 are all still in Cargo.lock, and lru 0.13.0 still arrives
+# under wreq 5.3.0. All four entries remain justified.
 [advisories]
 ignore = [
     # rustls 0.21.12 / rustls-webpki 0.101.7 — the aws-sdk's LEGACY TLS path, still
