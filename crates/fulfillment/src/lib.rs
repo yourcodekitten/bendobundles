@@ -4457,6 +4457,16 @@ async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // >>> permission scoped to the sync rule, which sends `Sync` and carries no claim fields.
     // >>> **Widen who may invoke this function and these strings stop being ours**, with nothing
     // >>> in this crate changing to tell you. That is the sentence to keep.
+    //     AND WHEN YOU GO CHECK THAT BOUNDARY, **LAMBDA HAS TWO GRANT MECHANISMS** (@oldmanbendobot
+    //     again): the IDENTITY-based policy above, and RESOURCE-based `aws_lambda_permission`
+    //     blocks — `eventbridge_sync` is one, and `aws-apigateway.tf:79/:87` are two more that
+    //     happen to target the API lambdas rather than this one. Following `invoke_fulfillment`
+    //     never traverses them, so **a future `aws_lambda_permission` on fulfillment would widen
+    //     this exact boundary while the policy named above stays untouched and correct-looking.**
+    //     Worse, `aws_lambda_function_url` is an invoke door with **no action string to grep at
+    //     all** (verified absent workspace-wide, 2026-08-08, along with any wildcard action and any
+    //     other grant naming the fulfillment ARN). *Enumerating one mechanism is not enumerating
+    //     the door* — the same defect as everything else in this comment, one layer out.
     //
     // A NOTE ON METHOD, because it cost four passes (@oldmanbendobot found the last one). This
     // comment said "several", then 31, then 35, then 45 — four counts, and every miss was an
