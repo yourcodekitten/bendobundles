@@ -4431,13 +4431,23 @@ async fn persist_sync(
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // `allowed_mentions` is load-bearing, not boilerplate (#174). Without it Discord parses
     // `@everyone` / `@here` / `<@&role>` out of `content` — and THE CONTENT IS NOT OURS. `Part::Id`
-    // carries runtime values at 50 call sites, and **29 of those 50 pass at least one
-    // Humble-authored string — 31 such arguments in all**, out of 103: `title`, `game.title`,
-    // `key.human_name`, `order.bundle_name`, `tpk.machine_name`, `titles.join(", ")`. All of it is
-    // free text off the wire response. A bundle titled `@everyone` would mass-ping.
-    // (Counted, not estimated — this comment read "several" until #176, which understated it by an
-    // order of magnitude. Ids and rendered numbers are deliberately excluded from the 31; the count
-    // is free text only, so it is a floor.)
+    // carries runtime values at 50 call sites, and **33 of those 50 pass at least one
+    // Humble-authored string — 35 such arguments in all**, out of 103. A bundle titled
+    // `@everyone` would mass-ping. Two families, and the second is the one that hides:
+    //   - 31 args, obviously wire text: `title`, `game.title`, `key.human_name`,
+    //     `order.bundle_name`, `tpk.machine_name`, `titles.join(", ")`.
+    //   - 4 args at :984, :1497, :1621, :1801, all spelled `Part::Id(&reason)` — which READS like
+    //     one of our own classifier strings and is not. Each is built by a `match &outcome` arm
+    //     that returns `HumbleError::KeyExpired { msg, .. }`'s `msg` **verbatim** (`msg.clone()`,
+    //     or `format!("{msg} [code: {c}]")`). That is Humble's sentence, carried whole from wire to
+    //     dynamo to here — by design, "one truth from wire to dynamo", which is a good property and
+    //     an untrusted one. A NAME IS NOT A PROVENANCE: `&reason` is the giveaway that auditing
+    //     this boundary by variable name undercounts it.
+    // (Counted, not estimated. This comment read "several" until #176 — an order of magnitude out;
+    // then "31 of 50 sites", which was two true numbers with the wrong denominator, 31 being the
+    // ARGUMENT count and 29 the SITE count, and which still missed the `&reason` family above.
+    // Excluded from the 35: claim/game ids, rendered numbers, and fixed literals we author. Those
+    // are unaudited rather than proven safe, so 35 remains a FLOOR.)
     //
     // `operator_message` closes this trust boundary against DISCLOSURE — an error's text cannot
     // reach Discord, enforced by the type. This is the SAME boundary with a different verb: not
