@@ -4431,8 +4431,13 @@ async fn persist_sync(
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // `allowed_mentions` is load-bearing, not boilerplate (#174). Without it Discord parses
     // `@everyone` / `@here` / `<@&role>` out of `content` — and THE CONTENT IS NOT OURS. `Part::Id`
-    // carries runtime values at 50 sites, several of them Humble-authored game titles
-    // (`human_name` / `title` off the wire response). A bundle titled `@everyone` would mass-ping.
+    // carries runtime values at 50 call sites, and **29 of those 50 pass at least one
+    // Humble-authored string — 31 such arguments in all**, out of 103: `title`, `game.title`,
+    // `key.human_name`, `order.bundle_name`, `tpk.machine_name`, `titles.join(", ")`. All of it is
+    // free text off the wire response. A bundle titled `@everyone` would mass-ping.
+    // (Counted, not estimated — this comment read "several" until #176, which understated it by an
+    // order of magnitude. Ids and rendered numbers are deliberately excluded from the 31; the count
+    // is free text only, so it is a floor.)
     //
     // `operator_message` closes this trust boundary against DISCLOSURE — an error's text cannot
     // reach Discord, enforced by the type. This is the SAME boundary with a different verb: not
@@ -4445,6 +4450,23 @@ async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // absence is invisible in every operator channel until the day it isn't.
     // Pinned by `operator_posts_never_carry_mention_permission`, which asserts on the payload we
     // send rather than on Discord's behaviour — Discord's behaviour is not ours to test, the field is.
+    //
+    // THE DOOR, NAMED HERE ON PURPOSE (#176 ②): `{"parse": []}` is a BLANKET deny, and the thing it
+    // denies is not only the attack. The day someone adds "wake Ben when fulfilment is actually
+    // broken", they will put `<@id>` in the message text and watch it **silently not ping** —
+    // nothing errors, the mention just renders as inert text. That is a long-fuse trap whose victim
+    // is the one message that most needs to arrive, and the debugging session it costs happens far
+    // from this line. The shape that keeps both properties is an allow-list, not a blanket deny:
+    //
+    //     "allowed_mentions": { "parse": [], "users": [BEN_ID] }   // deny by default, one door
+    //
+    // It is deliberately NOT written that way today: no such page exists or is planned in this
+    // repo, and there is no operator id in config. Plumbing an unused door is worse than naming
+    // one. If you are here because your page didn't fire — this is why, and that line is the fix.
+    // (Not hypothetical: Lilith hit the identical missing field in `claude-code-infra#61`, where a
+    // blanket deny would have welded shut the "page Ben when the box is dying" remedy her #57 asks
+    // for. Same bug, third language. #176 ① — `"flags": 4`, SUPPRESS_EMBEDS, so a title containing
+    // a URL cannot make the channel fetch and render it — is a separate, deliberate, open call.)
     let body = serde_json::json!({
         "content": content,
         "allowed_mentions": { "parse": [] },
