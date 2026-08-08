@@ -4431,33 +4431,40 @@ async fn persist_sync(
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // `allowed_mentions` is load-bearing, not boilerplate (#174). Without it Discord parses
     // `@everyone` / `@here` / `<@&role>` out of `content` — and THE CONTENT IS NOT OURS. `Part::Id`
-    // is the RUNTIME door by type — `Part::Text` takes `&'static str`, `Part::Id` takes `&'a str` —
-    // so all 103 of its arguments across 50 call sites are runtime values, and `allowed_mentions`
-    // has to cover the lot. Of those 103, **45 arguments across 36 of the 50 sites are HUMBLE's
-    // text, not ours**. A bundle titled `@everyone` would mass-ping. Three families:
-    //   - 34 args that LOOK like wire text and are: `title`, `game.title`, `key.human_name`,
-    //     `order.bundle_name`, `tpk.machine_name`, `titles.join(", ")`.
-    //   - 8 args that look like OUR identifiers and are not — `game_id`, `claim.game_id`, `p.id`.
-    //     `domain::game_id` is `format!("{gamekey}:{machine_name}")`: two wire values concatenated,
-    //     no hash, no validation. **An id is only trusted if WE minted it.** (`claim.id` really is
-    //     ours — `Uuid::new_v4()` — and a UUID cannot spell `@everyone`. That is the contrast that
-    //     makes the word "id" useless as a safety signal here.)
-    //   - 3 args spelled `reason`, where the SITE decides, not the name. Wire at :984 :1497 :1621
-    //     :1801 (`HumbleError::KeyExpired{msg}` verbatim — "one truth from wire to dynamo", a good
-    //     property and an untrusted one), at :1686 (`ChooseFailed{reason}` ← humble's
-    //     `body.errormsg`), and at :4309 (a `format!` interpolating `hit.machine_name`). Yet the
-    //     SAME name is OURS at :939 :1460 :1583 :1679 :1779 — every one of those is
-    //     `SecureAreaStepUpFailed`, whose reasons are all our own literals.
-    // >>> A NAME IS NOT A PROVENANCE. Three passes at this sentence undercounted it three times —
-    // >>> "several", then 31, then 35 — and every miss was an argument that READ like ours. The
-    // >>> only method that converges is tracing each form to its CONSTRUCTION SITE, and doing that
-    // >>> to the EXCLUDED list, because an undercount can only hide among what you didn't count.
-    // (The other 58 are traced too, not assumed: `csrf_note`, `gift_flag` and `p.reason` are
-    // `&'static str`; four are rendered numbers; the remaining 41 are `claim_id`/`claim.id`, which
-    // has exactly TWO producers workspace-wide — `public-api:726` and `admin-api:908`, both
-    // `Uuid::new_v4()` — with dynamo only propagating the parameter. So the residual risk here is
-    // not a category nobody examined; it is a THIRD producer appearing later. If you add one, it
-    // is this line you are invalidating.)
+    // is the RUNTIME door BY TYPE: `Part::Text` takes `&'static str`, `Part::Id` takes `&'a str`.
+    // **So every argument that goes through `Part::Id` is a runtime value, and `allowed_mentions`
+    // must cover ALL of them.** That is the whole justification for this field, it is checkable
+    // from the type signature alone, and it cannot go stale. Everything below is colour.
+    //
+    // WHERE THOSE VALUES COME FROM — two classes, and the second is the one that bites:
+    //   1. **Built here from Humble's wire data.** Titles and names (`title`, `game.title`,
+    //      `key.human_name`, `order.bundle_name`, `tpk.machine_name`); `domain::game_id`, which is
+    //      `format!("{gamekey}:{machine_name}")` — two wire values concatenated, no hash, no
+    //      validation, so **an "id" is not automatically ours**; and error text carried verbatim
+    //      (`HumbleError::KeyExpired{msg}` at :984 :1497 :1621 :1801 — "one truth from wire to
+    //      dynamo", a good property and an untrusted one; `ChooseFailed{reason}` ← `body.errormsg`
+    //      at :1686). Note the same NAME cuts both ways: `reason` is ours at :939 :1460 :1583 :1679
+    //      :1779, where every one is `SecureAreaStepUpFailed` and its reasons are our own literals.
+    //   2. **Never built here at all — DESERIALIZED.** `FulfillRequest` is `#[derive(Deserialize)]`
+    //      (:113). `claim_id`, `game_id`, `gamekey`, `machine_name` are fields of the INVOKE
+    //      PAYLOAD, destructured at :630+ and handed to every handler below. Grepping for where
+    //      these are constructed finds `Uuid::new_v4()` in public-api/admin-api and that is
+    //      **the wrong answer to the right question** — those are what the CALLERS put in the
+    //      payload, not what this lambda receives.
+    // >>> **WHAT MAKES CLASS 2 OURS IS AN IAM BOUNDARY, NOT A CONSTRUCTOR.** The
+    // >>> `invoke_fulfillment` policy (`terraform/aws-lambda.tf:155`) is attached at exactly two
+    // >>> places — `lambda_public_api` (:94) and `lambda_admin_api` (:137) — plus an EventBridge
+    // >>> permission scoped to the sync rule, which sends `Sync` and carries no claim fields.
+    // >>> **Widen who may invoke this function and these strings stop being ours**, with nothing
+    // >>> in this crate changing to tell you. That is the sentence to keep.
+    //
+    // A NOTE ON METHOD, because it cost four passes (@oldmanbendobot found the last one). This
+    // comment said "several", then 31, then 35, then 45 — four counts, and every miss was an
+    // argument that READ like ours. Tracing each form to its construction site fixed three of them
+    // and **structurally could not fix the fourth: a value that is never constructed here cannot be
+    // found by looking for where it is constructed. It arrives.** So do not trust a number in this
+    // comment as a safety property — trust the type invariant at the top, which covers all of them
+    // without needing to be recounted.
     //
     // `operator_message` closes this trust boundary against DISCLOSURE — an error's text cannot
     // reach Discord, enforced by the type. This is the SAME boundary with a different verb: not
