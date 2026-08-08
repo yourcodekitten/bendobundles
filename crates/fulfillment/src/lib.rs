@@ -4431,8 +4431,50 @@ async fn persist_sync(
 async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // `allowed_mentions` is load-bearing, not boilerplate (#174). Without it Discord parses
     // `@everyone` / `@here` / `<@&role>` out of `content` — and THE CONTENT IS NOT OURS. `Part::Id`
-    // carries runtime values at 50 sites, several of them Humble-authored game titles
-    // (`human_name` / `title` off the wire response). A bundle titled `@everyone` would mass-ping.
+    // is the RUNTIME door BY TYPE: `Part::Text` takes `&'static str`, `Part::Id` takes `&'a str`.
+    // **So every argument that goes through `Part::Id` is a runtime value, and `allowed_mentions`
+    // must cover ALL of them.** That is the whole justification for this field, it is checkable
+    // from the type signature alone, and it cannot go stale. Everything below is colour.
+    //
+    // WHERE THOSE VALUES COME FROM — two classes, and the second is the one that bites:
+    //   1. **Built here from Humble's wire data.** Titles and names (`title`, `game.title`,
+    //      `key.human_name`, `order.bundle_name`, `tpk.machine_name`); `domain::game_id`, which is
+    //      `format!("{gamekey}:{machine_name}")` — two wire values concatenated, no hash, no
+    //      validation, so **an "id" is not automatically ours**; and error text carried verbatim
+    //      (`HumbleError::KeyExpired{msg}` at :984 :1497 :1621 :1801 — "one truth from wire to
+    //      dynamo", a good property and an untrusted one; `ChooseFailed{reason}` ← `body.errormsg`
+    //      at :1686). Note the same NAME cuts both ways: `reason` is ours at :939 :1460 :1583 :1679
+    //      :1779, where every one is `SecureAreaStepUpFailed` and its reasons are our own literals.
+    //   2. **Never built here at all — DESERIALIZED.** `FulfillRequest` is `#[derive(Deserialize)]`
+    //      (:113). `claim_id`, `game_id`, `gamekey`, `machine_name` are fields of the INVOKE
+    //      PAYLOAD, destructured at :630+ and handed to every handler below. Grepping for where
+    //      these are constructed finds `Uuid::new_v4()` in public-api/admin-api and that is
+    //      **the wrong answer to the right question** — those are what the CALLERS put in the
+    //      payload, not what this lambda receives.
+    // >>> **WHAT MAKES CLASS 2 OURS IS AN IAM BOUNDARY, NOT A CONSTRUCTOR.** The
+    // >>> `invoke_fulfillment` policy (`terraform/aws-lambda.tf:155`) is attached at exactly two
+    // >>> places — `lambda_public_api` (:94) and `lambda_admin_api` (:137) — plus an EventBridge
+    // >>> permission scoped to the sync rule, which sends `Sync` and carries no claim fields.
+    // >>> **Widen who may invoke this function and these strings stop being ours**, with nothing
+    // >>> in this crate changing to tell you. That is the sentence to keep.
+    //     AND WHEN YOU GO CHECK THAT BOUNDARY, **LAMBDA HAS TWO GRANT MECHANISMS** (@oldmanbendobot
+    //     again): the IDENTITY-based policy above, and RESOURCE-based `aws_lambda_permission`
+    //     blocks — `eventbridge_sync` is one, and `aws-apigateway.tf:79/:87` are two more that
+    //     happen to target the API lambdas rather than this one. Following `invoke_fulfillment`
+    //     never traverses them, so **a future `aws_lambda_permission` on fulfillment would widen
+    //     this exact boundary while the policy named above stays untouched and correct-looking.**
+    //     Worse, `aws_lambda_function_url` is an invoke door with **no action string to grep at
+    //     all** (verified absent workspace-wide, 2026-08-08, along with any wildcard action and any
+    //     other grant naming the fulfillment ARN). *Enumerating one mechanism is not enumerating
+    //     the door* — the same defect as everything else in this comment, one layer out.
+    //
+    // A NOTE ON METHOD, because it cost four passes (@oldmanbendobot found the last one). This
+    // comment said "several", then 31, then 35, then 45 — four counts, and every miss was an
+    // argument that READ like ours. Tracing each form to its construction site fixed three of them
+    // and **structurally could not fix the fourth: a value that is never constructed here cannot be
+    // found by looking for where it is constructed. It arrives.** So do not trust a number in this
+    // comment as a safety property — trust the type invariant at the top, which covers all of them
+    // without needing to be recounted.
     //
     // `operator_message` closes this trust boundary against DISCLOSURE — an error's text cannot
     // reach Discord, enforced by the type. This is the SAME boundary with a different verb: not
@@ -4445,6 +4487,23 @@ async fn deliver(http: &reqwest::Client, url: &str, content: &str) -> u32 {
     // absence is invisible in every operator channel until the day it isn't.
     // Pinned by `operator_posts_never_carry_mention_permission`, which asserts on the payload we
     // send rather than on Discord's behaviour — Discord's behaviour is not ours to test, the field is.
+    //
+    // THE DOOR, NAMED HERE ON PURPOSE (#176 ②): `{"parse": []}` is a BLANKET deny, and the thing it
+    // denies is not only the attack. The day someone adds "wake Ben when fulfilment is actually
+    // broken", they will put `<@id>` in the message text and watch it **silently not ping** —
+    // nothing errors, the mention just renders as inert text. That is a long-fuse trap whose victim
+    // is the one message that most needs to arrive, and the debugging session it costs happens far
+    // from this line. The shape that keeps both properties is an allow-list, not a blanket deny:
+    //
+    //     "allowed_mentions": { "parse": [], "users": [BEN_ID] }   // deny by default, one door
+    //
+    // It is deliberately NOT written that way today: no such page exists or is planned in this
+    // repo, and there is no operator id in config. Plumbing an unused door is worse than naming
+    // one. If you are here because your page didn't fire — this is why, and that line is the fix.
+    // (Not hypothetical: Lilith hit the identical missing field in `claude-code-infra#61`, where a
+    // blanket deny would have welded shut the "page Ben when the box is dying" remedy her #57 asks
+    // for. Same bug, third language. #176 ① — `"flags": 4`, SUPPRESS_EMBEDS, so a title containing
+    // a URL cannot make the channel fetch and render it — is a separate, deliberate, open call.)
     let body = serde_json::json!({
         "content": content,
         "allowed_mentions": { "parse": [] },
