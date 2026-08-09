@@ -4,20 +4,20 @@
 //! - POST  /admin/api/login              — argon2 verify, 7-day session cookie
 //! - POST  /admin/api/logout             — revoke session server-side + clear cookie (idempotent)
 //! - GET   /admin/api/catalog            — full game catalog (all statuses)
-//! - POST  /admin/api/games/:id/hidden   — toggle hidden flag
-//! - POST  /admin/api/games/:id/self-claim — intake + synchronous reveal (RequestResponse)
-//! - POST  /admin/api/games/:id/steam-app-id — admin override for steam_app_id (null clears)
+//! - POST  /admin/api/games/{id}/hidden   — toggle hidden flag
+//! - POST  /admin/api/games/{id}/self-claim — intake + synchronous reveal (RequestResponse)
+//! - POST  /admin/api/games/{id}/steam-app-id — admin override for steam_app_id (null clears)
 //! - POST  /admin/api/links              — create link (64-char token)
 //! - GET   /admin/api/links              — list all links with used/allowed counts
-//! - POST  /admin/api/links/:token/revoke
-//! - GET   /admin/api/links/:token/claims
+//! - POST  /admin/api/links/{token}/revoke
+//! - GET   /admin/api/links/{token}/claims
 //! - GET   /admin/api/claims/self        — Ben's own self-claimed keys (SELF partition)
 //! - POST  /admin/api/sync               — trigger catalog sync now
 //! - GET   /admin/api/status             — sync state + game counts by status
 //! - POST  /admin/api/steam/identity     — set Ben's SteamID (17-digit validation)
 //! - DELETE /admin/api/steam/identity    — clear Ben's SteamID
 //! - GET   /admin/api/steam/identity     — read Ben's SteamID (null if unset)
-//! - GET   /admin/api/steam/owned/:steamid — session-guarded proxy: serve cache (≤24h) or fetch
+//! - GET   /admin/api/steam/owned/{steamid} — session-guarded proxy: serve cache (≤24h) or fetch
 //!
 //! All routes except `/login` and `/logout` require a valid session cookie (`session=<token>`).
 //! State-changing routes (POST/DELETE/…) additionally require the `X-Admin-Request` header —
@@ -92,24 +92,24 @@ pub fn router(
     // route_layer (vs layer) means 404s from unmatched paths don't hit the session check.
     let protected = Router::new()
         .route("/admin/api/catalog", get(handle_catalog))
-        .route("/admin/api/games/:id/detail", get(handle_game_detail))
-        .route("/admin/api/games/:id/hidden", post(handle_game_hidden))
-        .route("/admin/api/games/:id/self-claim", post(handle_self_claim))
+        .route("/admin/api/games/{id}/detail", get(handle_game_detail))
+        .route("/admin/api/games/{id}/hidden", post(handle_game_hidden))
+        .route("/admin/api/games/{id}/self-claim", post(handle_self_claim))
         .route(
-            "/admin/api/games/:id/steam-app-id",
+            "/admin/api/games/{id}/steam-app-id",
             post(handle_game_steam_appid),
         )
         .route(
             "/admin/api/links",
             post(handle_create_link).get(handle_list_links),
         )
-        .route("/admin/api/links/:token/revoke", post(handle_revoke_link))
-        .route("/admin/api/links/:token/note", post(handle_set_link_note))
+        .route("/admin/api/links/{token}/revoke", post(handle_revoke_link))
+        .route("/admin/api/links/{token}/note", post(handle_set_link_note))
         .route(
-            "/admin/api/links/:token/unlock",
+            "/admin/api/links/{token}/unlock",
             post(handle_set_link_unlock).delete(handle_delete_link_unlock),
         )
-        .route("/admin/api/links/:token/claims", get(handle_link_claims))
+        .route("/admin/api/links/{token}/claims", get(handle_link_claims))
         .route("/admin/api/claims/self", get(handle_self_claims))
         .route("/admin/api/sync", post(handle_sync))
         .route("/admin/api/status", get(handle_status))
@@ -120,7 +120,7 @@ pub fn router(
                 .get(handle_steam_identity_get),
         )
         .route(
-            "/admin/api/steam/owned/:steamid",
+            "/admin/api/steam/owned/{steamid}",
             get(handle_steam_owned_proxy),
         )
         .route_layer(axum::middleware::from_fn_with_state(
@@ -420,7 +420,7 @@ async fn handle_catalog(State(s): State<AppState>) -> Response {
     }
 }
 
-// ── POST /admin/api/games/:id/hidden ──────────────────────────────────────────
+// ── POST /admin/api/games/{id}/hidden ──────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct HiddenBody {
@@ -450,7 +450,7 @@ async fn handle_game_hidden(
     }
 }
 
-// ── POST /admin/api/games/:id/steam-app-id ────────────────────────────────────
+// ── POST /admin/api/games/{id}/steam-app-id ────────────────────────────────────
 
 #[derive(Deserialize)]
 struct SteamAppIdBody {
@@ -486,7 +486,7 @@ async fn handle_game_steam_appid(
     }
 }
 
-// ── GET /admin/api/games/:id/detail ──────────────────────────────────────────
+// ── GET /admin/api/games/{id}/detail ──────────────────────────────────────────
 
 /// Session-guarded game detail endpoint. Admin superset: any game id (including hidden,
 /// non-giftable, non-listable). Cache-only — Steam is never called at request time.
@@ -714,7 +714,7 @@ async fn handle_list_links(State(s): State<AppState>) -> Response {
     }
 }
 
-// ── POST /admin/api/links/:token/revoke ───────────────────────────────────────
+// ── POST /admin/api/links/{token}/revoke ───────────────────────────────────────
 
 async fn handle_revoke_link(State(s): State<AppState>, Path(token): Path<String>) -> Response {
     let mut link = match s.store.get_link(&token).await {
@@ -731,7 +731,7 @@ async fn handle_revoke_link(State(s): State<AppState>, Path(token): Path<String>
     }
 }
 
-// ── POST /admin/api/links/:token/note ─────────────────────────────────────────
+// ── POST /admin/api/links/{token}/note ─────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct SetLinkNoteBody {
@@ -765,7 +765,7 @@ async fn handle_set_link_note(
     }
 }
 
-// ── /admin/api/links/:token/unlock — the two seal verbs (spec 2026-08-05 §4) ─
+// ── /admin/api/links/{token}/unlock — the two seal verbs (spec 2026-08-05 §4) ─
 
 #[derive(Deserialize)]
 struct SetUnlockBody {
@@ -834,7 +834,7 @@ async fn handle_delete_link_unlock(
     }
 }
 
-// ── GET /admin/api/links/:token/claims ────────────────────────────────────────
+// ── GET /admin/api/links/{token}/claims ────────────────────────────────────────
 
 /// Admin view of a gift claim. Deliberately NOT `domain::Claim`: the friend's
 /// one-time gift URL is a bearer secret — it must never reach the admin surface,
@@ -874,7 +874,7 @@ async fn handle_link_claims(State(s): State<AppState>, Path(token): Path<String>
     }
 }
 
-// ── POST /admin/api/games/:id/self-claim ─────────────────────────────────────
+// ── POST /admin/api/games/{id}/self-claim ─────────────────────────────────────
 
 /// Self-claim view of a claim — the ONE admin surface that serves a key value (Ben's own).
 #[derive(serde::Serialize)]
@@ -1165,7 +1165,7 @@ async fn handle_steam_identity_get(State(s): State<AppState>) -> Response {
     }
 }
 
-// ── GET /admin/api/steam/owned/:steamid ───────────────────────────────────────
+// ── GET /admin/api/steam/owned/{steamid} ───────────────────────────────────────
 
 /// Session-guarded proxy to the Steam owned-games endpoint.
 ///
