@@ -13,7 +13,7 @@ domain = { path = "../domain" }
 dynamo = { path = "../dynamo" }
 fulfillment = { path = "../fulfillment" }
 steam-client = { path = "../steam-client" }
-axum = "0.7"
+axum = "0.8"
 lambda_http = "0.14"
 aws-sdk-lambda = "1"
 aws-sdk-dynamodb = "1"
