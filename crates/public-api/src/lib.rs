@@ -1,9 +1,9 @@
 //! Public (friend-facing) HTTP API: link view and claim flow.
 //!
-//! Routes: `GET /api/l/:token`, `POST /api/l/:token/claim`,
-//!         `POST /api/l/:token/thanks`,
+//! Routes: `GET /api/l/{token}`, `POST /api/l/{token}/claim`,
+//!         `POST /api/l/{token}/thanks`,
 //!         `GET /api/steam/login`, `GET /api/steam/return`,
-//!         `GET /api/l/:token/steam/owned/:steamid`, fallback 404.
+//!         `GET /api/l/{token}/steam/owned/{steamid}`, fallback 404.
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -172,14 +172,14 @@ pub fn router(
         base_url,
     };
     Router::new()
-        .route("/api/l/:token", get(handle_get_link))
-        .route("/api/l/:token/claim", post(handle_post_claim))
-        .route("/api/l/:token/thanks", post(handle_post_thanks))
+        .route("/api/l/{token}", get(handle_get_link))
+        .route("/api/l/{token}/claim", post(handle_post_claim))
+        .route("/api/l/{token}/thanks", post(handle_post_thanks))
         .route(
-            "/api/l/:token/steam/owned/:steamid",
+            "/api/l/{token}/steam/owned/{steamid}",
             get(handle_steam_owned_proxy),
         )
-        .route("/api/l/:token/games/:id/detail", get(handle_game_detail))
+        .route("/api/l/{token}/games/{id}/detail", get(handle_game_detail))
         .route("/api/steam/login", get(handle_steam_login))
         .route("/api/steam/return", get(handle_steam_return))
         .with_state(state)
@@ -434,7 +434,7 @@ async fn handle_steam_return(
     ))
 }
 
-// ── GET /api/l/:token/steam/owned/:steamid ────────────────────────────────────
+// ── GET /api/l/{token}/steam/owned/{steamid} ────────────────────────────────────
 
 /// Token-scoped proxy to the Steam owned-games endpoint.
 ///
@@ -531,7 +531,7 @@ async fn handle_steam_owned_proxy(
     }
 }
 
-// ── GET /api/l/:token ─────────────────────────────────────────────────────────
+// ── GET /api/l/{token} ─────────────────────────────────────────────────────────
 
 async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -> Response {
     let link = match s.store.get_link(&token).await {
@@ -678,7 +678,7 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
         .into_response()
 }
 
-// ── POST /api/l/:token/claim ──────────────────────────────────────────────────
+// ── POST /api/l/{token}/claim ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct ClaimBody {
@@ -816,7 +816,7 @@ async fn handle_post_claim(
     }
 }
 
-// ── POST /api/l/:token/thanks ─────────────────────────────────────────────────
+// ── POST /api/l/{token}/thanks ─────────────────────────────────────────────────
 
 /// Same budget as the gift note it answers (admin-api's `GIFT_NOTE_MAX_CHARS`) —
 /// the correspondence is symmetric on purpose.
@@ -1084,7 +1084,7 @@ fn link_not_found_response() -> Response {
         .into_response()
 }
 
-// ── GET /api/l/:token/games/:id/detail ───────────────────────────────────────
+// ── GET /api/l/{token}/games/{id}/detail ───────────────────────────────────────
 
 /// Token-scoped game detail endpoint. Friend-facing, cache-only: Steam is never called.
 ///
