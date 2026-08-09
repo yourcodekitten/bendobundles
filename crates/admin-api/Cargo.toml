@@ -30,7 +30,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 [dev-dependencies]
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
 tokio.workspace = true
 wiremock = "0.6"
