@@ -57,6 +57,30 @@ that there is no guard**: the day a Humble request carries a token in its URL, t
 credential leak with no type, no test and no lint in the way — and it will look exactly as green as
 it looks now.
 
+### 🔴 THE ONE THING `without_url()` ACTUALLY COSTS — and #173 got it wrong, so this spec did too
+
+#173 says the gamekey "is already sitting in the same log line as `claim_id`", and this spec repeated
+it as a reason the redaction was free. **It is false.** Measured 2026-08-10 (Lilith found it; both
+lines verified in-tree here):
+
+- `fulfillment/src/lib.rs:1077` → `warn!(claim_id, error = ?e, "choice pre-read order failed — parking (no spend)")` — **no `gamekey` field.**
+- `fulfillment/src/lib.rs:3392` → `warn!(gamekey = %gamekey, error = ?e, "order read failed — skipping this gamekey …")` — **no `claim_id` field.**
+
+Two sites, two paths, **neither carrying both**. So at `:1077` the gamekey reaches CloudWatch *only
+through the error's URL* — which is precisely the thing `without_url()` deletes. The spec was about to
+**spend a correlator and cite its own leak as the proof it was free.** You cannot spend it twice.
+
+**This dissolves the trade rather than pricing it:** add `gamekey = %gamekey` as an explicit field at
+`:1077`, exactly as `:3392` already does (`gamekey` is in scope — `deps.humble.order(gamekey)` is the
+call that fails). Then `without_url()` costs nothing anywhere.
+
+> **A correlator you can only get out of an unredacted URL was never a correlator — it was a leak
+> someone learned to lean on at 3am.**
+
+And the provenance matters more than the fix: **the false sentence was mine, from #173, three weeks
+old, and I quoted it into this spec as though it were a measurement.** An inherited premise gets
+re-read on every use and re-measured on none.
+
 ### Why not a third hand-fix
 
 Because the property would then rest on whoever writes the fourth client remembering. #173 says this
@@ -246,9 +270,10 @@ them it is sealed.**
   what is unforced is the conversion at its verbs.
 - **Not** #151's ping-formatter work or #172's `ReadFailed` decisions. Both are the same *family*;
   neither is this *property*. They keep their issues.
-- **Not** redacting workspace error types' own payloads (gamekeys in `Api(u16)`-adjacent messages,
-  claim ids). Those are deliberate diagnostics on the access-controlled side, and #173 established
-  the gamekey is already logged beside `claim_id`.
+- **Not** redacting workspace error types' own payloads (gamekeys, claim ids) where they are
+  *deliberate* structured fields. Those are intended diagnostics on the access-controlled side. Note
+  this is the opposite direction from the section above: we are **adding** `gamekey` as an explicit
+  field, because a diagnostic that only exists as a side effect of a leak is not a diagnostic.
 - **No** terraform, no new AWS resources, no wire-path change.
 
 ## Testing
@@ -265,7 +290,7 @@ them it is sealed.**
 
 | risk | mitigation |
 |---|---|
-| `without_url()` drops diagnostics an operator wants | It keeps the error *kind*. The dropped gamekey is already logged beside `claim_id` at `fulfillment:1077`. **Open question for review.** |
+| `without_url()` drops diagnostics an operator wants | **Real, and mispriced until measured** — `:1077` carries `claim_id` and *not* `gamekey`, so the URL was the only place it appeared. Resolved by adding `gamekey = %gamekey` at that site, not by keeping the URL. |
 | Removing `#[from]` produces a large mechanical diff | The compiler enumerates the sites exactly; scope is measured before the plan is written, not estimated. |
 | The census test is brittle in CI (parsing Rust with regex) | It parses for a narrow, committed shape and ships negative controls that prove it still rejects. A brittle *failing* census is safe; a brittle *passing* one is the defect — so every check is written to fail closed. |
 
@@ -275,3 +300,81 @@ them it is sealed.**
    enough diagnostic value that a redacted-but-correlatable form is better?
 2. **Is "every direct dependency gets a verdict" the right population**, or does the re-export gap
    need closing now rather than documenting?
+
+---
+
+## Review integration — Lilith, 2026-08-10 (shared channel)
+
+Four findings. Two were measurable and both checked out; one she flagged as explicitly unmeasured and
+I measured it; one is a design correction I have no counter to.
+
+### 1. A render site has no type path — the census's blind spot, with a real instance
+
+`crates/steam-client/src/lib.rs:929`, inside `keyed_json`:
+
+```rust
+200 => resp.json::<T>().await.map_err(|e| SteamError::Parse(e.to_string())),
+```
+
+A `reqwest::Error` stringified whole, **nine lines above the `fn net()` that exists to strip URLs.**
+`Network` got `without_url()`; `Parse`, on the same response in the same file, did not. **The string
+`reqwest::Error` does not appear on that line, so the name census never fires** — her point, and it
+stands regardless of payload.
+
+**Is it a live leak? No — measured, and she asked for exactly this.** In `reqwest` 0.12.28:
+
+- `Response::json()` = `self.bytes().await?` then `serde_json::from_slice(..).map_err(error::decode)`
+- `error::decode(e)` = `Error::new(Kind::Decode, Some(e))` — **no url**
+- `Response::bytes()` = `BodyExt::collect(..).map_err(error::decode)` — **no url**
+- **zero `with_url` callers** in `response.rs` / `body.rs`; the only url attach is
+  `error::status_code(*self.url, ..)` at `:387`/`:418`, i.e. `error_for_status()`, which `keyed_json`
+  never calls.
+
+**So the Steam key does not reach that string.** What makes it worth more than a footnote is the line
+three above it:
+
+> `/// … The key never appears in any error string.`
+
+**That claim is true, and it is true because of a `reqwest` internal that nobody in this repo wrote
+down.** A patch release attaching a url to decode errors turns the comment into a lie with **no diff
+in our tree and no test to fail.** A by-construction claim resting on an upstream implementation
+detail is a claim with no owner. So: seal that path too (it costs two lines), and make the comment say
+*why* it is true instead of merely asserting it.
+
+### 2. The re-export gap becomes a signed row, not a doc comment
+
+Her argument, which I accept without modification: *documenting isn't the failure; documenting
+somewhere with no execution is.* A caveat in a **test's** doc comment is the worst available location —
+**the green is what gets read; the comment is furniture.**
+
+So `DEP_VERDICTS` carries a required third field: whether the reviewer also checked the dependency's
+**re-exports**. A row cannot be `ReviewedSafe` with that field unset, and it is re-affirmed by the same
+test that fails on a new dependency. **A blind spot that ships becomes a row somebody has to sign.**
+
+### 3. The residual that survives both axes — named, not fixed
+
+16 sites in `crates/dynamo/src/lib.rs` do `StoreError::Aws(format!("{sdk_err:?}"))`. Not an HTTP
+client, so the mint verbs do not reach it; no type path on the line, so the name census does not
+either. **This is not a claim that AWS leaks** — it is that the verdict table's AWS rows are *never
+consulted at the point the bytes are captured.* That is #151's live ground (the same `StoreError::Aws`
+Debug is what reaches the operator ping). Out of scope here; the AWS rows in `DEP_VERDICTS` name the
+capture sites and #151 so the question is **asked** rather than merely recorded.
+
+### 4. She withdrew her own proposal, and she was right to
+
+Her first suggestion was to key the census on **render** sites (`format!` / `to_string()` / `{:?}`).
+She then retracted it in favour of the mint-verb axis, on the grounds that the formatting verbs are an
+**open set** (`{e}`, `{e:?}`, `.to_string()`, `write!`, `format_args!`, a future `From<E> for String`)
+— the same defect my name census had, in a new costume. Minting is upstream of both storage *and*
+rendering, and `.send()/.bytes()/.text()/.json()` is a set the client's own API closes. Recorded
+because the reasoning is the reusable part.
+
+### The lesson worth keeping over any of the mechanisms
+
+> **The measurement is never the weak link. The jump from *this one* to *all* is — and nothing
+> downstream ever re-checks a quantifier.**
+
+Both of this morning's failures were exactly that shape, and neither was in a fact: *"**provably**
+exhaustive"* (it was exhaustive over stored types only) and *"the gamekey is **already** on the line"*
+(it was on a different line, on a different path). **A quantifier is the cheapest thing to write and
+the only thing nobody re-derives.**
