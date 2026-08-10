@@ -35,6 +35,31 @@ const URL_BEARING: &[&str] = &["wreq::Error", "reqwest::Error"];
 /// workspace where this class is reasoned about.
 const REVIEWED_OCCURRENCES: &[(&str, &str, &str)] = &[
     (
+        "crates/humble-client/src/lib.rs",
+        "fn net(e: wreq::Error)",
+        "SEALING SITE: the crate's only wreq->HumbleError conversion, strips the url (#173)",
+    ),
+    (
+        "crates/humble-client/src/lib.rs",
+        "`wreq::Error`'s `Display` **appends th",
+        "PROSE: net()'s doc comment, citing the upstream line numbers for the leak",
+    ),
+    (
+        "crates/humble-client/src/lib.rs",
+        "the type `wreq::Error` m",
+        "PROSE: net()'s doc comment naming the enforcing test",
+    ),
+    (
+        "crates/humble-client/src/lib.rs",
+        "so a raw `wreq::Er",
+        "PROSE: fn send()'s doc comment",
+    ),
+    (
+        "crates/humble-client/src/lib.rs",
+        "also yields a `wreq::Error` — client CONSTRUCTION",
+        "PROSE: the .build() comment — client construction mints one and is NOT a request verb",
+    ),
+    (
         "crates/steam-client/src/lib.rs",
         "fn net(e: reqwest::Error)",
         "SEALING SITE: strips the url before stringifying",

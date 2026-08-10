@@ -261,7 +261,7 @@ pub enum HumbleError {
     #[error("humble returned status {0}")]
     Api(u16),
     #[error("network error talking to humble: {0}")]
-    Network(#[from] wreq::Error),
+    Network(String),
     #[error("could not parse humble response: {0}")]
     Parse(serde_json::Error),
     /// A 200 whose body carries no `tpkd_dict` at all (#160). Humble failed to send key truth
@@ -585,6 +585,26 @@ fn decode_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Humble
     })
 }
 
+/// The ONLY place in this crate where a `wreq` error becomes a `HumbleError`.
+///
+/// Strips the request URL before stringifying. Order fetches embed the gamekey as
+/// `/api/v1/order/{gamekey}?all_tpkds=true`, and `wreq::Error`'s `Display` **appends the URL**
+/// (`error.rs:229-230`) while its `Debug` prints the `url` field (`error.rs:198-199`).
+/// `without_url()` (`error.rs:77`) drops the url and keeps the kind — the half with diagnostic
+/// value. Same remedy as `crates/steam-client/src/lib.rs`'s `fn net`.
+///
+/// **This function is reachable from exactly two call sites on purpose** ([`HumbleClient::send`]
+/// and [`HumbleClient::body`]). #173 argued for a mechanism over a third hand-fix, and a sealer
+/// that must be remembered at 21 verb sites is the same dependency on memory as no sealer — which
+/// is measurably what happened next door: `steam-client` has had this exact function since #171
+/// and 13 call sites that are never forced through it.
+///
+/// Enforced by `crates/domain/tests/sealed_error_boundary.rs`: the type `wreq::Error` may be named
+/// only at reviewed sites, and this crate's `.send()`/`.bytes()` counts are pinned at 1 each.
+fn net(e: wreq::Error) -> HumbleError {
+    HumbleError::Network(e.without_url().to_string())
+}
+
 pub struct HumbleClient {
     http: wreq::Client,
     base: String,
@@ -599,6 +619,22 @@ pub struct HumbleClient {
 }
 
 impl HumbleClient {
+    /// The only `.send()` in this crate. Every request goes through here so a raw `wreq::Error`
+    /// cannot be bound anywhere else — see [`net`]. A future author who calls `.send()` directly
+    /// trips the pinned verb count in `crates/domain/tests/sealed_error_boundary.rs`.
+    async fn send(&self, rb: wreq::RequestBuilder) -> Result<wreq::Response, HumbleError> {
+        rb.send().await.map_err(net)
+    }
+
+    /// The only `.bytes()` in this crate. Same reason as [`HumbleClient::send`].
+    ///
+    /// Returns `Vec<u8>` rather than `Bytes`: every consumer takes `&bytes`, and
+    /// `Vec::default()` matches the previous `Bytes::default()` behaviour at the two
+    /// `.unwrap_or_default()` sites.
+    async fn body(resp: wreq::Response) -> Result<Vec<u8>, HumbleError> {
+        resp.bytes().await.map(|b| b.to_vec()).map_err(net)
+    }
+
     pub fn new(base_url: &str, cookie: SessionCookie) -> Result<Self, HumbleError> {
         // Emulate a real Chrome's TLS/JA3 + HTTP2 fingerprint. Humble sits behind Cloudflare,
         // whose WAF challenges non-browser TLS: the rustls fingerprint got the redeem POST a
@@ -613,7 +649,11 @@ impl HumbleClient {
             // stays bounded by the Task-5 walk deadline, not by 40 × hang.
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?;
+            // `.build()` also yields a `wreq::Error` — client CONSTRUCTION mints one, and it is
+            // not a request verb, so no verb census would catch it. The compiler did, which is why
+            // deleting `#[from]` is the enforcement and the census is only the change detector.
+            .build()
+            .map_err(net)?;
         Ok(Self {
             http,
             base: base_url.trim_end_matches('/').to_string(),
@@ -646,15 +686,16 @@ impl HumbleClient {
         path_q: &str,
     ) -> Result<T, HumbleError> {
         let resp = self
-            .http
-            .get(format!("{}{path_q}", self.base))
-            .header("Cookie", self.session_cookie())
-            .header("X-Requested-By", "hb_android_app")
-            .send()
+            .send(
+                self.http
+                    .get(format!("{}{path_q}", self.base))
+                    .header("Cookie", self.session_cookie())
+                    .header("X-Requested-By", "hb_android_app"),
+            )
             .await?;
         match resp.status().as_u16() {
             200 => {
-                let bytes = resp.bytes().await?;
+                let bytes = Self::body(resp).await?;
                 decode_body(&bytes)
             }
             401 | 403 | 302 => Err(HumbleError::Unauthorized),
@@ -720,14 +761,15 @@ impl HumbleClient {
     /// `Unauthorized` so self-heal can kick in).
     async fn get_html(&self, path: &str) -> Result<String, HumbleError> {
         let resp = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .header("Cookie", self.session_cookie())
-            .header("X-Requested-By", "hb_android_app")
-            .send()
+            .send(
+                self.http
+                    .get(format!("{}{path}", self.base))
+                    .header("Cookie", self.session_cookie())
+                    .header("X-Requested-By", "hb_android_app"),
+            )
             .await?;
         match resp.status().as_u16() {
-            200 => Ok(String::from_utf8_lossy(&resp.bytes().await?).into_owned()),
+            200 => Ok(String::from_utf8_lossy(&Self::body(resp).await?).into_owned()),
             401 | 403 | 302 => Err(HumbleError::Unauthorized),
             429 => Err(HumbleError::RateLimited),
             s => Err(HumbleError::Api(s)),
@@ -748,11 +790,15 @@ impl HumbleClient {
     /// there is already claimed and redeems through the existing key path.
     pub async fn choice_month(&self, month_url: &str) -> Result<ChoiceMonth, HumbleError> {
         let html = self.get_html(&format!("/membership/{month_url}")).await?;
-        let json = extract_script_json(&html, "webpack-monthly-product-data").ok_or_else(|| {
-            // A dead session serves the login page here (no blob); surface as Unauthorized so the
-            // caller's self-heal can kick in, same as a dead read elsewhere.
-            HumbleError::Unauthorized
-        })?;
+        // A dead session serves the login page here (no blob); surface as Unauthorized so the
+        // caller's self-heal can kick in, same as a dead read elsewhere.
+        //
+        // `ok_or`, not `ok_or_else`: MEASURED ODDITY — clippy's `unnecessary_lazy_evaluations`
+        // does NOT fire on this line at `origin/main` (0 errors) and DOES fire with this PR's
+        // change, on a line this PR never edits (0 diff hits). Mechanism unidentified; recorded
+        // rather than guessed. A type-shape change can move a lint's verdict on unrelated code.
+        let json = extract_script_json(&html, "webpack-monthly-product-data")
+            .ok_or(HumbleError::Unauthorized)?;
         let blob: MembershipBlob = serde_json::from_str(json).map_err(HumbleError::Parse)?;
         let cco = blob.content_choice_options;
         let ccd = cco.content_choice_data;
@@ -1234,13 +1280,14 @@ impl HumbleClient {
         // pair is humble's actual CSRF check; the Referer path is browser-shaping — VERIFY the exact
         // path against the live receipt if a 403 ever appears here.
         let resp = self
-            .csrf_write(
-                format!("{}/humbler/choosecontent", self.base),
-                &csrf,
-                "/membership",
+            .send(
+                self.csrf_write(
+                    format!("{}/humbler/choosecontent", self.base),
+                    &csrf,
+                    "/membership",
+                )
+                .form(&form),
             )
-            .form(&form)
-            .send()
             .await?;
         let status = resp.status().as_u16();
         tracing::info!(
@@ -1253,7 +1300,7 @@ impl HumbleClient {
         );
         match status {
             200 => {
-                let bytes = resp.bytes().await?;
+                let bytes = Self::body(resp).await?;
                 // A gated choose on a HEALTHY session returns `login_required` — catch it BEFORE the
                 // success parse so it drives a step-up, NOT a dead-cookie alarm and NOT a pick-spend:
                 // the handler never ran behind the gate. (Same live-verified shape as the redeem.)
@@ -1334,7 +1381,7 @@ impl HumbleClient {
         // Browser-shaped write via the shared CSRF-write builder (double-submit csrf pair +
         // same-origin Origin/Referer). NO X-Requested-By — the android-app header belongs to the
         // read API, not the browser-surface /humbler/ endpoints — so the form is added here.
-        let resp = self
+        let req = self
             .csrf_write(
                 format!("{}/humbler/redeemkey", self.base),
                 &csrf,
@@ -1350,9 +1397,8 @@ impl HumbleClient {
                 ("key", gamekey),
                 ("keyindex", &keyindex.to_string()),
                 ("gift", "true"),
-            ])
-            .send()
-            .await?;
+            ]);
+        let resp = self.send(req).await?;
         let status = resp.status().as_u16();
         // Diagnostic: this line named the original gift-redeem failure (live 403 on
         // 2026-07-04 → the missing-CSRF hypothesis this client now implements) and stays
@@ -1367,7 +1413,7 @@ impl HumbleClient {
         );
         match status {
             200 => {
-                let bytes = resp.bytes().await?;
+                let bytes = Self::body(resp).await?;
                 // A gated redeem on a HEALTHY session returns `login_required` (verified live
                 // 2026-07-04) — catch it BEFORE the success parse so it drives a step-up, not a
                 // Parse error, and above all NOT a burn: the key is untouched behind the gate.
@@ -1488,7 +1534,7 @@ impl HumbleClient {
                 (uuid::Uuid::new_v4().simple().to_string(), true)
             }
         };
-        let resp = self
+        let req = self
             .csrf_write(
                 format!("{}/humbler/redeemkey", self.base),
                 &csrf,
@@ -1499,9 +1545,8 @@ impl HumbleClient {
                 ("key", gamekey),
                 ("keyindex", &keyindex.to_string()),
                 // NO ("gift", "true") — omitting it IS the self-claim (HAR-proven).
-            ])
-            .send()
-            .await?;
+            ]);
+        let resp = self.send(req).await?;
         let status = resp.status().as_u16();
         // Names the outcome class only — never the key value.
         tracing::info!(
@@ -1513,7 +1558,7 @@ impl HumbleClient {
         );
         match status {
             200 => {
-                let bytes = resp.bytes().await?;
+                let bytes = Self::body(resp).await?;
                 if is_login_required(&bytes) {
                     tracing::info!(
                         status,
@@ -1617,9 +1662,10 @@ impl HumbleClient {
             }
         })?;
         let resp = self
-            .csrf_write(format!("{}/processlogin", self.base), &csrf, "/login")
-            .form(&processlogin_form(creds, &code))
-            .send()
+            .send(
+                self.csrf_write(format!("{}/processlogin", self.base), &csrf, "/login")
+                    .form(&processlogin_form(creds, &code)),
+            )
             .await?;
         let status = resp.status().as_u16();
         // NEVER log the body — a /processlogin response can echo account/session state. The parsed
@@ -1655,7 +1701,7 @@ impl HumbleClient {
             })?;
         // 1) Bootstrap with NO session cookie: humble sets an anonymous _simpleauth_sess + a
         //    csrf_cookie on the root GET. Both feed the login POST.
-        let boot = self.http.get(format!("{}/", self.base)).send().await?;
+        let boot = self.send(self.http.get(format!("{}/", self.base))).await?;
         let csrf = extract_set_cookie(boot.headers(), "csrf_cookie").ok_or_else(|| {
             HumbleError::LoginFailed {
                 reason: "bootstrap GET / offered no csrf_cookie".into(),
@@ -1670,16 +1716,15 @@ impl HumbleClient {
         // Same csrf dance as every other write, but riding the BOOTSTRAP session (not the
         // client's current, dead one) — csrf_write_as keeps the header shape shared.
         let boot_session = anon.as_ref().map(|a| format!("_simpleauth_sess={a}"));
-        let resp = self
+        let req = self
             .csrf_write_as(
                 format!("{}/processlogin", self.base),
                 &csrf,
                 "/login",
                 boot_session.as_deref(),
             )
-            .form(&processlogin_form(creds, &code))
-            .send()
-            .await?;
+            .form(&processlogin_form(creds, &code));
+        let resp = self.send(req).await?;
         let status = resp.status().as_u16();
         // The authenticated session is humble's rotated cookie if it set a new one, else the anon
         // session (now authenticated). Capture the rotation BEFORE draining the body.
