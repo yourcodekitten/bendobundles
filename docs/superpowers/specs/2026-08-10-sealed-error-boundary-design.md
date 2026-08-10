@@ -34,9 +34,15 @@ Three discoveries, two hand-defences, one still open (all verified in-tree on 20
 
 | Site | State |
 |---|---|
-| `crates/steam-client/src/lib.rs:939` — `fn net(e: reqwest::Error)` → `Network(String)` via `e.without_url().to_string()` | ✅ sealed, with a comment naming the leak |
-| `crates/fulfillment/src/lib.rs:4543` — `error = %e.without_url()` in `deliver()` | ✅ sealed at the log site (#171) |
+| `crates/steam-client/src/lib.rs:939` — `fn net(e: reqwest::Error)` → `Network(String)` via `e.without_url().to_string()` | ⚠️ **a sealer exists; nothing forces its use** — see below |
+| `crates/fulfillment/src/lib.rs:4543` — `error = %e.without_url()` in `deliver()` | ✅ genuinely sealed — `deliver()` is the crate's *only* reqwest error boundary (measured: 1 `Err` arm) |
 | `crates/humble-client/src/lib.rs:264` — `Network(#[from] wreq::Error)` | ❌ **open** — takes the error whole |
+
+**The middle row started this spec's life as a ✅ and the measurement demoted it.** `steam-client` has
+`fn net`, but it has **13 call sites** that mint a raw `reqwest::Error` (10 `.send()`, 1 `.json`,
+1 `.text()`, 1 `.bytes()`), and *nothing forces any of them through `net`*. A sealer that must be
+remembered at 13 sites is the same dependency-on-memory as no sealer, one step further along. So the
+class is at **three** crates once you stop asking "is there a fix" and start asking "what forces it."
 
 `wreq` 5.3.0 is a `reqwest` lineage fork: `Display` appends the request URL, `Debug` prints the `url`
 field, `without_url()` exists. `HumbleError::Network`'s own `Display` is
@@ -82,10 +88,28 @@ instead of the **log site** (unbounded, and includes sites nobody has written ye
    `steam-client` already uses. **Deleting `#[from]` deletes the `From` impl, so `?` stops
    auto-converting and the compiler now demands an explicit decision at every call site.** The
    enforcement for this crate is the absence of a conversion, not a lint.
-2. A committed census test that fails when its own population definition goes stale (below).
+2. **Collapse the 21 verbs to one.** Rather than sprinkle `.map_err(net)` across 21 sites — which
+   recreates steam-client's remember-it-every-time situation with a nicer spelling — route them
+   through two private helpers, so the crate contains exactly **one** `.send()` and **one**
+   `.bytes()`:
 
-**Cost:** one variant, its `?` sites, one test module. **Buys:** every present and future log site is
-safe without touching any of them, because there is no longer an unsealed value to log.
+   ```rust
+   /// The only place in this crate where a `wreq` error can come into existence.
+   async fn send(&self, rb: wreq::RequestBuilder) -> Result<wreq::Response, HumbleError> {
+       rb.send().await.map_err(net)
+   }
+   async fn body(resp: wreq::Response) -> Result<Vec<u8>, HumbleError> {
+       resp.bytes().await.map(|b| b.to_vec()).map_err(net)
+   }
+   ```
+
+   This is why the verb-count census is cheap to hold: the reviewed count for `humble-client` becomes
+   `1` and `1`, and a future author who calls `.send()` directly trips it.
+3. A committed census test that fails when its own population definition goes stale (below).
+
+**Cost:** one variant, 21 call sites collapsed onto two helpers, one test module. **Buys:** every
+present and future log site is safe without touching any of them, because there is no longer an
+unsealed value in the crate to log.
 
 ### B. Type the log sink — an `OperatorMessage` analogue for `tracing`
 
@@ -136,9 +160,25 @@ a **pinned allow-list of sealing sites** — today the two `fn net(…)` convers
 `%e.without_url()`. Any new occurrence anywhere, in a variant or at a log site or in a helper nobody
 has written yet, fails the census and has to be either sealed or added to the allow-list by a human.
 
-This is deliberately syntactic. It cannot be fooled by a rename it can see, and it does not need type
-inference to be complete — **you cannot render a value of a type you cannot name**, and the erasure
-hatches that would break that (`anyhow` / `eyre` / `Box<dyn Error>`) are measured absent below.
+This is deliberately syntactic — but **"you cannot render a value of a type you cannot name" is FALSE,
+and it was this spec's load-bearing sentence until it got measured.** Type inference names nothing:
+`http.post(url).send().await` binds a `reqwest::Error` in an `Err(e)` arm without the string
+`reqwest::Error` appearing anywhere. `deliver()` is exactly that shape. **A name-based census cannot
+see it.** So the argument is not "unnameable ⇒ unreachable"; it has to be built on where such a value
+can be *minted*:
+
+> A raw client error can only come into existence at a **verb** — `.send()`, `.bytes()`, `.text()`,
+> `.json()` — inside a crate that directly depends on the client. That set is small, enumerable, and
+> **countable without type inference.**
+
+Measured 2026-08-10: `humble-client` 21 verbs (9 `.send()`, 12 `.bytes()`), `steam-client` 13,
+`fulfillment` 3 (of which one, `deliver()`, is the only real error boundary). So the census pins
+**verb counts per producer crate** against a reviewed table alongside the name allow-list. A new HTTP
+call anywhere in a producer crate moves a count and fails the census, which is precisely the event
+that needs a human — *"you added a network call; seal its error."*
+
+The erasure hatches that would defeat both halves (`anyhow` / `eyre` / `Box<dyn Error>`) are measured
+absent from the workspace (below), so there is no third way for such a value to arrive.
 
 **And the checker does not strip comments — measured decision, not laziness.** The whole population
 today is 5 occurrences and **3 of them are prose** (`operator_message.rs:15`, `lib.rs:4525`,
@@ -197,6 +237,13 @@ them it is sealed.**
 
 - **Not** converting the 49 `error = ?e` sites. Once no unsealed value exists, they are safe as
   written, and 49 mechanical edits would bury the two lines that carry the guarantee.
+- **Not** collapsing `steam-client`'s 13 verbs onto a helper in this PR — even though the measurement
+  above says it needs it. That is a second crate's worth of mechanical churn riding a PR whose subject
+  is the mechanism, and it would make the diff argue for itself less clearly. **It gets its own issue,
+  filed with the measurement**, and the census's reviewed count for `steam-client` is pinned at
+  today's `13` with that issue named in the table — so the guard records the debt instead of implying
+  it away. `steam-client`'s errors are `Network(String)` already, so nothing *stored* is unsealed;
+  what is unforced is the conversion at its verbs.
 - **Not** #151's ping-formatter work or #172's `ReadFailed` decisions. Both are the same *family*;
   neither is this *property*. They keep their issues.
 - **Not** redacting workspace error types' own payloads (gamekeys in `Api(u16)`-adjacent messages,
