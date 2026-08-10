@@ -1240,7 +1240,7 @@ async fn handle_choice_claim(
         Err(e) => {
             // Pick spent, key not yet burned, tpk unknown THIS invoke = the crash-between-writes
             // state. Park; reconcile finishes from the snapshot — and NEVER re-chooses.
-            tracing::warn!(claim_id, error = ?e, "choice re-read after choose failed — parking; reconcile finishes (no re-choose)");
+            tracing::warn!(claim_id, gamekey = %gamekey, error = ?e, "choice re-read after choose failed — parking; reconcile finishes (no re-choose)");
             return parked_choice("re-read");
         }
     };
@@ -1860,7 +1860,7 @@ async fn recover_already_redeemed_key(
     let order = match deps.humble.order(gamekey).await {
         Ok(o) => o,
         Err(e) => {
-            tracing::warn!(claim_id, error = ?e, "self-claim recover: order re-read failed — parking");
+            tracing::warn!(claim_id, gamekey = %gamekey, error = ?e, "self-claim recover: order re-read failed — parking");
             return FulfillResponse::Parked {
                 reason: "recover re-read failed: park for reconcile".into(),
             };
