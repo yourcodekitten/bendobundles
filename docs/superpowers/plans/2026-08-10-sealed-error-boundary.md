@@ -1066,3 +1066,96 @@ not "fix" the numbers back to line counts.
 Humble request URL worth having at 3am? If no, `without_url()` is free everywhere and the last
 judgement call in this plan closes. **Does not block execution** — it changes no code in any task,
 only whether a future author is told the trade was priced.
+
+---
+
+## OMBB's gate — 2026-08-10, **CHANGES REQUESTED** (reviewed at `fc1c399`; verify every line number against the current head, he reviewed a commit, not a branch)
+
+**Verdict: fix probe.rs's scope, tighten the `.json` needle, answer the `claim_id` fork before Task 3 — do those and the gate is granted. Re-read at step 9 on the then-current head.**
+
+### 🔴 BLOCKER 1 — the scope seam: `crates/humble-client/src/bin/probe.rs`
+
+Verified in tree: builds its **own** `wreq::Client` (`:206`), `.send()` `:214`, `.bytes()` `:220`, and
+`Cargo.toml` marks it `required-features = ["probe"]` — so **`cargo check` never compiles it while
+`rust_sources()` walks `crates/*/src` recursively and scans it.** *Invisible to the compiler, fully
+visible to the text census.* After Task 2 collapses `lib.rs` to 1+1, the crate reads **2+2**, and the
+census red will say `reviewed 1, found 2` — **which looks like the collapse failed.**
+
+>>> ***MY REMEDIATION UNIT IS THE CLIENT IMPL AND MY CENSUS UNIT IS THE CRATE DIRECTORY, AND ONLY ONE
+>>> OF THEM WAS WRITTEN DOWN.*** Same class as the doctrine paragraph turning the census red — which I
+>>> caught in Task 4 and walked straight past in the sibling test.
+> **Fix:** pin crate-level counts at their true values with `probe.rs` named in the note, or seal it.
+> Do **not** narrow the scan to make it pass.
+
+### 🔴 BLOCKER 2 — the `.json` needle, and *his* fix opened a false negative
+
+He proposed `.json(` to drop two false positives in probe.rs (`:249` a doc comment, `:266`
+`format!("{gamekey}.json")`). Measured across `crates/*/src`: **`.json(` matches only
+`fulfillment:4516`, and `.json::<` matches only `steam-client:927`** — the turbofish, *which is
+Lilith's `keyed_json` Parse site, the one this arc's review rested on.* **His needle drops it.**
+> **Fix:** two rows, `.json(` **and** `.json::<`. **And write the limitation into the file**, not just
+> the second needle: a text census keyed on call syntax has **no closed set of spellings** (tomorrow
+> it's `let v: T = r.json().await?`, or a re-exported trait method). Say so where the next person
+> reads it, the way the file already says *change detector, not a quality bar*.
+>>> **His self-diagnosis, and it is the sharpest line of the gate:** *"I enumerated by call syntax, and
+>>> Rust gives you two spellings for one call — a scope seam between two spellings, walked into while
+>>> pointing at yours."* ⇒ ***YOU ARE MOST WRONG IN THE DISCIPLINE YOU ARE CURRENTLY ENFORCING.***
+
+### 🔴 BLOCKER 3 — the scan set is a DIRECTORY; the workspace is a MANIFEST LIST
+
+`rust_sources()` walks `crates/*/`, but membership is declared in the root `Cargo.toml` `members`.
+**Add a member outside `crates/` and it is invisible — and the `>= 7` floor still passes**, so the
+fail-closed guard does not fire. Derive the set from `members`.
+
+### 🔴 BLOCKER 4 — `crates/*/tests/*.rs` (8 files) are unscanned while the header claims *workspace-wide*
+
+Either walk them or narrow the sentence. **A claim wider than its instrument is the thing this file
+exists to stop.**
+
+### ⚠️ AND THE POSITIVE CONTROL IS ANCHORED IN THE SAFEST PLACE IN THE TREE
+
+It greps `OperatorMessage`, which lives in `fulfillment/src/operator_message.rs` — the most findable
+file in the workspace. But the scanner's realistic failure is **a directory it never reaches**, and a
+control sitting in the easy place cannot detect that. **Put the sentinel in a `src/bin/`.**
+>>> ***A LABELLED POSITIVE PLACED WHERE SUCCESS IS EASY CANNOT DETECT THE FAILURE MODE YOU ACTUALLY
+>>> HAVE.*** If it had been there, **probe.rs would have failed the control instead of needing a
+>>> reviewer.** This is the strongest single item in the gate.
+
+### Q1 answered — **NO, `without_url()` is not free**, and the remedy was aimed at an instance
+
+The URL is the only carrier of *which order / which month / which page*: `humble-client:673`
+`/api/v1/order/{gamekey}`, `:750` `/membership/{month_url}`, `:845`'s opaque cursor. **A diagnostic
+asset, not a leak.** ⇒ **`no credential is not the same as no value`** (his line, and the keeper —
+it stops the next person stripping a URL with a clean conscience).
+
+And it is **three** sites, not one: `fulfillment:1077` (fixed in `3bd8924`), **`:1238`**, **`:1858`**.
+His fork is unanswerable: *if `claim_id → gamekey` is resolvable at 3am then `:1077` never needed the
+field; if it isn't, the other two need it too — it cannot be both.* **Answer: not free at 3am** (it
+costs a Dynamo read during a live incident) ⇒ **all three get the field.**
+>>> ⭐ **THE STRUCTURAL ANSWER, HIS, AND THE BEST IDEA IN THE ARC: THE CENSUS PINS VERBS AND NEVER PINS
+>>> FIELDS.** So *"without_url() is free"* is re-established by hand at every site forever, by whoever
+>>> writes site N+1 — **holding this plan's own sentence saying it is free, with nothing checking that
+>>> it still is.** ⇒ **`net(e, correlator)`: the sealer TAKES what replaced the URL, so you cannot
+>>> strip one without supplying the other, and "free" becomes the compiler's problem instead of
+>>> memory's.** A small **enum**, not `&str` — gamekey / `month_url` / cursor are different kinds of
+>>> thing, and an enum lets the census see *which* correlator, which a bare `&str` never will.
+> **This is a DESIGN CHANGE, not a fix — it goes back through review rather than riding this branch.**
+
+### Blast radius, named and out of scope
+`fulfillment:~4143` does `Err(_) => continue` — **drops the error with no log at all**;
+`fulfillment/src/bin/heal_choice_pairs.rs:61` uses `eprintln!`, which never reaches the CloudWatch sink
+this invariant is about. Both outside this PR.
+
+### Q3 — the `steam-client` scope-out is **principled**, verified
+He counted 10/1/1/1 himself and confirmed `steam-client` is `lib.rs` only with **no `bin/`**, so it
+carries none of the hazard that just bit `humble-client`. Pinning the debt at today's number is the
+change-detector contract applied consistently; *avoidance would look like omitting the counts or
+dropping the crate from the list.* Ship as its own issue.
+
+### Two lessons from the exchange that outlive this PR
+- **The seat doesn't find the class; the enumeration does.** The instance-not-class defect on `:1077`
+  came from the *reviewing* seat, not the fixing one — so "have a reviewer" does not close it. What
+  turned one site into three was a boring callee-grep of `.order(` callers.
+- Lilith retracted her own *"the closed version always comes from whoever is reviewing"* (4/4) after
+  checking it: it is **1/4**. The law that survives is the bare one — ***who closes this set: a human,
+  or the substrate?*** *A wrong idea that scans well travels further than a right one that doesn't.*
