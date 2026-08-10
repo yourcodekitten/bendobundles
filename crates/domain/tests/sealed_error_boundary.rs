@@ -71,6 +71,13 @@ const REVIEWED_OCCURRENCES: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/fulfillment/src/operator_message.rs",
+        "`Network(#[from] wreq::Error)`, #173",
+        "PROSE: the doctrine paragraph naming the defect this mechanism closed — allow-listed in the \
+         SAME commit that added it, because the census correctly reddens on it and the failure would \
+         read as 'the documentation broke the build'",
+    ),
+    (
+        "crates/fulfillment/src/operator_message.rs",
         "on a `reqwest::Error`",
         "PROSE: the doctrine header this invariant implements",
     ),
