@@ -350,3 +350,230 @@ fn every_reviewed_occurrence_still_matches_a_real_line() {
         stale.join("\n")
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// THE STALENESS HALF — every direct dependency carries a reviewed verdict, and the verdict must be
+// SIGNED for re-exports.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Verdicts for every DIRECT dependency of every workspace member.
+///
+/// **Population argument.** A workspace error enum can only STORE a type it can NAME, and it can only
+/// name a type from a direct dependency. Measured 2026-08-10: the workspace has **zero `anyhow`, zero
+/// `eyre`, zero `Box<dyn Error>`** — no erasure hatch through which a transitive crate's error could
+/// arrive unnamed. So "review every direct dependency" is exhaustive **for the storage half**, not a
+/// heuristic hoping to spot clients. It says nothing about a value bound by inference.
+///
+/// **THE THIRD FIELD IS THE RE-EXPORT SIGNATURE, AND IT IS A FIELD RATHER THAN A CAVEAT ON PURPOSE.**
+/// This checker is syntactic, so it cannot see a foreign error type arriving under another name
+/// because a direct dependency re-exports it (`dep::TheirError`). That gap was going to live in this
+/// module's doc comment until Lilith pointed out the obvious: **a caveat in a test's doc comment is
+/// the worst available location, because the GREEN is what gets read and the comment is furniture.**
+/// So it is a value the same test enforces. **A blind spot that ships becomes a row somebody signed.**
+const DEP_VERDICTS: &[(&str, &str, &str)] = &[
+    ("argon2", "ReviewedSafe", "re-exports checked: none"),
+    (
+        "async-trait",
+        "NoErrorTypeHeld",
+        "re-exports checked: none (proc-macro)",
+    ),
+    (
+        "aws-config",
+        "ReviewedSafe",
+        "re-exports checked: aws-smithy types; captured as a String at dynamo/src/lib.rs:310,338 via format!(\"{sdk_err:?}\") — 16 sites, see #151",
+    ),
+    (
+        "aws-sdk-dynamodb",
+        "ReviewedSafe",
+        "re-exports checked: aws-smithy SdkError; same 16 capture sites, see #151",
+    ),
+    (
+        "aws-sdk-lambda",
+        "ReviewedSafe",
+        "re-exports checked: aws-smithy SdkError",
+    ),
+    (
+        "aws-sdk-ssm",
+        "ReviewedSafe",
+        "re-exports checked: aws-smithy SdkError",
+    ),
+    (
+        "axum",
+        "ReviewedSafe",
+        "re-exports checked: http/hyper error types, none stored by us",
+    ),
+    ("data-encoding", "ReviewedSafe", "re-exports checked: none"),
+    ("hmac", "NoErrorTypeHeld", "re-exports checked: none"),
+    (
+        "lambda_http",
+        "ReviewedSafe",
+        "re-exports checked: http types; adapter errors not stored (see #186)",
+    ),
+    (
+        "lambda_runtime",
+        "ReviewedSafe",
+        "re-exports checked: as lambda_http",
+    ),
+    (
+        "reqwest",
+        "UrlBearing",
+        "sealed at steam-client fn net + keyed_json, and fulfillment deliver()",
+    ),
+    ("serde", "ReviewedSafe", "re-exports checked: none"),
+    (
+        "serde_json",
+        "ReviewedSafe",
+        "re-exports checked: none; stored as Parse(serde_json::Error)",
+    ),
+    ("sha1", "NoErrorTypeHeld", "re-exports checked: none"),
+    ("sha2", "NoErrorTypeHeld", "re-exports checked: none"),
+    (
+        "thiserror",
+        "NoErrorTypeHeld",
+        "re-exports checked: none (derive only)",
+    ),
+    ("time", "ReviewedSafe", "re-exports checked: none"),
+    (
+        "tokio",
+        "ReviewedSafe",
+        "re-exports checked: io::Error, no URL surface",
+    ),
+    ("tracing", "NoErrorTypeHeld", "re-exports checked: none"),
+    (
+        "tracing-subscriber",
+        "ReviewedSafe",
+        "re-exports checked: none stored",
+    ),
+    ("urlencoding", "ReviewedSafe", "re-exports checked: none"),
+    ("uuid", "ReviewedSafe", "re-exports checked: none"),
+    (
+        "wreq",
+        "UrlBearing",
+        "sealed at humble-client fn net (#173)",
+    ),
+    (
+        "wreq-util",
+        "ReviewedSafe",
+        "re-exports checked: wreq types — emulation/profile config only, no error stored",
+    ),
+];
+
+/// Parse the `[dependencies]` section of a Cargo.toml.
+///
+/// **TWO SYNTAXES, AND MISSING ONE IS A SILENT UNDERCOUNT.** This workspace writes both
+/// `serde.workspace = true` and `tokio = { version = "1", features = [...] }`. A pattern anchored on
+/// `^name =` sees only the second and reports `domain` as having **NO dependencies at all** — which is
+/// how this parser was first written on 2026-08-10, and it under-reported *every* member while looking
+/// correct. `[dev-dependencies]` is excluded: the property is about production error types.
+fn direct_deps(manifest: &Path) -> Vec<String> {
+    let text = fs::read_to_string(manifest)
+        .unwrap_or_else(|e| panic!("FAIL CLOSED: cannot read {}: {e}", manifest.display()));
+    let mut in_deps = false;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_deps = t == "[dependencies]";
+            continue;
+        }
+        if !in_deps || t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let name: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if !name.is_empty() {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// CONTROL for the parser above: it must see a dependency written in EACH syntax. Without this, a
+/// parser that silently sees one form passes every verdict test vacuously.
+#[test]
+fn the_manifest_parser_sees_both_dependency_syntaxes() {
+    let root = workspace_root();
+    let d = direct_deps(&root.join("crates/domain/Cargo.toml"));
+    assert!(
+        d.contains(&"thiserror".to_string()),
+        "FAIL CLOSED: parser missed `thiserror.workspace = true` in crates/domain/Cargo.toml — it \
+         found {d:?}. Every verdict below would be vacuous."
+    );
+    let f = direct_deps(&root.join("crates/fulfillment/Cargo.toml"));
+    assert!(
+        f.contains(&"tokio".to_string()),
+        "FAIL CLOSED: parser missed a table-syntax dependency in crates/fulfillment/Cargo.toml — it \
+         found {f:?}."
+    );
+}
+
+#[test]
+fn every_direct_dependency_has_a_reviewed_verdict() {
+    let members = workspace_members();
+    let member_names: Vec<String> = members
+        .iter()
+        .map(|m| {
+            m.file_name()
+                .expect("member has a directory name")
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    let mut found: Vec<String> = Vec::new();
+    for m in &members {
+        found.extend(direct_deps(&m.join("Cargo.toml")));
+    }
+    found.retain(|d| !member_names.contains(d));
+    found.sort();
+    found.dedup();
+    assert!(
+        found.len() >= 20,
+        "FAIL CLOSED: only {} foreign direct dependencies parsed — expected ~25. The parser is \
+         under-reporting and this test would pass vacuously. Found: {found:?}",
+        found.len()
+    );
+
+    let reviewed: Vec<&str> = DEP_VERDICTS.iter().map(|(n, _, _)| *n).collect();
+    let unreviewed: Vec<&String> = found
+        .iter()
+        .filter(|d| !reviewed.contains(&d.as_str()))
+        .collect();
+    let vanished: Vec<&&str> = reviewed
+        .iter()
+        .filter(|r| !found.iter().any(|f| f == *r))
+        .collect();
+
+    assert!(
+        unreviewed.is_empty(),
+        "New direct dependency(ies) with no verdict: {unreviewed:?}\n\n\
+         Decide, for each: can its error type render a request URL or any credential? If yes, mark it \
+         UrlBearing and seal it at its boundary the way crates/humble-client's `fn net` does. If no, \
+         mark it ReviewedSafe — and note that verdict also claims its RE-EXPORTS are safe, which is \
+         this census's one stated blind spot. Then add it to DEP_VERDICTS."
+    );
+    assert!(
+        vanished.is_empty(),
+        "DEP_VERDICTS reviews dependency(ies) the workspace no longer has: {vanished:?}\n\n\
+         Remove them. A verdict table that rots in this direction quietly grows the set of names that \
+         would pass review without anyone looking."
+    );
+}
+
+/// The re-export signature is required, not decorative. An unsigned row is an unreviewed row.
+#[test]
+fn every_verdict_carries_a_re_export_signature() {
+    let unsigned: Vec<&str> = DEP_VERDICTS
+        .iter()
+        .filter(|(_, _, sig)| !sig.contains("re-exports checked") && !sig.contains("sealed at"))
+        .map(|(n, _, _)| *n)
+        .collect();
+    assert!(
+        unsigned.is_empty(),
+        "Dependency verdict(s) with no re-export signature: {unsigned:?}\n\n\
+         This checker is syntactic: it cannot see a foreign error type re-exported under another name. \
+         The verdict IS the compensating control, so it must state that the re-exports were looked at. \
+         Write `re-exports checked: <what you found>`, or for a UrlBearing crate `sealed at <where>`."
+    );
+}

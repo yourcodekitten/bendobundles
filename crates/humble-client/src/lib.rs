@@ -1012,10 +1012,11 @@ impl HumbleClient {
     /// preflight fails or offers no cookie — the caller decides how loudly to treat that.
     async fn csrf_token(&self) -> Option<String> {
         let resp = match self
-            .http
-            .get(format!("{}/", self.base))
-            .header("Cookie", self.session_cookie())
-            .send()
+            .send(
+                self.http
+                    .get(format!("{}/", self.base))
+                    .header("Cookie", self.session_cookie()),
+            )
             .await
         {
             Ok(r) => r,
@@ -1028,7 +1029,7 @@ impl HumbleClient {
         let status = resp.status().as_u16();
         // Drain the body so the connection returns to the pool — the redeem POST follows
         // immediately and shouldn't pay a fresh TCP+TLS handshake on the friend-facing path.
-        let _ = resp.bytes().await;
+        let _ = Self::body(resp).await;
         match captured {
             Some(v) => {
                 tracing::info!("csrf preflight: captured csrf_cookie from humble");
@@ -1335,7 +1336,7 @@ impl HumbleClient {
                 // systematic capture failure vs a rejection of humble's own token).
                 let raw_location = header_str(resp.headers(), "location");
                 let login_required_body =
-                    matches!(resp.bytes().await, Ok(b) if is_login_required(&b));
+                    matches!(Self::body(resp).await, Ok(b) if is_login_required(&b));
                 if raw_location.contains("secureArea") || login_required_body {
                     tracing::info!(status, "choose gated behind secure-area step-up — needed");
                     return Ok(ChooseStep::StepUpNeeded { status });
@@ -1479,7 +1480,7 @@ impl HumbleClient {
                 // records why the read failed (timeout vs reset vs decode) so the log distinguishes
                 // it from a genuinely empty body. The error text is wreq transport metadata, never
                 // response-body content.
-                let (login_required_body, body_read_err) = match resp.bytes().await {
+                let (login_required_body, body_read_err) = match Self::body(resp).await {
                     Ok(b) => (is_login_required(&b), None),
                     Err(e) => (false, Some(e.to_string())),
                 };
@@ -1590,7 +1591,7 @@ impl HumbleClient {
                 let cf_mitigated = header_str(resp.headers(), "cf-mitigated");
                 let server = header_str(resp.headers(), "server");
                 let raw_location = header_str(resp.headers(), "location");
-                let (login_required_body, body_read_err) = match resp.bytes().await {
+                let (login_required_body, body_read_err) = match Self::body(resp).await {
                     Ok(b) => (is_login_required(&b), None),
                     Err(e) => (false, Some(e.to_string())),
                 };
@@ -1670,7 +1671,7 @@ impl HumbleClient {
         let status = resp.status().as_u16();
         // NEVER log the body — a /processlogin response can echo account/session state. The parsed
         // outcome bit + status is the entire safe signal.
-        let bytes = resp.bytes().await.unwrap_or_default();
+        let bytes = Self::body(resp).await.unwrap_or_default();
         let ok = status == 200 && processlogin_ok(&bytes);
         tracing::info!(status, ok, "secure-area step-up (/processlogin) response");
         if ok {
@@ -1708,7 +1709,7 @@ impl HumbleClient {
             }
         })?;
         let anon = extract_set_cookie(boot.headers(), "_simpleauth_sess");
-        let _ = boot.bytes().await; // drain so the connection returns to the pool
+        let _ = Self::body(boot).await; // drain so the connection returns to the pool
         // 2) Authenticate that session. Double-submit csrf (cookie + header), same as a write.
         let code = totp_now(&creds.totp_secret).map_err(|reason| HumbleError::LoginFailed {
             reason: format!("TOTP: {reason}"),
@@ -1730,7 +1731,7 @@ impl HumbleClient {
         // session (now authenticated). Capture the rotation BEFORE draining the body.
         let rotated = extract_set_cookie(resp.headers(), "_simpleauth_sess");
         // NEVER log the body — a /processlogin response can echo account/session state.
-        let bytes = resp.bytes().await.unwrap_or_default();
+        let bytes = Self::body(resp).await.unwrap_or_default();
         let ok = status == 200 && processlogin_ok(&bytes);
         tracing::info!(status, ok, "humble self-login (/processlogin) response");
         if !ok {
