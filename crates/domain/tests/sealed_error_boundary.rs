@@ -577,3 +577,213 @@ fn every_verdict_carries_a_re_export_signature() {
          Write `re-exports checked: <what you found>`, or for a UrlBearing crate `sealed at <where>`."
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// THE MINT-SITE CENSUS — scoped by the DEPENDENCY GRAPH, and membership matters more than counts.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Calls that can bring a raw client error into existence.
+///
+/// ⚠️ **THESE SPELLINGS ARE AN OPEN SET AND THE FILE HAS TO SAY SO** (OMBB, 2026-08-10). `.json(`
+/// alone misses `steam-client`'s `.json::<T>()` — the turbofish — so both are listed; and a census
+/// keyed on **call syntax** has no closed set of forms. Tomorrow it is `let v: T = r.json().await?`,
+/// or a trait method someone re-exports. **Two needles are a patch on an open set; this sentence is
+/// what stops the third being a surprise.** The enforcement is the compiler (no `From` impl to
+/// auto-convert through); this census only notices change.
+///
+/// **Comments are NOT stripped, and that is measured, not lazy.** Stripping from `//` to end-of-line
+/// looks safe until a string literal contains `//` — this repo is full of `"https://..."`, so a naive
+/// strip truncates the literal and can lose a real call to its right. **A false negative in a census
+/// is the failure that never announces itself**, so prose is counted and its share is stated per row.
+const MINTING_VERBS: &[&str] = &[".send()", ".bytes()", ".text()", ".json(", ".json::<"];
+
+/// Pinned per-FILE verb counts for the `src/` of members that can mint one.
+/// `(workspace-relative file, verb, occurrences, note)`
+const REVIEWED_VERB_COUNTS: &[(&str, &str, usize, &str)] = &[
+    (
+        "crates/humble-client/src/lib.rs",
+        ".send()",
+        4,
+        "1 real (fn send, the sealer) + 3 in doc prose",
+    ),
+    (
+        "crates/humble-client/src/lib.rs",
+        ".bytes()",
+        3,
+        "1 real (fn body, the sealer) + 2 in doc prose",
+    ),
+    (
+        "crates/humble-client/src/bin/probe.rs",
+        ".send()",
+        1,
+        "probe builds its OWN wreq::Client; required-features=[\"probe\"] so the compiler never sees this file — only this census does",
+    ),
+    (
+        "crates/humble-client/src/bin/probe.rs",
+        ".bytes()",
+        1,
+        "same: outside the lib's sealing helpers by construction",
+    ),
+    (
+        "crates/steam-client/src/lib.rs",
+        ".send()",
+        10,
+        "UNFORCED — fn net exists and nothing requires it; pinned at today's debt, see #187",
+    ),
+    (
+        "crates/steam-client/src/lib.rs",
+        ".bytes()",
+        1,
+        "UNFORCED — see #187",
+    ),
+    (
+        "crates/steam-client/src/lib.rs",
+        ".text()",
+        1,
+        "UNFORCED — see #187",
+    ),
+    (
+        "crates/steam-client/src/lib.rs",
+        ".json::<",
+        1,
+        "keyed_json's Parse path, sealed with without_url(); the turbofish `.json(` would miss",
+    ),
+    (
+        "crates/fulfillment/src/lib.rs",
+        ".send()",
+        2,
+        "deliver() (the crate's only reqwest error boundary, sealed at #171) + a test helper",
+    ),
+    (
+        "crates/fulfillment/src/lib.rs",
+        ".json(",
+        1,
+        "deliver()'s request body — not an error-rendering path",
+    ),
+    (
+        "crates/fulfillment/src/main.rs",
+        ".send()",
+        2,
+        "client construction in the lambda entrypoint",
+    ),
+];
+
+/// Members that can mint a raw client error, **derived from the dependency graph rather than listed**.
+///
+/// A member with no `UrlBearing` direct dependency is **structurally incapable** of producing one.
+/// Measured 2026-08-10: `.send()` is also the AWS SDK's operation-builder method, so a workspace-wide
+/// count is dominated by calls that cannot fail this way — `dynamo` alone has **73**. Deriving the
+/// scope deletes 82 such occurrences **mechanically, with zero judgment calls and nothing to
+/// maintain** — the same discipline as reading the scan set from `members` instead of globbing
+/// `crates/*`. (OMBB's, and it is strictly better than the hand-written file list I proposed.)
+fn url_bearing_members() -> Vec<PathBuf> {
+    let url_bearing: Vec<&str> = DEP_VERDICTS
+        .iter()
+        .filter(|(_, verdict, _)| *verdict == "UrlBearing")
+        .map(|(n, _, _)| *n)
+        .collect();
+    assert!(
+        !url_bearing.is_empty(),
+        "FAIL CLOSED: no UrlBearing crates in DEP_VERDICTS — the scope would be empty and every \
+         verb assertion below would pass vacuously"
+    );
+    let out: Vec<PathBuf> = workspace_members()
+        .into_iter()
+        .filter(|m| {
+            let deps = direct_deps(&m.join("Cargo.toml"));
+            deps.iter().any(|d| url_bearing.contains(&d.as_str()))
+        })
+        .collect();
+    assert!(
+        !out.is_empty(),
+        "FAIL CLOSED: no member declares a UrlBearing dependency — scope empty, assertions vacuous"
+    );
+    out
+}
+
+/// Files under those members' `src/` that contain at least one minting verb.
+/// `tests/` is excluded here on purpose: a test hitting a mock server mints nothing that ships. It
+/// stays in the NAME census, where a test *naming* `wreq::Error` is a real occurrence of the class.
+fn files_with_client_verbs() -> Vec<String> {
+    let root = workspace_root();
+    let members = url_bearing_members();
+    let mut out: Vec<String> = rust_sources()
+        .into_iter()
+        .filter(|p| members.iter().any(|m| p.starts_with(m.join("src"))))
+        .filter(|p| {
+            let text = fs::read_to_string(p).expect("readable");
+            MINTING_VERBS.iter().any(|v| text.contains(v))
+        })
+        .map(|p| {
+            p.strip_prefix(&root)
+                .expect("under root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 🔑 **MEMBERSHIP — the durable half.** Counts catch a change in a file you already know about;
+/// **membership catches the file nobody told you about.** Declaring the unit documents where the seam
+/// is; it does not close it — a pinned list of three files cannot notice a fourth client file added
+/// next month. (OMBB, 2026-08-10, correcting a "declare the unit" proposal that would have repeated
+/// the same scope seam one level down.)
+#[test]
+fn the_set_of_files_with_client_verbs_is_exactly_the_reviewed_set() {
+    let actual = files_with_client_verbs();
+    let mut pinned: Vec<String> = REVIEWED_VERB_COUNTS
+        .iter()
+        .map(|(f, _, _, _)| (*f).to_string())
+        .collect();
+    pinned.sort();
+    pinned.dedup();
+    let missing: Vec<&String> = pinned.iter().filter(|f| !actual.contains(f)).collect();
+    let unreviewed: Vec<&String> = actual.iter().filter(|f| !pinned.contains(f)).collect();
+    assert!(
+        unreviewed.is_empty(),
+        "A file in a client-dependent crate contains a minting verb and is NOT in \
+         REVIEWED_VERB_COUNTS: {unreviewed:?}\n\n\
+         Someone added a network call in a crate that can mint a raw client error. Route it through \
+         that crate's sealer (see `fn net`/`fn send` in crates/humble-client/src/lib.rs) and pin the \
+         file's counts here, in the same commit."
+    );
+    assert!(
+        missing.is_empty(),
+        "REVIEWED_VERB_COUNTS pins file(s) that no longer contain any minting verb: {missing:?}\n\n\
+         Remove the rows. A pin list that rots in this direction quietly shrinks what is watched."
+    );
+}
+
+/// COUNTS — the weak half, kept because a count moving inside a known file is still worth a look.
+#[test]
+fn client_verb_counts_match_their_pins() {
+    let root = workspace_root();
+    let mut drift = Vec::new();
+    for (file, verb, expected, note) in REVIEWED_VERB_COUNTS {
+        let path = root.join(file);
+        assert!(
+            path.is_file(),
+            "FAIL CLOSED: pinned file {file} does not exist — a count of 0 here would be vacuous"
+        );
+        let text = fs::read_to_string(&path).expect("readable");
+        let actual = text.matches(verb).count();
+        if actual != *expected {
+            drift.push(format!(
+                "  {file}: `{verb}` reviewed {expected}, found {actual}  ({note})"
+            ));
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "Verb counts moved in {} place(s):\n{}\n\n\
+         A verb is where a raw client error is born. If you added a network call, route its error \
+         through the crate's sealer and update the count here in the same commit. This test is a \
+         CHANGE DETECTOR, not a quality bar — it does not know whether your new call is safe, only \
+         that nobody has said so.",
+        drift.len(),
+        drift.join("\n")
+    );
+}
