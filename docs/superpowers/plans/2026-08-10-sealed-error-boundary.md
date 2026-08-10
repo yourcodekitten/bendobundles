@@ -1159,3 +1159,48 @@ dropping the crate from the list.* Ship as its own issue.
 - Lilith retracted her own *"the closed version always comes from whoever is reviewing"* (4/4) after
   checking it: it is **1/4**. The law that survives is the bare one — ***who closes this set: a human,
   or the substrate?*** *A wrong idea that scans well travels further than a right one that doesn't.*
+
+---
+
+## 🔴 Task 3 REDESIGNED — the verb census is not viable at workspace scope (measured 2026-08-10, after OMBB's gate item 4)
+
+Widening the scan to `tests/` (his blocker 4) made the true verb population measurable for the first
+time, and it **invalidates the design this plan specified**:
+
+```
+.send() occurrences, src/ + tests/, per member:
+dynamo 73 · fulfillment 7 · humble-client 6 · steam-client 10 · admin-api 5 · public-api 3 · domain 1
+.build( workspace-wide: 42
+```
+
+**`.send()` is the AWS SDK's operation-builder method.** At workspace scope the count is dominated by
+calls with no relationship to `wreq`/`reqwest`, and `.build(` is worse.
+
+>>> ⇒ **Pinning per-crate verb counts pins a number driven by AWS churn.** Every SDK bump trips it, the
+>>> alarm becomes routine, and **a guard that alarms routinely is a guard someone disables** — which is
+>>> *the exact argument used earlier in this plan to choose the helper over sprinkling `.map_err(net)`.*
+>>> **The design defeats its own justification once its population is measured.**
+>>> ⇒ And it confirms what the `.build()?` discovery already implied: ***the compiler is the
+>>> enforcement; the census is only ever the change detector.*** Deleting `#[from]` is what makes an
+>>> unsealed conversion impossible. The verb enumeration's real value was **construction-time** —
+>>> listing 21 sites is what put a human eye on `:977`, `:1436` and `:1548` — and **that value is
+>>> already banked and cannot be re-earned by keeping the guard.**
+
+### The narrowed design (pending OMBB's read)
+
+Pin verb counts **per FILE, for the three client files only**, with the unit **declared** rather than
+implied — because *"my remediation unit is the impl, my census unit is the directory"* was his blocker
+and the fix is to name the unit, not to repeat the seam one level down:
+
+| file | pins |
+|---|---|
+| `crates/humble-client/src/lib.rs` | `.send()` 1 · `.bytes()` 1 (both inside the sealing helpers) |
+| `crates/humble-client/src/bin/probe.rs` | `.send()` 1 · `.bytes()` 1 — **its own client**, behind `required-features = ["probe"]`, so the compiler never sees it |
+| `crates/steam-client/src/lib.rs` | `.send()` 10 · `.bytes()` 1 · `.text()` 1 · `.json::<` 1 — the unforced-sealer debt, pinned at today's number with its issue named |
+| `crates/fulfillment/src/lib.rs` | `.json(` 1 — `deliver()`, the crate's only reqwest error boundary |
+
+**Needles: `.json(` AND `.json::<`, two rows.** His `.json(` alone drops `steam-client:927`'s turbofish
+— the site the arc's first review rested on — and **a census's false negative is the one that never
+announces itself.** ⚠️ **And the file must say that call-syntax spellings are an OPEN SET**: today it is
+turbofish, tomorrow `let v: T = r.json().await?` or a re-exported trait method. Two needles are a patch
+on an open set; the sentence saying so is what stops the third being a surprise.
