@@ -597,20 +597,40 @@ fn every_verdict_carries_a_re_export_signature() {
 /// is the failure that never announces itself**, so prose is counted and its share is stated per row.
 const MINTING_VERBS: &[&str] = &[".send()", ".bytes()", ".text()", ".json(", ".json::<"];
 
+/// Source with **whole-line comments removed**, for the verb census only.
+///
+/// 🔴 **WHY THIS EXISTS: THE DOC COMMENT THAT DOCUMENTS THE INVARIANT BROKE THE COUNT THAT ENFORCES
+/// IT.** `humble-client/src/lib.rs` contains the literal `.send()` four times — once as code, three
+/// times in the prose that says *"The only `.send()` in this crate"*. Counting raw occurrences is not
+/// merely noisy: **a real new call can be offset by deleting a prose mention, holding the total
+/// constant — a FALSE NEGATIVE, not a false alarm.** (OMBB, 2026-08-10; third instance of prose
+/// colliding with this census after the doctrine paragraph and `probe.rs`.)
+///
+/// **Only lines whose trimmed form STARTS with `//` are dropped, never a `//` mid-line.** Cutting
+/// from a mid-line `//` would truncate string literals — this repo is full of `"https://..."` — and
+/// could lose a real call to the right of one. **Residual, stated: a trailing comment mentioning a
+/// verb is still counted. That is a false POSITIVE, which fails in the safe direction.**
+fn code_only(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Pinned per-FILE verb counts for the `src/` of members that can mint one.
 /// `(workspace-relative file, verb, occurrences, note)`
 const REVIEWED_VERB_COUNTS: &[(&str, &str, usize, &str)] = &[
     (
         "crates/humble-client/src/lib.rs",
         ".send()",
-        4,
-        "1 real (fn send, the sealer) + 3 in doc prose",
+        1,
+        "fn send — the sealer, and the crate's only one",
     ),
     (
         "crates/humble-client/src/lib.rs",
         ".bytes()",
-        3,
-        "1 real (fn body, the sealer) + 2 in doc prose",
+        1,
+        "fn body — the sealer, and the crate's only one",
     ),
     (
         "crates/humble-client/src/bin/probe.rs",
@@ -646,19 +666,19 @@ const REVIEWED_VERB_COUNTS: &[(&str, &str, usize, &str)] = &[
         "crates/steam-client/src/lib.rs",
         ".json::<",
         1,
-        "keyed_json's Parse path, sealed with without_url(); the turbofish `.json(` would miss",
+        "keyed_json's Parse path, sealed with without_url(); the needle `.json(` would miss this turbofish",
     ),
     (
         "crates/fulfillment/src/lib.rs",
         ".send()",
         2,
-        "deliver() (the crate's only reqwest error boundary, sealed at #171) + a test helper",
+        "deliver() — the crate's only reqwest error boundary, sealed at #171 — plus a test helper",
     ),
     (
         "crates/fulfillment/src/lib.rs",
         ".json(",
         1,
-        "deliver()'s request body — not an error-rendering path",
+        "deliver()'s request body; not an error-rendering path",
     ),
     (
         "crates/fulfillment/src/main.rs",
@@ -712,7 +732,8 @@ fn files_with_client_verbs() -> Vec<String> {
         .filter(|p| members.iter().any(|m| p.starts_with(m.join("src"))))
         .filter(|p| {
             let text = fs::read_to_string(p).expect("readable");
-            MINTING_VERBS.iter().any(|v| text.contains(v))
+            let code = code_only(&text);
+            MINTING_VERBS.iter().any(|v| code.contains(v))
         })
         .map(|p| {
             p.strip_prefix(&root)
@@ -769,7 +790,7 @@ fn client_verb_counts_match_their_pins() {
             "FAIL CLOSED: pinned file {file} does not exist — a count of 0 here would be vacuous"
         );
         let text = fs::read_to_string(&path).expect("readable");
-        let actual = text.matches(verb).count();
+        let actual = code_only(&text).matches(verb).count();
         if actual != *expected {
             drift.push(format!(
                 "  {file}: `{verb}` reviewed {expected}, found {actual}  ({note})"
