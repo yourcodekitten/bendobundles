@@ -346,24 +346,83 @@ Add as private methods on the client type that owns `http: wreq::Client` (`lib.r
     }
 ```
 
-Then rewrite each of the 9 `.send()` sites (`653, 727, 972, 1243, 1354, 1503, 1622, 1658, 1681`) from
-`…builder….send().await?` to `self.send(…builder…).await?`, and each of the 12 `.bytes()` sites to
-`Self::body(resp).await?`.
+**⚠️ READ THIS BEFORE TOUCHING A LINE — THE SITES ARE NOT UNIFORM, AND THE THREE THAT MATTER MOST
+ARE THE THREE THE COMPILER WILL NEVER MENTION.**
 
-**Deleting `#[from]` deletes `impl From<wreq::Error> for HumbleError`, so `?` no longer
-auto-converts — the compiler enumerates every site that relied on it.** Work the list the compiler
-gives you; do not work a grep's list.
+An earlier draft of this step said "rewrite each of the 12 `.bytes()` sites to `Self::body(resp).await?`"
+and trusted `#[from]`'s deletion to enumerate the rest. **Both halves were wrong.** Deleting the `From`
+impl only breaks sites that *convert* — and **three sites render a raw `wreq::Error` without ever
+converting one**, so the compiler stays silent about exactly the lines that leak:
 
-- [ ] **Step 3: Compile and let the compiler enumerate what is left**
+| site | current code | why the compiler misses it |
+|---|---|---|
+| **`:977`** | `tracing::warn!(error = %e, "csrf preflight GET failed")` | `.send()` with **no `?`** — a `match` on the `Result`. **This is byte-for-byte the shape #171 fixed in `deliver()`**: raw client error, `%` Display, which appends the request URL. |
+| **`:1436`** | `Err(e) => (false, Some(e.to_string()))`, logged at `:1460` as `body_read_err` | matches the `Result`; no conversion, no type path on the line |
+| **`:1548`** | same, logged at `:1568` | same |
+
+**Measured, so nobody has to guess the severity:** `:977`'s URL is `format!("{}/", self.base)` and
+`:1436`/`:1548`'s is `{base}/humbler/redeemkey` — the gamekey and `machine_name` travel in the **POST
+form body**, not the URL. **So none of the three leaks a credential today.** They are the same class as
+`keyed_json`'s comment: *true today, guaranteed by nothing.*
+
+**The verb collapse is what found them.** The name census cannot see them (no type path), and the
+`#[from]` deletion cannot see them (no conversion). Enumerating the verbs to collapse them is the only
+one of the three mechanisms in this plan that put a human's eye on those lines — which is the
+argument for the verb census, discovered by the plan review rather than asserted in the spec.
+
+**Now the rewrite — all 21 sites route through the two helpers, and the three above are fixed *by*
+routing**, because `HumbleError`'s own `Display` is already sealed. No inline `without_url()` needed
+anywhere.
+
+**The 9 `.send()` sites.** Eight are `…builder….send().await?` → `self.send(…builder…).await?`
+(`653, 727, 1243, 1354, 1503, 1622, 1658, 1681`). The ninth, **`:972`**, is a `match` and becomes:
+
+```rust
+        let resp = match self
+            .send(
+                self.http
+                    .get(format!("{}/", self.base))
+                    .header("Cookie", self.session_cookie()),
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // `e` is now a HumbleError, whose Display is already URL-stripped by `net`.
+                tracing::warn!(error = %e, "csrf preflight GET failed");
+                return None;
+            }
+        };
+```
+
+**The 12 `.bytes()` sites**, by shape — every one becomes `Self::body(resp)`, and the differing tails
+stay exactly as they are:
+
+- **converts via `?`** (`657, 730, 1256, 1370, 1516`): `resp.bytes().await?` → `Self::body(resp).await?`.
+  `:730` keeps its borrow: `Ok(String::from_utf8_lossy(&Self::body(resp).await?).into_owned())`.
+- **discards deliberately** (`985, 1665`): `let _ = resp.bytes().await;` → `let _ = Self::body(resp).await;`
+  (both are connection-pool drains; the comments above them say so — keep them).
+- **defaults on error** (`1627, 1688`): `.unwrap_or_default()` → `Self::body(resp).await.unwrap_or_default()`.
+  `Vec<u8>::default()` is `vec![]`, matching the previous `Bytes::default()` behaviour at every use,
+  all of which take `&bytes`.
+- **matches the Result** (`1291, 1436, 1548`): `resp.bytes().await` → `Self::body(resp).await`.
+  `:1291`'s `matches!(…, Ok(b) if is_login_required(&b))` is unchanged in meaning. `:1436`/`:1548`'s
+  `Err(e) => (false, Some(e.to_string()))` **now stringifies a `HumbleError`**, i.e.
+  `"network error talking to humble: <stripped>"` — the field keeps its meaning and loses the URL.
+
+**After this step the crate contains exactly one `.send()` and one `.bytes()`, both inside the
+helpers, so a raw `wreq::Error` cannot be bound anywhere else.** That is the claim Task 3 pins.
+
+- [ ] **Step 2b: Let the compiler confirm the list, and treat any surprise as a finding**
 
 Run: `cargo check -p humble-client --all-targets -j 1`
 
-Expected: initially a list of `E0277 the trait bound HumbleError: From<wreq::Error> is not satisfied`
-errors, one per unconverted site. Fix until clean. **Record the count** — it is the honest measure of
-the surface, and it must equal 21 minus whatever sits inside the two helpers. If it does not, a verb
-was reached by a path the plan did not predict; stop and note it rather than pattern-matching a fix.
+Expected: `E0277 the trait bound HumbleError: From<wreq::Error> is not satisfied` at **exactly the
+sites not yet rewritten**, and clean once all 21 are done. **If the compiler names a site not in the
+tables above, stop and record it** — it means a 22nd verb reached a conversion by a path this review
+did not find, and the pinned counts in Task 3 are wrong. Do not pattern-match a fix onto it.
 
-- [ ] **Step 4: Add the new sealing site to the allow-list**
+- [ ] **Step 3: Add the new sealing site to the allow-list**
 
 In `crates/domain/tests/sealed_error_boundary.rs`, add to `REVIEWED_OCCURRENCES`:
 
@@ -375,7 +434,7 @@ In `crates/domain/tests/sealed_error_boundary.rs`, add to `REVIEWED_OCCURRENCES`
     ),
 ```
 
-- [ ] **Step 5: Run the census and the crate's own suite**
+- [ ] **Step 4: Run the census and the crate's own suite**
 
 Run: `cargo test -p domain --test sealed_error_boundary -j 1` — expected: **all four tests PASS**,
 including `every_reviewed_occurrence_still_matches_a_real_line` (which now proves the new sealing
@@ -386,7 +445,7 @@ Run: `cargo test -p humble-client -j 1` — expected: the existing `client_test.
 
 Run: `cargo clippy -p humble-client -p domain --all-targets -- -D warnings -j 1` — expected: clean.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add crates/humble-client/src/lib.rs crates/domain/tests/sealed_error_boundary.rs
@@ -815,15 +874,45 @@ ending *"A trust boundary has two sides and both of them need auditing."*:
 //! a dependency; it states its own blind spot, which is more than this one managed for two arcs.**
 ```
 
-- [ ] **Step 2: Verify nothing else moved**
+- [ ] **Step 1b: 🔴 THE PARAGRAPH YOU JUST WROTE TRIPS THE CENSUS. Allow-list it in the same commit.**
+
+The text above contains the literal string **`wreq::Error`** (in *"`humble-client`'s
+`Network(#[from] wreq::Error)`, #173"*). `crates/fulfillment/src/operator_message.rs` is scanned by
+`url_bearing_error_types_are_named_only_where_they_are_sealed`, which does **not** strip comments — by
+design, since a comment-stripper's failure mode is a false negative. **So the doc paragraph is a new
+unreviewed occurrence and the census goes red on it.**
+
+This is the census working exactly as intended and it is still a trap for whoever executes this task,
+because the failure will look like the *documentation* broke the build. Add to `REVIEWED_OCCURRENCES`
+in `crates/domain/tests/sealed_error_boundary.rs`, **in the same commit as the paragraph**:
+
+```rust
+    (
+        "crates/fulfillment/src/operator_message.rs",
+        "`Network(#[from] wreq::Error)`, #173",
+        "PROSE: the doctrine paragraph naming the defect this mechanism closed",
+    ),
+```
+
+**Do not fix this by rewording the paragraph to avoid the type name.** The whole point of counting
+prose is that discussion of the class is cheap to allow-list and expensive to lose; an author who
+learns to dodge the census by paraphrasing has been taught the wrong lesson by it.
+
+- [ ] **Step 2: Verify nothing else moved, and that the census is green *because* it was updated**
 
 Run: `cargo fmt --check` and `cargo clippy -p fulfillment --all-targets -- -D warnings -j 1`
 Expected: clean. (A doc comment cannot change behaviour, but `fmt` has opinions about comment width.)
 
+Run: `cargo test -p domain --test sealed_error_boundary -j 1` — expected: **all eight PASS.**
+
+**Then confirm the allow-list entry is load-bearing rather than decorative:** comment it out, re-run,
+and check the census FAILS naming `operator_message.rs`. Restore it. An entry that changes nothing
+when removed was matching something else.
+
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/fulfillment/src/operator_message.rs
+git add crates/fulfillment/src/operator_message.rs crates/domain/tests/sealed_error_boundary.rs
 git commit -S -m "docs: the doctrine's own file now names the mechanism on both sides
 
 This header carried 'a filter protects the code you audited; a type protects the
@@ -904,3 +993,75 @@ the Humble boundary; whether documenting the re-export blind spot is sufficient)
 task structure — the first changes one line inside `fn net`, the second changes a doc comment and
 possibly adds a verdict column. **Do not block execution on them; integrate the answers when they
 arrive.**
+
+---
+
+## Plan review — `implementation-plan-review`, 2026-08-10, cold-subagent walkthrough
+
+**Verdict: ready to execute, after the fixes below — which are already folded in above.** Three
+blockers, all found by walking the plan as a context-free subagent and then *checking its claims
+against the tree* rather than reading its prose.
+
+### BLOCKER 1 — Task 2 Step 2 told a subagent to rewrite 12 non-uniform sites identically
+
+The step read *"rewrite each of the 12 `.bytes()` sites to `Self::body(resp).await?`"*. Measured: **5**
+convert via `?`, **4** deliberately discard (`let _ =` × 2, `.unwrap_or_default()` × 2 — two of them
+documented connection-pool drains), and **3** match on the `Result`. A subagent following that
+instruction literally would have put `?` on a drain and changed control flow on the step-up paths.
+**Fixed:** the step now enumerates all 21 sites by shape with the exact post-change form for each.
+
+### BLOCKER 2 — the mechanism the plan's three checks were all blind to
+
+The `#[from]` deletion only breaks sites that *convert*. **Three sites render a raw `wreq::Error`
+without converting one**, so the compiler never names them and the name census cannot see them (no type
+path on the line):
+
+- **`crates/humble-client/src/lib.rs:977`** — `tracing::warn!(error = %e, "csrf preflight GET failed")`.
+  **Byte-for-byte the shape #171 fixed in `deliver()`**: raw client error, `%` Display, URL appended.
+- **`:1436`** and **`:1548`** — `Err(e) => (false, Some(e.to_string()))`, logged as `body_read_err` at
+  `:1460` / `:1568`.
+
+**Measured severity: no credential leaks today.** `:977`'s URL is `format!("{}/", self.base)`;
+`:1436`/`:1548` post to `{base}/humbler/redeemkey` with the gamekey and `machine_name` in the **form
+body**. Same class as `keyed_json`'s comment — true today, guaranteed by nothing.
+
+**The plan would have shipped a census, a doctrine paragraph, and "closes #173" while leaving the most
+direct instance of the class untouched, 700 lines above the variant it was fixing.** All three are
+fixed *by* routing through the helpers, since `HumbleError`'s `Display` is sealed. **What found them was
+enumerating the verbs in order to collapse them** — the verb census is the only one of the three
+mechanisms that put an eye on those lines, which is an argument the spec asserted and the review
+earned.
+
+### BLOCKER 3 — Task 4's own paragraph turns the census red, and the failure blames the docs
+
+The doctrine paragraph contains the literal `wreq::Error`, `operator_message.rs` is scanned, and the
+checker deliberately does not strip comments. **Fixed:** Step 1b adds the allow-list entry in the same
+commit, with an instruction *not* to dodge the census by rewording — plus a check that the new entry is
+load-bearing (comment it out, confirm red, restore).
+
+### MINOR — the pinned counts and the census count things differently
+
+`REVIEWED_VERB_COUNTS` was measured with `grep -c` (**lines**) and the test uses `str::matches`
+(**occurrences**). Cross-checked both ways on 2026-08-10 and every figure agrees (9/9, 12/12, 10/10,
+1/1, 2/2, 1/1), so the pins are correct — but they would diverge the day someone writes two `.send()`
+on one line. The census's occurrence semantics are the right ones; noted here so a future reader does
+not "fix" the numbers back to line counts.
+
+### Checked and clean (claims the plan makes that I verified rather than trusted)
+
+- No `[dependencies.x]` or `[target.…]` sections and no multi-line/indented continuation lines in any
+  of the 7 manifests — so `direct_deps`'s narrow parser cannot invent a dependency named `features`.
+- No existing `fn send` / `fn body` in `humble-client` to collide with the helpers.
+- The `enhancement` label exists in `yourcodekitten/bendobundles`.
+- All four `REVIEWED_OCCURRENCES` snippets from Task 1 match real lines today
+  (`steam-client:936,938`, `operator_message.rs:15`, `fulfillment:4525`).
+- `Vec<u8>` is a safe return for `body()`: every consuming site takes `&bytes`, and
+  `Vec::default()` matches the previous `Bytes::default()` behaviour at both `.unwrap_or_default()`
+  sites.
+
+### Open question that survives the review
+
+**q1, with OMBB:** with `gamekey = %gamekey` now explicit at `:1077`, is there anything left in a
+Humble request URL worth having at 3am? If no, `without_url()` is free everywhere and the last
+judgement call in this plan closes. **Does not block execution** — it changes no code in any task,
+only whether a future author is told the trade was priced.
