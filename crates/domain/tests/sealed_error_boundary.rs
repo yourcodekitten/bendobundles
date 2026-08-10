@@ -604,10 +604,19 @@ fn every_verdict_carries_a_re_export_signature() {
 /// what stops the third being a surprise.** The enforcement is the compiler (no `From` impl to
 /// auto-convert through); this census only notices change.
 ///
-/// **Comments are NOT stripped, and that is measured, not lazy.** Stripping from `//` to end-of-line
-/// looks safe until a string literal contains `//` — this repo is full of `"https://..."`, so a naive
-/// strip truncates the literal and can lose a real call to its right. **A false negative in a census
-/// is the failure that never announces itself**, so prose is counted and its share is stated per row.
+/// **Whole-line comments ARE stripped for this census; mid-line `//` is NOT.** See [`code_only`].
+/// Cutting from a mid-line `//` looks safe until a string literal contains one — this repo is full of
+/// `"https://..."`, so a naive strip truncates the literal and can lose a real call to its right, and
+/// **a false negative in a census is the failure that never announces itself.** Dropping only lines
+/// that *begin* with `//` cannot do that.
+///
+/// ⚠️ **THIS PARAGRAPH USED TO END "so prose is counted and its share is stated per row" — TRUE WHEN
+/// WRITTEN, FALSE ONCE [`code_only`] EXISTED, AND IT SHIPPED THAT WAY.** The rationale survived
+/// correctly and only the conclusion went stale, so this docstring and `code_only` asserted opposite
+/// things about the same census — **in the file whose entire thesis is that documentation and code must
+/// agree.** Caught by OMBB at the step-9 gate; fourth instance in this arc of a note describing a state
+/// the code does not have. **A stale conclusion under a sound rationale is the hardest kind to see,
+/// because re-reading the argument confirms it.**
 const MINTING_VERBS: &[&str] = &[".send()", ".bytes()", ".text()", ".json(", ".json::<"];
 
 /// Source with **whole-line comments removed**, for the verb census only.
@@ -761,6 +770,66 @@ fn files_with_client_verbs() -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// Construction sites for a sealed variant, pinned per file (code only).
+///
+/// 🔴 **WHY THIS EXISTS — OMBB's step-9 finding, and it is a hole in my own design.** Retyping
+/// `Network(#[from] wreq::Error)` to `Network(String)` moved the seal **from a conversion the compiler
+/// enforced to a helper that has to be remembered.** The two legs I offered as the guarantee — only
+/// `humble-client` declares `wreq`, and `fn net` is its only construction site — both hold (measured),
+/// **but both are about crates OTHER than `humble-client`, and the realistic regression is inside it**:
+/// a future author writing `HumbleError::Network(format!("failed talking to {url}"))` names no
+/// `wreq::Error` (name census blind) and uses no minting verb (verb census blind), in the one crate
+/// where the dependency leg does not apply.
+///
+/// ⇒ ***That reproduces the `steam-client` pattern one level up*** — and `fn net`'s own docstring makes
+/// the case: *"steam-client has had this exact function since #171 and 13 call sites that are never
+/// forced through it."* `#[non_exhaustive]` does not help; it constrains **external** construction and
+/// the risk is internal.
+///
+/// **This pin is an INTERIM guard, not the fix.** The fix is his: `Network(SealedNetworkMsg)` with a
+/// crate-private field, so only `fn net` can build one — the substrate closing the set instead of a
+/// human. Tracked in **#188**. A count that must be updated by hand is exactly the weaker instrument
+/// this arc keeps arguing against, and saying so here is cheaper than implying otherwise.
+const REVIEWED_CONSTRUCTIONS: &[(&str, &str, usize, &str)] = &[(
+    "crates/humble-client/src/lib.rs",
+    "HumbleError::Network(",
+    1,
+    "fn net at :605 — the crate's only construction of the sealed variant",
+)];
+
+/// The sealed variant must be constructed in exactly one place inside the crate that can mint the
+/// error it seals. Crates without a `UrlBearing` dependency also *pattern-match* this variant
+/// (`fulfillment` has 3) — **matching is not constructing**, and a crate with no `wreq` cannot put a
+/// `wreq` URL into it, so only the producing crate is pinned.
+#[test]
+fn the_sealed_variant_is_constructed_in_exactly_one_place() {
+    let root = workspace_root();
+    let mut drift = Vec::new();
+    for (file, pattern, expected, note) in REVIEWED_CONSTRUCTIONS {
+        let path = root.join(file);
+        assert!(
+            path.is_file(),
+            "FAIL CLOSED: pinned file {file} does not exist — a count of 0 would be vacuous"
+        );
+        let actual = code_only(&fs::read_to_string(&path).expect("readable"))
+            .matches(pattern)
+            .count();
+        if actual != *expected {
+            drift.push(format!(
+                "  {file}: `{pattern}` reviewed {expected}, found {actual}  ({note})"
+            ));
+        }
+    }
+    assert!(
+        drift.is_empty(),
+        "Construction sites for a sealed variant moved:\n{}\n\n\
+         A sealed variant may only be built by its sealing function. If you added a construction, route \
+         it through that function instead — and if you genuinely need a second one, say why here. See \
+         #188 for the type-level fix that would make this pin unnecessary.",
+        drift.join("\n")
+    );
 }
 
 /// 🔑 **MEMBERSHIP — the durable half.** Counts catch a change in a file you already know about;
