@@ -20,7 +20,7 @@ There are **two** sinks through which an error payload leaves this process:
 
 | Sink | Audience | Defence today |
 |---|---|---|
-| Discord operator channel | unprivileged | **a type** — `OperatorMessage`, private inner, no `From<String>`, 55 call sites, `ErrorSummary::of` never reads the error's text |
+| Discord operator channel | unprivileged | **a type** — `OperatorMessage`, private inner, no `From<String>`, 54 call sites, `ErrorSummary::of` never reads the error's text |
 | CloudWatch (`tracing`) | access-controlled | **a comment** — 49 hand-written `error = ?e` / `%e` sites (38 `?`, 11 `%`) across 7 crates, and exactly **two** hand-applied `.without_url()` calls in the entire workspace |
 
 **The file that says a filter protects only the code you audited protects one of its two sinks with
