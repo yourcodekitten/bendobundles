@@ -66,6 +66,12 @@ const REVIEWED_OCCURRENCES: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/steam-client/src/lib.rs",
+        "Client CONSTRUCTION mints a reqwest::Error too",
+        "PROSE: the .build() comment — construction mints one, is NOT a request verb, and this crate \
+         hand-rolls its conversions so there is no From impl for the compiler to withhold",
+    ),
+    (
+        "crates/steam-client/src/lib.rs",
         "reqwest::Error::Display can include",
         "PROSE: names the leak at the sealing site",
     ),
@@ -674,7 +680,9 @@ const REVIEWED_VERB_COUNTS: &[(&str, &str, usize, &str)] = &[
         "crates/steam-client/src/lib.rs",
         ".json::<",
         1,
-        "keyed_json's Parse path, sealed with without_url(); the needle `.json(` would miss this turbofish",
+        "keyed_json's Parse path, NOW genuinely sealed with without_url() — this note asserted it \
+         before the code did, which is the second time today a note shipped ahead of its work; the \
+         needle `.json(` would miss this turbofish",
     ),
     (
         "crates/fulfillment/src/lib.rs",

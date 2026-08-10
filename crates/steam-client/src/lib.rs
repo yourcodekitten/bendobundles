@@ -415,7 +415,13 @@ impl SteamClient {
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
-            .map_err(|e| SteamError::Network(e.to_string()))?;
+            // Client CONSTRUCTION mints a reqwest::Error too, and `.build()` is not a request
+            // verb — so no verb census reaches it and the compiler has nothing to say (this crate
+            // hand-rolls its conversions, so there is no `From` impl to delete). Same class as
+            // humble-client's `.build()`, found reviewing that fix. No request has been made so
+            // there is no url to leak today; stripping costs nothing and stops it being true by
+            // accident.
+            .map_err(|e| SteamError::Network(e.without_url().to_string()))?;
         Ok(Self {
             base_web_api: web_api_base.to_string(),
             base_store: store_base.to_string(),
@@ -918,7 +924,17 @@ pub fn steam_openid_redirect_url(realm: &str, return_to: &str) -> String {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Shared keyed-endpoint status mapping: 429 → RateLimited, 401/403 → KeyRejected,
-/// other non-2xx → Api(status), body → serde or Parse. The key never appears in any error string.
+/// other non-2xx → Api(status), body → serde or Parse.
+///
+/// The key never appears in any error string, and **THIS FUNCTION is why — not `reqwest`.** Both error
+/// paths out of here go through `without_url()`. Measured on reqwest 0.12.28: a `json()`/`bytes()`
+/// error is built by `error::decode`, which attaches no url (zero `with_url` callers in
+/// `response.rs`/`body.rs`; the only url attach is `error_for_status`, which this never calls), so
+/// stripping is a no-op **today**. That is an upstream implementation detail, not a promise — a patch
+/// release attaching the url would have falsified the sentence above with **no diff in this repo and
+/// no test to fail.** Keyed endpoints embed `?key=...`, so the property is worth owning here rather
+/// than borrowing. *A by-construction claim resting on a dependency's private implementation is a
+/// claim with no owner.*
 async fn keyed_json<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
 ) -> Result<T, SteamError> {
@@ -926,7 +942,7 @@ async fn keyed_json<T: serde::de::DeserializeOwned>(
         200 => resp
             .json::<T>()
             .await
-            .map_err(|e| SteamError::Parse(e.to_string())),
+            .map_err(|e| SteamError::Parse(e.without_url().to_string())),
         429 => Err(SteamError::RateLimited),
         401 | 403 => Err(SteamError::KeyRejected),
         s => Err(SteamError::Api(s)),
