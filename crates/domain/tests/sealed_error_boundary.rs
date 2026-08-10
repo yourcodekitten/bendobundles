@@ -636,8 +636,9 @@ const REVIEWED_VERB_COUNTS: &[(&str, &str, usize, &str)] = &[
     (
         "crates/humble-client/src/lib.rs",
         ".bytes()",
-        1,
-        "fn body — the sealer, and the crate's only one",
+        2,
+        "fn body (the sealer) + fn drain, which discards a body without to_vec()-ing it and whose \
+         error nothing renders — see its docstring",
     ),
     (
         "crates/humble-client/src/bin/probe.rs",

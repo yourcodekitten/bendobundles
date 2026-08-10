@@ -635,6 +635,21 @@ impl HumbleClient {
         resp.bytes().await.map(|b| b.to_vec()).map_err(net)
     }
 
+    /// Read and discard a body so the connection returns to the pool.
+    ///
+    /// **Deliberately NOT `body()`** — that would `to_vec()` a payload we are about to throw away,
+    /// which is a full copy of every drained response (the membership blob is the largest thing this
+    /// client fetches). `wreq` does not re-export `Bytes`, and adding the `bytes` crate to reach the
+    /// type would be a new direct dependency for a helper that returns nothing. So this keeps the
+    /// cheap refcounted read and drops it, which is byte-for-byte the behaviour before the collapse.
+    ///
+    /// **The error is intentionally discarded**: nothing renders it, so there is nothing to seal. That
+    /// is why this may hold the crate's second `.bytes()` without weakening the invariant — and why
+    /// the census pins `.bytes()` at 2 with this note rather than 1.
+    async fn drain(resp: wreq::Response) {
+        let _ = resp.bytes().await;
+    }
+
     pub fn new(base_url: &str, cookie: SessionCookie) -> Result<Self, HumbleError> {
         // Emulate a real Chrome's TLS/JA3 + HTTP2 fingerprint. Humble sits behind Cloudflare,
         // whose WAF challenges non-browser TLS: the rustls fingerprint got the redeem POST a
@@ -1029,7 +1044,7 @@ impl HumbleClient {
         let status = resp.status().as_u16();
         // Drain the body so the connection returns to the pool — the redeem POST follows
         // immediately and shouldn't pay a fresh TCP+TLS handshake on the friend-facing path.
-        let _ = Self::body(resp).await;
+        Self::drain(resp).await;
         match captured {
             Some(v) => {
                 tracing::info!("csrf preflight: captured csrf_cookie from humble");
@@ -1709,7 +1724,7 @@ impl HumbleClient {
             }
         })?;
         let anon = extract_set_cookie(boot.headers(), "_simpleauth_sess");
-        let _ = Self::body(boot).await; // drain so the connection returns to the pool
+        Self::drain(boot).await; // drain so the connection returns to the pool
         // 2) Authenticate that session. Double-submit csrf (cookie + header), same as a write.
         let code = totp_now(&creds.totp_secret).map_err(|reason| HumbleError::LoginFailed {
             reason: format!("TOTP: {reason}"),
