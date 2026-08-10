@@ -1074,7 +1074,12 @@ async fn handle_choice_claim(
         Ok(o) => o,
         Err(HumbleError::Unauthorized) => return choice_cookie_dead(deps).await,
         Err(e) => {
-            tracing::warn!(claim_id, error = ?e, "choice pre-read order failed — parking (no spend)");
+            // `gamekey` is explicit here because it USED to arrive only as a side effect of the
+            // error's unredacted request URL (`/api/v1/order/{gamekey}`). #173 claimed it was
+            // "already logged beside claim_id" — it was not: this site carried `claim_id` and not
+            // `gamekey`, and `:3392` carries `gamekey` and not `claim_id`. Two paths, neither
+            // carrying both. A correlator you can only get out of a leak was never a correlator.
+            tracing::warn!(claim_id, gamekey = %gamekey, error = ?e, "choice pre-read order failed — parking (no spend)");
             return parked_choice("pre-read");
         }
     };
