@@ -25,6 +25,27 @@
 //! Keep the direction in view: this module was built to stop a payload leaking OUT to the
 //! unprivileged channel, and the leak nobody was looking for went the other way — IN, to the side
 //! already declared safe. A trust boundary has two sides and both of them need auditing.
+//!
+//! **BOTH SIDES HAVE A MECHANISM NOW, AND FOR MOST OF THIS FILE'S LIFE ONLY ONE DID.** Everything
+//! above is the doctrine — *a filter protects the code you audited; a type protects the code you
+//! haven't* — and it was implemented on the Discord side only. The CloudWatch side had 49
+//! hand-written `error = ?e` / `%e` sites and **two** hand-applied `without_url()` calls covering
+//! three places that needed one. The third (`humble-client`'s `Network(#[from] wreq::Error)`, #173)
+//! sat open through two arcs that quoted this header while it did.
+//!
+//! The CloudWatch side is now sealed at the **error type** rather than the log site, because log
+//! sites are unbounded and error types are not: one `fn net` per client crate, and the verbs that
+//! can mint a raw client error collapsed onto one sealing helper each. **The enforcement is the
+//! absence of a `From` impl — delete `#[from]` and `?` cannot convert — not the census.** The census
+//! (`crates/domain/tests/sealed_error_boundary.rs`) only notices change: a URL-bearing type named
+//! somewhere unreviewed, a new file with a client verb, a new direct dependency without a verdict, or
+//! an allow-list row that no longer matches a line.
+//!
+//! ⚠️ **Read that file's header before adding a network call or a dependency.** It states its own
+//! blind spots, which is more than this one managed for two arcs — and three separate times during
+//! its construction, PROSE about this class broke the census that enforces it: this paragraph, a
+//! bin target, and the sealing helper's own docstring. **Documentation of an invariant is not outside
+//! the invariant.**
 //! (Found by OMBB at the #171 gate. The bug was pre-existing; the doctrine that would have
 //! protected it was not.)
 

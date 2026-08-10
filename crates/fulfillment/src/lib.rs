@@ -1074,7 +1074,12 @@ async fn handle_choice_claim(
         Ok(o) => o,
         Err(HumbleError::Unauthorized) => return choice_cookie_dead(deps).await,
         Err(e) => {
-            tracing::warn!(claim_id, error = ?e, "choice pre-read order failed — parking (no spend)");
+            // `gamekey` is explicit here because it USED to arrive only as a side effect of the
+            // error's unredacted request URL (`/api/v1/order/{gamekey}`). #173 claimed it was
+            // "already logged beside claim_id" — it was not: this site carried `claim_id` and not
+            // `gamekey`, and `:3392` carries `gamekey` and not `claim_id`. Two paths, neither
+            // carrying both. A correlator you can only get out of a leak was never a correlator.
+            tracing::warn!(claim_id, gamekey = %gamekey, error = ?e, "choice pre-read order failed — parking (no spend)");
             return parked_choice("pre-read");
         }
     };
@@ -1235,7 +1240,7 @@ async fn handle_choice_claim(
         Err(e) => {
             // Pick spent, key not yet burned, tpk unknown THIS invoke = the crash-between-writes
             // state. Park; reconcile finishes from the snapshot — and NEVER re-chooses.
-            tracing::warn!(claim_id, error = ?e, "choice re-read after choose failed — parking; reconcile finishes (no re-choose)");
+            tracing::warn!(claim_id, gamekey = %gamekey, error = ?e, "choice re-read after choose failed — parking; reconcile finishes (no re-choose)");
             return parked_choice("re-read");
         }
     };
@@ -1855,7 +1860,7 @@ async fn recover_already_redeemed_key(
     let order = match deps.humble.order(gamekey).await {
         Ok(o) => o,
         Err(e) => {
-            tracing::warn!(claim_id, error = ?e, "self-claim recover: order re-read failed — parking");
+            tracing::warn!(claim_id, gamekey = %gamekey, error = ?e, "self-claim recover: order re-read failed — parking");
             return FulfillResponse::Parked {
                 reason: "recover re-read failed: park for reconcile".into(),
             };
