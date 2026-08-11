@@ -19,12 +19,15 @@ constant; the admin hash is the live value pulled verbatim — see the README, n
 ```bash
 git checkout main && git pull        # post-merge
 cd terraform
-AWS_PROFILE=kitten-deploy terraform plan -var-file=production.tfvars -out=tf.plan
+# Use the .tfplan name the ignore list and every other doc use. A saved plan is a SECRET:
+# the zip carries tfplan + tfstate + tfstate-prev with admin_password_hash in cleartext.
+AWS_PROFILE=kitten-deploy terraform plan -var-file=production.tfvars -out=tf.tfplan
 # READ every resource line of the plan. Expected: ONLY the lambda code/hash updates.
 # ANY admin_password_hash line, ANY IAM/boundary line, ANY destroy — STOP, take the
 # plan output to ben before touching apply. NEVER pass admin_password_hash by hand;
 # never re-hash it — production.tfvars carries the verbatim stored hash.
-AWS_PROFILE=kitten-deploy terraform apply tf.plan
+AWS_PROFILE=kitten-deploy terraform apply tf.tfplan
+rm -f tf.tfplan     # single-use; don't leave a state-bearing artifact in the worktree
 cd ..
 ```
 

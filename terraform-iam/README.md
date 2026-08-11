@@ -37,9 +37,13 @@ terraform workspace select production-iam    # or: TF_WORKSPACE=production-iam
 # Self-check: if the plan wants to CREATE resources that already exist (roles, the
 # boundary, the manager user), you are in the wrong workspace — STOP, do not apply.
 
-terraform plan  -var aws_account_id=672812236571 -out tf.plan
+# .tfplan, NOT .plan — only *.tfplan/*.plan are gitignored, and the saved plan is a
+# SECRET: the zip carries tfplan + tfstate + tfstate-prev in cleartext. For THIS stack
+# that is the IAM state, boundary and manager user.
+terraform plan  -var aws_account_id=672812236571 -out tf.tfplan
 # review the IAM in the plan, especially the kitten-deploy policy
-terraform apply tf.plan
+terraform apply tf.tfplan
+rm -f tf.tfplan     # single-use; don't leave a state-bearing artifact in the worktree
 ```
 
 ## Hand kitten the credentials
@@ -73,6 +77,8 @@ deploying.
 
 ## Notes
 
-- `.gitignore` covers `terraform-iam/.terraform/`, `backend.hcl`, `*.tfplan`.
+- `.gitignore` covers `terraform-iam/.terraform/`, `backend.hcl`, `*.tfplan`, `*.plan`, `*.tfvars`.
+  Saved plans and tfvars are state-bearing; the globs are a backstop, not the guarantee —
+  the operator picks the filename, so prefer writing plans outside the worktree.
 - This stack is applied with **ben's** admin creds — kitten never applies its
   own access.

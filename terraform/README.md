@@ -106,10 +106,13 @@ needs — no part of this waits on Ben.**
 ```bash
 cd terraform
 AWS_PROFILE=kitten-deploy terraform init -backend-config=backend.hcl -input=false
-AWS_PROFILE=kitten-deploy terraform plan -var-file=production.tfvars -out=tf.plan
+# NOTE the .tfplan extension — that is the one `.gitignore` covers. A saved plan is a SECRET: the
+# zip carries tfplan + tfstate + tfstate-prev, admin_password_hash included, in cleartext.
+AWS_PROFILE=kitten-deploy terraform plan -var-file=production.tfvars -out=tf.tfplan
 # READ every "will be created/updated/destroyed" line — the count is exact (e.g. 2 crates changed = 2
 # updates; a 3rd line, ANY admin_hash change, or ANY `permissions_boundary` change is a STOP). Then:
-AWS_PROFILE=kitten-deploy terraform apply tf.plan
+AWS_PROFILE=kitten-deploy terraform apply tf.tfplan
+rm -f tf.tfplan     # single-use anyway; do not leave state-bearing artifacts in the worktree
 ./deploy-web.sh     # publish the SPA too (AWS_PROFILE=kitten-deploy) if web/ changed
 ```
 
@@ -256,10 +259,11 @@ cd terraform
 terraform workspace show          # MUST print 'production' — see bootstrap step 3
 terraform plan \
   -var-file=production.tfvars \
-  -out=tf.plan
+  -out=tf.tfplan          # .tfplan — the extension .gitignore covers; the file holds full state
 
 # 3. Apply
-terraform apply tf.plan
+terraform apply tf.tfplan
+rm -f tf.tfplan
 
 # 4. Publish the SPA (sync web/dist → S3 + CloudFront invalidation)
 ./deploy-web.sh

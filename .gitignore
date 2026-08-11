@@ -1,13 +1,26 @@
 /target
 /captures
+# A SAVED PLAN IS A SECRET. `terraform plan -out=<f>` writes a zip carrying `tfplan`,
+# `tfstate` AND `tfstate-prev` — i.e. the full production state, including the argon2
+# `admin_password_hash` in cleartext. Treat a plan file exactly like a tfvars file.
+#
+# The filename is CHOSEN BY THE OPERATOR, so these globs are a backstop, not the
+# guarantee — they can only cover spellings someone thought of. Both extensions are
+# listed because the repo's own docs used the one the ignore list missed: every
+# documented invocation said `-out=tf.plan` while only `*.tfplan` was ignored (fixed
+# in the same commit as this comment). Keep the docs and these globs in agreement,
+# and prefer writing plans OUTSIDE the worktree entirely.
 terraform/.terraform/
 terraform/backend.hcl
 terraform/artifacts/
 terraform/*.tfplan
+terraform/*.plan
 terraform/*.tfvars
 terraform-iam/.terraform/
 terraform-iam/backend.hcl
 terraform-iam/*.tfplan
+terraform-iam/*.plan
+terraform-iam/*.tfvars
 
 # impeccable ephemeral state is ignored by .impeccable/.gitignore (live/sessions/,
 # live/annotations/, live/server.json); design.json + live/config.json are tracked
