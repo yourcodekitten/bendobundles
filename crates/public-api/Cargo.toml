@@ -30,6 +30,9 @@ tracing-subscriber = "0.3"
 urlencoding = "2"
 
 [dev-dependencies]
+# Enables the feature-gated create_table_for_tests for this crate's integration tests
+# (production [dependencies] dynamo stays featureless — review pass 2, F2).
+dynamo = { path = "../dynamo", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
 tokio.workspace = true

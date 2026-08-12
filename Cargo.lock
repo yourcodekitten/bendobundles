@@ -1176,6 +1176,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "domain",
+ "dynamo",
  "serde",
  "serde_json",
  "sha2",
