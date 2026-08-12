@@ -15,6 +15,10 @@ serde_json.workspace = true
 steam-client = { path = "../steam-client" }
 thiserror.workspace = true
 time.workspace = true
+# create_table_for_tests' ACTIVE waiter sleeps between polls (#168 mechanism a). The
+# `time` feature is declared here explicitly rather than trusted to transitive
+# unification; weight-free at runtime — every consumer binary already carries tokio.
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }

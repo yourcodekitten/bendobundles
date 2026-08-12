@@ -3753,3 +3753,18 @@ async fn revoke_preserves_seal_attr() {
     assert!(item.get("unlock_at").and_then(|v| v.as_n().ok()).is_some());
     assert!(!item["body"].as_s().unwrap().contains("unlock_at"));
 }
+
+/// create_table_for_tests must be safe to call twice back-to-back: the second call's
+/// delete→create races its own DELETING state on a real dynamodb-local, which is the
+/// #168 candidate mechanism. Before the waiter existed this intermittently threw
+/// ResourceInUseException; with the drain+waiter it must be deterministic.
+#[tokio::test]
+async fn create_table_for_tests_is_idempotent_under_immediate_recreate() {
+    let Some(store) = store_or_skip("recreate-race").await else { return };
+    // store_or_skip already created once. Slam it twice more, no pause.
+    store.create_table_for_tests().await.expect("second create");
+    store.create_table_for_tests().await.expect("third create");
+    // And the GSIs must be queryable immediately after return.
+    let games = store.list_listable_games().await.expect("GSI must be ACTIVE on return");
+    assert!(games.is_empty(), "virgin table");
+}

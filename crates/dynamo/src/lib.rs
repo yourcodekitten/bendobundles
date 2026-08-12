@@ -2892,6 +2892,12 @@ impl Store {
     /// the mirror of `store_or_skip`'s refuse-to-forge-a-green. The delete tolerates
     /// NotFound (the virgin-container case, same as CI); the create's error PROPAGATES —
     /// the old `let _ =` discard also swallowed genuine create failures.
+    ///
+    /// The create DRAINS its own delete (retries through ResourceInUseException, bounded)
+    /// and then WAITS for the table + both GSIs to read ACTIVE before returning (#168
+    /// mechanism a): under `--workspace` parallelism against one shared dynamodb-local,
+    /// returning early let a caller's first GSI query race table creation, and the old
+    /// fire-and-forget delete let the create land mid-DELETING.
     pub async fn create_table_for_tests(&self) -> Result<(), StoreError> {
         let attr = |name: &str| {
             AttributeDefinition::builder()
@@ -2927,24 +2933,75 @@ impl Store {
             .table_name(&self.table)
             .send()
             .await;
-        self.client
-            .create_table()
-            .table_name(&self.table)
-            .billing_mode(BillingMode::PayPerRequest)
-            .attribute_definitions(attr("pk"))
-            .attribute_definitions(attr("sk"))
-            .attribute_definitions(attr("gsi1pk"))
-            .attribute_definitions(attr("gsi1sk"))
-            .attribute_definitions(attr("gsi2pk"))
-            .attribute_definitions(attr("gsi2sk"))
-            .key_schema(key("pk", KeyType::Hash))
-            .key_schema(key("sk", KeyType::Range))
-            .global_secondary_indexes(gsi(schema::GSI_LISTABLE, "gsi1pk", "gsi1sk"))
-            .global_secondary_indexes(gsi(schema::GSI_PENDING, "gsi2pk", "gsi2sk"))
-            .send()
-            .await
-            .map_err(|e| StoreError::Aws(format!("{e:?}")))?;
-        Ok(())
+        // Drain: a delete on dynamodb-local is fast but NOT instantaneous; a create
+        // that lands while the table is DELETING throws ResourceInUseException. Retry
+        // the create through that window, bounded. (#168 mechanism a.)
+        let create = || {
+            self.client
+                .create_table()
+                .table_name(&self.table)
+                .billing_mode(BillingMode::PayPerRequest)
+                .attribute_definitions(attr("pk"))
+                .attribute_definitions(attr("sk"))
+                .attribute_definitions(attr("gsi1pk"))
+                .attribute_definitions(attr("gsi1sk"))
+                .attribute_definitions(attr("gsi2pk"))
+                .attribute_definitions(attr("gsi2sk"))
+                .key_schema(key("pk", KeyType::Hash))
+                .key_schema(key("sk", KeyType::Range))
+                .global_secondary_indexes(gsi(schema::GSI_LISTABLE, "gsi1pk", "gsi1sk"))
+                .global_secondary_indexes(gsi(schema::GSI_PENDING, "gsi2pk", "gsi2sk"))
+                .send()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match create().await {
+                Ok(_) => break,
+                Err(e) => {
+                    let in_use = matches!(
+                        e.as_service_error(),
+                        Some(se) if se.is_resource_in_use_exception()
+                    );
+                    if in_use && std::time::Instant::now() < deadline {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    return Err(StoreError::Aws(format!("{e:?}")));
+                }
+            }
+        }
+        // Wait for ACTIVE — table AND both GSIs. Returning before ACTIVE lets the
+        // caller's first GSI query race table creation. Bounded: a table that isn't
+        // ACTIVE in 30s is a broken environment, and hanging forever would hide it.
+        loop {
+            let desc = self
+                .client
+                .describe_table()
+                .table_name(&self.table)
+                .send()
+                .await
+                .map_err(|e| StoreError::Aws(format!("{e:?}")))?;
+            let table = desc
+                .table()
+                .ok_or_else(|| StoreError::Aws("describe_table returned no table".into()))?;
+            let table_active =
+                table.table_status() == Some(&aws_sdk_dynamodb::types::TableStatus::Active);
+            let gsis_active = table
+                .global_secondary_indexes()
+                .iter()
+                .all(|g| g.index_status() == Some(&aws_sdk_dynamodb::types::IndexStatus::Active));
+            if table_active && gsis_active {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(StoreError::Aws(format!(
+                    "table {} not ACTIVE within 30s (status {:?})",
+                    self.table,
+                    table.table_status()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }
 
