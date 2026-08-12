@@ -13,6 +13,9 @@
 ## Global Constraints
 
 - Commits are GPG-signed (`git commit -S`), author `code kitten <yourcodekitten@gmail.com>`. Never force-push. Space out pushes (throttle).
+- **Family-review verdicts are FINAL and folded in** (spec rev 2): Q1 separate binaries ([env] can't unset); Q2 hidden seam accepted, both halves; Q3 #168 closes with the exact wording in Task 9 — no task branches on an open question.
+- **One manifest change is permitted and required** (plan-review B1): `crates/dynamo/Cargo.toml` `[dependencies]` gains `tokio = { workspace = true, features = ["time"] }` (Task 2). No other Cargo.toml edit anywhere.
+- The stage env flag is **PRESENCE-triggered** (`request.rs:408` `env::var(...).is_ok()` — `"false"` and `""` both activate). Controls that need it off need it ABSENT.
 - **The box cannot link test binaries.** Local verification = `cargo check -p <crate> --tests -j 1` and `cargo clippy -p <crate> --all-targets -j 1 -- -D warnings`. Behavior verification = CI on the draft PR (CI runs on `pull_request` only). "Run test, expect FAIL/PASS" steps below therefore name **which oracle** (check vs CI).
 - `unsafe { std::env::set_var }` appears ONLY inside the `Once`-guarded `init()` of the two adapter binaries — never in `api_test.rs`, never mid-test (edition-2024 racy; spec D2).
 - New store-backed tests use table prefixes **`t-pubadp-`** / **`t-admadp-`** — NOT `t-adm-`/`t-pub-` (adapter binaries run in parallel with `api_test.rs` binaries against the same dynamodb-local; a shared prefix + same test name would collide).
@@ -23,12 +26,12 @@
 ## File Structure
 
 - Modify `.github/workflows/ci.yml:36` — one line (Task 1).
-- Modify `crates/dynamo/src/lib.rs:2895-2948` — `create_table_for_tests` waiter (Task 2).
-- Modify `crates/admin-api/tests/api_test.rs:1299,:1598` — uuid-table leak (Task 3).
-- Create `crates/public-api/tests/adapter_test.rs` + `crates/public-api/tests/fixtures/{apigw_v1_fallback.json, apigw_v1_link_unknown.json, apigw_v1_multi_value_query.json, apigw_v1_base64_thanks.json, apigw_v2_guard.json}` (Task 4).
-- Create `crates/public-api/tests/adapter_stage_control_test.rs` (Task 5).
-- Create `crates/admin-api/tests/adapter_test.rs` + `crates/admin-api/tests/fixtures/{apigw_v1_note_with_cookie.json, apigw_v1_login.json}` (Tasks 6-7).
-- No `Cargo.toml` changes: `lambda_http` is a normal dep of both API crates; `tower`, `serde_json`, `aws-config` already present where needed. **Exception:** admin-api's dev-deps must gain nothing — verify at Task 6 Step 2 (`cargo check` says so).
+- Modify `crates/dynamo/Cargo.toml` (+1 dependency line) and `crates/dynamo/src/lib.rs:2895-2948` — `create_table_for_tests` waiter (Task 2).
+- Modify `crates/admin-api/tests/api_test.rs` — the two uuid-minting helpers and their callers (Task 3).
+- Create `crates/public-api/tests/adapter_test.rs` + `crates/public-api/tests/fixtures/{apigw_v1_fallback.json, apigw_v1_link_unknown.json, apigw_v1_multi_value_query.json, apigw_v1_base64_thanks.json, apigw_v2_guard.json, alb_guard.json, apigw_v1_degenerate.json}` (Task 4).
+- Create `crates/public-api/tests/adapter_stage_control_test.rs` + `crates/public-api/tests/fixtures/apigw_v1_no_stage.json` (Task 5) and `crates/public-api/tests/adapter_stage_false_test.rs` (Task 5b).
+- Create `crates/admin-api/tests/adapter_test.rs` + `crates/admin-api/tests/fixtures/{apigw_v1_note_with_cookie.json, apigw_v1_login.json}` (Tasks 6-7; the login fixture is created in Task 7).
+- No other `Cargo.toml` changes: `lambda_http` is a normal dep of both API crates; `tower`, `serde_json`, `aws-config`, `async_trait` usage mirrors what each crate's api_test.rs already compiles with — Task 4/6 Step 3's `cargo check` is the verification that no new dev-dep was needed.
 
 ---
 
@@ -61,6 +64,7 @@ to:
 
 Run: `cd ~/bendobundles && python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/ci.yml')); print('YAML OK')"`
 Expected: `YAML OK` (and nothing else changed: `git diff --stat` shows exactly 1 file, +4/−1).
+Fallback if PyYAML is absent (`ModuleNotFoundError`): skip the local parse, verify by eye that the diff is the 4 lines above, and let CI's own workflow parser be the gate — a broken workflow file fails loudly on push, which is the failure direction we want.
 
 - [ ] **Step 3: Commit**
 
@@ -75,6 +79,7 @@ cd ~/bendobundles && python3 -c "import yaml; yaml.safe_load(open('.github/workf
 ### Task 2: `create_table_for_tests` waits for ACTIVE and drains DELETING (#168 hardening, mechanism a)
 
 **Files:**
+- Modify: `crates/dynamo/Cargo.toml` (add ONE `[dependencies]` line — permitted by Global Constraints)
 - Modify: `crates/dynamo/src/lib.rs:2895-2948`
 - Test: `crates/dynamo/tests/store_test.rs` (append one test)
 
@@ -105,7 +110,20 @@ async fn create_table_for_tests_is_idempotent_under_immediate_recreate() {
 }
 ```
 
-(If `store_or_skip` in store_test.rs has a different name/shape, adapt the guard but keep the three-creates + immediate-GSI-query body. Read `crates/dynamo/tests/store_test.rs:40-70` first.)
+(Verified in plan review: store_test.rs's `store_or_skip` is at `:30` and returns `Option<Store>` — NOT `Option<Arc<Store>>` like the API crates' versions. The test body above is compatible with the bare `Store`; keep it as written.)
+
+- [ ] **Step 1b: Add the tokio dependency (the waiter needs `tokio::time::sleep` in the lib build)**
+
+dynamo has tokio only in `[dev-dependencies]`, and the workspace tokio lacks the `time`
+feature — without this line, Step 3 cannot compile (plan-review B1). In
+`crates/dynamo/Cargo.toml` `[dependencies]`, add:
+
+```toml
+tokio = { workspace = true, features = ["time"] }
+```
+
+(Explicit feature, not transitive unification — unification through another dep is an
+accident waiting for a bump.)
 
 - [ ] **Step 2: Local gate**
 
@@ -206,7 +224,7 @@ Expected: clean. (CI proves behavior on the draft PR after Task 4 opens it.)
 
 ```bash
 cd ~/bendobundles && cargo check -p dynamo --tests -j 1 \
-  && git add crates/dynamo/src/lib.rs crates/dynamo/tests/store_test.rs \
+  && git add crates/dynamo/Cargo.toml crates/dynamo/src/lib.rs crates/dynamo/tests/store_test.rs \
   && git commit -S -m "test-support: create_table_for_tests drains DELETING and waits for ACTIVE (#168 mechanism a)
 
 The old body fire-and-forgot the delete and returned before the create was
@@ -228,27 +246,21 @@ reproduced diagnosis."
 
 **Why:** two helpers mint uuid-derived table names (`sc<uuid[..10]>`, `steam<uuid[..8]>`) every run and never drop them. Against a persistent local dynamodb they accumulate forever (`ListTables` pressure on the shared instance — cross-test state). The stable-name convention (`t-adm-<test>` + delete-then-create) exists precisely to prevent this; these two are the only exceptions.
 
-- [ ] **Step 1: Read the two call sites**
+- [ ] **Step 1: Read the two helpers and enumerate their callers**
 
-Run: `cd ~/bendobundles && grep -n 'uid\[\.\.' crates/admin-api/tests/api_test.rs`
-Read ±20 lines around each hit. Determine why uuid was used: if the same *stable* name would collide (two tests sharing one helper), the fix is a caller-supplied stable name per test; if it's just habit, the fix is direct.
+Run: `cd ~/bendobundles && grep -n 'uid\[\.\.' crates/admin-api/tests/api_test.rs` (hits at `:1298-1299` and `:1597-1598`) and `grep -n 'test_app_with_call_invoker\|steam_test_app' crates/admin-api/tests/api_test.rs`.
+Verified in plan review: `test_app_with_call_invoker` has **~10 callers** (`:1409,:1440,:1456,:1467,:1486,:1509,:1535,:1996,:2022`, ±drift) and `steam_test_app` ~6; the two helpers use DIFFERENT error idioms (`test_app_with_call_invoker` uses `.await.expect(...)` and returns a tuple; `steam_test_app` uses `?`) — keep each helper's own idiom, change ONLY where the table name comes from.
 
-- [ ] **Step 2: Replace with stable per-test names**
+- [ ] **Step 2: Replace with caller-supplied stable names**
 
-At `:1272-1310` (`test_app_with_call_invoker`) change the helper to take the test name and pass it through, e.g.:
-
-```rust
-// BEFORE (approx):
-//   let uid = uuid::Uuid::new_v4().simple().to_string();
-//   let store = store_or_skip(&format!("sc{}", &uid[..10])).await?;
-// AFTER:
-async fn test_app_with_call_invoker(test: &str, ...) -> ... {
-    let store = store_or_skip(&format!("sc-{test}")).await?;
-    ...
-}
-```
-
-and update each caller to pass its own test fn name (they are unique in the file — the same guarantee `store_or_skip("t-adm-{test}")` already relies on). Do the same for the `steam{}` site at `:1598`. Table names must stay ≤255 chars and `[a-zA-Z0-9_.-]` — test names in this file satisfy both.
+Change each helper's signature to take `test: &str` as its FIRST parameter and use it in the
+table name (`format!("sc-{test}")` / `format!("steam-{test}")`), deleting the uuid minting.
+Then update every caller to pass **the enclosing test fn's name, verbatim, as a string
+literal** (they are unique in the file — the same guarantee `store_or_skip("t-adm-{test}")`
+already relies on). Rule for the edge case: if any single test calls the same helper twice,
+suffix `-a`/`-b` at those two call sites (plan review found none, but the rule exists so the
+executor doesn't improvise). Keep bodies otherwise untouched. Table names stay ≤255 chars,
+charset `[a-zA-Z0-9_.-]` — test fn names satisfy both.
 
 - [ ] **Step 3: Local gate + commit**
 
@@ -329,12 +341,30 @@ the fix, now applied to the last two exceptions."
 - `"path": "/api/l/definitely-not-a-token/thanks"`, `"pathParameters": { "proxy": "l/definitely-not-a-token/thanks" }`,
 - `"httpMethod": "POST"` (both top-level and in `requestContext`),
 - headers gain `"Content-Type": "application/json"` (and mirror it into `multiValueHeaders`),
-- `"body": "eyJub3RlIjoidGhhbmsgeW91IGJlbiDinaEifQ=="` (base64 of `{"note":"thank you ben ❤"}` — non-ASCII on purpose: it proves byte-level decode, not just ASCII luck),
+- `"body": "eyJub3RlIjoidGhhbmsgeW91IGJlbiDinaQifQ=="` (base64 of `{"note":"thank you ben ❤"}` — non-ASCII on purpose: it proves byte-level decode, not just ASCII luck; ❤ is U+2764 → bytes `e2 9d a4` → `DinaQ` in the encoding, NOT `DinaE`/U+2761 — plan review caught the wrong constant here once already),
 - `"isBase64Encoded": true`.
 
-First verify the base64 is right: `python3 -c "import base64; print(base64.b64encode('{\"note\":\"thank you ben ❤\"}'.encode()).decode())"` and paste the output — do not trust the value above without running that.
+Verify the constant anyway (a check, not a repair): `python3 -c "import base64; print(base64.b64encode('{\"note\":\"thank you ben ❤\"}'.encode()).decode())"` must print exactly the value above; if it differs, STOP and reconcile before committing.
 
-`apigw_v2_guard.json` — copy `~/.cargo/registry/src/*/lambda_http-1.3.0/tests/data/apigw_v2_proxy_request_minimal.json` verbatim, then set `"rawPath": "/api/l/x"`, `"routeKey": "$default"`. (v2 is identified by `version: "2.0"` + `rawPath`; it must keep parsing as v2 — spec D4.)
+**Full-key-set requirement (spec D5, applies to EVERY apigw_v1_*.json above):** each fixture
+must carry ALL of: `resource`, `path`, `httpMethod`, `headers`, `multiValueHeaders` (every
+header mirrored), `queryStringParameters`, `multiValueQueryStringParameters` (both maps
+populated together or both null-and-then-empty-maps — production sends both; when the
+fixture has a query, BOTH maps carry it), `pathParameters`, `stageVariables`,
+`requestContext` (with `accountId, resourceId, stage, requestId, requestTimeEpoch, identity,
+resourcePath, httpMethod, apiId`, **and `path` = `"/" + stage + top-level path`**), `body`,
+`isBase64Encoded`. The corpus file this skeleton descends from is a parser-exercise artifact
+missing five of these — the loader predicate below is what makes "real-shaped" a machine
+check instead of an adjective.
+
+`apigw_v2_guard.json` — copy `~/.cargo/registry/src/*/lambda_http-1.3.0/tests/data/apigw_v2_proxy_request_minimal.json` verbatim, then set `"rawPath": "/api/l/x"`, `"routeKey": "$default"`. (It must keep parsing as v2 AND not be captured by the v1 arm — spec D4.)
+
+`alb_guard.json` — copy `~/.cargo/registry/src/*/lambda_http-1.3.0/tests/data/alb_request.json` verbatim, set its path to `/api/l/x`. (The cascade has more arms than v1/v2; one ALB fixture pins the fall-through class — spec D4, OMBB Q4.)
+
+`apigw_v1_degenerate.json` — a COPY of `apigw_v1_fallback.json` with `multiValueHeaders`
+deleted and `requestContext.path` set to `"/wrong/prefix"` — this one exists to prove the
+loader predicate itself can fail (spec AC4). It is loaded ONLY by the predicate's own red
+test, never by a translation test.
 
 - [ ] **Step 2: Write `crates/public-api/tests/adapter_test.rs`**
 
@@ -413,20 +443,60 @@ async fn fake_store() -> Arc<dynamo::Store> {
     Arc::new(dynamo::Store::new(aws_sdk_dynamodb::Client::new(&cfg), "fake".into()))
 }
 
+// The real trait (verified in plan review): public_api::Invoker has exactly ONE method,
+// `gift`, and its types live in the fulfillment crate — NOT domain. Mirror of
+// public api_test.rs's MockInvoker error arm; async_trait usage matches that file.
 struct NoInvoker;
 #[async_trait::async_trait]
 impl public_api::Invoker for NoInvoker {
-    async fn fire(&self, _req: domain::FulfillRequest) -> Result<(), String> {
-        Err("adapter tests never invoke".into())
-    }
-    async fn call(&self, _req: domain::FulfillRequest) -> Result<domain::FulfillResponse, String> {
+    async fn gift(
+        &self,
+        _req: fulfillment::FulfillRequest,
+    ) -> Result<fulfillment::FulfillResponse, String> {
         Err("adapter tests never invoke".into())
     }
 }
-// NOTE for implementer: check the real `Invoker` trait shape in
-// crates/public-api/src/lib.rs (name, methods, types) and mirror it exactly —
-// or reuse an existing test mock if one is importable. api_test.rs::MockInvoker
-// (public api_test.rs:105-140) is the reference; copy its impl, don't invent one.
+
+/// spec D5: "real-shaped" is a predicate. Every v1 fixture goes through here before
+/// from_str ever sees it: (i) full production key-set present, (ii) correlated fields
+/// consistent. Closes the hand-edit class, not the instance.
+fn load_v1_fixture(raw: &'static str) -> String {
+    let v: serde_json::Value = serde_json::from_str(raw).expect("fixture must be JSON");
+    for key in [
+        "resource", "path", "httpMethod", "headers", "multiValueHeaders",
+        "queryStringParameters", "multiValueQueryStringParameters", "pathParameters",
+        "stageVariables", "requestContext", "body", "isBase64Encoded",
+    ] {
+        assert!(
+            v.get(key).is_some(),
+            "fixture missing production key {key:?} — a corpus-minimal fixture exercises \
+             arms production never takes (spec D5-1)"
+        );
+    }
+    let ctx = &v["requestContext"];
+    for key in ["accountId", "resourceId", "stage", "requestId", "requestTimeEpoch",
+                "identity", "resourcePath", "httpMethod", "apiId", "path"] {
+        assert!(ctx.get(key).is_some(), "requestContext missing {key:?} (spec D5-1)");
+    }
+    let stage = ctx["stage"].as_str().expect("stage is a string");
+    let path = v["path"].as_str().expect("path is a string");
+    assert_eq!(
+        ctx["path"].as_str().unwrap(),
+        format!("/{stage}{path}"),
+        "requestContext.path must equal /<stage><path> (spec D5-2 correlated-field check)"
+    );
+    assert_eq!(v["httpMethod"], ctx["httpMethod"], "method must agree in both places (D5-2)");
+    assert_eq!(v["resource"], ctx["resourcePath"], "resource must agree in both places (D5-2)");
+    raw.to_string()
+}
+
+/// The predicate must also earn its red (spec AC4): a fixture missing multiValueHeaders
+/// and carrying an inconsistent requestContext.path must be rejected loudly.
+#[test]
+#[should_panic(expected = "fixture missing production key")]
+fn degenerate_fixture_fails_the_loader_predicate() {
+    load_v1_fixture(include_str!("fixtures/apigw_v1_degenerate.json"));
+}
 
 fn test_router(store: Arc<dynamo::Store>) -> axum::Router {
     router(store, Arc::new(NoInvoker), None, "https://bendobundles.com".into())
@@ -444,7 +514,7 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn v1_translation_derives_stageless_path_and_falls_back() {
     init_stage_env();
-    let req = lambda_http::request::from_str(include_str!("fixtures/apigw_v1_fallback.json"))
+    let req = lambda_http::request::from_str(&load_v1_fixture(include_str!("fixtures/apigw_v1_fallback.json")))
         .expect("v1 fixture must translate");
     assert_eq!(req.uri().path(), "/api/definitely/no/such/route", "stage must not be prepended");
     let resp = test_router(fake_store().await).oneshot(req).await.unwrap();
@@ -459,7 +529,7 @@ async fn v1_translation_derives_stageless_path_and_falls_back() {
 async fn v1_translation_reaches_link_route_with_unknown_token() {
     init_stage_env();
     let Some(store) = store_or_skip("link-unknown").await else { return };
-    let req = lambda_http::request::from_str(include_str!("fixtures/apigw_v1_link_unknown.json"))
+    let req = lambda_http::request::from_str(&load_v1_fixture(include_str!("fixtures/apigw_v1_link_unknown.json")))
         .expect("v1 fixture must translate");
     assert_eq!(req.uri().path(), "/api/l/definitely-not-a-token");
     let resp = test_router(store).oneshot(req).await.unwrap();
@@ -474,7 +544,7 @@ async fn v1_translation_reaches_link_route_with_unknown_token() {
 #[tokio::test]
 async fn v1_translation_preserves_multi_value_query() {
     init_stage_env();
-    let req = lambda_http::request::from_str(include_str!("fixtures/apigw_v1_multi_value_query.json"))
+    let req = lambda_http::request::from_str(&load_v1_fixture(include_str!("fixtures/apigw_v1_multi_value_query.json")))
         .expect("v1 fixture must translate");
     let qs = req.query_string_parameters();
     assert_eq!(qs.all("a").expect("a present"), vec!["1", "2"]);
@@ -482,6 +552,10 @@ async fn v1_translation_preserves_multi_value_query() {
     let query = req.uri().query().expect("query must be reconstructed");
     assert!(query.contains("a=1") && query.contains("a=2") && query.contains("b=3"),
         "reconstructed URI must carry every value: got {query}");
+    // Deliberately NOT asserted: parameter ORDER in the reconstructed URI (map-backed,
+    // not part of the property) — recorded as asserted-not-pinned in spec AC1.
+    // NOTE: qs.all()'s exact return type may need a deref nudge vs the vec![] literal —
+    // fix to what cargo check names; do not weaken to a contains-check.
 }
 
 /// isBase64Encoded body is DECODED by translation (to bytes, non-ASCII intact), and
@@ -492,7 +566,7 @@ async fn v1_translation_preserves_multi_value_query() {
 async fn v1_translation_decodes_base64_body_to_reach_json_extractor() {
     init_stage_env();
     let Some(store) = store_or_skip("b64-thanks").await else { return };
-    let req = lambda_http::request::from_str(include_str!("fixtures/apigw_v1_base64_thanks.json"))
+    let req = lambda_http::request::from_str(&load_v1_fixture(include_str!("fixtures/apigw_v1_base64_thanks.json")))
         .expect("v1 fixture must translate");
     assert_eq!(
         std::str::from_utf8(req.body().as_ref()).expect("decoded body must be the original UTF-8"),
@@ -522,9 +596,36 @@ async fn v2_guard_still_parses_as_v2() {
         other => panic!("v2 fixture parsed as {other:?} — deserializer arm changed"),
     }
 }
+
+/// ALB guard (spec D4, OMBB Q4): the cascade has more arms than v1/v2 — one ALB fixture
+/// pins the fall-through class. Same pair logic as the v2 guard: parses AS ALB, which
+/// simultaneously asserts the v1 arm didn't capture it.
+#[tokio::test]
+async fn alb_guard_still_parses_as_alb() {
+    init_stage_env();
+    let req = lambda_http::request::from_str(include_str!("fixtures/alb_guard.json"))
+        .expect("ALB must remain parseable");
+    assert_eq!(req.uri().path(), "/api/l/x");
+    match req.request_context() {
+        lambda_http::request::RequestContext::Alb(_) => {}
+        other => panic!("ALB fixture parsed as {other:?} — deserializer arm changed"),
+    }
+}
 ```
 
-Implementer notes: (1) exact trait paths (`public_api::Invoker`, `domain::FulfillRequest/Response`) must be read from `crates/public-api/src/lib.rs` and mirrored from `crates/public-api/tests/api_test.rs:105-140`'s `MockInvoker` — copy that mock's shape verbatim; (2) `RequestContext` variant names come from `lambda_http::request` — `cargo check` will name them; (3) if `async_trait` isn't in public-api's dev-deps, reuse whatever api_test.rs uses (it defines mocks, so the pattern exists — do what it does).
+(The two guard fixtures deliberately do NOT go through `load_v1_fixture` — they are not v1
+events and the predicate would rightly reject them; their doc comments say so.)
+
+Implementer notes: (1) the `NoInvoker` impl above IS the verified trait shape (one `gift`
+method, `fulfillment::` types — read from `public-api/src/lib.rs:28-30` during plan review);
+if cargo check disagrees, `public api_test.rs:105-140`'s `MockInvoker` is the tiebreaker —
+mirror it, never invent; (2) `RequestContext` variant names (`ApiGatewayV2`, `Alb`, and the
+v1 variant) come from `lambda_http::request` — `cargo check` will name them exactly;
+(3) `async_trait`: use whatever `public api_test.rs` uses for its mocks — same crate, same
+dev-deps, guaranteed available. (4) **Deliberate deviation from spec D3's first draft
+(recorded per plan review M5):** the multi-value test does not drive the steam-return
+extractor — see the spec's Non-goals for the reasoning; the narrowing is a decision, not
+drift.
 
 - [ ] **Step 3: Local gate**
 
@@ -550,8 +651,11 @@ body decode through the Json extractor, and a v2 discriminator guard." \
 
 - [ ] **Step 5: Watch CI — the new binary must RUN, not just compile**
 
-Run: `cd ~/bendobundles && gh pr checks --watch` then fetch the test job log and confirm the census names the binary:
-`gh run view <run-id> --log | grep -E 'Running.*adapter_test|test result'`
+Run: `cd ~/bendobundles && gh pr checks --watch`, then:
+```bash
+run_id=$(gh run list --branch kitten/ci-truth-adapter -L 1 --json databaseId -q '.[0].databaseId')
+gh run view "$run_id" --log | grep -E 'Running.*(adapter|api)_test|test result'
+```
 Expected: a `Running tests/adapter_test.rs` line for public-api, all its tests listed pass, 0 fail, and the pre-existing suites all present (per-suite counts read from the log, per #185's lesson — never infer from the green check alone).
 
 ---
@@ -591,22 +695,102 @@ async fn without_stage_flag_the_stage_is_prepended_and_routing_breaks() {
         "without the flag, stage IS prepended — this is the world terraform's env var prevents"
     );
 }
+
+/// The stage-ABSENT arm (spec D2, plan-review M4): with no stage in the event
+/// (requestContext.stage null), the path is not prefixed even without the flag —
+/// request.rs's `None => path.into()` branch, otherwise unreachable in these suites.
+#[tokio::test]
+async fn without_stage_in_event_the_path_is_untouched_even_without_flag() {
+    assert!(
+        std::env::var("AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH").is_err(),
+        "control precondition: flag must be ABSENT in this binary"
+    );
+    let req = lambda_http::request::from_str(include_str!("fixtures/apigw_v1_no_stage.json"))
+        .expect("fixture must translate");
+    assert_eq!(req.uri().path(), "/api/l/definitely-not-a-token",
+        "no stage in event ⇒ nothing to prepend, flag or no flag");
+}
 ```
 
-(No router/oneshot needed: the path assertion alone proves the divergence, and a storeless test keeps the control binary trivial. The precondition assert makes the control self-checking — if ambient env ever leaks in, it reports "NOT MEASURED" loudly instead of passing vacuously.)
+`apigw_v1_no_stage.json`: copy `apigw_v1_link_unknown.json`, set `requestContext.stage` to
+`null` and `requestContext.path` equal to the top-level `path` (no stage to prefix). These
+two fixtures do NOT go through `load_v1_fixture` (it lives in the other binary, and the
+no-stage variant intentionally breaks the `/<stage><path>` correlation the predicate
+enforces) — the control binary's fixtures are pinned by their own assertions instead;
+say this in the file header.
 
-- [ ] **Step 2: Local gate + commit + push (throttled: batch with next task's push if < 10 min apart)**
+(No router/oneshot needed: the path assertions alone prove the divergence, and storeless
+tests keep the control binary trivial. The precondition asserts make the controls
+self-checking — if ambient env ever leaks in, they report VOID loudly instead of passing
+vacuously.)
+
+- [ ] **Step 2: Local gate + commit + push**
 
 ```bash
 cd ~/bendobundles && cargo check -p public-api --tests -j 1 \
-  && git add crates/public-api/tests/adapter_stage_control_test.rs \
+  && git add crates/public-api/tests/adapter_stage_control_test.rs crates/public-api/tests/fixtures/apigw_v1_no_stage.json \
   && git commit -S -m "test: env-free control — without the stage flag, translation prepends /live and routing breaks
 
 Same fixture as the flag-set binary, opposite verdict: the pair proves the
-env var is load-bearing rather than decorative (spec D3)."
+env var is load-bearing rather than decorative (spec D2/D3). Plus the
+stage-absent arm: no stage in the event, nothing prepended, flag or no flag." \
+  && git push
 ```
 
 - [ ] **Step 3: CI check as in Task 4 Step 5** — both new binaries must appear in the census.
+
+---
+
+### Task 5b: the presence footgun — `="false"` still strips (spec D2 third binary)
+
+**Files:**
+- Create: `crates/public-api/tests/adapter_stage_false_test.rs`
+
+**Interfaces:**
+- Consumes: `apigw_v1_link_unknown.json` from Task 4 (same fixture, third env world).
+
+**Why its own binary:** the flag check is `env::var(...).is_ok()` — presence, not value
+(verified `request.rs:408`). An operator who "disables" the flag by setting it to `"false"`
+changes nothing, silently. This binary pins that semantic so the surprise has a test with
+its name on it. It needs env = `"false"` process-wide, which neither sibling binary can host.
+
+- [ ] **Step 1: Write it**
+
+```rust
+//! THIRD ENV WORLD (spec D2): AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH set to the string
+//! "false". lambda_http checks PRESENCE (request.rs:408 `env::var(...).is_ok()`), so
+//! "false" still strips the stage — terraform's `= "true"` works by presence, not truth.
+//! If this test ever fails, lambda_http moved to value-semantics and terraform's config
+//! (and both sibling binaries' assumptions) must be re-read.
+
+use std::sync::Once;
+
+static STAGE_ENV: Once = Once::new();
+
+fn init_false_env() {
+    STAGE_ENV.call_once(|| {
+        // SAFETY: same containment contract as adapter_test.rs's init (spec D2).
+        unsafe { std::env::set_var("AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH", "false") }
+    });
+}
+
+#[tokio::test]
+async fn flag_set_to_false_still_strips_the_stage() {
+    init_false_env();
+    let req = lambda_http::request::from_str(include_str!("fixtures/apigw_v1_link_unknown.json"))
+        .expect("fixture must translate");
+    assert_eq!(req.uri().path(), "/api/l/definitely-not-a-token",
+        "the flag is PRESENCE-triggered: \"false\" activates it too");
+}
+```
+
+- [ ] **Step 2: Local gate + commit (batch the push with Task 6's)**
+
+```bash
+cd ~/bendobundles && cargo check -p public-api --tests -j 1 \
+  && git add crates/public-api/tests/adapter_stage_false_test.rs \
+  && git commit -S -m "test: the stage flag is presence-triggered — =\"false\" still strips (spec D2)"
+```
 
 ---
 
@@ -617,8 +801,8 @@ env var is load-bearing rather than decorative (spec D3)."
 - Create: `crates/admin-api/tests/fixtures/apigw_v1_note_with_cookie.json`
 
 **Interfaces:**
-- Consumes: `admin_api::router(store, invoker, admin_hash: String, steam: Option<Arc<SteamClient>>) -> Router` (`crates/admin-api/src/lib.rs:78`); helpers mirrored from `crates/admin-api/tests/api_test.rs`: `store_or_skip` (`:28-56`, reprefix `t-admadp-`), `test_admin_hash` (`:78-88`), `admin_login` (`:138-178`), `MockAdminInvoker` (`:92-125`), `test_link` (near `:341-418` — read it), plus `body_json` (`:129`).
-- Produces: `apigw_v1_login.json` skeleton reused by Task 7.
+- Consumes: `admin_api::router(store, invoker, admin_hash: String, steam: Option<Arc<SteamClient>>) -> Router` (`crates/admin-api/src/lib.rs:78`); helpers mirrored from `crates/admin-api/tests/api_test.rs`: `store_or_skip` (`:28-56`, reprefix `t-admadp-`), `test_admin_hash` (`:78-88`), `admin_login` (`:138-178`), `MockAdminInvoker` (`:92-125`), `test_link` (`:204` — plan review corrected this ref), plus `body_json` (`:129-134`).
+- Produces: `crates/admin-api/tests/adapter_test.rs` (with the mirrored helpers + `init_stage_env`) and `apigw_v1_note_with_cookie.json`; Task 7 appends to this file and creates its own fixture.
 
 **Flow:** mint a real session via direct-router `admin_login` (that half is already covered by api_test.rs — not the subject), then send the note POST **through translation**: fixture carries `Cookie: session=__SESSION__` and `X-Admin-Request: 1` headers; the test substitutes the real session into the JSON string before `from_str`. Assert the note landed (read back through the store or a direct-router GET) — proving the Cookie header and CSRF header both survive translation and satisfy the middleware (`crates/admin-api/src/lib.rs:145-194`).
 
@@ -628,7 +812,12 @@ env var is load-bearing rather than decorative (spec D3)."
 - `"resource": "/admin/api/{proxy+}"`, `"resourcePath": "/admin/api/{proxy+}"`,
 - `"path": "/admin/api/links/fixture-tok/note"`, `"pathParameters": { "proxy": "links/fixture-tok/note" }`,
 - `"httpMethod": "POST"` (both places),
-- headers (mirrored into `multiValueHeaders`): `"Content-Type": "application/json"`, `"Cookie": "session=__SESSION__"`, `"X-Admin-Request": "1"` — read the exact CSRF header name/value the middleware requires from `crates/admin-api/src/lib.rs:160` and `:184` first and use THAT, not this guess,
+- headers — **every one of them mirrored into `multiValueHeaders` too; a real REST event
+  populates both maps, always, and translation merges them (OMBB Q4 / spec D3)**:
+  `"Content-Type": "application/json"`, `"Cookie": "session=__SESSION__"`,
+  `"X-Admin-Request": "1"` — verified in plan review: the middleware const is
+  `ADMIN_REQUEST_HEADER = "x-admin-request"` and only `contains_key` is checked (any value
+  passes; `"1"` is fine); no cookie → 401, cookie-without-header → 403,
 - `"body": "{\"gift_note\":\"from the adapter side\"}"`, `"isBase64Encoded": false`.
 
 - [ ] **Step 2: Test**
@@ -680,7 +869,11 @@ async fn v1_translation_carries_session_cookie_and_csrf_header() {
 }
 ```
 
-Implementer notes: `test_link`'s exact shape and `Link.gift_note`'s field name must be read from api_test.rs / `crates/domain/src/lib.rs` — if the field differs (e.g. accessor method), assert through whatever api_test.rs's own note tests assert through (find them: `grep -n 'note' crates/admin-api/tests/api_test.rs`). The 200-vs-401 distinction is the test's teeth: sabotage in Task 8 strips the Cookie from the fixture and must produce 401, observed red.
+Implementer notes: verified in plan review — `test_link` at api_test.rs:204,
+`Link.gift_note` exists (`domain/src/lib.rs:181`), success response is 200 `{"ok":true}`,
+`store.create_link(&Link)` exists. The code block omits `use` statements — take them from
+api_test.rs's own imports (same crate). The 200-vs-401 distinction is the test's teeth:
+sabotage in Task 8 strips the Cookie from BOTH header maps and must produce 401, observed red.
 
 - [ ] **Step 3: Local gate + commit**
 
@@ -707,7 +900,12 @@ cd ~/bendobundles && cargo check -p admin-api --tests -j 1 && cargo clippy -p ad
 
 - [ ] **Step 1: Fixture**
 
-`apigw_v1_login.json` — the v1 skeleton with `"path": "/admin/api/login"`, `"pathParameters": { "proxy": "login" }`, `"httpMethod": "POST"`, `Content-Type: application/json` header, `"body": "{\"password\":\"pw\"}"`, `"isBase64Encoded": false`.
+`apigw_v1_login.json` — the v1 skeleton with `"resource": "/admin/api/{proxy+}"` and
+`requestContext.resourcePath` matching (the admin shape — plan review caught the public
+skeleton's `/api/{proxy+}` leaking in here), `"path": "/admin/api/login"`,
+`"pathParameters": { "proxy": "login" }`, `"httpMethod": "POST"` (both places),
+`Content-Type: application/json` in both header maps, `"body": "{\"password\":\"pw\"}"`,
+`"isBase64Encoded": false`.
 
 - [ ] **Step 2: Test (append to adapter_test.rs)**
 
@@ -727,6 +925,11 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
     let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
     let hash = test_admin_hash("pw");
 
+    // lambda_runtime is NOT a dependency of admin-api and must not become one —
+    // lambda_http RE-EXPORTS it (lambda_http-1.3.0/src/lib.rs:77: `pub use
+    // lambda_runtime::{self, Context, LambdaEvent}`), which is the only sanctioned path
+    // here (plan-review M3).
+    use lambda_http::lambda_runtime;
     let payload: lambda_http::request::LambdaRequest =
         serde_json::from_str(include_str!("fixtures/apigw_v1_login.json"))
             .expect("fixture must deserialize as a LambdaRequest");
@@ -748,6 +951,7 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
         json["cookies"].is_null(),
         "v1 must NOT hoist cookies into a v2-style cookies array"
     );
+    assert_eq!(json["isBase64Encoded"], false, "a JSON body must not be base64-flagged (spec G2)");
 }
 ```
 
@@ -773,12 +977,27 @@ cd ~/bendobundles && cargo check -p admin-api --tests -j 1 \
 
 - [ ] **Step 1: The sabotage commit**
 
-In one commit, make each family wrong in the way its test claims to detect:
-- `apigw_v1_fallback.json` + `apigw_v1_link_unknown.json`: change `"stage": "live"` → `"stage": "sabotage"` AND path `/api/l/definitely-not-a-token` → `/api/x/definitely-not-a-token` (path tests must fail on path, not luck).
-- `apigw_v1_multi_value_query.json`: drop `"a": ["1", "2"]` to `["2"]`.
-- `apigw_v1_base64_thanks.json`: set `"isBase64Encoded": false` (body stays base64 text → Json extractor must refuse → the unknown-link assertion fails).
-- `apigw_v2_guard.json`: change `"version": "2.0"` to `"version": "1.0"` (guard must detect arm change).
-- `apigw_v1_note_with_cookie.json`: delete the `Cookie` header entirely (expect 401, so the 200 assertion fails).
+Two of this plan's original recipes were themselves no-ops, caught in plan review (a stage
+edit that a presence-flag binary ignores BY DESIGN; a `version` edit that `#[serde(default)]`
+swallows). The recipes below are the corrected set. In ONE commit:
+
+| # | File (edit) | Expected red — test, binary, and the SPECIFIC assertion |
+|---|---|---|
+| 1 | `apigw_v1_fallback.json`: path `/api/definitely/no/such/route` → `/api/l/x` (+ keep `pathParameters.proxy` and `requestContext.path` consistent — the loader predicate must PASS; we sabotage the property, not the parse) | `v1_translation_derives_stageless_path_and_falls_back` (public adapter_test): now MATCHES a route → fake store errors → 500 ≠ 404 status assert, or unknown-link body ≠ fallback body assert. Either message is the test's own. |
+| 2 | `apigw_v1_link_unknown.json`: path `/api/l/definitely-not-a-token` → `/api/x/definitely-not-a-token` (+ consistent `pathParameters`/`requestContext.path`) | THREE tests, one edit: `v1_translation_reaches_link_route_with_unknown_token` (public adapter_test — fallback body ≠ unknown-link assert); `without_stage_flag_the_stage_is_prepended_and_routing_breaks` (control binary — `/live/api/x/...` ≠ expected `/live/api/l/...`); `flag_set_to_false_still_strips_the_stage` (false binary — `/api/x/...` ≠ `/api/l/...`). The cross-binary fan-out is DELIBERATE — the census reader must expect all three lines. |
+| 3 | `apigw_v1_multi_value_query.json`: `"a": ["1","2"]` → `["2"]` (and single-value map stays `"a":"2"` — consistent) | `v1_translation_preserves_multi_value_query` (public adapter_test): `qs.all("a")` equality assert fires. |
+| 4 | `apigw_v1_base64_thanks.json`: `"isBase64Encoded": true` → `false` | `v1_translation_decodes_base64_body_to_reach_json_extractor` (public adapter_test): the decoded-bytes `from_utf8`/equality assert fires FIRST (body is still base64 text) — that exact message is the expected line. |
+| 5 | `apigw_v2_guard.json`: add top-level `"httpMethod": "GET"` (Lilith's measured recipe — the v1 arm requires top-level `httpMethod` + a parseable `requestContext`, and v1 is tried FIRST; the v2 fixture's own `requestContext` may satisfy v1's all-optional context, flipping capture to v1) | `v2_guard_still_parses_as_v2`: the variant match panics with "parsed as ... deserializer arm changed". **If it stays green**, the cascade did NOT capture it as v1 — escalate the sabotage to also replacing `requestContext` with the v1 fixture's (then the fixture is v1-shaped and MUST capture); diagnose per the stop-rule, don't guess. |
+| 6 | `alb_guard.json`: delete its `requestContext` (ALB's ELB marker lives there; without it no arm matches and `pass_through` is off) | `alb_guard_still_parses_as_alb`: `from_str` errors → the `expect("ALB must remain parseable")` fires. |
+| 7 | `apigw_v1_note_with_cookie.json`: delete the `Cookie` entry from **BOTH** `headers` AND `multiValueHeaders` (translation merges the maps — deleting one is a no-op) | `v1_translation_carries_session_cookie_and_csrf_header` (admin adapter_test): the `headers().get("cookie")` expect, or the 200 status assert (observed 401). Record whichever fires — both are the test's own teeth. |
+| 8 | `apigw_v1_login.json`: body `{"password":"pw"}` → `{"password":"wrong"}` | `v1_response_translation_puts_set_cookie_in_multi_value_headers` (admin adapter_test): login 401 mints no Set-Cookie → the `multiValueHeaders["set-cookie"]` extraction expect fires — the property assertion itself, input-side form (spec D6). |
+
+NOT sabotaged, with reasons stated in the PR table: Task 2's dynamo test (race is
+nondeterministic; excused in its own commit message) · `degenerate_fixture_fails_the_loader_predicate`
+(it IS a permanent red-exercise — its sabotage is its normal operation) ·
+`without_stage_in_event_the_path_is_untouched_even_without_flag` (edit #2 does not touch its
+fixture; its property is the `None` branch, pinned by the no-stage fixture's own assert —
+demoted to asserted-not-sabotaged, per spec AC1's honesty clause).
 
 ```bash
 cd ~/bendobundles \
@@ -787,10 +1006,28 @@ cd ~/bendobundles \
   && git push
 ```
 
+- [ ] **Step 1b: Prove every sabotage LANDED before reading any result (spec D6 item 2)**
+
+```bash
+cd ~/bendobundles && git show --stat HEAD && git show HEAD -- crates/ | grep -E '^[+-]' | grep -vE '^[+-]{3}'
+```
+Expected: exactly the 8 files above, and every changed line is one of the named edits — a
+mis-aimed edit that matched nothing leaves a test green for a reason that is NOT vacuity.
+Paste this diff into the evidence table alongside the failures.
+
 - [ ] **Step 2: Read the red census from the CI log**
 
-Run: `gh pr checks --watch` (expect the test job RED), then pull the log and verify EVERY sabotaged test appears as FAILED, each with an assertion message matching its dimension (path, multi-value, base64, discriminator, cookie). Record the run URL + the per-test failure list — it goes in the PR body as the D6 evidence table.
-Expected: ≥6 named failures across 3 adapter binaries in ONE run — the `--no-fail-fast` census working as designed. If any sabotaged test still PASSES, that test is vacuous: STOP, fix the test (not the sabotage), re-run this task for that test.
+Run: `gh pr checks --watch` (expect the test job RED), then pull the log (run-id command from
+Task 4 Step 5) and verify BOTH DIRECTIONS: **every test in the expected-red column above
+appears FAILED with its named assertion message** (10 failure lines across 4 adapter
+binaries: 5 public adapter_test + 1 control + 1 false-binary + 2 admin + the #2 fan-out's
+third line), **and no test outside the column went red** (a stranger's red means a sabotage
+landed somewhere it shouldn't — diagnose before proceeding). Record the run URL + the
+per-test failure list with messages — it goes in the PR body as the D6 evidence table.
+**Stop-rule (softened per plan review — my own first draft had two no-op recipes):** if a
+listed test stays GREEN, diagnose **which of test/sabotage is broken** — a green under
+sabotage has two causes and only one of them means the test is vacuous. Fix whichever is
+actually at fault, document which it was, re-run this step for that family.
 
 - [ ] **Step 3: Revert**
 
@@ -822,14 +1059,37 @@ EOF
 
 - [ ] **Step 2: comment on #186 with the correction** (v2 → v1, terraform receipts, spec link) — so the issue record carries it even after autoclose.
 
-- [ ] **Step 3: #168 per the family verdict (spec Q3)**
+- [ ] **Step 3: close #168 (verdict FINAL — family answered Q3, spec rev 2)**
 
-If family agreed close-on-hardening: comment with the measured inventory (no set_var; the two mechanisms; commits), state plainly "probable-mechanism hardening, NOT a reproduced diagnosis", give reopen-on-captured-output instructions, close. If family said keep open: post the same comment, leave open, add to the PR body that #168 remains open pending reproduction.
+Comment and close. The comment must contain, in this order: (1) the measured inventory (zero
+`set_var` in `crates/`; mechanism a = waiter-less delete→create on the shared dynamodb-local;
+mechanism b = two uuid-per-call sites ≈19+ tables/run) with the hardening commit SHAs;
+(2) this exact claim, verbatim: **"not reproduced; two real defects found by inspection and
+hardened; reopen on captured output"**; (3) reopen instructions: capture the failing test
+name + full assertion output + run id BEFORE re-running, then reopen with that attached.
+The close must never read as a diagnosis — "probable mechanism" appears only wearing the
+word *probable*.
 
 ---
 
-## Self-review notes (run before handing to implementation-plan-review)
+## Self-review notes (rev 2 — after cold plan review + family review, all integrated)
 
-- Spec coverage: G1→Tasks 4-6, G2→Task 7, G3→Task 1, G4→Tasks 2-3+9, D4→Task 4 (v2 guard), D6→Task 8, AC6→Global Constraints (separate binaries, distinct prefixes). Q1/Q2/Q3 answers from family review get folded in before execution; the plan encodes the spec's stated leans.
-- Types: `router` signatures copied from source (`public-api lib.rs:162`, `admin-api lib.rs:78`); mocks explicitly mirrored from api_test.rs rather than invented; every "the SDK will name it" spot is marked as a cargo-check-resolved step, never silent.
-- The one deliberate deviation from strict TDD: behavioral RED cannot precede implementation locally (no linker); Task 8's batched sabotage census is the compensating control, and each test's red is still observed before the PR claims coverage.
+- Spec coverage: G1→Tasks 4-6, G2→Task 7, G3→Task 1, G4→Tasks 2-3+9, D2→Tasks 4/5/5b (three
+  env worlds), D4→Task 4 (v2 + ALB guards), D5→Task 4's `load_v1_fixture` + degenerate red
+  (AC4), D6→Task 8 (landed-proof, per-property, bidirectional census, response-side included),
+  AC6/7→Global Constraints. Q1/Q2/Q3 are ANSWERED and folded — no task branches on an open
+  question.
+- Plan-review disposition: B1 (tokio dep) → Task 2 Step 1b + Global Constraints exception;
+  B2/B3 (no-op sabotages) → Task 8's corrected table + softened stop-rule; M1 (Invoker
+  shape) → verified `gift`/fulfillment types in Task 4; M2 (base64 constant) → corrected with
+  the byte-level reason; M3 (lambda_runtime path) → lambda_http re-export named in Task 7;
+  M4 (stage-absent arm) → Task 5's no-stage fixture; M5 (multi-value narrowing) → recorded in
+  spec Non-goals + Task 4 note; M6 (response-side red) → Task 8 row 8; M7 (Task 3
+  placeholders) → real signatures, caller counts, verbatim-name rule. Minors: line refs
+  corrected (`test_link:204`, store_test `store_or_skip:30` returns bare `Store`), run-id
+  command supplied, pushes added, admin fixture resource shape fixed, isBase64Encoded assert
+  added, PyYAML fallback named.
+- The one deliberate deviation from strict TDD: behavioral RED cannot precede implementation
+  locally (no linker — measured 2026-08-07, ≥1638M to link); Task 8's batched sabotage census
+  is the compensating control, and each test's red is still observed (or its exclusion
+  recorded) before the PR claims coverage.
