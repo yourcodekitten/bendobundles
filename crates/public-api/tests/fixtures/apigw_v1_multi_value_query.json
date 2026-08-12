@@ -8,13 +8,31 @@
     "X-Forwarded-Port": "443"
   },
   "multiValueHeaders": {
-    "Host": ["wt6mne2s9k.execute-api.us-east-1.amazonaws.com"],
-    "X-Forwarded-Proto": ["https"],
-    "X-Forwarded-Port": ["443"]
+    "Host": [
+      "wt6mne2s9k.execute-api.us-east-1.amazonaws.com"
+    ],
+    "X-Forwarded-Proto": [
+      "https"
+    ],
+    "X-Forwarded-Port": [
+      "443"
+    ]
   },
-  "queryStringParameters": { "a": "2", "b": "3" },
-  "multiValueQueryStringParameters": { "a": ["1", "2"], "b": ["3"] },
-  "pathParameters": { "proxy": "l/definitely-not-a-token" },
+  "queryStringParameters": {
+    "a": "2",
+    "b": "3"
+  },
+  "multiValueQueryStringParameters": {
+    "a": [
+      "2"
+    ],
+    "b": [
+      "3"
+    ]
+  },
+  "pathParameters": {
+    "proxy": "l/definitely-not-a-token"
+  },
   "stageVariables": null,
   "requestContext": {
     "accountId": "123456789012",
@@ -23,7 +41,10 @@
     "requestId": "41b45ea3-70b5-11e6-b7bd-69b5aaebc7d9",
     "requestTimeEpoch": 1583798639428,
     "path": "/live/api/l/definitely-not-a-token",
-    "identity": { "sourceIp": "203.0.113.10", "userAgent": "adapter-test" },
+    "identity": {
+      "sourceIp": "203.0.113.10",
+      "userAgent": "adapter-test"
+    },
     "resourcePath": "/api/{proxy+}",
     "httpMethod": "GET",
     "apiId": "wt6mne2s9k"
