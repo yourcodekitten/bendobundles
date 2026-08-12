@@ -7,6 +7,14 @@
     "X-Forwarded-Proto": "https",
     "X-Forwarded-Port": "443"
   },
+  "multiValueHeaders": {
+    "Host": [
+      "wt6mne2s9k.execute-api.us-east-1.amazonaws.com"
+    ],
+    "X-Forwarded-Proto": [
+      "https"
+    ]
+  },
   "queryStringParameters": null,
   "multiValueQueryStringParameters": null,
   "pathParameters": {

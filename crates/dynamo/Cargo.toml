@@ -15,13 +15,17 @@ serde_json.workspace = true
 steam-client = { path = "../steam-client" }
 thiserror.workspace = true
 time.workspace = true
-# create_table_for_tests' ACTIVE waiter sleeps between polls (#168 mechanism a). The
-# `time` feature is declared here explicitly rather than trusted to transitive
-# unification; weight-free at runtime — every consumer binary already carries tokio.
-tokio = { workspace = true, features = ["time"] }
+# create_table_for_tests' ACTIVE waiter sleeps between polls (#168 mechanism a).
+# OPTIONAL, activated only by the test-util feature — so tokio (and the table-deleting
+# helper it serves) never enters a production lambda build at all (review pass 2, F2).
+# The `time` feature is declared explicitly rather than trusted to transitive unification.
+tokio = { workspace = true, features = ["time"], optional = true }
 
 [dev-dependencies]
 aws-config = { version = "1", features = ["behavior-version-latest", "test-util"] }
+# Self-dev-dep: enables test-util for THIS crate's own integration tests (the standard
+# pattern for feature-gated test support; `cargo test -p dynamo` alone stays green).
+dynamo = { path = ".", features = ["test-util"] }
 # iam_capture.rs only: request-shape interceptor (#70). Both are already in the tree as
 # transitive deps of the SDK; pinning "1" keeps them lockstep with aws-sdk-dynamodb.
 aws-smithy-runtime-api = "1"
@@ -34,3 +38,7 @@ uuid.workspace = true
 # Gates delete_game — compiled ONLY for the heal_choice_pairs operator bin, never the
 # lambda build, so "the sync path never deletes" is a compiler guarantee (spec Q5).
 heal = []
+# Gates create_table_for_tests (a pub table-DELETING helper) out of production builds —
+# same compiler-guarantee pattern as `heal`; enabled only from consumers'
+# [dev-dependencies], so cargo-lambda release builds never contain it (review pass 2, F2).
+test-util = ["dep:tokio"]

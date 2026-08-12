@@ -93,7 +93,46 @@ fn load_v1_fixture(raw: &'static str) -> String {
         v["resource"], ctx["resourcePath"],
         "resource must agree in both places (D5-2)"
     );
+    // Dual-map correlations — the highest-risk pairs by the spec's own argument:
+    // production sends both maps, translation MERGES headers and PREFERS the mv query
+    // map, so a hand edit to only one map is invisible to every downstream test.
+    // Single-map value = LAST multi-map element (API GW's convention). Review pass 2, F1.
+    assert_dual_maps(&v["headers"], &v["multiValueHeaders"], "headers");
+    assert_dual_maps(
+        &v["queryStringParameters"],
+        &v["multiValueQueryStringParameters"],
+        "query",
+    );
     raw.to_string()
+}
+
+/// D5's dual-map law: both present or both null; every single-map key in the multi map
+/// with last element equal to the single value; every multi-map key in the single map.
+fn assert_dual_maps(single: &serde_json::Value, multi: &serde_json::Value, what: &str) {
+    match (single.as_object(), multi.as_object()) {
+        (None, None) => {} // both null — legal (e.g. no query string)
+        (Some(s), Some(m)) => {
+            for (k, v) in s {
+                let arr = m.get(k).and_then(|x| x.as_array()).unwrap_or_else(|| {
+                    panic!("{what}: single-map key {k:?} missing from the multi map (D5 dual-map)")
+                });
+                assert_eq!(
+                    arr.last().unwrap_or(&serde_json::Value::Null),
+                    v,
+                    "{what}: multi-map last element for {k:?} must equal the single-map value (D5 dual-map)"
+                );
+            }
+            for k in m.keys() {
+                assert!(
+                    s.contains_key(k),
+                    "{what}: multi-map key {k:?} missing from the single map (D5 dual-map)"
+                );
+            }
+        }
+        _ => {
+            panic!("{what}: single and multi maps must be both present or both null (D5 dual-map)")
+        }
+    }
 }
 
 /// Mirror of api_test.rs::store_or_skip with prefix `t-admadp-` (stated delta).
@@ -332,5 +371,14 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
     assert_eq!(
         json["isBase64Encoded"], false,
         "a JSON body must not be base64-flagged (spec G2)"
+    );
+    // v1 puts ALL headers in multiValueHeaders and leaves `headers` empty
+    // (response.rs:85-88) — asserted, not just claimed (review pass 2, F5).
+    assert!(
+        json["headers"]
+            .as_object()
+            .is_none_or(serde_json::Map::is_empty),
+        "v1 response must leave the single-value headers map empty: {:?}",
+        json["headers"]
     );
 }

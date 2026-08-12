@@ -2898,6 +2898,11 @@ impl Store {
     /// mechanism a): under `--workspace` parallelism against one shared dynamodb-local,
     /// returning early let a caller's first GSI query race table creation, and the old
     /// fire-and-forget delete let the create land mid-DELETING.
+    ///
+    /// Feature-gated behind `test-util` (same compiler-guarantee pattern as `heal`):
+    /// a pub table-deleting helper has no business existing in a production lambda
+    /// binary, and "test-only" enforced by prose is not enforced (review pass 2, F2).
+    #[cfg(feature = "test-util")]
     pub async fn create_table_for_tests(&self) -> Result<(), StoreError> {
         let attr = |name: &str| {
             AttributeDefinition::builder()
@@ -2973,23 +2978,40 @@ impl Store {
         // Wait for ACTIVE — table AND both GSIs. Returning before ACTIVE lets the
         // caller's first GSI query race table creation. Bounded: a table that isn't
         // ACTIVE in 30s is a broken environment, and hanging forever would hide it.
+        // Transient describe errors RETRY until the deadline instead of propagating —
+        // a de-flaking helper that polls ~300×/table must not add its own flake
+        // surface (review pass 2, F4).
         loop {
-            let desc = self
+            let table_state = match self
                 .client
                 .describe_table()
                 .table_name(&self.table)
                 .send()
                 .await
-                .map_err(|e| StoreError::Aws(format!("{e:?}")))?;
-            let table = desc
-                .table()
-                .ok_or_else(|| StoreError::Aws("describe_table returned no table".into()))?;
+            {
+                Ok(desc) => desc.table().cloned(),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(e) => return Err(StoreError::Aws(format!("{e:?}"))),
+            };
+            let Some(table) = table_state else {
+                if std::time::Instant::now() >= deadline {
+                    return Err(StoreError::Aws("describe_table returned no table".into()));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            };
             let table_active =
                 table.table_status() == Some(&aws_sdk_dynamodb::types::TableStatus::Active);
-            let gsis_active = table
-                .global_secondary_indexes()
-                .iter()
-                .all(|g| g.index_status() == Some(&aws_sdk_dynamodb::types::IndexStatus::Active));
+            // len == 2, not just all-ACTIVE: `.all()` on an empty list is vacuously true,
+            // and this function itself just requested exactly two GSIs (review pass 2, F4).
+            let gsis = table.global_secondary_indexes();
+            let gsis_active = gsis.len() == 2
+                && gsis.iter().all(|g| {
+                    g.index_status() == Some(&aws_sdk_dynamodb::types::IndexStatus::Active)
+                });
             if table_active && gsis_active {
                 return Ok(());
             }

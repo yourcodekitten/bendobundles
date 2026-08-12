@@ -99,14 +99,59 @@ fn load_v1_fixture(raw: &'static str) -> String {
         v["resource"], ctx["resourcePath"],
         "resource must agree in both places (D5-2)"
     );
+    // Dual-map correlations — the highest-risk pairs by the spec's own argument:
+    // production sends both maps, translation MERGES headers and PREFERS the mv query
+    // map, so a hand edit to only one map is invisible to every downstream test.
+    // Single-map value = LAST multi-map element (API GW's convention). Review pass 2, F1.
+    assert_dual_maps(&v["headers"], &v["multiValueHeaders"], "headers");
+    assert_dual_maps(
+        &v["queryStringParameters"],
+        &v["multiValueQueryStringParameters"],
+        "query",
+    );
     raw.to_string()
+}
+
+/// D5's dual-map law: both present or both null; every single-map key in the multi map
+/// with last element equal to the single value; every multi-map key in the single map.
+fn assert_dual_maps(single: &serde_json::Value, multi: &serde_json::Value, what: &str) {
+    match (single.as_object(), multi.as_object()) {
+        (None, None) => {} // both null — legal (e.g. no query string)
+        (Some(s), Some(m)) => {
+            for (k, v) in s {
+                let arr = m.get(k).and_then(|x| x.as_array()).unwrap_or_else(|| {
+                    panic!("{what}: single-map key {k:?} missing from the multi map (D5 dual-map)")
+                });
+                assert_eq!(
+                    arr.last().unwrap_or(&serde_json::Value::Null),
+                    v,
+                    "{what}: multi-map last element for {k:?} must equal the single-map value (D5 dual-map)"
+                );
+            }
+            for k in m.keys() {
+                assert!(
+                    s.contains_key(k),
+                    "{what}: multi-map key {k:?} missing from the single map (D5 dual-map)"
+                );
+            }
+        }
+        _ => {
+            panic!("{what}: single and multi maps must be both present or both null (D5 dual-map)")
+        }
+    }
 }
 
 /// The predicate must earn its red PER ARM (spec AC4; one planted defect per copy —
 /// a both-defects fixture proves only whichever arm panics first, masking the other).
+/// Each opens with init_stage_env() even though the predicate never reads the flag:
+/// these tests panic BY DESIGN, and std's panic machinery lazily getenv()s
+/// RUST_BACKTRACE on the first panic — ungated, that read can race the Once's
+/// setenv on another thread, the precise UB edition-2024 set_var warns about
+/// (review pass 2, F3).
 #[test]
 #[should_panic(expected = "fixture missing production key")]
 fn degenerate_missing_key_fails_the_keyset_arm() {
+    init_stage_env();
     load_v1_fixture(include_str!(
         "fixtures/apigw_v1_degenerate_missing_key.json"
     ));
@@ -115,8 +160,27 @@ fn degenerate_missing_key_fails_the_keyset_arm() {
 #[test]
 #[should_panic(expected = "requestContext.path must equal")]
 fn degenerate_inconsistent_path_fails_the_correlation_arm() {
+    init_stage_env();
     load_v1_fixture(include_str!(
         "fixtures/apigw_v1_degenerate_inconsistent.json"
+    ));
+}
+
+#[test]
+#[should_panic(expected = "missing from the multi map")]
+fn degenerate_header_map_drift_fails_the_dual_map_arm() {
+    init_stage_env();
+    load_v1_fixture(include_str!(
+        "fixtures/apigw_v1_degenerate_header_drift.json"
+    ));
+}
+
+#[test]
+#[should_panic(expected = "must equal the single-map value")]
+fn degenerate_query_map_drift_fails_the_dual_map_arm() {
+    init_stage_env();
+    load_v1_fixture(include_str!(
+        "fixtures/apigw_v1_degenerate_query_drift.json"
     ));
 }
 
