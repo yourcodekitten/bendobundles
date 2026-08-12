@@ -73,7 +73,10 @@ fn load_v1_fixture(raw: &'static str) -> String {
         "apiId",
         "path",
     ] {
-        assert!(ctx.get(key).is_some(), "requestContext missing {key:?} (spec D5-1)");
+        assert!(
+            ctx.get(key).is_some(),
+            "requestContext missing {key:?} (spec D5-1)"
+        );
     }
     let stage = ctx["stage"].as_str().expect("stage is a string");
     let path = v["path"].as_str().expect("path is a string");
@@ -82,8 +85,14 @@ fn load_v1_fixture(raw: &'static str) -> String {
         format!("/{stage}{path}"),
         "requestContext.path must equal /<stage><path> (spec D5-2 correlated-field check)"
     );
-    assert_eq!(v["httpMethod"], ctx["httpMethod"], "method must agree in both places (D5-2)");
-    assert_eq!(v["resource"], ctx["resourcePath"], "resource must agree in both places (D5-2)");
+    assert_eq!(
+        v["httpMethod"], ctx["httpMethod"],
+        "method must agree in both places (D5-2)"
+    );
+    assert_eq!(
+        v["resource"], ctx["resourcePath"],
+        "resource must agree in both places (D5-2)"
+    );
     raw.to_string()
 }
 
@@ -230,7 +239,9 @@ fn test_link(token: &str) -> Link {
 #[tokio::test]
 async fn v1_translation_carries_session_cookie_and_csrf_header() {
     init_stage_env();
-    let Some(store) = store_or_skip("note-cookie").await else { return };
+    let Some(store) = store_or_skip("note-cookie").await else {
+        return;
+    };
     let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
     let hash = test_admin_hash("pw");
     store.create_link(&test_link("fixture-tok")).await.unwrap();
@@ -283,7 +294,9 @@ async fn v1_translation_carries_session_cookie_and_csrf_header() {
 #[tokio::test]
 async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
     init_stage_env();
-    let Some(store) = store_or_skip("resp-cookie").await else { return };
+    let Some(store) = store_or_skip("resp-cookie").await else {
+        return;
+    };
     let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
     let hash = test_admin_hash("pw");
 
@@ -291,13 +304,17 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
     // lambda_http RE-EXPORTS it (lambda_http-1.3.0/src/lib.rs:77), the only
     // sanctioned path here (plan-review M3).
     use lambda_http::lambda_runtime;
-    let payload: lambda_http::request::LambdaRequest =
-        serde_json::from_str(&load_v1_fixture(include_str!("fixtures/apigw_v1_login.json")))
-            .expect("fixture must deserialize as a LambdaRequest");
+    let payload: lambda_http::request::LambdaRequest = serde_json::from_str(&load_v1_fixture(
+        include_str!("fixtures/apigw_v1_login.json"),
+    ))
+    .expect("fixture must deserialize as a LambdaRequest");
     let event = lambda_runtime::LambdaEvent::new(payload, lambda_runtime::Context::default());
 
     let adapter = lambda_http::Adapter::from(router(store, invoker, hash, None));
-    let resp = adapter.oneshot(event).await.expect("adapter must produce a response");
+    let resp = adapter
+        .oneshot(event)
+        .await
+        .expect("adapter must produce a response");
 
     let json = serde_json::to_value(&resp).expect("LambdaResponse must serialize");
     assert_eq!(json["statusCode"], 200);
@@ -312,5 +329,8 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
         json["cookies"].is_null(),
         "v1 must NOT hoist cookies into a v2-style cookies array"
     );
-    assert_eq!(json["isBase64Encoded"], false, "a JSON body must not be base64-flagged (spec G2)");
+    assert_eq!(
+        json["isBase64Encoded"], false,
+        "a JSON body must not be base64-flagged (spec G2)"
+    );
 }

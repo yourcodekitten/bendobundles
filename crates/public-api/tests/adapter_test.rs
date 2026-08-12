@@ -79,7 +79,10 @@ fn load_v1_fixture(raw: &'static str) -> String {
         "apiId",
         "path",
     ] {
-        assert!(ctx.get(key).is_some(), "requestContext missing {key:?} (spec D5-1)");
+        assert!(
+            ctx.get(key).is_some(),
+            "requestContext missing {key:?} (spec D5-1)"
+        );
     }
     let stage = ctx["stage"].as_str().expect("stage is a string");
     let path = v["path"].as_str().expect("path is a string");
@@ -88,8 +91,14 @@ fn load_v1_fixture(raw: &'static str) -> String {
         format!("/{stage}{path}"),
         "requestContext.path must equal /<stage><path> (spec D5-2 correlated-field check)"
     );
-    assert_eq!(v["httpMethod"], ctx["httpMethod"], "method must agree in both places (D5-2)");
-    assert_eq!(v["resource"], ctx["resourcePath"], "resource must agree in both places (D5-2)");
+    assert_eq!(
+        v["httpMethod"], ctx["httpMethod"],
+        "method must agree in both places (D5-2)"
+    );
+    assert_eq!(
+        v["resource"], ctx["resourcePath"],
+        "resource must agree in both places (D5-2)"
+    );
     raw.to_string()
 }
 
@@ -98,13 +107,17 @@ fn load_v1_fixture(raw: &'static str) -> String {
 #[test]
 #[should_panic(expected = "fixture missing production key")]
 fn degenerate_missing_key_fails_the_keyset_arm() {
-    load_v1_fixture(include_str!("fixtures/apigw_v1_degenerate_missing_key.json"));
+    load_v1_fixture(include_str!(
+        "fixtures/apigw_v1_degenerate_missing_key.json"
+    ));
 }
 
 #[test]
 #[should_panic(expected = "requestContext.path must equal")]
 fn degenerate_inconsistent_path_fails_the_correlation_arm() {
-    load_v1_fixture(include_str!("fixtures/apigw_v1_degenerate_inconsistent.json"));
+    load_v1_fixture(include_str!(
+        "fixtures/apigw_v1_degenerate_inconsistent.json"
+    ));
 }
 
 /// Same store idiom as api_test.rs::store_or_skip, but prefix `t-pubadp-` — this
@@ -145,7 +158,10 @@ async fn fake_store() -> Arc<dynamo::Store> {
         .test_credentials()
         .load()
         .await;
-    Arc::new(dynamo::Store::new(aws_sdk_dynamodb::Client::new(&cfg), "fake".into()))
+    Arc::new(dynamo::Store::new(
+        aws_sdk_dynamodb::Client::new(&cfg),
+        "fake".into(),
+    ))
 }
 
 // The real trait (verified at public-api/src/lib.rs:27-30): exactly ONE method,
@@ -159,11 +175,18 @@ impl Invoker for NoInvoker {
 }
 
 fn test_router(store: Arc<dynamo::Store>) -> axum::Router {
-    router(store, Arc::new(NoInvoker), None, "https://bendobundles.com".into())
+    router(
+        store,
+        Arc::new(NoInvoker),
+        None,
+        "https://bendobundles.com".into(),
+    )
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).expect("response body must be JSON")
 }
 
@@ -174,13 +197,21 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn v1_translation_derives_stageless_path_and_falls_back() {
     init_stage_env();
-    let req =
-        lambda_http::request::from_str(&load_v1_fixture(include_str!("fixtures/apigw_v1_fallback.json")))
-            .expect("v1 fixture must translate");
-    assert_eq!(req.uri().path(), "/api/definitely/no/such/route", "stage must not be prepended");
+    let req = lambda_http::request::from_str(&load_v1_fixture(include_str!(
+        "fixtures/apigw_v1_fallback.json"
+    )))
+    .expect("v1 fixture must translate");
+    assert_eq!(
+        req.uri().path(),
+        "/api/definitely/no/such/route",
+        "stage must not be prepended"
+    );
     let resp = test_router(fake_store().await).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 404);
-    assert_eq!(body_json(resp).await, serde_json::json!({"error": "not found"}));
+    assert_eq!(
+        body_json(resp).await,
+        serde_json::json!({"error": "not found"})
+    );
 }
 
 /// The automated twin of #186's manual prod probe: unknown token through the REAL
@@ -189,7 +220,9 @@ async fn v1_translation_derives_stageless_path_and_falls_back() {
 #[tokio::test]
 async fn v1_translation_reaches_link_route_with_unknown_token() {
     init_stage_env();
-    let Some(store) = store_or_skip("link-unknown").await else { return };
+    let Some(store) = store_or_skip("link-unknown").await else {
+        return;
+    };
     let req = lambda_http::request::from_str(&load_v1_fixture(include_str!(
         "fixtures/apigw_v1_link_unknown.json"
     )))
@@ -233,7 +266,9 @@ async fn v1_translation_preserves_multi_value_query() {
 #[tokio::test]
 async fn v1_translation_decodes_base64_body_to_reach_json_extractor() {
     init_stage_env();
-    let Some(store) = store_or_skip("b64-thanks").await else { return };
+    let Some(store) = store_or_skip("b64-thanks").await else {
+        return;
+    };
     let req = lambda_http::request::from_str(&load_v1_fixture(include_str!(
         "fixtures/apigw_v1_base64_thanks.json"
     )))
