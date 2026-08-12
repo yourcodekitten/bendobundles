@@ -1285,18 +1285,19 @@ impl AdminInvoker for MockCallInvoker {
 }
 
 /// Build a fully-wired app + fresh DynamoDB table + invoker log, all sharing the same state.
-/// Uses a UUID-based table name so concurrent tests don't collide.
+/// `test` is the calling test fn's name, verbatim — stable per-test names + the
+/// delete-then-create convention replace the old uuid-per-call minting, which leaked
+/// ~13 tables per run into a persistent dynamodb-local (#168 mechanism b).
 /// Panics if DYNAMODB_LOCAL_URL is set but dynamo-local is unreachable.
 async fn test_app_with_call_invoker(
+    test: &str,
     response: FulfillResponse,
 ) -> (
     axum::Router,
     Arc<Store>,
     Arc<std::sync::Mutex<Vec<FulfillRequest>>>,
 ) {
-    // Use a UUID-derived table name for per-call isolation.
-    let uid = uuid::Uuid::new_v4().simple().to_string();
-    let store = store_or_skip(&format!("sc{}", &uid[..10]))
+    let store = store_or_skip(&format!("sc-{test}"))
         .await
         .expect("DYNAMODB_LOCAL_URL must be set and dynamo-local reachable for self-claim tests");
     let log = Arc::new(std::sync::Mutex::new(Vec::<FulfillRequest>::new()));
@@ -1406,7 +1407,7 @@ async fn body_string(resp: axum::response::Response) -> String {
 /// - The invoke carried the correct game identifiers
 #[tokio::test]
 async fn self_claim_endpoint_intakes_invokes_and_returns_key() {
-    let (app, store, invoker_log) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, invoker_log) = test_app_with_call_invoker("self_claim_endpoint_intakes_invokes_and_returns_key", FulfillResponse::RevealedKey {
         key: "K-123".into(),
     })
     .await;
@@ -1437,7 +1438,7 @@ async fn self_claim_endpoint_intakes_invokes_and_returns_key() {
 /// POST /admin/api/games/:id/self-claim on a Pending game → 409 (game not available).
 #[tokio::test]
 async fn self_claim_endpoint_409s_when_game_pending() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("self_claim_endpoint_409s_when_game_pending", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -1453,7 +1454,7 @@ async fn self_claim_endpoint_409s_when_game_pending() {
 #[tokio::test]
 async fn self_claim_endpoint_202_on_parked() {
     let (app, store, _) =
-        test_app_with_call_invoker(FulfillResponse::Parked { reason: "x".into() }).await;
+        test_app_with_call_invoker("self_claim_endpoint_202_on_parked", FulfillResponse::Parked { reason: "x".into() }).await;
     seed_available_game(&store, "gkL:mnL", "Parked Game").await;
 
     let resp = authed_post(&app, "/admin/api/games/gkL:mnL/self-claim", "{}").await;
@@ -1464,7 +1465,7 @@ async fn self_claim_endpoint_202_on_parked() {
 /// admin-facing copy (byte-exact — mirrors the neighboring AlreadyRedeemed GONE arm).
 #[tokio::test]
 async fn self_claim_endpoint_410_on_dead_key() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::KeyDead).await;
+    let (app, store, _) = test_app_with_call_invoker("self_claim_endpoint_410_on_dead_key", FulfillResponse::KeyDead).await;
     seed_available_game(&store, "gkN:mnN", "Dead Key Game").await;
 
     let resp = authed_post(&app, "/admin/api/games/gkN:mnN/self-claim", "{}").await;
@@ -1483,7 +1484,7 @@ async fn self_claim_endpoint_410_on_dead_key() {
 /// Crucially: does NOT 404 even though LINK#SELF has no META item (handle_link_claims would 404).
 #[tokio::test]
 async fn claims_self_lists_revealed_keys_without_link_precheck() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("claims_self_lists_revealed_keys_without_link_precheck", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -1506,7 +1507,7 @@ async fn claims_self_lists_revealed_keys_without_link_precheck() {
 /// GET /admin/api/catalog includes requires_choice on each game view.
 #[tokio::test]
 async fn catalog_exposes_requires_choice() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("catalog_exposes_requires_choice", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -1532,7 +1533,7 @@ async fn catalog_exposes_requires_choice() {
 /// Regression guard: a new SelfClaimView with revealed_key must not bleed into this endpoint.
 #[tokio::test]
 async fn gift_link_claims_still_hide_gift_url() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("gift_link_claims_still_hide_gift_url", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -1593,9 +1594,10 @@ fn steam_router(
 const TEST_STEAMID: &str = "76561198000000001";
 
 /// Build a test app with steam wired to `steam_base`. Returns (app, store).
-async fn steam_test_app(steam_base: &str) -> Option<(axum::Router, Arc<Store>)> {
-    let uid = uuid::Uuid::new_v4().simple().to_string();
-    let store = store_or_skip(&format!("steam{}", &uid[..8])).await?;
+/// `test` is the calling test fn's name, verbatim (same #168-mechanism-b fix as
+/// test_app_with_call_invoker — stable names, no per-call uuid minting).
+async fn steam_test_app(test: &str, steam_base: &str) -> Option<(axum::Router, Arc<Store>)> {
+    let store = store_or_skip(&format!("steam-{test}")).await?;
     let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
     let admin_hash = test_admin_hash(TEST_ADMIN_PW);
     let app = steam_router(Arc::clone(&store), invoker, admin_hash, steam_base);
@@ -1763,7 +1765,7 @@ async fn steam_endpoints_503_when_not_configured() {
 #[tokio::test]
 async fn steam_identity_roundtrip() {
     let server = wiremock::MockServer::start().await;
-    let Some((app, _store)) = steam_test_app(&server.uri()).await else {
+    let Some((app, _store)) = steam_test_app("steam_identity_roundtrip", &server.uri()).await else {
         return;
     };
 
@@ -1813,7 +1815,7 @@ async fn steam_identity_roundtrip() {
 #[tokio::test]
 async fn steam_identity_invalid_steamid_returns_400() {
     let server = wiremock::MockServer::start().await;
-    let Some((app, _store)) = steam_test_app(&server.uri()).await else {
+    let Some((app, _store)) = steam_test_app("steam_identity_invalid_steamid_returns_400", &server.uri()).await else {
         return;
     };
 
@@ -1852,7 +1854,7 @@ async fn steam_owned_proxy_fresh_cache_served_without_hitting_steam() {
     )
     .await;
 
-    let Some((app, store)) = steam_test_app(&server.uri()).await else {
+    let Some((app, store)) = steam_test_app("steam_owned_proxy_fresh_cache_served_without_hitting_steam", &server.uri()).await else {
         return;
     };
 
@@ -1895,7 +1897,7 @@ async fn steam_owned_proxy_stale_cache_fetches_and_caches() {
     )
     .await;
 
-    let Some((app, store)) = steam_test_app(&server.uri()).await else {
+    let Some((app, store)) = steam_test_app("steam_owned_proxy_stale_cache_fetches_and_caches", &server.uri()).await else {
         return;
     };
 
@@ -1935,7 +1937,7 @@ async fn steam_owned_proxy_private_returns_private_and_preserves_cache() {
     // Private response: no game_count field.
     mock_owned_games(&server, r#"{"response":{}}"#, 1).await;
 
-    let Some((app, store)) = steam_test_app(&server.uri()).await else {
+    let Some((app, store)) = steam_test_app("steam_owned_proxy_private_returns_private_and_preserves_cache", &server.uri()).await else {
         return;
     };
 
@@ -1974,7 +1976,7 @@ async fn steam_owned_proxy_private_returns_private_and_preserves_cache() {
 #[tokio::test]
 async fn steam_owned_proxy_invalid_steamid_returns_400() {
     let server = wiremock::MockServer::start().await;
-    let Some((app, _store)) = steam_test_app(&server.uri()).await else {
+    let Some((app, _store)) = steam_test_app("steam_owned_proxy_invalid_steamid_returns_400", &server.uri()).await else {
         return;
     };
 
@@ -1993,7 +1995,7 @@ async fn steam_owned_proxy_invalid_steamid_returns_400() {
 /// POST /admin/api/games/:id/steam-app-id {app_id: 12345} → {ok:true}, game has Manual appid.
 #[tokio::test]
 async fn steam_appid_override_sets_manual() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("steam_appid_override_sets_manual", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -2019,7 +2021,7 @@ async fn steam_appid_override_sets_manual() {
 /// POST /admin/api/games/:id/steam-app-id {app_id: null} → {ok:true}, clears both fields.
 #[tokio::test]
 async fn steam_appid_override_null_clears() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("steam_appid_override_null_clears", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -2047,7 +2049,7 @@ async fn steam_appid_override_null_clears() {
 /// POST /admin/api/games/:id/steam-app-id on unknown game → 404.
 #[tokio::test]
 async fn steam_appid_override_unknown_game_returns_404() {
-    let (app, _store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, _store, _) = test_app_with_call_invoker("steam_appid_override_unknown_game_returns_404", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -2066,7 +2068,7 @@ async fn steam_appid_override_unknown_game_returns_404() {
 /// GET /admin/api/catalog returns steam_app_id and owned_by_ben on each game view.
 #[tokio::test]
 async fn catalog_view_carries_steam_app_id_and_owned_by_ben() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("catalog_view_carries_steam_app_id_and_owned_by_ben", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -2094,7 +2096,7 @@ async fn catalog_view_carries_steam_app_id_and_owned_by_ben() {
 /// Catalog game with no steam_app_id → steam_app_id is null (not missing), owned_by_ben is false.
 #[tokio::test]
 async fn catalog_view_steam_fields_absent_when_unset() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("catalog_view_steam_fields_absent_when_unset", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
@@ -2144,7 +2146,7 @@ async fn admin_game_detail_401_without_session() {
 /// → 200 with CatalogGameView superset fields AND steam blob.
 #[tokio::test]
 async fn admin_game_detail_superset_fields_and_steam_blob() {
-    let (app, store, _) = test_app_with_call_invoker(FulfillResponse::RevealedKey {
+    let (app, store, _) = test_app_with_call_invoker("admin_game_detail_superset_fields_and_steam_blob", FulfillResponse::RevealedKey {
         key: "unused".into(),
     })
     .await;
