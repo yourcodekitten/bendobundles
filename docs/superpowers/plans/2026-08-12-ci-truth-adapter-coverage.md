@@ -554,8 +554,8 @@ async fn v1_translation_preserves_multi_value_query() {
         "reconstructed URI must carry every value: got {query}");
     // Deliberately NOT asserted: parameter ORDER in the reconstructed URI (map-backed,
     // not part of the property) — recorded as asserted-not-pinned in spec AC1.
-    // NOTE: qs.all()'s exact return type may need a deref nudge vs the vec![] literal —
-    // fix to what cargo check names; do not weaken to a contains-check.
+    // (Verified: QueryMap::all returns Option<Vec<&str>> — query_map-0.7.0 lib.rs:101 —
+    // so the assert_eq against vec!["1", "2"] compiles as written.)
 }
 
 /// isBase64Encoded body is DECODED by translation (to bytes, non-ASCII intact), and
@@ -955,7 +955,7 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
 }
 ```
 
-Implementer notes: `LambdaEvent`/`Context` paths and whether `Adapter` implements `tower::Service` directly (needing `.oneshot` from ServiceExt) are cargo-check-verified; if `Context::default()` is not available, build the minimal Context the constructor requires (`lambda_runtime` types.rs:66,90-96 documents `LambdaEvent::new`). If `serde_json::to_value(&resp)` fails because `LambdaResponse` isn't `Serialize` in this direction, serialize via the type the runtime actually returns to AWS — find `into_response`/serialization in lambda_http `response.rs` and assert on that exact struct. Header-name case in the serialized map is whatever `http::HeaderMap` yields (lowercase) — the test uses `"set-cookie"` lowercase for that reason; verify against the actual output and pin what's real.
+Implementer notes: `LambdaEvent`/`Context` paths and whether `Adapter` implements `tower::Service` directly (needing `.oneshot` from ServiceExt) are cargo-check-verified; if `Context::default()` is not available, build the minimal Context the constructor requires (`lambda_runtime` types.rs:66,90-96 documents `LambdaEvent::new`). If `serde_json::to_value(&resp)` fails because `LambdaResponse` isn't `Serialize` in this direction, serialize via the type the runtime actually returns to AWS — find `into_response`/serialization in lambda_http `response.rs` and assert on that exact struct. Header-name case: VERIFIED — `serialize_multi_value_headers` writes `key.as_str()` from `http::HeaderName` (aws_lambda_events-1.2.0 custom_serde/headers.rs:9-22), which is always lowercase; `"set-cookie"` as written is correct.
 
 - [ ] **Step 3: Local gate + commit + push + CI census check**
 
