@@ -2994,8 +2994,10 @@ impl Store {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
+                // The 30s budget is SHARED with the create-drain loop above — name that,
+                // or a slow drain gets misreported as a slow activation (review pass 1).
                 return Err(StoreError::Aws(format!(
-                    "table {} not ACTIVE within 30s (status {:?})",
+                    "table {} not ACTIVE within the shared 30s create+activate budget (status {:?})",
                     self.table,
                     table.table_status()
                 )));
