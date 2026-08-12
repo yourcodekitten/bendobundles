@@ -28,7 +28,7 @@
 - Modify `.github/workflows/ci.yml:36` — one line (Task 1).
 - Modify `crates/dynamo/Cargo.toml` (+1 dependency line) and `crates/dynamo/src/lib.rs:2895-2948` — `create_table_for_tests` waiter (Task 2).
 - Modify `crates/admin-api/tests/api_test.rs` — the two uuid-minting helpers and their callers (Task 3).
-- Create `crates/public-api/tests/adapter_test.rs` + `crates/public-api/tests/fixtures/{apigw_v1_fallback.json, apigw_v1_link_unknown.json, apigw_v1_multi_value_query.json, apigw_v1_base64_thanks.json, apigw_v2_guard.json, alb_guard.json, apigw_v1_degenerate.json}` (Task 4).
+- Create `crates/public-api/tests/adapter_test.rs` + `crates/public-api/tests/fixtures/{apigw_v1_fallback.json, apigw_v1_link_unknown.json, apigw_v1_multi_value_query.json, apigw_v1_base64_thanks.json, apigw_v2_guard.json, alb_guard.json, apigw_v1_degenerate_missing_key.json, apigw_v1_degenerate_inconsistent.json}` (Task 4).
 - Create `crates/public-api/tests/adapter_stage_control_test.rs` + `crates/public-api/tests/fixtures/apigw_v1_no_stage.json` (Task 5) and `crates/public-api/tests/adapter_stage_false_test.rs` (Task 5b).
 - Create `crates/admin-api/tests/adapter_test.rs` + `crates/admin-api/tests/fixtures/{apigw_v1_note_with_cookie.json, apigw_v1_login.json}` (Tasks 6-7; the login fixture is created in Task 7).
 - No other `Cargo.toml` changes: `lambda_http` is a normal dep of both API crates; `tower`, `serde_json`, `aws-config`, `async_trait` usage mirrors what each crate's api_test.rs already compiles with — Task 4/6 Step 3's `cargo check` is the verification that no new dev-dep was needed.
@@ -361,10 +361,15 @@ check instead of an adjective.
 
 `alb_guard.json` — copy `~/.cargo/registry/src/*/lambda_http-1.3.0/tests/data/alb_request.json` verbatim, set its path to `/api/l/x`. (The cascade has more arms than v1/v2; one ALB fixture pins the fall-through class — spec D4, OMBB Q4.)
 
-`apigw_v1_degenerate.json` — a COPY of `apigw_v1_fallback.json` with `multiValueHeaders`
-deleted and `requestContext.path` set to `"/wrong/prefix"` — this one exists to prove the
-loader predicate itself can fail (spec AC4). It is loaded ONLY by the predicate's own red
-test, never by a translation test.
+**Degenerate fixtures — ONE PLANTED DEFECT PER COPY** (Lilith's required edit: a fixture
+carrying both defect classes proves only the arm that panics first — the masked arm's
+asserts could be deleted tomorrow and the suite stays green forever):
+- `apigw_v1_degenerate_missing_key.json` — a COPY of `apigw_v1_fallback.json` with
+  `multiValueHeaders` deleted, everything else untouched (key-set arm).
+- `apigw_v1_degenerate_inconsistent.json` — a COPY of `apigw_v1_fallback.json`,
+  **key-complete**, with `requestContext.path` set to `"/wrong/prefix"` (correlated-field
+  arm — reachable only because every key is present).
+Both are loaded ONLY by the predicate's own red tests, never by a translation test.
 
 - [ ] **Step 2: Write `crates/public-api/tests/adapter_test.rs`**
 
@@ -490,12 +495,18 @@ fn load_v1_fixture(raw: &'static str) -> String {
     raw.to_string()
 }
 
-/// The predicate must also earn its red (spec AC4): a fixture missing multiValueHeaders
-/// and carrying an inconsistent requestContext.path must be rejected loudly.
+/// The predicate must earn its red PER ARM (spec AC4; one planted defect per copy —
+/// a both-defects fixture proves only whichever arm panics first, masking the other).
 #[test]
 #[should_panic(expected = "fixture missing production key")]
-fn degenerate_fixture_fails_the_loader_predicate() {
-    load_v1_fixture(include_str!("fixtures/apigw_v1_degenerate.json"));
+fn degenerate_missing_key_fails_the_keyset_arm() {
+    load_v1_fixture(include_str!("fixtures/apigw_v1_degenerate_missing_key.json"));
+}
+
+#[test]
+#[should_panic(expected = "requestContext.path must equal")]
+fn degenerate_inconsistent_path_fails_the_correlation_arm() {
+    load_v1_fixture(include_str!("fixtures/apigw_v1_degenerate_inconsistent.json"));
 }
 
 fn test_router(store: Arc<dynamo::Store>) -> axum::Router {
@@ -991,13 +1002,17 @@ swallows). The recipes below are the corrected set. In ONE commit:
 | 6 | `alb_guard.json`: delete its `requestContext` (ALB's ELB marker lives there; without it no arm matches and `pass_through` is off) | `alb_guard_still_parses_as_alb`: `from_str` errors → the `expect("ALB must remain parseable")` fires. |
 | 7 | `apigw_v1_note_with_cookie.json`: delete the `Cookie` entry from **BOTH** `headers` AND `multiValueHeaders` (translation merges the maps — deleting one is a no-op) | `v1_translation_carries_session_cookie_and_csrf_header` (admin adapter_test): the `headers().get("cookie")` expect, or the 200 status assert (observed 401). Record whichever fires — both are the test's own teeth. |
 | 8 | `apigw_v1_login.json`: body `{"password":"pw"}` → `{"password":"wrong"}` | `v1_response_translation_puts_set_cookie_in_multi_value_headers` (admin adapter_test): login 401 mints no Set-Cookie → the `multiValueHeaders["set-cookie"]` extraction expect fires — the property assertion itself, input-side form (spec D6). |
+| 9 | `apigw_v1_no_stage.json`: set `requestContext.stage` from `null` → `"live"` (Lilith's recipe — exactly one test reads this fixture, so attribution stays clean) | `without_stage_in_event_the_path_is_untouched_even_without_flag` (control binary): flag absent + stage present → path becomes `/live/...` → its equality assert fires. This UN-demotes the `None`-branch property to fully pinned. |
+
+**Why batching all sabotages into one commit is sound (invariant for future editors):**
+attribution is by-construction — each test reads exactly ONE sabotaged file, so every red
+maps to its row with no ambiguity; the single fixture shared across binaries (edit #2) fans
+out *within one counted row*, not across rows. If you ever share a fixture across two
+DIFFERENT property rows, this invariant breaks and the census must be split into two commits.
 
 NOT sabotaged, with reasons stated in the PR table: Task 2's dynamo test (race is
-nondeterministic; excused in its own commit message) · `degenerate_fixture_fails_the_loader_predicate`
-(it IS a permanent red-exercise — its sabotage is its normal operation) ·
-`without_stage_in_event_the_path_is_untouched_even_without_flag` (edit #2 does not touch its
-fixture; its property is the `None` branch, pinned by the no-stage fixture's own assert —
-demoted to asserted-not-sabotaged, per spec AC1's honesty clause).
+nondeterministic; excused in its own commit message) · the two `degenerate_*` predicate
+tests (they ARE permanent red-exercises — their sabotage is their normal operation).
 
 ```bash
 cd ~/bendobundles \
@@ -1011,7 +1026,7 @@ cd ~/bendobundles \
 ```bash
 cd ~/bendobundles && git show --stat HEAD && git show HEAD -- crates/ | grep -E '^[+-]' | grep -vE '^[+-]{3}'
 ```
-Expected: exactly the 8 files above, and every changed line is one of the named edits — a
+Expected: exactly the 9 files above, and every changed line is one of the named edits — a
 mis-aimed edit that matched nothing leaves a test green for a reason that is NOT vacuity.
 Paste this diff into the evidence table alongside the failures.
 
@@ -1019,8 +1034,8 @@ Paste this diff into the evidence table alongside the failures.
 
 Run: `gh pr checks --watch` (expect the test job RED), then pull the log (run-id command from
 Task 4 Step 5) and verify BOTH DIRECTIONS: **every test in the expected-red column above
-appears FAILED with its named assertion message** (10 failure lines across 4 adapter
-binaries: 5 public adapter_test + 1 control + 1 false-binary + 2 admin + the #2 fan-out's
+appears FAILED with its named assertion message** (11 failure lines across 4 adapter
+binaries: 5 public adapter_test + 2 control + 1 false-binary + 2 admin + the #2 fan-out's
 third line), **and no test outside the column went red** (a stranger's red means a sabotage
 landed somewhere it shouldn't — diagnose before proceeding). Record the run URL + the
 per-test failure list with messages — it goes in the PR body as the D6 evidence table.

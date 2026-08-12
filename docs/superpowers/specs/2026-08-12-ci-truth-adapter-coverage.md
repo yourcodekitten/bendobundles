@@ -227,9 +227,11 @@ coupling.
    the sabotaged-login form.
 3. `ci.yml` runs `cargo test --workspace --no-fail-fast`; the diff is one functional line
    plus its comment, nothing else.
-4. Every v1 fixture passes the `load_v1_fixture()` key-set + consistency predicates (which
-   are themselves tested by one deliberately-degenerate fixture in a `#[should_panic]` or
-   Err-asserting test — the predicate must also earn its red).
+4. Every v1 fixture passes the `load_v1_fixture()` key-set + consistency predicates — and
+   the predicate earns its red **per arm**: one deliberately-degenerate fixture per defect
+   class (key-set; correlated-field), each with its own `#[should_panic]` expecting that
+   arm's message. One planted defect per copy — a both-defects fixture proves only the arm
+   that panics first, masking the other (Lilith's required edit; the 08-06 house classic).
 5. `create_table_for_tests` drains DELETING and waits bounded-time for ACTIVE (table + GSIs);
    the two uuid-per-call sites use stable names; both changes are test-support-only (plus
    the one declared manifest line).
