@@ -360,12 +360,16 @@ async fn v2_guard_still_parses_as_v2() {
     init_stage_env();
     let req = lambda_http::request::from_str(include_str!("fixtures/apigw_v2_guard.json"))
         .expect("v2 must remain parseable");
-    // v2's rawPath carries no stage; the translated path is the rawPath verbatim.
-    assert_eq!(req.uri().path(), "/api/l/x");
+    // The variant match comes FIRST: it is the guard's specific voice, and behind a
+    // path assert it could never speak — the first census's red fired the generic
+    // path equality instead of this panic (Lilith's census read; D6 wants the
+    // property's own message on the record).
     match req.request_context() {
         lambda_http::request::RequestContext::ApiGatewayV2(_) => {}
         other => panic!("v2 fixture parsed as {other:?} — deserializer arm changed"),
     }
+    // v2's rawPath carries no stage; the translated path is the rawPath verbatim.
+    assert_eq!(req.uri().path(), "/api/l/x");
 }
 
 /// ALB guard (spec D4, OMBB Q4): the cascade has more arms than v1/v2 — one ALB fixture

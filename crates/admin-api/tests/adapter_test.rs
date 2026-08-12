@@ -356,10 +356,14 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
         .expect("adapter must produce a response");
 
     let json = serde_json::to_value(&resp).expect("LambdaResponse must serialize");
-    assert_eq!(json["statusCode"], 200);
+    // The PROPERTY assert speaks first: behind a status gate it could never go red —
+    // the first census's input-side sabotage (wrong password) fired `401 != 200` and
+    // the multiValueHeaders extraction had never been observed red (Lilith's census
+    // read). Property-first ordering makes AC2 true at property granularity.
     let set_cookie = json["multiValueHeaders"]["set-cookie"]
         .as_array()
         .expect("v1: Set-Cookie must be in multiValueHeaders");
+    assert_eq!(json["statusCode"], 200);
     assert!(
         set_cookie[0].as_str().unwrap().starts_with("session="),
         "the session cookie must survive response translation: {set_cookie:?}"
