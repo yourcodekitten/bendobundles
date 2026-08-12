@@ -237,8 +237,9 @@ coupling.
    the one declared manifest line).
 6. #168 closed with the exact wording of G4 — *not reproduced; hardened; reopen on captured
    output* — plus the mechanism inventory and commits.
-7. All existing tests untouched and green; the 109 existing API tests' isolation profile
-   unchanged (no ambient env added to their binaries).
+7. All existing tests untouched and green — *except AC5's named edits* (the two uuid-site
+   helpers and their callers in `admin api_test.rs`, table names only); the 109 existing API
+   tests' isolation profile unchanged (no ambient env added to their binaries).
 
 ## Family review — answered questions (record, 2026-08-12)
 

@@ -16,7 +16,7 @@
 - **Family-review verdicts are FINAL and folded in** (spec rev 2): Q1 separate binaries ([env] can't unset); Q2 hidden seam accepted, both halves; Q3 #168 closes with the exact wording in Task 9 — no task branches on an open question.
 - **One manifest change is permitted and required** (plan-review B1): `crates/dynamo/Cargo.toml` `[dependencies]` gains `tokio = { workspace = true, features = ["time"] }` (Task 2). No other Cargo.toml edit anywhere.
 - The stage env flag is **PRESENCE-triggered** (`request.rs:408` `env::var(...).is_ok()` — `"false"` and `""` both activate). Controls that need it off need it ABSENT.
-- **The box cannot link test binaries.** Local verification = `cargo check -p <crate> --tests -j 1` and `cargo clippy -p <crate> --all-targets -j 1 -- -D warnings`. Behavior verification = CI on the draft PR (CI runs on `pull_request` only). "Run test, expect FAIL/PASS" steps below therefore name **which oracle** (check vs CI).
+- **The box cannot link test binaries.** Local verification = `cargo check -p <crate> --tests -j 1` and `cargo clippy -p <crate> --all-targets -j 1 -- -D warnings`. Behavior verification = CI on the draft PR (CI triggers on `pull_request` plus `push` to main only — a feature-branch push alone runs nothing; the draft PR is what makes CI fire). "Run test, expect FAIL/PASS" steps below therefore name **which oracle** (check vs CI).
 - `unsafe { std::env::set_var }` appears ONLY inside the `Once`-guarded `init()` of the two adapter binaries — never in `api_test.rs`, never mid-test (edition-2024 racy; spec D2).
 - New store-backed tests use table prefixes **`t-pubadp-`** / **`t-admadp-`** — NOT `t-adm-`/`t-pub-` (adapter binaries run in parallel with `api_test.rs` binaries against the same dynamodb-local; a shared prefix + same test name would collide).
 - Fixture JSON lives at `crates/<crate>/tests/fixtures/*.json`, loaded with `include_str!` (repo idiom).
@@ -29,7 +29,7 @@
 - Modify `crates/dynamo/Cargo.toml` (+1 dependency line) and `crates/dynamo/src/lib.rs:2895-2948` — `create_table_for_tests` waiter (Task 2).
 - Modify `crates/admin-api/tests/api_test.rs` — the two uuid-minting helpers and their callers (Task 3).
 - Create `crates/public-api/tests/adapter_test.rs` + `crates/public-api/tests/fixtures/{apigw_v1_fallback.json, apigw_v1_link_unknown.json, apigw_v1_multi_value_query.json, apigw_v1_base64_thanks.json, apigw_v2_guard.json, alb_guard.json, apigw_v1_degenerate_missing_key.json, apigw_v1_degenerate_inconsistent.json}` (Task 4).
-- Create `crates/public-api/tests/adapter_stage_control_test.rs` + `crates/public-api/tests/fixtures/apigw_v1_no_stage.json` (Task 5) and `crates/public-api/tests/adapter_stage_false_test.rs` (Task 5b).
+- Create `crates/public-api/tests/adapter_stage_control_test.rs` + `crates/public-api/tests/fixtures/{apigw_v1_no_stage.json, apigw_v1_default_stage.json}` (Task 5) and `crates/public-api/tests/adapter_stage_false_test.rs` (Task 5b).
 - Create `crates/admin-api/tests/adapter_test.rs` + `crates/admin-api/tests/fixtures/{apigw_v1_note_with_cookie.json, apigw_v1_login.json}` (Tasks 6-7; the login fixture is created in Task 7).
 - No other `Cargo.toml` changes: `lambda_http` is a normal dep of both API crates; `tower`, `serde_json`, `aws-config`, `async_trait` usage mirrors what each crate's api_test.rs already compiles with — Task 4/6 Step 3's `cargo check` is the verification that no new dev-dep was needed.
 
@@ -213,7 +213,7 @@ Replace the tail of `create_table_for_tests` (`crates/dynamo/src/lib.rs:2923-294
         }
 ```
 
-Notes for the implementer: `attr`/`key`/`gsi` closures already exist above this block — keep them. The exact service-error predicate name may differ by SDK version (`is_resource_in_use_exception` on the create-table error type); `cargo check` will name it — fix to what the SDK exposes, do NOT string-match on `format!("{e:?}")`. Also update the doc comment above the fn (`:2890-2894`) — it currently documents the discard-and-return behavior; describe the drain+waiter instead.
+Notes for the implementer: `attr`/`key`/`gsi` closures already exist above this block — keep them. The exact service-error predicate name may differ by SDK version (`is_resource_in_use_exception` on the create-table error type); `cargo check` will name it — fix to what the SDK exposes, do NOT string-match on `format!("{e:?}")`. Also update the doc comment above the fn (`:2890-2894`) — it currently documents delete-tolerates-NotFound + create-propagates; extend it to describe the drain+waiter (keep what's still true).
 
 - [ ] **Step 4: Local gate**
 
@@ -249,7 +249,7 @@ reproduced diagnosis."
 - [ ] **Step 1: Read the two helpers and enumerate their callers**
 
 Run: `cd ~/bendobundles && grep -n 'uid\[\.\.' crates/admin-api/tests/api_test.rs` (hits at `:1298-1299` and `:1597-1598`) and `grep -n 'test_app_with_call_invoker\|steam_test_app' crates/admin-api/tests/api_test.rs`.
-Verified in plan review: `test_app_with_call_invoker` has **~10 callers** (`:1409,:1440,:1456,:1467,:1486,:1509,:1535,:1996,:2022`, ±drift) and `steam_test_app` ~6; the two helpers use DIFFERENT error idioms (`test_app_with_call_invoker` uses `.await.expect(...)` and returns a tuple; `steam_test_app` uses `?`) — keep each helper's own idiom, change ONLY where the table name comes from.
+Verified in plan review: `test_app_with_call_invoker` has **13 callers** (OMBB's recount, 14 grep hits − 1 definition; the listed lines `:1409,:1440,:1456,:1467,:1486,:1509,:1535,:1996,:2022` are a sample, Step 1's grep derives the full list) and `steam_test_app` ~6; the two helpers use DIFFERENT error idioms (`test_app_with_call_invoker` uses `.await.expect(...)` and returns a tuple; `steam_test_app` uses `?`) — keep each helper's own idiom, change ONLY where the table name comes from.
 
 - [ ] **Step 2: Replace with caller-supplied stable names**
 
@@ -319,6 +319,7 @@ the fix, now applied to the last two exceptions."
     "stage": "live",
     "requestId": "41b45ea3-70b5-11e6-b7bd-69b5aaebc7d9",
     "requestTimeEpoch": 1583798639428,
+    "path": "/live/api/definitely/no/such/route",
     "identity": { "sourceIp": "203.0.113.10", "userAgent": "adapter-test" },
     "resourcePath": "/api/{proxy+}",
     "httpMethod": "GET",
@@ -329,16 +330,20 @@ the fix, now applied to the last two exceptions."
 }
 ```
 
+**⚠️ EVERY derived fixture must update `requestContext.path` to `"/live" + its new top-level
+path` in the same edit** — the loader's D5-2 consistency assert makes any drift a panic (OMBB
+step-5 B1: the creation steps must match the sabotage steps' care).
+
 `apigw_v1_link_unknown.json` — same skeleton, with:
-- `"path": "/api/l/definitely-not-a-token"`, `"pathParameters": { "proxy": "l/definitely-not-a-token" }` (this mirrors the manual prod probe from #186's interim mitigation).
+- `"path": "/api/l/definitely-not-a-token"`, `"pathParameters": { "proxy": "l/definitely-not-a-token" }`, `"requestContext.path": "/live/api/l/definitely-not-a-token"` (this mirrors the manual prod probe from #186's interim mitigation).
 
 `apigw_v1_multi_value_query.json` — same skeleton, with:
-- `"path": "/api/l/definitely-not-a-token"`, matching `pathParameters`,
+- `"path": "/api/l/definitely-not-a-token"`, matching `pathParameters` AND `requestContext.path` = `/live/api/l/definitely-not-a-token`,
 - `"queryStringParameters": { "a": "2", "b": "3" }`,
 - `"multiValueQueryStringParameters": { "a": ["1", "2"], "b": ["3"] }`.
 
 `apigw_v1_base64_thanks.json` — same skeleton, with:
-- `"path": "/api/l/definitely-not-a-token/thanks"`, `"pathParameters": { "proxy": "l/definitely-not-a-token/thanks" }`,
+- `"path": "/api/l/definitely-not-a-token/thanks"`, `"pathParameters": { "proxy": "l/definitely-not-a-token/thanks" }`, `"requestContext.path": "/live/api/l/definitely-not-a-token/thanks"`,
 - `"httpMethod": "POST"` (both top-level and in `requestContext`),
 - headers gain `"Content-Type": "application/json"` (and mirror it into `multiValueHeaders`),
 - `"body": "eyJub3RlIjoidGhhbmsgeW91IGJlbiDinaQifQ=="` (base64 of `{"note":"thank you ben ❤"}` — non-ASCII on purpose: it proves byte-level decode, not just ASCII luck; ❤ is U+2764 → bytes `e2 9d a4` → `DinaQ` in the encoding, NOT `DinaE`/U+2761 — plan review caught the wrong constant here once already),
@@ -675,9 +680,11 @@ Expected: a `Running tests/adapter_test.rs` line for public-api, all its tests l
 
 **Files:**
 - Create: `crates/public-api/tests/adapter_stage_control_test.rs`
+- Create: `crates/public-api/tests/fixtures/apigw_v1_no_stage.json`
+- Create: `crates/public-api/tests/fixtures/apigw_v1_default_stage.json`
 
 **Interfaces:**
-- Consumes: `apigw_v1_fallback.json` + `apigw_v1_link_unknown.json` from Task 4 (same files — that's the point: same input, different env, different verdict).
+- Consumes: `apigw_v1_link_unknown.json` from Task 4 (same file — that's the point: same input, different env, different verdict).
 
 **Why a separate binary:** the control needs the env var ABSENT for its whole process lifetime; the Once in adapter_test.rs sets it for that whole process. Two binaries = two processes = both worlds observable. This is the spec's "exercise the probe against a state different from the one it currently reports" — if we cannot make translation disagree with the flag-set world, we haven't controlled it.
 
@@ -724,9 +731,30 @@ async fn without_stage_in_event_the_path_is_untouched_even_without_flag() {
 ```
 
 `apigw_v1_no_stage.json`: copy `apigw_v1_link_unknown.json`, set `requestContext.stage` to
-`null` and `requestContext.path` equal to the top-level `path` (no stage to prefix). These
-two fixtures do NOT go through `load_v1_fixture` (it lives in the other binary, and the
-no-stage variant intentionally breaks the `/<stage><path>` correlation the predicate
+`null` and `requestContext.path` equal to the top-level `path` (no stage to prefix).
+
+`apigw_v1_default_stage.json`: copy `apigw_v1_no_stage.json`, set `requestContext.stage` to
+`"$default"` (path fields unchanged — `$default` is never a real path prefix). Third test in
+this binary (spec AC1's fourth arm; OMBB step-5 M1 — `Some("$default")` and `None` are
+DISTINCT match arms in `apigw_path_with_stage` and each deserves its own pin):
+
+```rust
+/// `$default` stage arm: treated like no-stage — never prepended, flag or no flag.
+#[tokio::test]
+async fn default_stage_is_never_prepended_even_without_flag() {
+    assert!(
+        std::env::var("AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH").is_err(),
+        "control precondition: flag must be ABSENT in this binary"
+    );
+    let req = lambda_http::request::from_str(include_str!("fixtures/apigw_v1_default_stage.json"))
+        .expect("fixture must translate");
+    assert_eq!(req.uri().path(), "/api/l/definitely-not-a-token",
+        "$default is a sentinel, not a prefix");
+}
+```
+
+These control fixtures do NOT go through `load_v1_fixture` (it lives in the other binary,
+and the stage variants intentionally break the `/<stage><path>` correlation the predicate
 enforces) — the control binary's fixtures are pinned by their own assertions instead;
 say this in the file header.
 
@@ -739,12 +767,13 @@ vacuously.)
 
 ```bash
 cd ~/bendobundles && cargo check -p public-api --tests -j 1 \
-  && git add crates/public-api/tests/adapter_stage_control_test.rs crates/public-api/tests/fixtures/apigw_v1_no_stage.json \
+  && git add crates/public-api/tests/adapter_stage_control_test.rs crates/public-api/tests/fixtures/apigw_v1_no_stage.json crates/public-api/tests/fixtures/apigw_v1_default_stage.json \
   && git commit -S -m "test: env-free control — without the stage flag, translation prepends /live and routing breaks
 
 Same fixture as the flag-set binary, opposite verdict: the pair proves the
-env var is load-bearing rather than decorative (spec D2/D3). Plus the
-stage-absent arm: no stage in the event, nothing prepended, flag or no flag." \
+env var is load-bearing rather than decorative (spec D2/D3). Plus the two
+sentinel arms: stage absent and stage \$default — nothing prepended, flag
+or no flag; distinct match arms, each with its own pin." \
   && git push
 ```
 
@@ -821,7 +850,7 @@ cd ~/bendobundles && cargo check -p public-api --tests -j 1 \
 
 `apigw_v1_note_with_cookie.json` — Task 4's v1 skeleton with:
 - `"resource": "/admin/api/{proxy+}"`, `"resourcePath": "/admin/api/{proxy+}"`,
-- `"path": "/admin/api/links/fixture-tok/note"`, `"pathParameters": { "proxy": "links/fixture-tok/note" }`,
+- `"path": "/admin/api/links/fixture-tok/note"`, `"pathParameters": { "proxy": "links/fixture-tok/note" }`, `"requestContext.path": "/live/admin/api/links/fixture-tok/note"` (B1: derived fixtures update requestContext.path with the top-level path, always),
 - `"httpMethod": "POST"` (both places),
 - headers — **every one of them mirrored into `multiValueHeaders` too; a real REST event
   populates both maps, always, and translation merges them (OMBB Q4 / spec D3)**:
@@ -839,13 +868,20 @@ cd ~/bendobundles && cargo check -p public-api --tests -j 1 \
 
 // HELPERS — copy, do not invent (the repo has no tests/common; duplication is the idiom):
 //   init_stage_env()        → verbatim from crates/public-api/tests/adapter_test.rs (Task 4)
+//   load_v1_fixture()       → verbatim COPY from Task 4's adapter_test.rs (spec AC4 covers
+//                             EVERY v1 fixture — the admin ones included; OMBB step-5 B2).
+//                             A test binary CANNOT import another crate's test binary —
+//                             there is no `use public_api_tests::...`; mirroring the fn body
+//                             is the ONLY mechanism, same as init_stage_env (Lilith's rider).
+//                             The degenerate-red tests stay public-side only: AC4's
+//                             predicate-red needs one home, not two.
 //   store_or_skip()         → crates/admin-api/tests/api_test.rs:28-56, table prefix
 //                             changed to format!("t-admadp-{test}") — ONLY that change
 //   test_admin_hash()       → api_test.rs:78-88 verbatim
 //   MockAdminInvoker        → api_test.rs:92-125 verbatim
 //   admin_login()           → api_test.rs:138-178 verbatim
 //   body_json()             → api_test.rs:129-134 verbatim
-//   test_link()             → find with `grep -n 'fn test_link' api_test.rs`, copy verbatim
+//   test_link()             → api_test.rs:204, copy verbatim
 
 /// The admin session cookie and CSRF header survive translation: a note POST through
 /// the REAL v1 event path lands on the middleware, passes both auth layers, and the
@@ -861,7 +897,9 @@ async fn v1_translation_carries_session_cookie_and_csrf_header() {
     // Session minted via the already-covered direct-router path (not the subject here).
     let session = admin_login(&store, &invoker, &hash, "pw").await;
 
-    let fixture = include_str!("fixtures/apigw_v1_note_with_cookie.json")
+    // Predicate BEFORE substitution (spec AC4 — every v1 fixture; the __SESSION__
+    // placeholder doesn't touch any predicate-checked key, so raw validation is exact).
+    let fixture = load_v1_fixture(include_str!("fixtures/apigw_v1_note_with_cookie.json"))
         .replace("__SESSION__", &session);
     let req = lambda_http::request::from_str(&fixture).expect("v1 fixture must translate");
     assert_eq!(req.uri().path(), "/admin/api/links/fixture-tok/note");
@@ -914,7 +952,7 @@ cd ~/bendobundles && cargo check -p admin-api --tests -j 1 && cargo clippy -p ad
 `apigw_v1_login.json` — the v1 skeleton with `"resource": "/admin/api/{proxy+}"` and
 `requestContext.resourcePath` matching (the admin shape — plan review caught the public
 skeleton's `/api/{proxy+}` leaking in here), `"path": "/admin/api/login"`,
-`"pathParameters": { "proxy": "login" }`, `"httpMethod": "POST"` (both places),
+`"requestContext.path": "/live/admin/api/login"` (B1), `"pathParameters": { "proxy": "login" }`, `"httpMethod": "POST"` (both places),
 `Content-Type: application/json` in both header maps, `"body": "{\"password\":\"pw\"}"`,
 `"isBase64Encoded": false`.
 
@@ -941,8 +979,9 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
     // lambda_runtime::{self, Context, LambdaEvent}`), which is the only sanctioned path
     // here (plan-review M3).
     use lambda_http::lambda_runtime;
+    // load_v1_fixture first — spec AC4 covers every v1 fixture, this one included (B2).
     let payload: lambda_http::request::LambdaRequest =
-        serde_json::from_str(include_str!("fixtures/apigw_v1_login.json"))
+        serde_json::from_str(&load_v1_fixture(include_str!("fixtures/apigw_v1_login.json")))
             .expect("fixture must deserialize as a LambdaRequest");
     let event = lambda_runtime::LambdaEvent::new(payload, lambda_runtime::Context::default());
 
@@ -1003,6 +1042,7 @@ swallows). The recipes below are the corrected set. In ONE commit:
 | 7 | `apigw_v1_note_with_cookie.json`: delete the `Cookie` entry from **BOTH** `headers` AND `multiValueHeaders` (translation merges the maps — deleting one is a no-op) | `v1_translation_carries_session_cookie_and_csrf_header` (admin adapter_test): the `headers().get("cookie")` expect, or the 200 status assert (observed 401). Record whichever fires — both are the test's own teeth. |
 | 8 | `apigw_v1_login.json`: body `{"password":"pw"}` → `{"password":"wrong"}` | `v1_response_translation_puts_set_cookie_in_multi_value_headers` (admin adapter_test): login 401 mints no Set-Cookie → the `multiValueHeaders["set-cookie"]` extraction expect fires — the property assertion itself, input-side form (spec D6). |
 | 9 | `apigw_v1_no_stage.json`: set `requestContext.stage` from `null` → `"live"` (Lilith's recipe — exactly one test reads this fixture, so attribution stays clean) | `without_stage_in_event_the_path_is_untouched_even_without_flag` (control binary): flag absent + stage present → path becomes `/live/...` → its equality assert fires. This UN-demotes the `None`-branch property to fully pinned. |
+| 10 | `apigw_v1_default_stage.json`: set `requestContext.stage` from `"$default"` → `"live"` (same one-fixture-one-test attribution) | `default_stage_is_never_prepended_even_without_flag` (control binary): the sentinel arm's equality assert fires — `Some("$default")` and `None` are distinct match arms, each pinned by its own red (OMBB M1). |
 
 **Why batching all sabotages into one commit is sound (invariant for future editors):**
 attribution is by-construction — each test reads exactly ONE sabotaged file, so every red
@@ -1026,7 +1066,7 @@ cd ~/bendobundles \
 ```bash
 cd ~/bendobundles && git show --stat HEAD && git show HEAD -- crates/ | grep -E '^[+-]' | grep -vE '^[+-]{3}'
 ```
-Expected: exactly the 9 files above, and every changed line is one of the named edits — a
+Expected: exactly the 10 files above, and every changed line is one of the named edits — a
 mis-aimed edit that matched nothing leaves a test green for a reason that is NOT vacuity.
 Paste this diff into the evidence table alongside the failures.
 
@@ -1034,10 +1074,11 @@ Paste this diff into the evidence table alongside the failures.
 
 Run: `gh pr checks --watch` (expect the test job RED), then pull the log (run-id command from
 Task 4 Step 5) and verify BOTH DIRECTIONS: **every test in the expected-red column above
-appears FAILED with its named assertion message** (11 failure lines across 4 adapter
-binaries: 5 public adapter_test + 2 control + 1 false-binary + 2 admin + the #2 fan-out's
-third line), **and no test outside the column went red** (a stranger's red means a sabotage
-landed somewhere it shouldn't — diagnose before proceeding). Record the run URL + the
+appears FAILED with its named assertion message** — per-binary (OMBB MINOR-4's restatement;
+the table's rows govern): **public adapter_test 6** (rows 1-6) · **control 3** (row 2's
+fan-out + rows 9-10) · **false-binary 1** (row 2's fan-out) · **admin adapter_test 2**
+(rows 7-8) = **12 lines total** — **and no test outside the column went red** (a stranger's
+red means a sabotage landed somewhere it shouldn't — diagnose before proceeding). Record the run URL + the
 per-test failure list with messages — it goes in the PR body as the D6 evidence table.
 **Stop-rule (softened per plan review — my own first draft had two no-op recipes):** if a
 listed test stays GREEN, diagnose **which of test/sabotage is broken** — a green under
@@ -1054,7 +1095,12 @@ Expected: CI green again; `git diff main...HEAD -- crates/*/tests/fixtures/` sho
 
 - [ ] **Step 4: Record the evidence**
 
-Edit the PR body: add a "Sabotage census (D6)" section — table of test → sabotage → observed failure line → link to the red run. This is what review passes and OMBB's gate will check.
+Edit the PR body: add a "Sabotage census (D6)" section — table of test → sabotage → landed-proof diff → observed failure line → link to the red run. This is what review passes and OMBB's gate will check.
+**Do NOT use `gh pr edit --body` — it FAILS on this box** (Projects-deprecation 4xx; OMBB M2, measured). Use the GraphQL mutation:
+```bash
+prid=$(gh api repos/yourcodekitten/bendobundles/pulls/<N> --jq .node_id)
+gh api graphql -f query='mutation($id: ID!, $body: String!) { updatePullRequest(input: {pullRequestId: $id, body: $body}) { pullRequest { number } } }' -F id="$prid" -F body="$(cat /tmp/pr-body.md)"
+```
 
 ---
 
@@ -1064,12 +1110,18 @@ Edit the PR body: add a "Sabotage census (D6)" section — table of test → sab
 
 - [ ] **Step 1: PR ready for review**
 
+Write the final body to a file first, then apply via GraphQL (NOT `gh pr edit` — fails on
+this box, OMBB M2; same mutation as Task 8 Step 4). Body contents, all required: what
+shipped per issue (#186 adapter coverage: request-side ×4 + guards ×2 + three control-binary
+arms + response-side ×1; #185 one line; #168 hardening ×2), the v1-not-v2 correction with
+terraform receipts, the sabotage census table from Task 8 (12 lines, landed-proof included),
+per-suite counts read from the green run's log, and the spec/plan paths. `Fixes #185.
+Fixes #186.`
+
 ```bash
-cd ~/bendobundles && gh pr ready \
-  && gh pr edit --body "$(cat <<'EOF'
-[Write the final body: what shipped per issue (#186 adapter coverage: request-side x4 + control binary + response-side x1 + v2 guard; #185 one line; #168 hardening x2), the v1-not-v2 correction with terraform receipts, the sabotage census table from Task 8, per-suite counts read from the green run's log, and the spec/plan paths. Fixes #185. Fixes #186.]
-EOF
-)"
+cd ~/bendobundles && gh pr ready <N> \
+  && prid=$(gh api repos/yourcodekitten/bendobundles/pulls/<N> --jq .node_id) \
+  && gh api graphql -f query='mutation($id: ID!, $body: String!) { updatePullRequest(input: {pullRequestId: $id, body: $body}) { pullRequest { number } } }' -F id="$prid" -F body="$(cat /tmp/claude-1003/pr-body.md)"
 ```
 
 - [ ] **Step 2: comment on #186 with the correction** (v2 → v1, terraform receipts, spec link) — so the issue record carries it even after autoclose.
@@ -1108,3 +1160,11 @@ word *probable*.
   locally (no linker — measured 2026-08-07, ≥1638M to link); Task 8's batched sabotage census
   is the compensating control, and each test's red is still observed (or its exclusion
   recorded) before the PR claims coverage.
+- OMBB step-5 gate disposition (rev 3): B1 → `requestContext.path` in the skeleton + a
+  per-derivation update rule in Tasks 4/6/7; B2 → `load_v1_fixture` mirrored into the admin
+  binary (verbatim copy — a test binary cannot import another crate's test binary, Lilith's
+  rider) and both admin loads wrapped, predicate-before-substitution; M1 → the `$default`
+  arm gets its own fixture, test, and sabotage row 10 (census 12: public 6 / control 3 /
+  false 1 / admin 2); M2 → `gh pr edit --body` replaced with the GraphQL `updatePullRequest`
+  mutation in Tasks 8/9 (fails on this box, measured); minors 1-6 and the AC7 clause all
+  applied.
