@@ -129,7 +129,7 @@ naming the field forces contact with the artifact that pitching never does.
 | unspent Choice pick | 🟡 **field, no data** | `requires_choice` exists; its own doc says *nothing writes `true` yet* |
 | unread thanks | 🟢 **real** | `Link.thanked_at: Option<OffsetDateTime>` |
 | stale invite | 🟢 **real** | `Link.created_at: OffsetDateTime` |
-| surplus key | 🟢 **real** | `Game.owned_by_ben: bool` + `giftable` + unclaimed |
+| surplus key | 🟢 predicate real · ⚠️ **transition NOT MEASURABLE** | `Game.owned_by_ben: bool` + `giftable` + unclaimed — **14 in prod. but a bare `bool` has no timestamp, so its FLOW cannot be measured at all: case 4 of criterion ⑥, instrument before judging** |
 
 **and the upstream is bare too** — humble supplies no dates, verified against captured payloads
 rather than against the wire model alone:
@@ -185,7 +185,20 @@ principle here, not an enforced arm, and saying so beats a five-item claim where
    |---|---|---|
    | the generating behaviour **EXISTS** and its rate is ~0 | 🔴 **FIRE** | **don't build.** *(this app: claims and links exist, and are near-zero)* |
    | the source **does not exist yet** (greenfield) | ⚠️ **NOT MEASURED** | **silent, never permissive.** justify separately, and **schedule the measurement as a JOB** |
+   | the source **EXISTS but is UNINSTRUMENTED** — the behaviour happens, nothing records *when* | ⚠️ **NOT MEASURED** | **instrument the flow first.** do not proceed on a FIRE or a CLEAR you cannot see |
    | flow is nonzero and measured | ✅ **CLEAR** | derive N and set the floor |
+
+   ⚠️ **the fourth row is not the greenfield row folded over — the ACTION differs.** greenfield says
+   *justify separately and schedule the measurement.* **case 4's fix is available today: add the
+   timestamp.** *waiting for post-ship data when you could instrument it this afternoon is the wrong
+   remedy.* (Lilith, catching that her own table had **three verdicts over four cases** — *at least
+   the direction of the error changed.*)
+   🔴 **AND THIS DOCUMENT CONTAINS A LIVE INSTANCE OF CASE 4 AND WAS SILENT ABOUT IT:** **reason 3,
+   surplus keys.** 14 in stock; **flow unmeasurable, because `owned_by_ben` is a bare `bool` with no
+   timestamp** — which is precisely *why* the clearing marker had to double as its transition
+   detector. **that was said in the review channel and never written here.** ⇒ *the spec carried a
+   specimen of the case its own table could not classify.* **reason 3's honest verdict is NOT
+   MEASURED / instrument first — not the 🟢 the data table gave it.**
 
    ⚠️ **A KILL DATE IS NOT A MECHANISM.** *"Justify another way, with a kill date"* is a date someone
    writes down, and **a date passes silently.** ⇒ **it must be a job, not a calendar note:** *ships at
