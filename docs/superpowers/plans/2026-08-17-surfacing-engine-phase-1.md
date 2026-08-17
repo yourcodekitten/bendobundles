@@ -1,5 +1,27 @@
 # Surfacing Engine (Phase 1) Implementation Plan
 
+> # 🔴 DO NOT EXECUTE THIS PLAN. IT WAS NEVER RUN, AND ITS PREMISE IS FALSE.
+>
+> **Measured against production on 2026-08-17, after this plan was written and reviewed:**
+> `thank-you notes ever left: 0` (from **24 real claims**) · `claims 2026-07 -> 24, 2026-08 -> 0` ·
+> `18 links across 1114 games`. **Flow is approximately zero.**
+>
+> Task 4 builds `unread thanks` as the flagship reason. **It has no production path** — its four
+> tests (null arm, fire arm, fires-once, falsifiability) would pass forever on fixtures against a
+> predicate that can never fire. The engine as a whole would run a backfill and then be **correct and
+> silent forever**, which its own criterion ① would score as success.
+>
+> ⇒ See the **VERDICT FIRST** section of
+> `docs/superpowers/specs/2026-08-17-surfacing-engine-design.md`, and criterion **⑥ (fire-rate
+> floor)**, which was added because of this and is the thing that would have caught it.
+>
+> **This file is kept as the design that would have been right had the rows been there** — the
+> mechanics (fires-once markers, per-reason first-run policy, an explicit null verdict, evidence that
+> re-derives) are sound and reusable. **The reasons are not.** Anyone reviving this must re-run the
+> reachability and flow measurements first; a plan that looks executable is a trap when its premise
+> has been retracted.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a pure reason engine that decides — from store state alone — whether the app has anything worth telling Ben today, and record what it *would* have said, delivering nothing to anyone.
