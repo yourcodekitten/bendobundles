@@ -167,43 +167,48 @@ principle here, not an enforced arm, and saying so beats a five-item claim where
    is filler by default.*** a daily digest is a schedule hunting for content. EventBridge still
    drives the tick; it **evaluates predicates** instead of filling a quota.
 
-6. 🔑 **a null state needs a FIRE-RATE FLOOR.** (Lilith, 2026-08-17, after the measurement above
-   killed this design — and it is the criterion that would have caught it.) ***a null-capable engine
-   cannot distinguish "correctly quiet" from "structurally empty."*** an engine that fires zero times
-   in a year makes criterion ① report **perfect health, every day**. ⇒ ***"nothing fired in N days"
-   is not silence — it is a dead engine, and it must say so in a different voice.***
-   🔴 **AND ⑥'s N MUST BE DERIVED FROM MEASURED FLOW — it cannot be set until that number exists**
-   (OMBB, step-5 condition). *a floor screaming "dead engine" every month when the honest flow is
-   three fires a year is an always-red check* — **and an alarm nobody can switch off gets switched
-   off**, which is the failure ⑥ was invented to prevent, reproduced inside ⑥. ⇒ **record the
-   dependency, or the next person picks 30 because it is round.** *the fraction-flagged gate applies
-   to one's own new criterion: if the floor would fire on most periods, it is measuring a convention.*
-   ⭐ **AND THE REFORMULATION THAT MAKES ⑥ USEFUL BEFORE THE BUILD (Lilith, taking OMBB's condition
-   one step further): ⑥'S REAL OUTPUT IS NOT A THRESHOLD — IT IS A BUILD / DON'T-BUILD GATE.**
-   > ***if you cannot derive N because the flow is too sparse to have a rate, ⑥ has just told you the
-   > engine is unjustified.***
-   **⑥ has a PRECONDITION: a fire-rate floor is only meaningful over a nonzero flow.** derive N from
-   measured flow; **if the derivation has no answer, do not build the engine.**
-   ⇒ *that is the same conclusion this document reached by measuring — ⑥ gets there **by
-   construction**, at the spec stage rather than the query stage.*
-   🔴 **and note the shape ⑥ nearly had:** it was written as the fix for ①'s blind spot and carried
-   ①'s **mirror** — ① cannot see a dead engine; a mis-set ⑥ cannot see a **healthy quiet** one, and
-   on this app *any* N would be red on day one and red forever. ***a fix that introduces the inverse
-   of the defect it repairs.***
-   🔴 **AND THE GATE NEEDS A DISCRIMINATOR, or it forbids all greenfield work** (OMBB, third
-   refinement of ⑥ in ten minutes): **⑥-as-gate cannot, alone, tell ABSENT flow from NOT-YET flow.**
-   a feature whose source events do not exist until it ships has flow `0` **by construction** — so as
-   first written, ⑥ says *don't build* to everything new, *which is the always-red check one layer up:
-   a gate that says no to everything and gets switched off.* ⇒ **ask why the zero:**
-   - **the generating behaviour EXISTS and its rate is ~0** ⇒ **⑥ FIRES. don't build.** *(this app:
-     claims and links exist, and are near-zero.)*
-   - **the source does not exist yet** ⇒ **⑥ is SILENT, NOT PERMISSIVE.** it cannot judge, so the
-     verdict is **NOT MEASURED, never a pass** — justify the build another way, **with a kill date.**
-   **this spec does not set N. flow here is ~0 with the generating behaviour present ⇒ by ⑥'s own
-   gate, the engine is unjustified.**
-   **this is the assertion-count floor aimed at a product:** a suite with no floor cannot tell *34
-   passed* from *34 passed with a stage silently skipped*; an engine with no fire-rate floor cannot
-   tell *a quiet week* from *nothing to do, ever*. **⑥ survives whichever design anyone builds later.**
+6. 🔑 **A NULL STATE NEEDS A FIRE-RATE FLOOR — AND THE FLOOR HAS THREE VERDICTS AND TWO APPLICATION
+   POINTS.** (Lilith, after the measurement below killed this design; refined three times by OMBB and
+   restated by her. The evolution is recorded at the end because *how* it got here is the useful part.)
+
+   **The defect it repairs:** ***a null-capable engine cannot distinguish "correctly quiet" from
+   "structurally empty."*** An engine that fires zero times in a year makes criterion ① report
+   **perfect health, every day.** *"Nothing fired in N days" is not silence — it is a dead engine, and
+   it must say so in a different voice.* This is the **assertion-count floor aimed at a product**: a
+   suite with no floor cannot tell *34 passed* from *34 passed with a stage silently skipped.*
+
+   **The rule.** A fire-rate floor is only meaningful over a nonzero flow. **Derive N from measured
+   flow — never pick it.** If the derivation has no answer, **ask why the zero**, and answer with one
+   of *three* verdicts:
+
+   | why the flow is zero | verdict | action |
+   |---|---|---|
+   | the generating behaviour **EXISTS** and its rate is ~0 | 🔴 **FIRE** | **don't build.** *(this app: claims and links exist, and are near-zero)* |
+   | the source **does not exist yet** (greenfield) | ⚠️ **NOT MEASURED** | **silent, never permissive.** justify separately, and **schedule the measurement as a JOB** |
+   | flow is nonzero and measured | ✅ **CLEAR** | derive N and set the floor |
+
+   ⚠️ **A KILL DATE IS NOT A MECHANISM.** *"Justify another way, with a kill date"* is a date someone
+   writes down, and **a date passes silently.** ⇒ **it must be a job, not a calendar note:** *ships at
+   D; at D+90 the flow is MEASURED and ⑥ is evaluated for real.* otherwise NOT MEASURED becomes
+   permanent and the feature lives on a promissory note nobody redeems — ***a deferral the tool
+   doesn't print is one you forgot***, and this one has to print itself.
+
+   ⭐ **TWO APPLICATION POINTS, chosen by which verdict ⑥ returns:**
+   - **brownfield — ⑥ asks *should this be built?*** measurable now. **it kills this app's engine at
+     spec stage**, which is where this document should have died.
+   - **greenfield — ⑥ asks *did this earn its existence?*** measurable only after shipping, so ⑥
+     becomes a **RETIREMENT criterion.** *this is the more valuable half long-term, because nothing
+     we build currently has a mechanism for asking whether it should still exist.*
+
+   📌 **How it got here, because the evolution is the lesson.** ⑥ was written as the fix for ①'s blind
+   spot **and carried ①'s mirror**: ① cannot see a dead engine; a mis-set ⑥ cannot see a **healthy
+   quiet** one, and on this app *any* N would be red on day one and red forever — ***a fix that
+   introduces the inverse of the defect it repairs.*** Reframed as a build/don't-build gate, it then
+   **forbade all greenfield work**, since a not-yet-shipped feature has flow `0` by construction —
+   *the always-red check one layer up: a gate that says no to everything new, and gets switched off.*
+   🔴 **Both versions had TWO verdicts, and both collapsed *"I cannot judge this"* into one of the
+   two** — the exact defect the three of us spent a night on, shipped twice inside one criterion, the
+   second time in the replacement for the first. **The third verdict is what makes it work.**
 
 ## the mechanic: FIRES-ONCE
 
