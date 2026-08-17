@@ -3,25 +3,103 @@
 **date:** 2026-08-17 · **author:** code kitten · **status:** spec (design reviewed in the family
 channel, 2026-08-17; pending OMBB sign-off)
 
-## the idea
+## 🔴 VERDICT FIRST: the premise did not survive contact with production
 
-**this app is sitting on kindness ben has never seen.**
+**status: NOT BUILT, deliberately.** this document is kept because the *criteria* are durable and the
+*measurement* is the deliverable. the reasons died. read this section before anything below it.
 
-`Link.thanked_at` is written when a friend leaves a thank-you note. it is read by **nothing that
-reaches him**. measured, with the grep's own control:
+**the original lead argument of this spec was:** *"this app is sitting on kindness ben has never
+seen"* — that `Link.thanked_at` is written and reaches him through nothing.
+
+***it is false, and it was false in two independent ways.***
+
+**① there is no kindness sitting there.** measured against `brd-prod-ue1-bendobundles-table`:
 
 ```
-grep 'thanked' across fulfillment/ + admin-api/, filtered to operator|notify|message|discord
-  → ZERO hits
+games 1114 · links 18 · claims 24 · total items 2025
+thank-you notes ever left: 0
 ```
 
-⇒ a friend performs an act of gratitude toward ben, and the system absorbs it. **they believe they
-thanked him. they thanked a DynamoDB attribute.**
+not *"0 unread"* — **0 ever.** `set_link_thanks` writes top-level `thank_note`/`thanked_at`; a
+full-table scan finds **19 distinct top-level attributes and none matching /thank/i**, scan
+positive-controlled.
+⚠️ *and the near-miss on the way: the first query looked for `thanked_at` inside the serialized
+`body` blob, where it is not. a filter on the wrong population returns `0` — **indistinguishable from
+the truth it eventually found.***
 
-that is not a missing notification. it is a **shipped feature that has never once done its job**,
-and it passed review because *writing* is the visible half. ***an unconditional write nobody reads
-is the same as no write*** (OMBB's line, applied here by Lilith) — a feature that writes and nothing
-reads is **a side effect with good intentions**.
+**② and there IS a reader.** the grep that produced *"read by nothing"* was scoped to
+`operator|notify|message|discord` — **push readers.** the feature is wired end to end:
+
+```
+friend affordance : web/src/friend/ThanksCard.tsx, rendered at LinkPage.tsx:511
+route             : POST /api/l/{token}/thanks -> handle_post_thanks
+store write       : set_link_thanks (top-level thank_note + thanked_at)
+reader            : web/src/admin/Links.tsx:587 — "The friend's thank-you — read-only,
+                    ben receives their words."
+```
+
+⇒ **nothing is broken, unwired, or undiscoverable. 24 people claimed a game and none chose to
+thank.** *the sample cannot distinguish "poor affordance" from "people don't always thank," and
+there is no query that can.*
+⚖️ **so it is recorded as a FACT, not a problem: *it works; nobody chose to.*** **not** broken, **not**
+undiscoverable, **not** an engagement failure — *we have now been wrong twice by deciding what a
+number means before ben has.*
+⚠️ **the population i examined excluded the answer** — which is the defect §"the problem this belongs
+to" names, committed in the same document that names it.
+
+## 🔴 AND THE MEASUREMENT THAT KILLED THE ENGINE: FLOW ≈ 0
+
+*stock justifies a backfill; **flow** justifies an engine* (OMBB).
+
+```
+links   2026-07 -> 17   ·   2026-08 -> 1
+claims  2026-07 -> 24   ·   2026-08 -> 0        (measured 2026-08-17)
+reachability, all three reasons, against production:
+  unread thanks : 0 rows            UNREACHABLE
+  stale invites : 14 links with unused capacity, oldest 2026-07-03
+  surplus keys  : 14 owned+giftable+unclaimed  (control: 297 owned_by_ben, 681 giftable
+                  ⇒ the filters discriminate; 14 is a real intersection)
+18 links across 1114 games ⇒ ~1.6% of the collection has ever been shared.
+```
+
+⇒ **every claim in the app's life happened in its launch month.** the engine would fire a backfill
+and then be **correct and silent forever** — and *criterion ① would score that as success.*
+🔴 ***the null state this document is proudest of would have concealed that the engine has nothing
+to do.***
+
+**and structurally, independent of the numbers (Lilith):** *two of the three reasons have flow
+downstream of **ben's own engagement**, in an app that exists because he disengages.* **it goes
+quiet exactly when the problem it was built for is at its worst** — ***a metric that cannot express
+its own bad state.*** the only reason whose flow is exogenous is unread thanks, **and that is the one
+with no data.**
+
+## how both retractions got past review, recorded as a pattern
+
+**Lilith reviewed 271 lines, produced six findings, and ratified the premise** — opening with *"your
+opening finding is that `thanked_at` is written and reaches him through nothing"* and calling the
+measurements *"real and controlled."* ⇒ ***she audited the mechanism and took the premise on
+report.*** **OMBB asked the one question that mattered — *is the founding claim checkable?* — without
+having read the spec at all.**
+🔴 **and the scope was PRINTED in the evidence she quoted.** the block at the old §data table read
+`filtered to operator|notify|message|discord` — **a push population, structurally unable to see
+`admin/Links.tsx`.** *the filter was in the code block copied into the review; the conclusion was
+read and the filter skipped.*
+⇒ **reviewer-specific shape, and she asked for it recorded as a pattern rather than an incident:**
+***a reviewer who checks the mechanism and trusts the lead has inspected the half that was already
+argued.*** this is her second of the morning — the other is the C retraction below — **both inside
+paragraphs where she was agreeing.** *nobody audits the paragraph that agrees with them.*
+⇒ **and the author's half:** ***a spec's LEAD argument should be the most-measured thing in it, not
+the least.*** the lead is what survives summarisation — mine propagated into a plan, nine tasks, a
+commit message and four channel posts **before anyone counted the rows.**
+
+## what was NOT concluded, because it was not measured
+
+⚠️ *"the quiet is an engagement problem"* is **exactly as unmeasured as the lead this document
+retracts.** ben shared 18 links, 24 were claimed, and he stopped. **that may simply be what
+happened — a tool with a burst of use and then quiet is not broken; it may be finished.**
+⇒ **whether low engagement is a defect or the natural shape of the tool is a question about what ben
+WANTS, and there is no query for it.** *the criteria are ours, the threshold is his — and one turn
+further out, **the problem statement is his too.***
 
 ## the problem this belongs to
 
@@ -68,7 +146,10 @@ temporality is a **deliberate schema change with ben's name on it**, not a hook 
 
 ## the five criteria a surfacing must meet
 
-Lilith's, 2026-08-17, adopted whole. each is enforced below, none is a note.
+Lilith's ①-⑤ and ⑥, 2026-08-17. ⑥ was added *after* the measurement killed this design.
+⚠️ **honesty about enforcement: ①②④⑤ each have a mechanism below. ③ does not — it is a design
+principle here, not an enforced arm, and saying so beats a five-item claim where one item isn't**
+(Lilith's review: *count-vs-list, in the sentence asserting enforcement*).
 
 1. **it must be able to say nothing.** a digest of *N games* has no null verdict **by construction**
    — it manufactures content on a quiet day, and that is the day it becomes furniture. **a
@@ -83,6 +164,15 @@ Lilith's, 2026-08-17, adopted whole. each is enforced below, none is a note.
 5. 🔑 **the trigger is the event, not the calendar.** ***if the schedule is the trigger, the content
    is filler by default.*** a daily digest is a schedule hunting for content. EventBridge still
    drives the tick; it **evaluates predicates** instead of filling a quota.
+
+6. 🔑 **a null state needs a FIRE-RATE FLOOR.** (Lilith, 2026-08-17, after the measurement above
+   killed this design — and it is the criterion that would have caught it.) ***a null-capable engine
+   cannot distinguish "correctly quiet" from "structurally empty."*** an engine that fires zero times
+   in a year makes criterion ① report **perfect health, every day**. ⇒ ***"nothing fired in N days"
+   is not silence — it is a dead engine, and it must say so in a different voice.***
+   **this is the assertion-count floor aimed at a product:** a suite with no floor cannot tell *34
+   passed* from *34 passed with a stage silently skipped*; an engine with no fire-rate floor cannot
+   tell *a quiet week* from *nothing to do, ever*. **⑥ survives whichever design anyone builds later.**
 
 ## the mechanic: FIRES-ONCE
 
