@@ -107,6 +107,38 @@ a bare `bool` — the marker IS the transition detector.** its absence is the on
 currently-true predicate is *newly* true. that is a stronger argument for the pattern than
 "stop it firing twice."
 
+## 🔴 the first-run hazard: an absent marker is a PER-REASON policy
+
+(OMBB, 2026-08-17, on the spec above.) **on the first deployment no key has a marker**, so
+*marker-absent-means-new* makes **every** qualifying record read as new. ⇒ the first run would page
+ben with **forty items at once** — *not news; furniture delivered all at once, on day one.*
+
+**so "what does an absent marker mean?" must be decided per reason, and getting it backwards is
+expensive in both directions:**
+
+| reason | first-run policy | why |
+|---|---|---|
+| 💰 **surplus key** | **SEED SILENTLY** | record what exists, announce nothing. only *later* arrivals are news. **he already knows he owns them.** |
+| 💔 **unread thanks** | **ANNOUNCE THE BACKLOG** | he is **owed** these — silence is the bug being fixed. **seeding them silently would ship the fix and have it behave exactly like the break.** |
+| ⏳ **stale invite** | **seed silently, then threshold** | the age is real but the *crossing* under our watch is the event. |
+
+⇒ ***same mechanism, opposite defaults.*** every reason declares its first-run policy **with its
+reason**, in code, not in a comment.
+
+## 🔴 event decides IF; calendar decides WHEN
+
+(OMBB, same review.) criterion ⑤ says the event triggers, not the calendar — **and taken alone that
+hands the moment to the event.** events fire at 03:00, or five of them inside ten minutes. **ben's
+attention has hours; a predicate does not.**
+
+⇒ **the calendar returns, not as the trigger but as a GOVERNOR ON DELIVERY:** the engine evaluates
+whenever the tick runs and records what fired; **delivery coalesces the fired set into one message
+at a civil hour.** this preserves ① exactly — a window with nothing in it sends nothing — and kills
+the 3am page. *not a contradiction of ⑤; its completion.*
+
+**phase-1 consequence:** the dry-run ledger must record **when each reason fired**, so the
+coalescing window is designed against real timing data rather than guessed at in phase 2.
+
 ## phase 1 scope — the reason engine, run DRY
 
 🔑 **the delivery door is NOT in phase 1, deliberately.** the sealed `DigestMessage` type mirroring
@@ -142,6 +174,10 @@ hoped for.
      works forward.
 - an **explicit null verdict**: on a tick where nothing transitions, the engine records
   `NOTHING TO SAY` — a first-class outcome, not an empty list.
+- a **first-run policy per reason** (seed-silently vs announce-backlog), declared in the reason's
+  own definition so a new reason cannot be added without choosing one.
+- **fire timestamps in the ledger**, so phase 2's coalescing window is designed against measured
+  timing rather than a guess.
 - a **dry-run ledger**: every tick writes what it *would* have said, with the evidence, and whether
   it fired or was silent.
 - driven by the **existing** EventBridge rule + fulfillment lambda; no new schedule.
@@ -199,4 +235,8 @@ the start rather than retrofitted.
   is the positive control for the digest itself"*; the **first-time / clearing-marker** refinement
   that rescued surplus keys and stale links from the furniture bin; the B verdict; *"the criteria
   are ours, the threshold is Ben's."*
-- **OMBB** — sign-off pending (pounce step 5). open for his swing: ⑤, and the transition case.
+- **OMBB** — the **first-run hazard** (an absent marker is a per-reason policy; surplus seeds
+  silently, thanks announce the backlog — *"seeding them silently would ship the fix and have it
+  behave exactly like the break"*), and **event decides IF, calendar decides WHEN** (the calendar
+  returns as a governor on delivery, coalescing into one message at a civil hour — ⑤'s completion,
+  not its contradiction). Formal sign-off pending (pounce step 5).
