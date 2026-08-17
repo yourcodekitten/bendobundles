@@ -1,7 +1,9 @@
 # the surfacing engine — reasons that fire once
 
-**date:** 2026-08-17 · **author:** code kitten · **status:** spec (design reviewed in the family
-channel, 2026-08-17; pending OMBB sign-off)
+**date:** 2026-08-17 · **author:** code kitten
+**status: 🔴 RETRACTED — NOT BUILT.** family-reviewed 2026-08-17; OMBB step-5 sign-off received on
+the decision *not* to build, with two conditions, both applied. **the criteria and the measurement
+are the deliverable.**
 
 ## 🔴 VERDICT FIRST: the premise did not survive contact with production
 
@@ -188,7 +190,17 @@ principle here, not an enforced arm, and saying so beats a five-item claim where
    ①'s **mirror** — ① cannot see a dead engine; a mis-set ⑥ cannot see a **healthy quiet** one, and
    on this app *any* N would be red on day one and red forever. ***a fix that introduces the inverse
    of the defect it repairs.***
-   **this spec does not set N. flow here is ~0 ⇒ by ⑥'s own gate, the engine is unjustified.**
+   🔴 **AND THE GATE NEEDS A DISCRIMINATOR, or it forbids all greenfield work** (OMBB, third
+   refinement of ⑥ in ten minutes): **⑥-as-gate cannot, alone, tell ABSENT flow from NOT-YET flow.**
+   a feature whose source events do not exist until it ships has flow `0` **by construction** — so as
+   first written, ⑥ says *don't build* to everything new, *which is the always-red check one layer up:
+   a gate that says no to everything and gets switched off.* ⇒ **ask why the zero:**
+   - **the generating behaviour EXISTS and its rate is ~0** ⇒ **⑥ FIRES. don't build.** *(this app:
+     claims and links exist, and are near-zero.)*
+   - **the source does not exist yet** ⇒ **⑥ is SILENT, NOT PERMISSIVE.** it cannot judge, so the
+     verdict is **NOT MEASURED, never a pass** — justify the build another way, **with a kill date.**
+   **this spec does not set N. flow here is ~0 with the generating behaviour present ⇒ by ⑥'s own
+   gate, the engine is unjustified.**
    **this is the assertion-count floor aimed at a product:** a suite with no floor cannot tell *34
    passed* from *34 passed with a stage silently skipped*; an engine with no fire-rate floor cannot
    tell *a quiet week* from *nothing to do, ever*. **⑥ survives whichever design anyone builds later.**
@@ -268,7 +280,11 @@ it owes a report.*** the governor's **silent path is an asserted arm like any ot
 the one nobody will think to test, *because testing it means running a job and watching it do
 nothing.*
 
-## phase 1 scope — the reason engine, run DRY
+## phase 1 scope — the reason engine, run DRY   🔴 *(NOT BUILT — see VERDICT FIRST)*
+
+> ⚠️ **everything from here to §"the threshold is ben's" is the design as it stood BEFORE the
+> measurement.** it is kept because the mechanics are reusable; **it is not a plan of record and
+> nothing in it was implemented.** *a scope section reads as intent, and intent reads as approval.*
 
 🔑 **the delivery door is NOT in phase 1, deliberately.** the sealed `DigestMessage` type mirroring
 `OperatorMessage` is the satisfying part and it would feel like progress; building it first is the
