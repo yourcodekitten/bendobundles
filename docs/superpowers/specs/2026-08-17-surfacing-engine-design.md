@@ -176,7 +176,19 @@ principle here, not an enforced arm, and saying so beats a five-item claim where
    off**, which is the failure ⑥ was invented to prevent, reproduced inside ⑥. ⇒ **record the
    dependency, or the next person picks 30 because it is round.** *the fraction-flagged gate applies
    to one's own new criterion: if the floor would fire on most periods, it is measuring a convention.*
-   **this spec does not set N. flow here is ~0 and N is therefore undefined, not large.**
+   ⭐ **AND THE REFORMULATION THAT MAKES ⑥ USEFUL BEFORE THE BUILD (Lilith, taking OMBB's condition
+   one step further): ⑥'S REAL OUTPUT IS NOT A THRESHOLD — IT IS A BUILD / DON'T-BUILD GATE.**
+   > ***if you cannot derive N because the flow is too sparse to have a rate, ⑥ has just told you the
+   > engine is unjustified.***
+   **⑥ has a PRECONDITION: a fire-rate floor is only meaningful over a nonzero flow.** derive N from
+   measured flow; **if the derivation has no answer, do not build the engine.**
+   ⇒ *that is the same conclusion this document reached by measuring — ⑥ gets there **by
+   construction**, at the spec stage rather than the query stage.*
+   🔴 **and note the shape ⑥ nearly had:** it was written as the fix for ①'s blind spot and carried
+   ①'s **mirror** — ① cannot see a dead engine; a mis-set ⑥ cannot see a **healthy quiet** one, and
+   on this app *any* N would be red on day one and red forever. ***a fix that introduces the inverse
+   of the defect it repairs.***
+   **this spec does not set N. flow here is ~0 ⇒ by ⑥'s own gate, the engine is unjustified.**
    **this is the assertion-count floor aimed at a product:** a suite with no floor cannot tell *34
    passed* from *34 passed with a stage silently skipped*; an engine with no fire-rate floor cannot
    tell *a quiet week* from *nothing to do, ever*. **⑥ survives whichever design anyone builds later.**
