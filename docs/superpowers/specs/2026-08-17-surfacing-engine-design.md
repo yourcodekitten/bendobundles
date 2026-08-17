@@ -125,6 +125,18 @@ expensive in both directions:**
 ⇒ ***same mechanism, opposite defaults.*** every reason declares its first-run policy **with its
 reason**, in code, not in a comment.
 
+**and the policy is chosen by a ONE-QUESTION TEST, so whoever adds reason #4 gets the answer without
+re-deriving it** (Lilith): ***would he say "why didn't you tell me sooner?"***
+- **yes ⇒ DEBT ⇒ announce the backlog.** he is owed it; **a remedy whose output is
+  indistinguishable from the defect has not been deployed.**
+- **no ⇒ INVENTORY ⇒ seed silently.** a standing fact he already knows; announcing it is
+  **furniture wearing a migration's clothes.**
+
+⚠️ **third case — a debt that is also LARGE.** fourteen unread thanks going back to march are *owed*
+**and** unshippable as fourteen messages. ⇒ **announce the debt's EXISTENCE and SIZE, not its
+contents**: *"you have 14 unread thank-you notes, oldest from march."* **the backlog is a single
+event; its items are not.**
+
 ## 🔴 event decides IF; calendar decides WHEN
 
 (OMBB, same review.) criterion ⑤ says the event triggers, not the calendar — **and taken alone that
@@ -138,6 +150,14 @@ the 3am page. *not a contradiction of ⑤; its completion.*
 
 **phase-1 consequence:** the dry-run ledger must record **when each reason fired**, so the
 coalescing window is designed against real timing data rather than guessed at in phase 2.
+
+🔴 **AND THE HAZARD INSIDE THE GOVERNOR — where criterion ① is most likely to die.** a coalescing
+delivery job **must be able to produce no message at all.** if it wakes at its civil hour and sends
+*"nothing today"*, we have **built the null state and then thrown it away in the plumbing.**
+⇒ ***a delivery scheduler is exactly where a null verdict dies, because a job that runs feels like
+it owes a report.*** the governor's **silent path is an asserted arm like any other** — and it is
+the one nobody will think to test, *because testing it means running a job and watching it do
+nothing.*
 
 ## phase 1 scope — the reason engine, run DRY
 
@@ -218,6 +238,9 @@ the start rather than retrofitted.
 
 ## testing
 
+- **the governor's silent path is a test:** a delivery window whose fired-set is empty must produce
+  **no message** — asserted, with a sibling arm that produces a message from the same harness, or
+  the silent arm proves nothing.
 - **null state is a test, not a hope:** a tick with no transitions must produce `NOTHING TO SAY`,
   asserted — and a sibling arm must produce a fire from the same fixture, or the null arm proves
   nothing.
