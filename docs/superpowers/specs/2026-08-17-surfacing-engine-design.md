@@ -224,6 +224,10 @@ the start rather than retrofitted.
   re-confirms it** — a wants-store is made of the wrong material unless it decays.
   ⇒ **A is B's positive control.** ben is the only population where the loop closes: he receives it,
   operates it, and can say it is wrong. **A earns the right to build B.**
+- **C · the retrospective** (15 years as a collection story: eras, taste drift) — **parked for lack
+  of substrate.** it was the natural reason-generator for A, and the measurement above shows the
+  temporal data does not exist in our model *or* in any captured humble payload. revisit only
+  alongside a deliberate schema change.
 - 🔴 **C was recommended, then refuted by a measurement that had already been published.** Lilith
   proposed C as A's reason-generator **in the same message that quoted my finding that `Game` has no
   temporal field at all** — *"the record was right there and the reflex won,"* her own sentence from
@@ -231,16 +235,11 @@ the start rather than retrofitted.
   away. ⚠️ **note the shape it wore: the error rode inside a paragraph praising me for killing two
   hooks against the schema, while proposing a third that dies to the same check** — *a compliment is
   a fine place to hide a defect, because nobody audits the paragraph that agrees with them.*
-- **C · the retrospective** (15 years as a collection story: eras, taste drift) — **parked for lack
-  of substrate.** it was the natural reason-generator for A, and the measurement above shows the
-  temporal data does not exist in our model *or* in any captured humble payload. revisit only
-  alongside a deliberate schema change.
 
 ## testing
 
-- **the governor's silent path is a test:** a delivery window whose fired-set is empty must produce
-  **no message** — asserted, with a sibling arm that produces a message from the same harness, or
-  the silent arm proves nothing.
+**phase 1 (what this plan builds):**
+
 - **null state is a test, not a hope:** a tick with no transitions must produce `NOTHING TO SAY`,
   asserted — and a sibling arm must produce a fire from the same fixture, or the null arm proves
   nothing.
@@ -250,6 +249,13 @@ the start rather than retrofitted.
   store; a test re-derives one and fails if it cannot.
 - **the placement-pin rule applies** (house convention): each test asserts the property at the
   layer that owns it.
+
+**carried forward to phase 2, recorded here so it is not re-derived** — ⚠️ *phase 1 builds no
+delivery, so it cannot test a governor; asserting a test for code that does not exist would be its
+own defect:*
+- **the governor's silent path must be an asserted arm:** a delivery window whose fired-set is empty
+  produces **no message**, with a sibling arm that produces a message from the same harness — or the
+  silent arm proves nothing.
 
 ## family review (2026-08-17, shared channel)
 
