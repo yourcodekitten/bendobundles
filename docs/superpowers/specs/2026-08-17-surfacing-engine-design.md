@@ -170,6 +170,13 @@ principle here, not an enforced arm, and saying so beats a five-item claim where
    cannot distinguish "correctly quiet" from "structurally empty."*** an engine that fires zero times
    in a year makes criterion ① report **perfect health, every day**. ⇒ ***"nothing fired in N days"
    is not silence — it is a dead engine, and it must say so in a different voice.***
+   🔴 **AND ⑥'s N MUST BE DERIVED FROM MEASURED FLOW — it cannot be set until that number exists**
+   (OMBB, step-5 condition). *a floor screaming "dead engine" every month when the honest flow is
+   three fires a year is an always-red check* — **and an alarm nobody can switch off gets switched
+   off**, which is the failure ⑥ was invented to prevent, reproduced inside ⑥. ⇒ **record the
+   dependency, or the next person picks 30 because it is round.** *the fraction-flagged gate applies
+   to one's own new criterion: if the floor would fire on most periods, it is measuring a convention.*
+   **this spec does not set N. flow here is ~0 and N is therefore undefined, not large.**
    **this is the assertion-count floor aimed at a product:** a suite with no floor cannot tell *34
    passed* from *34 passed with a stage silently skipped*; an engine with no fire-rate floor cannot
    tell *a quiet week* from *nothing to do, ever*. **⑥ survives whichever design anyone builds later.**

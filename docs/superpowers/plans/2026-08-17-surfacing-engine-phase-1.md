@@ -1,4 +1,4 @@
-# Surfacing Engine (Phase 1) Implementation Plan
+# 🔴 RETRACTED — Surfacing Engine (Phase 1) Implementation Plan — DO NOT EXECUTE
 
 > # 🔴 DO NOT EXECUTE THIS PLAN. IT WAS NEVER RUN, AND ITS PREMISE IS FALSE.
 >
