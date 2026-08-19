@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- Rust gates: `cargo fmt --check` · `cargo clippy --workspace --all-targets --all-features -- -D warnings` · `cargo test --workspace --no-fail-fast` with dynamodb-local (`docker run -d -p 8000:8000 amazon/dynamodb-local:2.5.2` then `export DYNAMODB_LOCAL_URL=http://localhost:8000`). **Store-backed tests SILENTLY SKIP without that env var — a green run without it proves nothing. Export it before claiming green.**
+- Rust gates: `cargo fmt --check` · `cargo clippy --workspace --all-targets --all-features -- -D warnings` · `cargo test --workspace --no-fail-fast` with dynamodb-local at `DYNAMODB_LOCAL_URL=http://localhost:8000`. **Store-backed tests SILENTLY SKIP without that env var — a green run without it proves nothing about them.**
+- 🔴 **EXECUTION-BOX REALITY (kitten's box, measured 2026-08-19): no docker, no java, no dynamodb-local anywhere, ~800MB free RAM on a global-OOM-kill box.** Consequences, all mandatory: (1) do NOT set `DYNAMODB_LOCAL_URL` locally — set-but-unreachable PANICS by design (`store_or_skip`'s anti-forged-green guard); (2) do NOT stand up a JVM; (3) local verification = fmt + clippy + compile + non-store tests + the FULL web suite; store-backed tests SKIP locally — expected, count and NAME the skipped tests in the task report, never call their absence green; (4) **the RED/GREEN receipt for store-backed tests is CI on the draft PR** — CI runs on `pull_request` only, so Task 1 ends by opening a DRAFT PR, and every task's push gets the full suite against a real dynamodb-local. Watch it with `gh pr checks` before calling a task done. The `DYNAMODB_LOCAL_URL=…`-prefixed commands in the task steps are CI-fidelity documentation and run verbatim in any environment that HAS a runner.
 - Web gates (from `web/`): `npm run lint` · `npm run typecheck` · `npm test -- --run` · `npm run build`.
 - ALL user-facing copy and aria-labels are lowercase (DESIGN.md, The Lowercase Rule).
 - Burgundy (`bg-give`) ONLY where giving/claiming happens (The Button Burgundy Rule). New chips are `bg-shelf`/`bg-control` + `text-ink-soft`; ghost-card chip `bg-floor text-dust`. No shadows on cards/chips (The Ceremony Rule).
@@ -202,7 +203,14 @@ Expected: exit=0, all pass including the four new ones (not SKIP — verify the 
 
 - [ ] **Step 5: Workspace still compiles:** `cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -5` → clean.
 
-- [ ] **Step 6: Commit:** `git add -A && git commit -S -m "feat(domain+dynamo): curated_game_ids on Link — top-level order-preserving attribute, rollback-pinned"`
+- [ ] **Step 6: Commit, push, open the DRAFT PR** (the CI receipt for every store-backed test from here on):
+```bash
+git add -A && git commit -S -m "feat(domain+dynamo): curated_game_ids on Link — top-level order-preserving attribute, rollback-pinned" \
+  && git push -u origin chosen-for-you \
+  && gh pr create -R yourcodekitten/bendobundles --draft --title "chosen for you: per-link curation — the product thesis, implemented" --body "draft while the plan executes — real body lands at the final task. spec + plan in docs/superpowers/."
+gh pr checks --watch
+```
+Expected: CI green — the four new store tests RAN there (open the run log and find their names; a green that skipped them is not a receipt).
 
 ---
 
@@ -1236,9 +1244,9 @@ Expected: every gate green; confirm the new store-backed tests RAN (grep the out
 
 - [ ] **Step 2: Flip the spec status line** to `status: accepted (family-reviewed 2026-08-19); implemented on this branch` and commit: `git add -A && git commit -S -m "docs: chosen-for-you spec accepted"`
 
-- [ ] **Step 3: Push and open the PR** (body written to a file first — no placeholders in an executable block):
+- [ ] **Step 3: Push, finalize the body, mark the draft ready** (the draft PR exists since Task 1):
 ```bash
-git push -u origin chosen-for-you
+git push
 cat > /tmp/chosen-for-you-pr.md <<'EOF'
 PRODUCT.md's design principle 2 — "Chosen-for-you, never shopping" — was never implemented: every friend on every link saw ben's whole listable catalog. a link now carries the exact games ben picked when he wrapped it.
 
@@ -1251,10 +1259,11 @@ PRODUCT.md's design principle 2 — "Chosen-for-you, never shopping" — was nev
 spec: `docs/superpowers/specs/2026-08-19-chosen-for-you-design.md` (three family-review rounds)
 plan: `docs/superpowers/plans/2026-08-19-chosen-for-you.md` (adversarially reviewed pre-execution)
 EOF
-gh pr create -R yourcodekitten/bendobundles --title "chosen for you: per-link curation — the product thesis, implemented" --body-file /tmp/chosen-for-you-pr.md
+gh pr edit -R yourcodekitten/bendobundles --body-file /tmp/chosen-for-you-pr.md
+gh pr ready -R yourcodekitten/bendobundles
 ```
 
-- [ ] **Step 4: Watch CI to green:** `gh pr checks --watch` (bendobundles CI runs the full suite on pull_request — memory: never block on local-only greens).
+- [ ] **Step 4: Watch CI to green:** `gh pr checks --watch` — and confirm in the run log that the new store-backed test NAMES appear as executed (they SKIP on the local box by design; CI is their only receipt).
 
 ---
 
