@@ -125,6 +125,7 @@ fn link(token: &str) -> Link {
         revoked: false,
         expires_at: None,
         unlock_at: None,
+        curated_game_ids: None,
         created_at: OffsetDateTime::now_utc(),
     }
 }

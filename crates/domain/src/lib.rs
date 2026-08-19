@@ -222,6 +222,17 @@ pub struct Link {
         skip_serializing_if = "Option::is_none"
     )]
     pub unlock_at: Option<OffsetDateTime>,
+    /// The games ben picked when he wrapped this link — `None` = open shelf (the
+    /// whole listable catalog, every pre-field record). CREATE-TIME-ONLY, like
+    /// `unlock_at` (spec 2026-08-19 §1): no edit path exists or may be added
+    /// without its own spec. ORDER IS MEANING: pick order = presentation order.
+    /// Storage: top-level dynamo `L` attribute, NEVER the body blob — the claim
+    /// gate reads this, making it an enforcement field (dynamo doctrine, its
+    /// lib.rs "body for immutable identity, top-level attrs for enforcement"),
+    /// and a body-carried copy would be erased by a pre-field binary's `SET
+    /// body = :b` write-back on rollback. See the rollback pin in store_test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curated_game_ids: Option<Vec<String>>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -515,6 +526,7 @@ mod tests {
             revoked: false,
             expires_at: None,
             unlock_at: None,
+            curated_game_ids: None,
             created_at: datetime!(2026-07-02 00:00 UTC),
         }
     }

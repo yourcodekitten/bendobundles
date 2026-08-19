@@ -689,6 +689,9 @@ async fn handle_create_link(
         revoked: false,
         expires_at,
         unlock_at,
+        // Task 4 replaces this with the real curated pick list; this handler
+        // must compile now, and every pre-task-4 link is open-shelf anyway.
+        curated_game_ids: None,
         created_at: now,
     };
 

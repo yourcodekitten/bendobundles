@@ -452,6 +452,18 @@ fn link_from_item(
             )
         }
     };
+    // Top-level attr is the ONLY source (body never carries it). Absent = open
+    // shelf. Malformed entries are a Corrupt read, not a silent skip.
+    link.curated_game_ids = match item.get("curated_game_ids") {
+        None => None,
+        Some(aws_sdk_dynamodb::types::AttributeValue::L(list)) => Some(
+            list.iter()
+                .map(|v| v.as_s().cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| StoreError::Corrupt("curated_game_ids holds a non-string"))?,
+        ),
+        Some(_) => return Err(StoreError::Corrupt("curated_game_ids is not a list")),
+    };
     Ok(link)
 }
 
