@@ -82,13 +82,16 @@ product thesis, implemented instead of asserted.
 - **Live vs ghost, decided out loud** (the first draft let `is_listable()` decide by accident;
   `gone` has six causes, not three — status `Pending`/`Gifted`/`BenRedeemed`/`Expired`,
   `!giftable`, `hidden`):
-  - **LIVE** = `is_listable()` **or `status == Pending`.** A pending claim is IN FLIGHT —
-    nobody has decided its outcome (`fail_stuck_self_claim` resolves it to Gifted OR back
-    toward available via compensate). A ghost over a reversible state is a prediction wearing
-    the clothes of a fact (Lilith; OMBB concurring). The friend may try to claim it; the
-    transaction is the arbiter — its condition (`#st = :available AND
-    attribute_exists(gsi1pk)`) refuses race-free with the existing "someone beat you to it"
-    409, which is exactly the semantics of an undecided race.
+  - **LIVE** = `giftable && !hidden && status ∈ {Available, Pending}` — **`Pending` rescues
+    only the STATUS axis, never the decided ones** (Lilith, sign-off review: my first cut was
+    `is_listable() || Pending`, which let an in-flight claim override a deliberate hide —
+    and hidden+Pending has NO path back to claimable, because compensate re-lists conditioned
+    on `#st = :pending` while the hide outlives the claim; a live card that can never become
+    claimable is the prediction-in-fact's-clothing objection pointing the other way). A plain
+    Pending claim IS genuinely undecided (`compensate` → Available, success → Gifted,
+    terminal → Expired), so it rides live and the claim transaction is the arbiter — its
+    condition (`#st = :available AND attribute_exists(gsi1pk)`) refuses race-free with the
+    existing "someone beat you to it" 409, exactly the semantics of an undecided race.
   - **GHOST** (`gone: true`) = the decided states: `Gifted`, `BenRedeemed`, `Expired`,
     `!giftable`, `hidden`. Rendered with title/art, dimmed, non-interactive, cause-neutral
     copy.

@@ -382,11 +382,18 @@ Module-level, near the view structs:
 /// drifted; do not add a third caller-specific rederivation.
 fn live_on_link(link: &domain::Link, game: &domain::Game) -> bool {
     match &link.curated_game_ids {
-        // Curated: member AND (listable OR in-flight — Pending's outcome is
-        // undecided; the claim tx is the arbiter, spec §2).
+        // Curated: member, and Pending rescues ONLY the status axis — never a
+        // deliberate hide or an ungiftable key (spec §2, Lilith's sign-off
+        // catch: hidden+Pending has no path back to claimable, so `is_listable
+        // || Pending` would pin a permanently-unclaimable card live).
         Some(ids) => {
             ids.iter().any(|id| id == &game.id)
-                && (game.is_listable() || game.status == domain::GameStatus::Pending)
+                && game.giftable
+                && !game.hidden
+                && matches!(
+                    game.status,
+                    domain::GameStatus::Available | domain::GameStatus::Pending
+                )
         }
         // Open shelf: the sparse listable index that feeds the grid IS this
         // predicate — one truth, two spellings, pinned by the gate tests.
@@ -546,6 +553,23 @@ async fn detail_gate_opens_for_curated_pending_only() {
         .oneshot(Request::get(format!("/api/l/cur-d/games/{}/detail", test_game(2).id))
             .body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(no.status(), StatusCode::NOT_FOUND, "ghosts stay non-interactive");
+
+    // hidden + Pending → GHOST, so 404: Pending rescues only the status axis
+    // (ben hid it while a claim was in flight; no resolution path re-lists it)
+    let mut hp = store.get_game(&test_game(1).id).await.unwrap().unwrap();
+    hp.hidden = true;
+    store.put_game(&hp).await.unwrap();
+    let mock3 = mock.clone();
+    let hpr = plain_router(Arc::clone(&store), mock3)
+        .oneshot(Request::get(format!("/api/l/cur-d/games/{}/detail", test_game(1).id))
+            .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(hpr.status(), StatusCode::NOT_FOUND);
+    // un-hide to keep the earlier live-Pending arm's world intact for the
+    // cross-link arm below (ordering: run this arm AFTER the live-Pending
+    // assert above, which it is).
+    let mut unh = store.get_game(&test_game(1).id).await.unwrap().unwrap();
+    unh.hidden = false;
+    store.put_game(&unh).await.unwrap();
 
     // and a Pending game NOT in this link's set → still 404 (not one id more)
     let mut lnk2 = test_link("cur-d2");
