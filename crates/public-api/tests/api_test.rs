@@ -219,6 +219,49 @@ async fn revoked_link_active_false_games_empty() {
     assert!(j["claims"].as_array().is_some());
 }
 
+/// A dead (revoked) curated link withholds the `curated` flag too — final-review
+/// finding: the dead-link view already withholds gift_note/thank_note on the
+/// rationale that a dead link serves no personal content, and the curated mode is
+/// personal content too. Raw-substring on purpose, cribbed from
+/// sealed_curated_link_withholds_curation_entirely: over-matching is the safe
+/// direction for a withholding pin.
+#[tokio::test]
+async fn revoked_curated_link_withholds_curation_entirely() {
+    let Some(store) = store_or_skip("revoked-curated-link").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut lnk = test_link("rev-cur-tok");
+    lnk.revoked = true;
+    lnk.curated_game_ids = Some(vec![test_game(1).id]);
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    let req = Request::get("/api/l/rev-cur-tok")
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(req)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        !raw.contains("curated"),
+        "a dead link serves no personal content, and the curated mode is included"
+    );
+    let j: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(j["state"], "revoked");
+    assert_eq!(j["games"], serde_json::json!([]));
+}
+
 /// gift_note passes through to the friend view when set, and is OMITTED from the
 /// JSON (not null) when unset — the client gates the note dialog on field presence.
 #[tokio::test]

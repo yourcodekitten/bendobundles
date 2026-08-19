@@ -765,7 +765,10 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             claims_allowed: link.claims_allowed,
             claims_used: link.claims_used,
             state,
-            curated: is_curated,
+            // Same personal-content gate as gift_note/thank_note above: a dead
+            // (revoked/expired) link serves no personal content, and the curated
+            // mode is personal content too — withheld, not false.
+            curated: if hide_games { false } else { is_curated },
             games,
             claims,
             unlocks_in_seconds: None,
@@ -1199,9 +1202,14 @@ fn link_not_found_response() -> Response {
 
 /// Token-scoped game detail endpoint. Friend-facing, cache-only: Steam is never called.
 ///
-/// Access rule (no-oracle): the link must resolve AND the game must be currently
-/// listable OR its id must appear in this specific link's claims history.
-/// Any other condition → byte-identical 404 so callers learn nothing about why.
+/// Access rule (no-oracle): the link must resolve AND (`live_on_link(&link, &game)` —
+/// the same shared liveness computation the games grid uses — OR the game id appears
+/// in this specific link's claims history, the friend's receipt for something they
+/// already claimed off this link). Any other condition → byte-identical 404 so callers
+/// learn nothing about why. On curated links this is a deliberate tightening: a
+/// listable game that is NOT one of the link's curated picks is not `live_on_link`, so
+/// it 404s here too — a curated token cannot use this endpoint to enumerate the whole
+/// catalog (spec §2).
 ///
 /// Response shape:
 /// ```json
