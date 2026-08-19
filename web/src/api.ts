@@ -10,6 +10,8 @@ export type GameView = {
   genres?: string[];
   /** Top community tags (popularity order, ≤10); absent when unknown/empty — fall back to genres (#71). */
   tags?: string[];
+  /** ghost marker (curated links): a chosen game in a decided non-listable state. cause-blind by decision (spec §2). */
+  gone?: boolean;
 };
 
 export type ClaimView = {
@@ -38,6 +40,8 @@ export type LinkView = {
   unlocks_in_seconds?: number;
   /** Wrapped gift: the unlock instant (rfc3339); present ONLY while sealed. */
   unlocks_at?: string;
+  /** true iff this link carries a curated set (absent = open shelf). */
+  curated?: boolean;
 };
 
 export type ThanksResult =
@@ -132,6 +136,8 @@ export type AdminLink = {
    * serde, the thanked_at shape — never null). */
   unlock_at?: string;
   created_at: string;
+  /** ben's pick order; absent = open shelf. */
+  curated_game_ids?: string[];
 };
 
 export type StatusView = {
@@ -376,6 +382,7 @@ export async function adminCreateLink(
   expiresDays?: number,
   giftNote?: string,
   unlockAt?: string,
+  gameIds?: string[],
 ): Promise<{ token: string; url_path: string }> {
   const response = await fetch('/admin/api/links', {
     method: 'POST',
@@ -386,6 +393,7 @@ export async function adminCreateLink(
       expires_days: expiresDays,
       gift_note: giftNote,
       unlock_at: unlockAt,
+      game_ids: gameIds,
     }),
   });
 
