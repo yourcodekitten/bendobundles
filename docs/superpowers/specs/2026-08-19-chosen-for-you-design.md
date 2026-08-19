@@ -26,7 +26,7 @@ product thesis, implemented instead of asserted.
 
 ## design decisions (each enforced, none cosmetic)
 
-### 1. domain: `curated_game_ids: Option<Vec<String>>` on `Link`, create-time-only
+### 1. domain: `curated_game_ids: Option<Vec<String>>` on `Link`, create-time-only, stored as a TOP-LEVEL attribute
 
 - `None` = open shelf (every existing record; `#[serde(default)]` makes pre-field records read
   back as `None` — the same back-compat shape every optional `Link` field already uses).
@@ -34,42 +34,86 @@ product thesis, implemented instead of asserted.
   order and the friend's presentation order. No shuffle for curated links.
 - **Create-time-only, like the seal.** `unlock_at`'s rationale transfers verbatim: the server
   can't know whether a friend already looked, so mutating the gift under them is off the table
-  (spec 2026-08-05 §4). A wrapped gift's contents are chosen when it's wrapped. This also
-  settles storage: an immutable field lives in the stored `body` blob — the top-level-attribute
-  dance (`gift_note`, `thank_note`) exists ONLY for fields editable after create.
-- **⚠️ The body blob has more than one writer** (OMBB, family review; both verified in source):
-  the claim tx rewrites `body` from a round-tripped `Link` (`SET body = :b` via
-  `schema::link_body(&bumped)`, `crates/dynamo/src/lib.rs:~1073`), and `update_link_meta` does
-  the same on admin edits (`:658`). Three consequences, each enforced:
-  1. `schema::link_body` must CARRY `curated_game_ids` (it strips only the
-     editable-elsewhere fields; this field is neither).
-  2. A pinned test: claiming on a curated link preserves `curated_game_ids` in the stored
-     body byte-for-byte — the round-trip is where an old struct silently eats the field.
-  3. **Deploy order is a correctness constraint**: every body-writing binary (public-api,
-     admin-api, anything in fulfillment that writes link bodies) deploys WITH or BEFORE the
-     first curated create. An old binary's `Link` deserializer ignores the unknown field and
-     its re-serialize erases the set — silently. The release runbook states this.
+  (spec 2026-08-05 §4). A wrapped gift's contents are chosen when it's wrapped.
+- **Storage: a top-level dynamo `L`-of-`S` attribute (order-preserving list — never `SS`, string
+  sets don't hold order and order is meaning), written once by `link_item` at create, STRIPPED
+  from the body blob by `schema::link_body`, overridden on read by `link_from_item` (absent =
+  `None`).** This reverses the first draft's body-blob choice, and the reversal is the merge of
+  two threat axes (family review, both verified in source):
+  - *Edit races* (OMBB, #69's axis): irrelevant here — the field is immutable, no edit exists
+    to race. Body-blob was adequate on this axis alone.
+  - *Stale writers* (Lilith's axis, and the decider): the claim tx rewrites `body` from a
+    round-tripped `Link` (`SET body = :b`, `crates/dynamo/src/lib.rs:~1073`); so does
+    `update_link_meta` (`:658`, called by revoke). A ROLLED-BACK binary — bad deploy reverted,
+    lambda pinned to an old version — deserializes the body into a `Link` with no such field
+    and its re-serialize ERASES the curation, silently, on the next claim or revoke. Deploy
+    order protects the first rollout; nothing protects a rollback, forever. A top-level
+    attribute is structurally immune: `SET body = :b` cannot touch what does not live in the
+    body, and no existing update expression names the new attribute.
+  - **The repo had already ruled and all three of us initially walked past it** (Lilith read it
+    back to us): dynamo `lib.rs:379` — *"body for immutable identity, top-level attrs for
+    enforcement AND for anything editable post-creation."* The claim gate READS the curated
+    set, so it is an enforcement field. A field can be immutable and still be enforcement;
+    the doctrine has two axes and each of us checked only the one we were holding.
+  - What a stale binary CAN still do: serve the open shelf and skip the claim gate (it doesn't
+    know the field exists). **The attribute does not buy immunity — it buys RECOVERABLE-AND-LOUD
+    instead of UNRECOVERABLE-AND-SILENT** (Lilith's terms, adopted verbatim): a rollback shows
+    the whole shelf on a curated link, visibly and undoably, and self-heals on redeploy; the
+    body-blob choice would have let the first claim erase ben's picks forever.
+  - Pinned tests (structural immunity is asserted, not assumed): create→read round-trip
+    preserves order; a claim on a curated link leaves the attribute intact; revoke (today's one
+    `update_link_meta` caller) leaves it intact; the stored `body` blob never contains the
+    field (the `gift_note_never_persisted_in_body_blob` shape, same test file); **and the
+    rollback pin** — `update_link_meta` and `claim_game` called with a `Link` carrying
+    `curated_game_ids: None` (what a pre-field binary's deserialize produces) against a stored
+    record that HAS the attribute must leave the attribute standing. That is the rollback,
+    pinned (Lilith).
 - Empty vec is refused at create (422) and never stored — `Some([])` would be a link to nothing,
-  which is a typo, not a gift.
+  which is a typo, not a gift. Absent attribute is the single representation of "open shelf".
 
 ### 2. wire, friend side: `LinkView` gains `curated: bool`; curated `games[]` come from the set
 
-- Curated link: `games[]` = `batch_get_games` over the curated ids, filtered to `is_listable()`,
-  **in stored order**, genres/tags riding the same slim steam-cache batch read as today.
+- Curated link: `games[]` = `batch_get_games` over the curated ids, **PARTITIONED — never
+  filtered** (Lilith caught the first draft filtering to `is_listable()` two lines above the
+  ghost cards it was supposed to produce: you cannot mark what you dropped). Walk the stored
+  id order; each id becomes a live card, a ghost card, or is skipped only when the game record
+  no longer exists at all. Genres/tags ride the same slim steam-cache batch read as today.
   Open-shelf links keep the exact current path (`list_listable_games`), untouched.
+- **Live vs ghost, decided out loud** (the first draft let `is_listable()` decide by accident;
+  `gone` has six causes, not three — status `Pending`/`Gifted`/`BenRedeemed`/`Expired`,
+  `!giftable`, `hidden`):
+  - **LIVE** = `is_listable()` **or `status == Pending`.** A pending claim is IN FLIGHT —
+    nobody has decided its outcome (`fail_stuck_self_claim` resolves it to Gifted OR back
+    toward available via compensate). A ghost over a reversible state is a prediction wearing
+    the clothes of a fact (Lilith; OMBB concurring). The friend may try to claim it; the
+    transaction is the arbiter — its condition (`#st = :available AND
+    attribute_exists(gsi1pk)`) refuses race-free with the existing "someone beat you to it"
+    409, which is exactly the semantics of an undecided race.
+  - **GHOST** (`gone: true`) = the decided states: `Gifted`, `BenRedeemed`, `Expired`,
+    `!giftable`, `hidden`. Rendered with title/art, dimmed, non-interactive, cause-neutral
+    copy.
+  - Consequence for the detail endpoint: its access gate (`is_listable() ||` claims-history)
+    would 404 a live Pending card's modal. It gains one narrow arm: **this link's curated set
+    contains the id AND the game is `Pending`** — the gate mirrors exactly what the grid
+    offers live, and not one id more. Ghosts stay non-interactive; the gate does not widen
+    for them (the surface is not the boundary, in both directions).
 - `curated: true` on the wire so the friend surface can shift its copy and drop the shuffle —
   inferring it from list size would misfire the day ben's open shelf dwindles to three games.
 - The sealed state's withholding is unchanged: a sealed curated link returns `games: []` like
   any sealed link. Curation must not leak through the seal.
 - A curated game already claimed **on this link** appears in the claims history exactly as
   today (that path already batch-reads titles for claimed ids).
-- A curated game claimed **via another link** (or hidden/unlisted since wrapping): returned
-  with `gone: true` and rendered as a ghost card rather than silently shrinking the gift. A
-  three-game gift that quietly becomes two gaslights the friend; a storefront hides sold-out
-  stock, a gift acknowledges it. **Copy must stay cause-neutral** (OMBB, family review):
-  `gone` covers claimed-elsewhere AND hidden AND dead-key — "already found a home" is a fib
-  for a key ben pulled dead. Neutral copy, decided at implementation, e.g. "this one's spoken
-  for". The wire says only `gone: true`, never the cause.
+- Ghosts appear rather than vanish: a three-game gift that quietly becomes two gaslights the
+  friend; a storefront hides sold-out stock, a gift acknowledges it. **Copy stays
+  cause-neutral** (OMBB): "already found a home" is a fib for a key ben pulled dead; the copy
+  is e.g. "this one's spoken for", true under every cause.
+- **The wire carries `gone: true` and NOT the cause — by decision, not by silence** (Lilith
+  flagged that the first draft made this choice without noticing it was one). Rationale: the
+  cause (`BenRedeemed`, `hidden`, dead key…) is ben's catalog management, and the friend wire
+  is unauthenticated-beyond-token; the sealed view already established that withholding
+  happens at the source and devtools is not a spoiler channel. Ben's admin surfaces carry full
+  status for debugging. If a future UI wants differentiated ghost copy, adding a cause field
+  is an additive wire change made THEN, out loud.
 
 ### 3. enforcement: the claim path refuses out-of-set games server-side
 
@@ -86,11 +130,15 @@ freshly-read link cannot race an edit that can't happen.)
   duplicates. `claims_allowed > game_ids.len()` is also 422 — a 5-claim link over 3 games is a
   promise the link cannot keep, and admin-api's create already 422s on impossible inputs
   (born-exhausted, overflow-year expiry) rather than clamping silently.
-- **The `allowed ≤ count` invariant is enforced on EVERY path that can move `claims_allowed`,
-  not just create** (OMBB, family review — a create-only check is theater): `update_link_meta`
-  (`crates/dynamo/src/lib.rs:658`) makes `claims_allowed` editable post-create, so whichever
-  admin endpoint raises it must 422 when the link is curated and the new value exceeds the set
-  size. Verified in source 2026-08-19, not taken on OMBB's word alone.
+- **The `allowed ≤ count` invariant is enforced on EVERY path that can move `claims_allowed`**
+  (OMBB, family review — a create-only check is theater). Verified in source 2026-08-19, with a
+  refinement: `update_link_meta` (`crates/dynamo/src/lib.rs:658`) CAN write `claims_allowed`,
+  but its only admin caller today is `handle_revoke_link` (`admin-api/src/lib.rs:719-731`),
+  which never changes the number — **no endpoint edits `claims_allowed` post-create yet.** So
+  the enforcement lands where it can actually run: the sync create check, plus a doc-comment on
+  `update_link_meta` obligating any future `claims_allowed` editor to re-check, plus a pinned
+  test that revoke (today's one `update_link_meta` caller) preserves `curated_game_ids` through
+  its body rewrite.
 - Admin web: the **Catalog page grows multi-select** — tap cards into a pick, riding the
   existing toolkit (search/filter/sort/group already work; selection is the only new state) —
   then "wrap these into a link" carries the pick to the Links create form, which shows them as
@@ -100,7 +148,11 @@ freshly-read link cannot race an edit that can't happen.)
 
 ### 5. friend surface: the curated unwrap
 
-- No shuffle; ben's order. The "N gifts waiting" beacon counts the curated set's live games.
+- No shuffle; ben's order. The "N gifts waiting" beacon is UNCHANGED — it counts remaining
+  claims (`claims_allowed - claims_used`), which is the true number of gifts the friend can
+  still take; a 3-game / 1-claim curated link correctly says "1 gift waiting". (This line
+  originally said to count the curated set's live games — that was wrong, corrected 2026-08-19
+  during planning.)
 - Copy shift in the JRPG dialog framing: the grid header reads as chosen-for-you, not as the
   whole attic. Exact copy at implementation, gated by the existing typewriter flow — no new
   narrative machinery, the same box just says something more personal.
@@ -165,5 +217,19 @@ OMBB, 11:10Z (all three mechanisms verified in source before integrating):
    order (body-writers before first curated create) is a stated release constraint. Folded
    into §1.
 
-Lilith: no reply as of 11:2xZ; spec review is not a blocking gate (plan sign-off at step 5 is).
-Anything she adds folds in when it lands.
+Lilith + OMBB, round two (11:14–11:17Z) — the round that reversed a storage decision:
+
+4. **§2 contradicted itself** (filter-to-listable two lines above the ghosts it was meant to
+   produce) — rewritten: partition, never filter.
+5. **`gone` is six causes**, and `Pending` was being decided by omission — now decided out
+   loud: Pending rides LIVE (in-flight, tx is the arbiter), decided states ghost. §2.
+6. **Cause-blind wire made a conscious decision** with the privacy rationale written down. §2.
+7. **Storage reversed: body blob → top-level `L` attribute.** Lilith named the axis nobody
+   weighed (a ROLLBACK's stale binary erases a body-carried field via `SET body = :b`,
+   silently, forever); OMBB took the correction against his own answer and brought the
+   citation that overrules him — dynamo `lib.rs:379`'s own doctrine: enforcement fields go
+   top-level, and the claim gate makes this an enforcement field. "Recoverable-and-loud
+   instead of unrecoverable-and-silent" adopted verbatim, rollback pinned by test. §1.
+
+All mechanisms in rounds one and two were verified in source by at least two of the three of
+us before folding — including each other's.
