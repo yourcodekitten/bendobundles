@@ -99,26 +99,6 @@ async fn claim_leaves_curated_attribute_standing() {
 }
 
 #[tokio::test]
-async fn update_link_meta_refuses_curated_overpromise() {
-    // The invariant guard at the choke point (OMBB, sign-off): a NEW binary
-    // raising claims_allowed past a curated set's size is refused HERE, not
-    // just at the create endpoint's 422. ⚠️ CAVEAT, stated on purpose: this
-    // guard cannot see a STALE binary's None — the rollback pin below covers
-    // that direction (survival, not refusal). Two pins, two threats.
-    let Some(store) = store_or_skip("curated-overpromise-guard").await else { return };
-    let mut l = link("cur-guard");
-    l.claims_allowed = 1;
-    l.curated_game_ids = Some(vec!["g-1".into(), "g-2".into()]);
-    store.create_link(&l).await.unwrap();
-    let mut edit = store.get_link("cur-guard").await.unwrap().unwrap();
-    edit.claims_allowed = 5; // exceeds the 2-game set
-    let err = store.update_link_meta(&edit).await;
-    assert!(err.is_err(), "raising claims_allowed past the curated set must refuse");
-    // and the stored record is untouched:
-    assert_eq!(store.get_link("cur-guard").await.unwrap().unwrap().claims_allowed, 1);
-}
-
-#[tokio::test]
 async fn stale_binary_write_back_cannot_erase_curation() {
     // THE ROLLBACK PIN (spec §1, Lilith): a pre-field binary deserializes this link
     // with curated_game_ids: None and calls update_link_meta (revoke does exactly
@@ -184,24 +164,6 @@ Expected: compile error `no field curated_game_ids on type Link` (exit!=0).
             AttributeValue::L(ids.iter().map(|id| s(id)).collect()),
         );
     }
-```
-
-`crates/dynamo/src/lib.rs` — `update_link_meta` (:658), FIRST thing in the fn body — the
-invariant guard at the choke point:
-```rust
-        // Invariant guard (spec §4): a curated link's claims_allowed must not
-        // exceed its set size. Refused here so no future editor endpoint can
-        // ship the overpromise by forgetting its own 422. ⚠️ This cannot see a
-        // STALE binary's Link (its curated_game_ids deserializes to None and
-        // the guard passes vacuously) — that direction is covered by the
-        // attribute's structural immunity, pinned in store_test.
-        if let Some(ids) = &l.curated_game_ids {
-            if l.claims_allowed as usize > ids.len() {
-                return Err(StoreError::Corrupt(
-                    "claims_allowed exceeds curated set size — editor must 422 first",
-                ));
-            }
-        }
 ```
 
 `crates/dynamo/src/lib.rs` — `link_from_item`, with the other top-level overrides (after the `gift_note` override):
@@ -848,16 +810,21 @@ In `handle_create_link`, after `body.validate()` (:647) and before the Link lite
 ```
 Link literal (:678-693): replace Task 1's stopgap `curated_game_ids: None` with `curated_game_ids: body.game_ids.clone(),`.
 
-`crates/dynamo/src/lib.rs` — extend `update_link_meta`'s doc-comment (:652-657) to match the
-guard Task 1 installed in its body:
+`crates/dynamo/src/lib.rs` — extend `update_link_meta`'s doc-comment (:652-657). **This is a
+DEFERRAL, written out loud — deliberately NOT an in-body guard, and deliberately NOT listed as
+a covered invariant** (family sign-off, final round): no endpoint edits `claims_allowed` today
+(revoke is the sole caller and carries it untouched), so there is nothing for a guard to catch —
+and an in-store check would make REVOKE the hostage: the one caller is the one safety operation
+that must never be refused, and a hand-drifted record would brick its own revoke button over an
+unrelated invariant.
 ```rust
-    /// INVARIANT (spec §4): on a curated link, claims_allowed <= set length.
-    /// This fn REFUSES a new-binary write that violates it (guard at the top
-    /// of the body, pinned by update_link_meta_refuses_curated_overpromise).
-    /// A future claims_allowed editor endpoint must still 422 first — the
-    /// guard is a backstop with an ugly error, not a UX. ⚠️ The guard cannot
-    /// see a STALE binary's None; that direction is the attribute's
-    /// structural immunity (rollback pin, store_test).
+    /// DEFERRED INVARIANT (spec §4) — enforced at CREATE (422), NOT here: on a
+    /// curated link, claims_allowed <= set length. No endpoint edits
+    /// claims_allowed today (revoke is this fn's only caller and never moves
+    /// the number). WHOEVER ADDS a claims_allowed editor owns re-checking it
+    /// with a 422 — and must NOT add the check here: this fn's callers
+    /// include revoke, which must never be refused over an unrelated
+    /// invariant (a drifted record still gets to be revoked).
 ```
 
 - [ ] **Step 4: Run:** `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p admin-api --test api_test 2>&1 | tail -5; echo "exit=${PIPESTATUS[0]}"` → green.
