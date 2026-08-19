@@ -25,7 +25,7 @@
 ### Task 1: domain field + attribute storage + rollback pins
 
 **Files:**
-- Modify: `crates/domain/src/lib.rs` (Link struct, ~:213 after `unlock_at`)
+- Modify: `crates/domain/src/lib.rs` (Link struct — `unlock_at` ends :224, insert before `created_at` :226)
 - Modify: `crates/dynamo/src/schema.rs` (`link_body` :98-130, `link_item` :132-179)
 - Modify: `crates/dynamo/src/lib.rs` (`link_from_item` :387-…)
 - Modify: `crates/dynamo/tests/store_test.rs` (fixture `link()` :80 + new tests)
@@ -35,7 +35,7 @@
 - Produces: `Link.curated_game_ids: Option<Vec<String>>` — every later task reads this exact field name. Storage attribute name: `curated_game_ids` (top-level, `AttributeValue::L` of `S`).
 - **Compiler note for the executor:** `Link` has no builder; adding the field breaks every struct literal — `schema::link_body`'s exhaustive destructure (by design), `store_test.rs::link()`, `public-api/tests/api_test.rs::test_link()`, `admin-api/src/lib.rs:678` (create handler), `admin-api/tests` fixtures. Fix each: fixtures get `curated_game_ids: None`; the admin handler is Task 4's job but needs `curated_game_ids: None` NOW to compile (Task 4 replaces it with the real value).
 
-- [ ] **Step 1: Write the failing tests** (append to `crates/dynamo/tests/store_test.rs`; copy the `raw_client`/`store_or_skip` usage from `gift_note_never_persisted_in_body_blob` :243):
+- [ ] **Step 1: Write the failing tests** (append to `crates/dynamo/tests/store_test.rs`; copy the `raw_client`/`store_or_skip` usage from `gift_note_never_persisted_in_body_blob` :244):
 
 ```rust
 #[tokio::test]
@@ -58,7 +58,7 @@ async fn curated_ids_round_trip_in_order_and_never_in_body() {
     // spec §1, dynamo doctrine lib.rs:379: enforcement fields go top-level).
     let item = raw
         .get_item()
-        .table_name(format!("t-curated-roundtrip"))
+        .table_name("t-curated-roundtrip")
         .key("pk", aws_sdk_dynamodb::types::AttributeValue::S("LINK#cur-tok".into()))
         .key("sk", aws_sdk_dynamodb::types::AttributeValue::S("META".into()))
         .send().await.unwrap().item.unwrap();
@@ -73,7 +73,7 @@ async fn open_shelf_link_stores_no_curated_attribute() {
     let raw = raw_client("curated-absent").await;
     store.create_link(&link("open-tok")).await.unwrap();
     let item = raw.get_item()
-        .table_name(format!("t-curated-absent"))
+        .table_name("t-curated-absent")
         .key("pk", aws_sdk_dynamodb::types::AttributeValue::S("LINK#open-tok".into()))
         .key("sk", aws_sdk_dynamodb::types::AttributeValue::S("META".into()))
         .send().await.unwrap().item.unwrap();
@@ -122,8 +122,8 @@ async fn stale_binary_write_back_cannot_erase_curation() {
 ```
 
 - [ ] **Step 2: Run to verify they fail to COMPILE** (the field doesn't exist — that's the expected failure):
-Run: `export DYNAMODB_LOCAL_URL=http://localhost:8000 && cargo test -p dynamo --test store_test curated 2>&1 | tail -20`
-Expected: compile error `no field curated_game_ids on type Link`.
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p dynamo --test store_test curated 2>&1 | tail -20; echo "exit=${PIPESTATUS[0]}"`
+Expected: compile error `no field curated_game_ids on type Link` (exit!=0).
 
 - [ ] **Step 3: Implement.**
 
@@ -175,18 +175,30 @@ Expected: compile error `no field curated_game_ids on type Link`.
             list.iter()
                 .map(|v| v.as_s().map(String::clone))
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| StoreError::Corrupt("curated_game_ids holds a non-string".into()))?,
+                .map_err(|_| StoreError::Corrupt("curated_game_ids holds a non-string"))?,
         ),
-        Some(_) => return Err(StoreError::Corrupt("curated_game_ids is not a list".into())),
+        Some(_) => return Err(StoreError::Corrupt("curated_game_ids is not a list")),
     };
 ```
-(Check `link_from_item`'s existing error idiom first and match it exactly — if its overrides use a helper like `n_attr`, follow the local pattern for error construction.)
+(Check `link_from_item`'s existing error idiom first and match it exactly — if its overrides use a helper like `n_attr`, follow the local pattern for error construction. `StoreError::Corrupt` holds a `&'static str` (lib.rs:313): plain literals as above, never `format!`.)
+
+Also add the pre-field BODY pin (a plain `#[test]`, no store needed — put it in `store_test.rs` beside the others; serde_json is already a dynamo dep):
+```rust
+#[test]
+fn pre_field_link_body_json_parses_with_none_curation() {
+    // A body blob written before the field existed — the exact fields
+    // schema::link_body keeps, nothing more. Must deserialize clean.
+    let legacy = r#"{"token":"t","label":"l","claims_allowed":1,"claims_used":0,"revoked":false,"expires_at":null,"created_at":"2026-01-01T00:00:00Z"}"#;
+    let l: domain::Link = serde_json::from_str(legacy).expect("legacy body parses");
+    assert_eq!(l.curated_game_ids, None);
+}
+```
 
 Fix every `Link` literal the compiler flags with `curated_game_ids: None` (fixtures + admin handler — Task 4 owns the real admin value).
 
 - [ ] **Step 4: Run the new tests + the whole dynamo suite:**
-Run: `cargo test -p dynamo --test store_test 2>&1 | tail -5`
-Expected: all pass, including the four new ones (not SKIP — verify the word "SKIP" absent for the new names).
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p dynamo --test store_test 2>&1 | tail -5; echo "exit=${PIPESTATUS[0]}"`
+Expected: exit=0, all pass including the four new ones (not SKIP — verify the word "SKIP" absent for the new names; without the env var these tests SKIP GREEN, which proves nothing).
 
 - [ ] **Step 5: Workspace still compiles:** `cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -5` → clean.
 
@@ -211,16 +223,16 @@ Expected: all pass, including the four new ones (not SKIP — verify the word "S
 #[tokio::test]
 async fn curated_link_serves_the_set_in_ben_order_with_ghosts() {
     let Some(store) = store_or_skip("curated-view").await else { return };
-    // three games: g2 stays live, g1 gets claimed via ANOTHER link (ghost),
+    // three games: g2 stays live, g1 is GIFTED (a decided state → ghost),
     // g3 is hidden by ben (ghost). Pick order: g3, g1, g2 — order must survive.
-    for n in 1..=3 { store.put_game(&test_game(n)).await.unwrap(); }
+    // ⚠️ Do NOT seed the ghost by claiming via another link at the store layer:
+    // that leaves the game Pending, which is LIVE by live_on_link (spec §2) —
+    // the adversarial review caught exactly that in this test's first draft.
+    store.put_game(&test_game(2)).await.unwrap();
+    let mut gifted = test_game(1); gifted.status = domain::GameStatus::Gifted;
+    store.put_game(&gifted).await.unwrap();
     let mut hidden = test_game(3); hidden.hidden = true;
     store.put_game(&hidden).await.unwrap();
-
-    let other = test_link("other-tok");
-    store.create_link(&other).await.unwrap();
-    store.claim_game("other-tok", &test_game(1).id, "c-oth", time::OffsetDateTime::now_utc())
-        .await.unwrap();
 
     let mut lnk = test_link("curated-tok");
     lnk.curated_game_ids = Some(vec![test_game(3).id, test_game(1).id, test_game(2).id]);
@@ -303,13 +315,16 @@ async fn sealed_curated_link_withholds_curation_entirely() {
         .oneshot(Request::get("/api/l/sealed-cur").body(Body::empty()).unwrap()).await.unwrap();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let raw = std::str::from_utf8(&bytes).unwrap();
+    // raw-substring on purpose: over-matching is the safe direction for a
+    // withholding pin — any future curated-ish key leaking into a sealed
+    // payload should trip this.
     assert!(!raw.contains("curated"), "the seal withholds even the mode (spec §2)");
     let j: serde_json::Value = serde_json::from_str(raw).unwrap();
     assert_eq!(j["games"], serde_json::json!([]));
 }
 ```
 
-- [ ] **Step 2: Run to verify failure:** `cargo test -p public-api --test api_test curated 2>&1 | tail -10` → compile error (`curated_game_ids` ok from Task 1, but `curated`/`gone` fields and assertions fail) or assertion failures.
+- [ ] **Step 2: Run to verify failure:** `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p public-api --test api_test curated 2>&1 | tail -10; echo "exit=${PIPESTATUS[0]}"` → compile error (`curated_game_ids` ok from Task 1, but `curated`/`gone` fields and assertions fail) or assertion failures.
 
 - [ ] **Step 3: Implement.**
 
@@ -428,7 +443,7 @@ borrow checker is satisfied). Inside the games future, branch:
 ```
 (Executor: `domain::GameStatus` — check the existing `use` lines; public-api already imports `domain::…` items, follow the local idiom.)
 
-- [ ] **Step 4: Run:** `cargo test -p public-api --test api_test 2>&1 | tail -5` → all pass including the 4 new; existing sealed/link tests untouched-green.
+- [ ] **Step 4: Run:** `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p public-api --test api_test 2>&1 | tail -5; echo "exit=${PIPESTATUS[0]}"` → all pass including the 4 new; existing sealed/link tests untouched-green.
 
 - [ ] **Step 5: Commit:** `git add -A && git commit -S -m "feat(public-api): curated LinkView — partition into live/ghost in pick order, seal withholds the mode"`
 
@@ -441,8 +456,8 @@ borrow checker is satisfied). Inside the games future, branch:
 - Test: `crates/public-api/tests/api_test.rs`
 
 **Interfaces:**
-- Consumes: `Link.curated_game_ids` (Task 1).
-- Produces: 409 refusal body `{"error": "that one isn't part of this gift"}` — Task 8's friend UI may surface this string verbatim.
+- Consumes: `Link.curated_game_ids` (Task 1) · `fn live_on_link(&domain::Link, &domain::Game) -> bool` (Task 2 — THE single liveness computation; this task is its second caller).
+- Produces: 409 refusal body `{"error": "that one isn't part of this gift"}` — no dedicated consumer needed: the friend UI's existing claim-error path already surfaces server strings verbatim.
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -472,7 +487,8 @@ async fn claim_of_out_of_set_game_is_409_and_leaves_world_untouched() {
     assert_eq!(store.get_game(&test_game(2).id).await.unwrap().unwrap().status,
         domain::GameStatus::Available);
     assert_eq!(store.get_link("cur-gate").await.unwrap().unwrap().claims_used, 0);
-    assert!(mock.requests().is_empty(), "fulfillment never invoked");
+    // MockInvoker's real API (api_test.rs:118) — there is no .requests():
+    assert!(mock.captured_request().await.is_none(), "fulfillment never invoked");
 }
 
 #[tokio::test]
@@ -534,7 +550,7 @@ async fn detail_gate_opens_for_curated_pending_only() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure:** `cargo test -p public-api --test api_test claim_of_out 2>&1 | tail -5` → the 409 test fails (claim currently succeeds/404s differently).
+- [ ] **Step 2: Run to verify failure:** `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p public-api --test api_test claim_of_out 2>&1 | tail -5; echo "exit=${PIPESTATUS[0]}"` → exit!=0: fails on the 409 assertion — the ungated claim returns 200 OK. (That assertion-failure red, not a compile error, is the correct red.)
 
 - [ ] **Step 3: Implement.** In `handle_post_claim` at :725:
 ```rust
@@ -552,6 +568,14 @@ async fn detail_gate_opens_for_curated_pending_only() {
         }
     }
 ```
+**Subsumption, stated so nobody deletes the wrong arm (Lilith, family round four):** today's
+gate is TWO conditions answering DIFFERENT questions — `is_listable()` (*is this visible on
+this link?*) and claims-history (*did YOU already take this one?*). `live_on_link` subsumes
+ONLY the visibility arm. **The claims-history arm SURVIVES: it is the friend's receipt, not a
+grid mirror** — under the partition, the game they just claimed IS a ghost, so the receipt arm
+is the only thing keeping their own claim's modal reachable. "No third arm" must never be
+over-applied as "no second arm."
+
 In `handle_game_detail`'s gate (:1152), REPLACE the `is_listable()` arm — one computation, two
 callers (spec §2, family round three; a third hand-mirrored `||` arm is the defect the #154
 comment on this very gate records):
@@ -573,10 +597,14 @@ comment on this very gate records):
 ```
 (Executor: the handler already resolves `link` before the gate — confirm the variable name in
 scope; if it resolved only the token, add the read via the same idiom the handler's step 1
-uses. Update the gate's `1b.` doc-comment to name `live_on_link` as the single source.)
+uses. Update the gate's `3.` friend-access-gate doc-comment to name `live_on_link` as the
+single source and the claims arm as the receipt — `1b.` is the LINK-level liveness gate, a
+different comment; leave it alone.)
 
-Add to the Step-1 test `detail_gate_opens_for_curated_pending_only` a fourth arm — the
-tightening, pinned:
+The Step-1 test `detail_gate_opens_for_curated_pending_only` carries this fourth arm FROM THE
+START (write it with the rest in Step 1 — same red, not a post-green amendment). The
+enumeration tightening it pins is INTENTIONAL, not incidental (spec §2) — an unpinned side
+effect is one refactor from being "optimised" back out:
 ```rust
     // a LISTABLE game NOT in the curated set → 404: a curated token cannot
     // enumerate the catalog (spec §2's deliberate tightening).
@@ -586,9 +614,10 @@ tightening, pinned:
             .body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(tight.status(), StatusCode::NOT_FOUND);
 ```
-(`mock2`: clone the MockInvoker before its last move, same as the other arms do.)
+(`mock2`: `let mock2 = mock.clone();` before the previous router build consumes `mock` —
+`MockInvoker` is `Clone`; the existing tests clone it the same way.)
 
-- [ ] **Step 4: Run:** `cargo test -p public-api --test api_test 2>&1 | tail -5` → green.
+- [ ] **Step 4: Run:** `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p public-api --test api_test 2>&1 | tail -5; echo "exit=${PIPESTATUS[0]}"` → green.
 
 - [ ] **Step 5: Commit:** `git add -A && git commit -S -m "feat(public-api): claim gate refuses out-of-set ids; detail gate mirrors the live grid"`
 
@@ -609,7 +638,7 @@ tightening, pinned:
 
 ```rust
 #[tokio::test]
-async fn create_link_with_games_stores_pick_order() {
+async fn cur_create_stores_pick_order() {
     let Some(store) = store_or_skip("cur-create-ok").await else { return };
     let password = "valpw";
     let admin_hash = test_admin_hash(password);
@@ -628,7 +657,7 @@ async fn create_link_with_games_stores_pick_order() {
 }
 
 #[tokio::test]
-async fn create_link_unknown_game_id_is_422_naming_it() {
+async fn cur_create_unknown_game_id_is_422_naming_it() {
     let Some(store) = store_or_skip("cur-create-unknown").await else { return };
     let password = "valpw";
     let admin_hash = test_admin_hash(password);
@@ -645,7 +674,7 @@ async fn create_link_unknown_game_id_is_422_naming_it() {
 }
 
 #[tokio::test]
-async fn create_link_unlistable_game_is_422_naming_it() {
+async fn cur_create_unlistable_game_is_422_naming_it() {
     let Some(store) = store_or_skip("cur-create-unlist").await else { return };
     let password = "valpw";
     let admin_hash = test_admin_hash(password);
@@ -661,7 +690,7 @@ async fn create_link_unlistable_game_is_422_naming_it() {
 }
 
 #[tokio::test]
-async fn create_link_curated_422_arms_empty_dupes_overpromise() {
+async fn cur_create_422_arms_empty_dupes_overpromise_toolarge() {
     let Some(store) = store_or_skip("cur-create-arms").await else { return };
     let password = "valpw";
     let admin_hash = test_admin_hash(password);
@@ -685,10 +714,19 @@ async fn create_link_curated_422_arms_empty_dupes_overpromise() {
             "game_ids": [test_game(1).id]})).await;
     assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert!(body_json(r).await["error"].as_str().unwrap().contains("claims_allowed"));
+    // set larger than CURATED_GAMES_MAX — every 422 arm gets its own named
+    // assertion (spec testing rule; the cap is kept deliberately: the claims
+    // cap does NOT bound the set size, and an unbounded admin array is still
+    // an unbounded array).
+    let big: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+    let r = post_create_link(&store, &invoker, &admin_hash, &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1, "game_ids": big})).await;
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body_json(r).await["error"].as_str().unwrap().contains("at most"));
 }
 ```
 
-- [ ] **Step 2: Run to verify failure:** `cargo test -p admin-api --test api_test cur_create 2>&1 | tail -8` → the happy-path test fails (game_ids silently ignored → stored None).
+- [ ] **Step 2: Run to verify failure:** `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p admin-api --test api_test cur_create 2>&1 | tail -8; echo "exit=${PIPESTATUS[0]}"` → the happy-path test fails (game_ids silently ignored → stored None).
 
 - [ ] **Step 3: Implement.**
 
@@ -749,8 +787,8 @@ Link literal (:678-693): replace Task 1's stopgap `curated_game_ids: None` with 
     /// and never moves the number). This fn will NOT check it for you.
 ```
 
-- [ ] **Step 4: Run:** `cargo test -p admin-api --test api_test 2>&1 | tail -5` → green.
-- [ ] **Step 5: Full rust gates:** `cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --no-fail-fast 2>&1 | tail -5` → green.
+- [ ] **Step 4: Run:** `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p admin-api --test api_test 2>&1 | tail -5; echo "exit=${PIPESTATUS[0]}"` → green.
+- [ ] **Step 5: Full rust gates** (pipefail so a failing suite cannot hide behind `tail`): `set -o pipefail && export DYNAMODB_LOCAL_URL=http://localhost:8000 && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --no-fail-fast 2>&1 | tail -5` → exit 0, green.
 - [ ] **Step 6: Commit:** `git add -A && git commit -S -m "feat(admin-api): create accepts game_ids — five 422 arms, pick order stored verbatim"`
 
 ---
@@ -772,7 +810,7 @@ Link literal (:678-693): replace Task 1's stopgap `curated_game_ids: None` with 
 `AdminLink`: add `/** ben's pick order; absent = open shelf. */ curated_game_ids?: string[];`
 `adminCreateLink`: append 6th param `gameIds?: string[]` and `game_ids: gameIds,` in the body literal.
 
-- [ ] **Step 2: Update every existing `toHaveBeenCalledWith` for adminCreateLink** in `Links.test.tsx` to append `undefined` as the 6th arg. Find them all: `grep -n "adminCreateLink).toHaveBeenCalledWith" web/src/admin/Links.test.tsx` — update each.
+- [ ] **Step 2: Update every existing `toHaveBeenCalledWith` for adminCreateLink** in `Links.test.tsx` to append `undefined` as the 6th arg. Find them all: `grep -n "adminCreateLink).toHaveBeenCalledWith" web/src/admin/Links.test.tsx` — update each. (Consistency housekeeping, not load-bearing: vitest equality treats trailing explicit `undefined` and an absent arg the same. Do it anyway so the assertions document the real call shape.)
 
 - [ ] **Step 3: Run:** `cd web && npm run typecheck && npm test -- --run 2>&1 | tail -5` → green.
 
@@ -787,8 +825,8 @@ Link literal (:678-693): replace Task 1's stopgap `curated_game_ids: None` with 
 - Test: `web/src/admin/Links.test.tsx`
 
 **Interfaces:**
-- Consumes: `adminCreateLink(...gameIds)` (Task 5). Router state from Task 7: `location.state?.picked` typed `{ id: string; title: string }[] | undefined`.
-- Produces: the `picked` router-state contract Task 7 must send EXACTLY: `navigate('/admin/links', { state: { picked: [{ id, title }, …] } })`.
+- Consumes: `adminCreateLink(...gameIds)` (Task 5).
+- Produces (and DEFINES): the `picked` router-state contract — `location.state.picked: { id: string; title: string }[]`. Task 7 sends this exact shape LATER; this task's tests inject it directly via MemoryRouter initialEntries, so there is no forward dependency at execution time.
 
 - [ ] **Step 1: Write the failing tests** (partial-mock pattern per :10-33; `renderLinks` helper — extend it to accept an `initialEntries` override so router state can be injected):
 
@@ -839,7 +877,7 @@ it('removes a chip and reorders with the arrow buttons', async () => {
   });
 });
 
-it('clears the picks after a successful create', async () => {
+it('clears the picks after a successful create and confirms the wrapped titles', async () => {
   const user = userEvent.setup();
   vi.mocked(adminLinks).mockResolvedValue([]);
   vi.mocked(adminCreateLink).mockResolvedValue({ token: 't1', url_path: '/l/t1' });
@@ -847,13 +885,17 @@ it('clears the picks after a successful create', async () => {
   await waitFor(() => screen.getByText('Hades'));
   await user.type(screen.getByRole('textbox', { name: 'label' }), 'x');
   await user.click(screen.getByRole('button', { name: /create invite link/i }));
+  // chips gone (exact-text query misses the longer confirmation string)…
   await waitFor(() => expect(screen.queryByText('Hades')).toBeNull());
+  // …but the success card confirms what got wrapped (spec §4: the
+  // confirmation lives at create time, at zero fetch cost).
+  expect(screen.getByText('wrapped: Hades')).toBeInTheDocument();
 });
 
 it('shows a chosen-count chip on curated links in the list', async () => {
   vi.mocked(adminLinks).mockResolvedValue([
-    { ...baseAdminLink, token: 'a', label: 'open one' },
-    { ...baseAdminLink, token: 'b', label: 'curated one', curated_game_ids: ['g1', 'g2', 'g3'] },
+    { ...link1, token: 'a', label: 'open one' },
+    { ...link1, token: 'b', label: 'curated one', curated_game_ids: ['g1', 'g2', 'g3'] },
   ]);
   renderLinks();
   await waitFor(() => screen.getByText('curated one'));
@@ -861,12 +903,12 @@ it('shows a chosen-count chip on curated links in the list', async () => {
   expect(screen.queryAllByText(/chosen/)).toHaveLength(1);
 });
 ```
-(Executor: `baseAdminLink` — the file already has an AdminLink fixture; find its name with `grep -n "token: " web/src/admin/Links.test.tsx | head` and reuse it. If none exists, build the minimal literal the `AdminLink` type requires.)
+(Executor: the file's fixtures are `link1`/`link2` at Links.test.tsx:46-64 — spread `link1` as above. There is no `baseAdminLink`.)
 
 - [ ] **Step 2: Run to verify failure:** `cd web && npx vitest run src/admin/Links.test.tsx 2>&1 | tail -10` → new tests fail (no chips rendered).
 
 - [ ] **Step 3: Implement in `Links.tsx`.**
-State (after :78):
+Add `useLocation` to the existing `react-router-dom` import line. State (after :78):
 ```tsx
   const location = useLocation();
   // picks arrive from the catalog's "wrap these into a link" (router state) —
@@ -875,7 +917,22 @@ State (after :78):
     () => (location.state as { picked?: { id: string; title: string }[] } | null)?.picked ?? [],
   );
 ```
-handleCreate: `const gameIds = picked.length > 0 ? picked.map((p) => p.id) : undefined;` → pass as 6th arg → in `.then`, add `setPicked([]);` beside the other resets.
+handleCreate: `const gameIds = picked.length > 0 ? picked.map((p) => p.id) : undefined;` → pass as 6th arg. In `.then`: extend `createdInfo` with the chosen titles (captured from the `picked` closure BEFORE the reset) and add `setPicked([]);` beside the other resets —
+```tsx
+      setCreatedInfo({
+        fullUrl: inviteUrl(result.token),
+        label: trimmedLabel,
+        chosen: picked.map((p) => p.title),
+      });
+      // …existing resets…
+      setPicked([]);
+```
+Widen the state type: `createdInfo: { fullUrl: string; label: string; chosen?: string[] } | null`. In the created-card JSX (find the block rendering `createdInfo.fullUrl`), add:
+```tsx
+        {createdInfo.chosen !== undefined && createdInfo.chosen.length > 0 && (
+          <p className="text-xs text-dust">wrapped: {createdInfo.chosen.join(', ')}</p>
+        )}
+```
 Form JSX, between the gift-note label and the submit button:
 ```tsx
         {picked.length > 0 && (
@@ -925,7 +982,7 @@ List row, beside the seal chip (:465-ish, same flex-wrap header):
 ### Task 7: web — Catalog multi-select → "wrap these into a link"
 
 **Files:**
-- Modify: `web/src/admin/Catalog.tsx` (state :58-96, renderRow :334-567, toolbar area)
+- Modify: `web/src/admin/Catalog.tsx` (state :58-96, renderRow :360+, toolbar area; `navigate` already in scope at :58)
 - Test: `web/src/admin/Catalog.test.tsx`
 
 **Interfaces:**
@@ -949,7 +1006,7 @@ it('picks games across groups and wraps them into a link in pick order', async (
   await waitFor(() => screen.getByText('links page'));
 });
 
-it('pick state survives the duplicated rows grouping creates', async () => {
+it('pick toggles off and the wrap bar hides when empty', async () => {
   const user = userEvent.setup();
   vi.mocked(adminCatalog).mockResolvedValue([
     makeAdminGame({ id: 'g-1', title: 'Hades' }),
@@ -963,13 +1020,22 @@ it('pick state survives the duplicated rows grouping creates', async () => {
   expect(screen.queryByRole('button', { name: /wrap these into a link/i })).toBeNull();
 });
 ```
-(Executor: `makeAdminGame` — reuse the file's existing AdminGame factory; grep for it. The navigation assertion goes through a real `<Route>`, not a navigate mock — the automock covers `../api` only. To assert pick ORDER crosses the boundary, prefer replacing the `'links page'` div with a probe component that reads `useLocation().state` and renders `JSON.stringify(state.picked)`, then assert the Celeste-before-Hades order in the rendered text.)
+(Executor: Catalog.test.tsx has NO factory — only const fixtures, with `gameFixture` as the spread base (:26). Define at the top of the test file:
+```tsx
+const makeAdminGame = (o: Partial<AdminGame> & { id: string; title: string }): AdminGame => ({
+  ...gameFixture,
+  giftable: true,
+  hidden: false,
+  ...o,
+});
+```
+The navigation assertion goes through a real `<Route>`, not a navigate mock — the automock covers `../api` only. To assert pick ORDER crosses the boundary, replace the `'links page'` div with a probe component that reads `useLocation().state` and renders `JSON.stringify(state.picked)`, then assert Celeste-before-Hades in the rendered text.)
 
 - [ ] **Step 2: Run to verify failure:** `cd web && npx vitest run src/admin/Catalog.test.tsx 2>&1 | tail -8`.
 
 - [ ] **Step 3: Implement in `Catalog.tsx`.**
 State: `const [picked, setPicked] = useState<{ id: string; title: string }[]>([]);` — array IS the order; membership check `picked.some((p) => p.id === game.id)`.
-In `renderRow`, as a SIBLING control in the flex row (the row div must NOT be the control — :346 comment; copy the hidden-switch label shape :490-502):
+In `renderRow`, as a SIBLING control in the flex row (the row div must NOT be the control — the :373 comment is load-bearing; copy the hidden-switch label shape at :482). Membership derives from the id-keyed `picked` array, so the duplicated rows grouping creates stay in sync BY CONSTRUCTION — no per-row state to reconcile:
 ```tsx
         <label className="flex cursor-pointer items-center gap-1.5">
           <input type="checkbox"
@@ -1000,7 +1066,7 @@ Toolbar (above the groups, near the toolkit controls), only when picks exist:
         </div>
       )}
 ```
-(`navigate` already in scope, :57. Only listable games are pickable? NO — keep it simple and honest: the checkbox renders on every row, and create-time 422 names any unlistable pick; the admin sees exactly what the API refuses. Note this in a one-line code comment.)
+(Only listable games are pickable? NO — keep it simple and honest: the checkbox renders on every row, and create-time 422 names any unlistable pick; the admin sees exactly what the API refuses. Note this in a one-line code comment.)
 
 - [ ] **Step 4: Run:** `cd web && npx vitest run src/admin/Catalog.test.tsx 2>&1 | tail -5` → green.
 - [ ] **Step 5: Commit:** `git add -A && git commit -S -m "feat(web/admin): catalog multi-select — pick across groups, wrap into a link"`
@@ -1055,32 +1121,44 @@ it('open shelf: dedupe and copies chip unchanged', () => {
 });
 ```
 
-`LinkPage.test.tsx` (fixture `baseLink` :51-58; mock the link fetch the way the file's other tests do):
+`LinkPage.test.tsx` (fixture `baseLink` :51-58). LinkPage.test.tsx has NO `makeGame` and NO
+`mockGetLink` helper — copy `makeGame` VERBATIM from GameGrid.test.tsx:7 (it is a local const
+there, not exported), and mock the link fetch exactly the way the file's existing tests do:
+the idiom is `vi.mocked(<the api fn the file's vi.mock block stubs — check its name at the
+top of the file>).mockResolvedValue(...)`, referred to as `mockLink(...)` below — define it as
+a two-line local helper wrapping that idiom.
 ```tsx
 it('curated link renders games in server order without shuffling', async () => {
-  mockGetLink({
+  // 4 games: a preserved order under the open-shelf shuffle would be a 1/24
+  // coincidence — this asserts the shuffle is BYPASSED, not merely lucky.
+  mockLink({
     ...baseLink,
     curated: true,
     games: [
-      makeGame({ id: 'g-3', title: 'Third First' }),
-      makeGame({ id: 'g-1', title: 'Then This' }),
+      makeGame({ id: 'g-3', title: 'Ccc' }),
+      makeGame({ id: 'g-1', title: 'Aaa' }),
+      makeGame({ id: 'g-4', title: 'Ddd' }),
+      makeGame({ id: 'g-2', title: 'Bbb' }),
     ],
   });
   renderLinkPage();
-  await waitFor(() => screen.getByText('Third First'));
-  const titles = screen.getAllByRole('heading', { level: 3 }).map((h) => h.textContent);
-  expect(titles).toEqual(['Third First', 'Then This']);
+  await waitFor(() => screen.getByText('Ccc'));
+  const labels = screen
+    .getAllByRole('button', { name: /details/i })
+    .map((b) => b.getAttribute('aria-label'));
+  expect(labels).toEqual([
+    'Ccc — details', 'Aaa — details', 'Ddd — details', 'Bbb — details',
+  ]);
 });
-```
-(Executor: check how existing LinkPage tests assert card order/presence — if cards don't use h3 headings, mirror whatever the `×N copies` or title queries do. The load-bearing assertion is exact order equality on a curated link across the full render — the open-shelf shuffle would only coincidentally preserve a 2-item order 50% of the time, so use 4+ games if flake risk bothers you: with 4 games a preserved order under shuffle is 1/24.)
-Use 4 games. Also:
-```tsx
+
 it('curated link swaps the dialog body copy', async () => {
-  mockGetLink({ ...baseLink, curated: true, games: [makeGame({ id: 'g-1' })] });
+  mockLink({ ...baseLink, curated: true, games: [makeGame({ id: 'g-1' })] });
   renderLinkPage();
   await waitFor(() => screen.getByText(/picked these out just for you/));
 });
 ```
+(Executor: if the details-button aria-label format differs from `"${title} — details"`, read
+GameGrid.tsx's button and match it — the assertion's substance is exact ORDER equality.)
 
 - [ ] **Step 2: Run to verify failure:** `cd web && npx vitest run src/friend 2>&1 | tail -8`.
 
@@ -1095,6 +1173,15 @@ it('curated link swaps the dialog body copy', async () => {
     : dedupedByTitle(games);
 ```
 (refactor the existing Map loop into `dedupedByTitle` or branch inline — match the file's style; card `key={curated ? game.id : game.title}`.)
+Small-set layout (spec §5): the curated section caps its columns at the entry count so 1-2
+games don't rattle around a 3-column frame —
+```tsx
+  <section className={curated
+    ? `grid grid-cols-1 gap-4 p-6 ${entries.length >= 2 ? 'sm:grid-cols-2' : ''} ${entries.length >= 3 ? 'lg:grid-cols-3' : ''}`
+    : 'grid grid-cols-1 gap-4 p-6 sm:grid-cols-2 lg:grid-cols-3'}>
+```
+(open shelf keeps today's literal class string, byte-stable; no test — presentation only.)
+
 Ghost rendering in the card (where the details button/card body renders): when `game.gone`,
 ```tsx
     // A ghost is an acknowledgment, not a control: dimmed art, neutral copy,
@@ -1138,7 +1225,8 @@ const DIALOG_BODY_CURATED =
 
 - [ ] **Step 1: Full rust + web gates, one chain, dynamodb-local running:**
 ```bash
-export DYNAMODB_LOCAL_URL=http://localhost:8000 \
+set -o pipefail \
+  && export DYNAMODB_LOCAL_URL=http://localhost:8000 \
   && cargo fmt --check \
   && cargo clippy --workspace --all-targets --all-features -- -D warnings \
   && cargo test --workspace --no-fail-fast 2>&1 | tail -3 \
@@ -1148,22 +1236,37 @@ Expected: every gate green; confirm the new store-backed tests RAN (grep the out
 
 - [ ] **Step 2: Flip the spec status line** to `status: accepted (family-reviewed 2026-08-19); implemented on this branch` and commit: `git add -A && git commit -S -m "docs: chosen-for-you spec accepted"`
 
-- [ ] **Step 3: Push and open the PR:**
+- [ ] **Step 3: Push and open the PR** (body written to a file first — no placeholders in an executable block):
 ```bash
 git push -u origin chosen-for-you
-gh pr create -R yourcodekitten/bendobundles --title "chosen for you: per-link curation — the product thesis, implemented" --body-file - <<'EOF'
-[executor: summarize spec §§1-6 here — the idea, the storage reversal and why (rollback axis,
-family review), live-vs-ghost, the five 422 arms, and the deploy note: all lambdas deploy with
-this release; a stale public-api shows the open shelf on a curated link (recoverable-and-loud)
-and can never erase the set. Link the spec and plan files.]
+cat > /tmp/chosen-for-you-pr.md <<'EOF'
+PRODUCT.md's design principle 2 — "Chosen-for-you, never shopping" — was never implemented: every friend on every link saw ben's whole listable catalog. a link now carries the exact games ben picked when he wrapped it.
+
+- **domain/storage**: `curated_game_ids: Option<Vec<String>>` on `Link`, stored as a top-level order-preserving `L` attribute — an enforcement field per dynamo's own doctrine, structurally immune to `SET body = :b` erasure by a rolled-back binary. recoverable-and-loud, never unrecoverable-and-silent; the rollback is pinned by test.
+- **public-api**: curated links partition their set into live/ghost cards in ben's pick order (`gone: true`, cause-blind by decision). `live_on_link` is ONE computation with two callers (grid partition + detail gate); fallout, pinned as intentional: a curated token can no longer enumerate catalog details. the claim endpoint 409s out-of-set ids — the surface is not the boundary.
+- **admin**: create accepts `game_ids` behind six named 422 arms; the catalog grows multi-select → "wrap these into a link"; the create form shows reorderable pick chips; the success card lists the wrapped titles.
+- **friend**: no shuffle on curated links — ben's order is the presentation order; honest ghost cards ("this one's spoken for"); personal dialog copy. the gifts-waiting beacon is deliberately unchanged (claims-remaining is the true count).
+- **deploy note**: all lambdas ship with this release. a stale/rolled-back public-api serves the open shelf on a curated link and gates nothing for that window — data survives, the promise degrades visibly, and it self-heals on redeploy.
+
+spec: `docs/superpowers/specs/2026-08-19-chosen-for-you-design.md` (three family-review rounds)
+plan: `docs/superpowers/plans/2026-08-19-chosen-for-you.md` (adversarially reviewed pre-execution)
 EOF
+gh pr create -R yourcodekitten/bendobundles --title "chosen for you: per-link curation — the product thesis, implemented" --body-file /tmp/chosen-for-you-pr.md
 ```
 
 - [ ] **Step 4: Watch CI to green:** `gh pr checks --watch` (bendobundles CI runs the full suite on pull_request — memory: never block on local-only greens).
 
 ---
 
-## Self-review notes (done at write time)
+## Self-review notes (write-time; adversarial review integrated 2026-08-19T07:5x-04:00)
+
+The pre-execution adversarial review (cold reader, full source verification) returned READY
+AFTER FIXES; all 4 blockers, 7 majors, and the actionable minors are integrated above — the
+ghost-test seeding (Pending is live, seed `Gifted` instead), `captured_request()` not
+`.requests()`, real fixture code for `makeAdminGame`/`mockLink`/`makeGame`, `DYNAMODB_LOCAL_URL`
+on every store-backed command (skip-green is the most misleading signal an executor can get),
+pipefail on gate chains, the `cur_create` filter fix, the sixth 422 arm, the receipt-arm
+subsumption statement, the real PR body, and the small-set column cap.
 
 - Spec §4 admin "reorderable chips" → Task 6 (up/down buttons). §4 "links list count chip" → Task 6. §4 catalog picker → Task 7. §2 partition/ghost/Pending → Tasks 2, 3, 8. §1 storage + pins → Task 1. §3 claim gate → Task 3. §5 friend presentation → Task 8 (beacon deliberately untouched, spec corrected 2026-08-19). §6 out-of-scope list → no task, correct.
 - Type consistency: `curated_game_ids` (rust + AdminLink), `curated`/`gone` (wire + TS), `picked: {id,title}[]` (Tasks 6↔7 contract), `gameIds` 6th positional (Tasks 5↔6).

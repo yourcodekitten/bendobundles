@@ -153,7 +153,11 @@ freshly-read link cannot race an edit that can't happen.)
   then "wrap these into a link" carries the pick to the Links create form, which shows them as
   reorderable chips (pick order = default order). The Links form also works standalone: create
   with no picks = open-shelf link, exactly today's flow.
-- Links list rows show a curated-count chip; the existing link detail surfaces the chosen set.
+- Links list rows show a curated-count chip, and the **create-success card lists the chosen
+  titles** — the "did i wrap the right things" confirmation, captured at create time at zero
+  fetch cost. Retro-inspection of an OLDER link's full title list is deliberately out of scope
+  (§6): the count chip and the API carry the ids; a titles join on the links page arrives with
+  its own need.
 
 ### 5. friend surface: the curated unwrap
 
@@ -181,6 +185,8 @@ freshly-read link cannot race an edit that can't happen.)
   pass doesn't reach for it as the obvious tidy-up.
 - **Friend-side search/filter for open-shelf links** — real gap (admin has a whole toolkit,
   friends have a shuffle), separate concern, separate spec.
+- **Retro-inspection UI of an old link's chosen titles** — the created card confirms at wrap
+  time (§4); a browse-back UI needs a titles join the links page doesn't have today.
 - **Choice-game interaction**: curated sets may include `requires_choice` games; the claim path
   is identical to today's (curation gates WHICH ids, fulfillment owns HOW they redeem). No new
   choice logic.
