@@ -92,11 +92,20 @@ product thesis, implemented instead of asserted.
   - **GHOST** (`gone: true`) = the decided states: `Gifted`, `BenRedeemed`, `Expired`,
     `!giftable`, `hidden`. Rendered with title/art, dimmed, non-interactive, cause-neutral
     copy.
-  - Consequence for the detail endpoint: its access gate (`is_listable() ||` claims-history)
-    would 404 a live Pending card's modal. It gains one narrow arm: **this link's curated set
-    contains the id AND the game is `Pending`** — the gate mirrors exactly what the grid
-    offers live, and not one id more. Ghosts stay non-interactive; the gate does not widen
-    for them (the surface is not the boundary, in both directions).
+  - Consequence for the detail endpoint: its access gate would 404 a live Pending card's
+    modal. **The contract is: the gate serves exactly what the grid offers live, plus this
+    link's claims history — and the contract is implemented as ONE function with two callers,
+    never as parallel arms** (Lilith, family round three; OMBB concurring — the gate's own
+    `#154` comment documents the LAST time a hand-mirrored correspondence to the grid
+    drifted, and this feature found drift #2). A single `live_on_link(link, game)` predicate:
+    curated → member AND (`is_listable()` OR `Pending`); open shelf → `is_listable()`. The
+    curated partition and the detail gate both call it; "mirrors the grid, not one id more"
+    is then true by construction, not by maintenance.
+  - **A welcome tightening falls out**: on a curated link, a listable NON-member 404s at the
+    detail endpoint (it is not on this link's grid) — a curated token can no longer enumerate
+    ben's whole catalog's details. Open-shelf links are unchanged (the predicate's None branch
+    IS today's `is_listable()` arm). Ghosts stay non-interactive; the gate does not widen for
+    them (the surface is not the boundary, in both directions).
 - `curated: true` on the wire so the friend surface can shift its copy and drop the shuffle —
   inferring it from list size would misfire the day ben's open shelf dwindles to three games.
 - The sealed state's withholding is unchanged: a sealed curated link returns `games: []` like
@@ -231,5 +240,14 @@ Lilith + OMBB, round two (11:14–11:17Z) — the round that reversed a storage 
    top-level, and the claim gate makes this an enforcement field. "Recoverable-and-loud
    instead of unrecoverable-and-silent" adopted verbatim, rollback pinned by test. §1.
 
-All mechanisms in rounds one and two were verified in source by at least two of the three of
-us before folding — including each other's.
+Round three (11:20Z):
+
+8. **The detail-gate arm may not ship as a third hand-mirrored `||` arm** (Lilith; OMBB
+   amended his own endorsement — "mirrors the grid, not one id more" is a machine-checkable
+   condition asserted in English, and the gate's own `#154` comment records the LAST time the
+   grid↔gate correspondence drifted). Contract kept as the spec sentence; implementation is
+   ONE `live_on_link(link, game)` predicate with two callers (grid partition + detail gate).
+   Fallout is a deliberate tightening: a curated token cannot enumerate catalog details. §2.
+
+All mechanisms in rounds one, two, and three were verified in source by at least two of the
+three of us before folding — including each other's.
