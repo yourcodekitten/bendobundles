@@ -37,6 +37,18 @@ product thesis, implemented instead of asserted.
   (spec 2026-08-05 §4). A wrapped gift's contents are chosen when it's wrapped. This also
   settles storage: an immutable field lives in the stored `body` blob — the top-level-attribute
   dance (`gift_note`, `thank_note`) exists ONLY for fields editable after create.
+- **⚠️ The body blob has more than one writer** (OMBB, family review; both verified in source):
+  the claim tx rewrites `body` from a round-tripped `Link` (`SET body = :b` via
+  `schema::link_body(&bumped)`, `crates/dynamo/src/lib.rs:~1073`), and `update_link_meta` does
+  the same on admin edits (`:658`). Three consequences, each enforced:
+  1. `schema::link_body` must CARRY `curated_game_ids` (it strips only the
+     editable-elsewhere fields; this field is neither).
+  2. A pinned test: claiming on a curated link preserves `curated_game_ids` in the stored
+     body byte-for-byte — the round-trip is where an old struct silently eats the field.
+  3. **Deploy order is a correctness constraint**: every body-writing binary (public-api,
+     admin-api, anything in fulfillment that writes link bodies) deploys WITH or BEFORE the
+     first curated create. An old binary's `Link` deserializer ignores the unknown field and
+     its re-serialize erases the set — silently. The release runbook states this.
 - Empty vec is refused at create (422) and never stored — `Some([])` would be a link to nothing,
   which is a typo, not a gift.
 
@@ -51,11 +63,13 @@ product thesis, implemented instead of asserted.
   any sealed link. Curation must not leak through the seal.
 - A curated game already claimed **on this link** appears in the claims history exactly as
   today (that path already batch-reads titles for claimed ids).
-- A curated game claimed **via another link** (or hidden/unlisted since wrapping): 🟡 OPEN
-  QUESTION for family review — see below. My lean: return it with `gone: true` and render a
-  ghost card ("this one already found a home") rather than silently shrinking the gift. A
+- A curated game claimed **via another link** (or hidden/unlisted since wrapping): returned
+  with `gone: true` and rendered as a ghost card rather than silently shrinking the gift. A
   three-game gift that quietly becomes two gaslights the friend; a storefront hides sold-out
-  stock, a gift acknowledges it.
+  stock, a gift acknowledges it. **Copy must stay cause-neutral** (OMBB, family review):
+  `gone` covers claimed-elsewhere AND hidden AND dead-key — "already found a home" is a fib
+  for a key ben pulled dead. Neutral copy, decided at implementation, e.g. "this one's spoken
+  for". The wire says only `gone: true`, never the cause.
 
 ### 3. enforcement: the claim path refuses out-of-set games server-side
 
@@ -72,6 +86,11 @@ freshly-read link cannot race an edit that can't happen.)
   duplicates. `claims_allowed > game_ids.len()` is also 422 — a 5-claim link over 3 games is a
   promise the link cannot keep, and admin-api's create already 422s on impossible inputs
   (born-exhausted, overflow-year expiry) rather than clamping silently.
+- **The `allowed ≤ count` invariant is enforced on EVERY path that can move `claims_allowed`,
+  not just create** (OMBB, family review — a create-only check is theater): `update_link_meta`
+  (`crates/dynamo/src/lib.rs:658`) makes `claims_allowed` editable post-create, so whichever
+  admin endpoint raises it must 422 when the link is curated and the new value exceeds the set
+  size. Verified in source 2026-08-19, not taken on OMBB's word alone.
 - Admin web: the **Catalog page grows multi-select** — tap cards into a pick, riding the
   existing toolkit (search/filter/sort/group already work; selection is the only new state) —
   then "wrap these into a link" carries the pick to the Links create form, which shows them as
@@ -131,15 +150,20 @@ freshly-read link cannot race an edit that can't happen.)
   grid curated presentation (no shuffle — pin by rendering twice and asserting stable order);
   ghost-card arm per family answer.
 
-## family review (2026-08-19, shared channel) — PENDING
+## family review (2026-08-19, shared channel)
 
-questions posted to OMBB + Lilith:
+OMBB, 11:10Z (all three mechanisms verified in source before integrating):
 
-1. **cross-link take / vanished game**: ghost card with `gone: true` ("already found a home")
-   vs silently dropping it from the curated view? kitten leans ghost card — a gift that
-   shrinks silently reads as a bug or a lie; acknowledged absence reads as life.
-2. **`claims_allowed > curated count`**: 422 at create (my lean, matches existing create
-   strictness) or clamp-with-warning?
-3. **storage sniff test**: immutable-set-in-body-blob vs the top-level-attr pattern — any
-   schema objection to §1's reasoning? (OMBB shaped the note/thanks storage rules in #69; if
-   the body-blob choice offends something I can't see, now is the moment.)
+1. **cross-link take / vanished game**: ghost card, agreed — with **cause-neutral copy**,
+   because `gone` also covers hidden and dead-key games. Folded into §2.
+2. **`claims_allowed > curated count`**: 422 at create — AND mirrored on the post-create
+   `claims_allowed` edit path, which my draft missed (`update_link_meta` makes it editable;
+   create-only enforcement is theater). Folded into §4.
+3. **storage**: body blob holds; #69's top-level dance is an edit-race fix and curation has no
+   edits. But the body has multiple WRITERS (claim tx `:~1073`, `update_link_meta` `:658`) —
+   `schema::link_body` must carry the field, a pin test proves claim preserves it, and deploy
+   order (body-writers before first curated create) is a stated release constraint. Folded
+   into §1.
+
+Lilith: no reply as of 11:2xZ; spec review is not a blocking gate (plan sign-off at step 5 is).
+Anything she adds folds in when it lands.
