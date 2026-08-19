@@ -667,6 +667,14 @@ impl Store {
     /// `get_link` overrides body's (possibly stale) counter on read. A full-item put would clobber
     /// the enforcer's truth — hence this narrow SET/REMOVE. expires_at is written numerically
     /// (epoch seconds) when Some and REMOVEd when None, matching `link_item`.
+    ///
+    /// DEFERRED INVARIANT (spec §4) — enforced at CREATE (422), NOT here: on a
+    /// curated link, claims_allowed <= set length. No endpoint edits
+    /// claims_allowed today (revoke is this fn's only caller and never moves
+    /// the number). WHOEVER ADDS a claims_allowed editor owns re-checking it
+    /// with a 422 — and must NOT add the check here: this fn's callers
+    /// include revoke, which must never be refused over an unrelated
+    /// invariant (a drifted record still gets to be revoked).
     pub async fn update_link_meta(&self, l: &Link) -> Result<(), StoreError> {
         let (pk, sk) = schema::key_pair(link_pk(&l.token), "META");
         let expr = if l.expires_at.is_some() {

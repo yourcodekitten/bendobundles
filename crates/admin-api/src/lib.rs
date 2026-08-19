@@ -558,6 +558,7 @@ const UNLOCK_MAX_DAYS: i64 = 370; // a typo'd year must not seal a gift forever
 const CLAIMS_ALLOWED_MAX: u32 = 100;
 const LABEL_MAX_CHARS: usize = 200;
 const GIFT_NOTE_MAX_CHARS: usize = 500; // fits the friend page's dialog box without scrolling
+const CURATED_GAMES_MAX: usize = 100; // an unbounded admin array is still an unbounded array
 
 /// Single owner of the gift-note input rules — create and edit-after-the-fact both
 /// call this, so the two paths can never drift apart, and validation can't be
@@ -611,6 +612,9 @@ struct CreateLinkBody {
     /// local pick at write time; a bare datetime is a client bug and parses as Err).
     /// Optional; a seal is create-time-only (spec 2026-08-05 §4).
     unlock_at: Option<String>,
+    /// Curated shelf: the admin's pick order, preserved verbatim (never sorted/deduped-by-
+    /// reorder — order IS meaning, storage and wire). Omitted/absent means open-shelf.
+    game_ids: Option<Vec<String>>,
 }
 
 impl CreateLinkBody {
@@ -636,6 +640,30 @@ impl CreateLinkBody {
             ));
         }
         parse_gift_note(self.gift_note.as_deref())?;
+        if let Some(ids) = &self.game_ids {
+            if ids.is_empty() {
+                return Err(
+                    "game_ids must not be empty when provided — omit it for an open-shelf link"
+                        .into(),
+                );
+            }
+            if ids.len() > CURATED_GAMES_MAX {
+                return Err(format!(
+                    "game_ids must be at most {CURATED_GAMES_MAX} games"
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            if let Some(dup) = ids.iter().find(|id| !seen.insert(id.as_str())) {
+                return Err(format!("game_ids contains a duplicate: {dup}"));
+            }
+            if self.claims_allowed as usize > ids.len() {
+                return Err(format!(
+                    "claims_allowed ({}) exceeds the {} curated games — the link would promise more than it can deliver",
+                    self.claims_allowed,
+                    ids.len()
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -646,6 +674,34 @@ async fn handle_create_link(
 ) -> Response {
     if let Err(msg) = body.validate() {
         return unprocessable(msg);
+    }
+
+    // Store-backed validation: every curated id must exist and be listable NOW.
+    // (It can stop being listable later — the friend surface ghosts it; spec §2.)
+    if let Some(ids) = &body.game_ids {
+        let found = match s.store.batch_get_games(ids).await {
+            Ok(m) => m,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let unknown: Vec<&str> = ids
+            .iter()
+            .filter(|id| !found.contains_key(*id))
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return unprocessable(format!("unknown game ids: {}", unknown.join(", ")));
+        }
+        let unlistable: Vec<&str> = ids
+            .iter()
+            .filter(|id| found.get(*id).is_some_and(|g| !g.is_listable()))
+            .map(String::as_str)
+            .collect();
+        if !unlistable.is_empty() {
+            return unprocessable(format!(
+                "not claimable right now: {}",
+                unlistable.join(", ")
+            ));
+        }
     }
 
     // Token = two uuid-v4 simple-format (no hyphens) concatenated: 32 + 32 = 64 hex chars.
@@ -689,9 +745,7 @@ async fn handle_create_link(
         revoked: false,
         expires_at,
         unlock_at,
-        // Task 4 replaces this with the real curated pick list; this handler
-        // must compile now, and every pre-task-4 link is open-shelf anyway.
-        curated_game_ids: None,
+        curated_game_ids: body.game_ids.clone(),
         created_at: now,
     };
 
