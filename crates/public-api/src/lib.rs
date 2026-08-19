@@ -91,6 +91,16 @@ struct GameView {
     /// back-compat (an older cached SPA bundle still reads `genres`). Empty → omitted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
+    /// Ghost marker (curated links only): this chosen game is in a DECIDED
+    /// non-listable state (gifted / ben-redeemed / expired / ungiftable /
+    /// hidden). Absent when false so open-shelf payloads stay byte-identical.
+    /// Cause-blind by decision (spec §2) — never add the cause here casually.
+    #[serde(skip_serializing_if = "is_false")]
+    gone: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl GameView {
@@ -109,7 +119,16 @@ impl GameView {
             steam_app_id: g.steam_app_id,
             genres,
             tags,
+            gone: false,
         }
+    }
+
+    /// A curated pick in a decided non-listable state — real identity fields
+    /// (the friend sees what the gift WAS), no enrichment, gone flag on.
+    fn ghost(g: domain::Game) -> Self {
+        let mut v = Self::from_game(g, Vec::new(), Vec::new());
+        v.gone = true;
+        v
     }
 }
 
@@ -143,6 +162,11 @@ struct LinkView {
     /// banners and gates claim buttons from this; it must never have to infer
     /// the reason from side signals like games.len().
     state: &'static str,
+    /// True iff this link carries a curated set. Absent when false (open-shelf
+    /// payloads unchanged); the sealed view sets false deliberately — the seal
+    /// withholds even the mode.
+    #[serde(skip_serializing_if = "is_false")]
+    curated: bool,
     games: Vec<GameView>,
     claims: Vec<ClaimView>,
     /// Wrapped gift: seconds until unlock, server-computed and CEILED (never arrives
@@ -533,6 +557,33 @@ async fn handle_steam_owned_proxy(
 
 // ── GET /api/l/{token} ─────────────────────────────────────────────────────────
 
+/// THE one liveness computation (spec §2): a game is LIVE on a link iff the
+/// grid offers it as a claimable card. The curated partition below and the
+/// detail gate (its second caller) both use this — "the gate mirrors the
+/// grid, not one id more" is true by construction, not by maintenance. The
+/// gate's #154 comment records the last hand-mirrored correspondence that
+/// drifted; do not add a third caller-specific rederivation.
+fn live_on_link(link: &domain::Link, game: &domain::Game) -> bool {
+    match &link.curated_game_ids {
+        // Curated: member, and Pending rescues ONLY the status axis — never a
+        // deliberate hide or an ungiftable key (spec §2, Lilith's sign-off
+        // catch: hidden+Pending has no path back to claimable, so `is_listable
+        // || Pending` would pin a permanently-unclaimable card live).
+        Some(ids) => {
+            ids.iter().any(|id| id == &game.id)
+                && game.giftable
+                && !game.hidden
+                && matches!(
+                    game.status,
+                    domain::GameStatus::Available | domain::GameStatus::Pending
+                )
+        }
+        // Open shelf: the sparse listable index that feeds the grid IS this
+        // predicate — one truth, two spellings, pinned by the gate tests.
+        None => game.is_listable(),
+    }
+}
+
 async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -> Response {
     let link = match s.store.get_link(&token).await {
         Ok(Some(l)) => l,
@@ -578,6 +629,7 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
                     claims_allowed: link.claims_allowed,
                     claims_used: link.claims_used,
                     state: "sealed",
+                    curated: false, // withheld, not false — the seal hides the mode too
                     games: vec![],
                     claims: vec![],
                     unlocks_in_seconds: Some(remaining),
@@ -600,42 +652,86 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
     // BatchGetItem over the claimed ids (claimed games leave the listable set,
     // so the games list can't supply them). A failed lookup degrades to
     // title:None — the client falls back to game_id.
+    let is_curated = link.curated_game_ids.is_some();
     let (games, claims) = tokio::join!(
         async {
             if hide_games {
                 return vec![];
             }
-            let gs = match s.store.list_listable_games().await {
-                Ok(gs) => gs,
-                Err(_) => return vec![],
-            };
-            // Genres ride the same steam cache the detail endpoint reads, via
-            // ONE BatchGetItem over the distinct appids (the games list is the
-            // whole listable catalog — N serial GetItems here would put the
-            // client's old N+1 inside the lambda). Cache-only: Steam is never
-            // called at request time. Best-effort: a failed batch or a
-            // missing/stub entry degrades to chip-less cards, never an error.
-            let mut app_ids: Vec<u32> = gs.iter().filter_map(|g| g.steam_app_id).collect();
-            app_ids.sort_unstable();
-            app_ids.dedup();
-            // Slim read: only genres+tags per app, not the whole SteamAppCache blob (#64) — the
-            // list never touches detail's heavier fields (reviews, #62's screenshots).
-            let caches = s
-                .store
-                .batch_get_steam_genres_tags(&app_ids)
-                .await
-                .unwrap_or_default();
-            gs.into_iter()
-                .map(|g| {
-                    let gt = g.steam_app_id.and_then(|id| caches.get(&id));
-                    let genres = gt
-                        .map(|c| c.genres.iter().take(5).cloned().collect())
+            match &link.curated_game_ids {
+                Some(ids) => {
+                    // Partition, never filter (spec §2): every stored id becomes a
+                    // live card or a ghost, in ben's pick order; an id is skipped
+                    // only when the game record no longer exists at all.
+                    let found = match s.store.batch_get_games(ids).await {
+                        Ok(m) => m,
+                        Err(_) => return vec![],
+                    };
+                    let mut app_ids: Vec<u32> = found
+                        .values()
+                        .filter(|g| live_on_link(&link, g))
+                        .filter_map(|g| g.steam_app_id)
+                        .collect();
+                    app_ids.sort_unstable();
+                    app_ids.dedup();
+                    let caches = s
+                        .store
+                        .batch_get_steam_genres_tags(&app_ids)
+                        .await
                         .unwrap_or_default();
-                    // Stored tags are already capped at 10 — no take() here.
-                    let tags = gt.map(|c| c.tags.clone()).unwrap_or_default();
-                    GameView::from_game(g, genres, tags)
-                })
-                .collect()
+                    ids.iter()
+                        .filter_map(|id| found.get(id))
+                        .map(|g| {
+                            // live vs ghost: the ONE computation, shared with the
+                            // detail gate. (Membership is tautological here — g came
+                            // from the set — but the shared fn is the point.)
+                            if live_on_link(&link, g) {
+                                let gt = g.steam_app_id.and_then(|id| caches.get(&id));
+                                let genres = gt
+                                    .map(|c| c.genres.iter().take(5).cloned().collect())
+                                    .unwrap_or_default();
+                                let tags = gt.map(|c| c.tags.clone()).unwrap_or_default();
+                                GameView::from_game(g.clone(), genres, tags)
+                            } else {
+                                GameView::ghost(g.clone())
+                            }
+                        })
+                        .collect()
+                }
+                None => {
+                    let gs = match s.store.list_listable_games().await {
+                        Ok(gs) => gs,
+                        Err(_) => return vec![],
+                    };
+                    // Genres ride the same steam cache the detail endpoint reads, via
+                    // ONE BatchGetItem over the distinct appids (the games list is the
+                    // whole listable catalog — N serial GetItems here would put the
+                    // client's old N+1 inside the lambda). Cache-only: Steam is never
+                    // called at request time. Best-effort: a failed batch or a
+                    // missing/stub entry degrades to chip-less cards, never an error.
+                    let mut app_ids: Vec<u32> = gs.iter().filter_map(|g| g.steam_app_id).collect();
+                    app_ids.sort_unstable();
+                    app_ids.dedup();
+                    // Slim read: only genres+tags per app, not the whole SteamAppCache blob (#64) — the
+                    // list never touches detail's heavier fields (reviews, #62's screenshots).
+                    let caches = s
+                        .store
+                        .batch_get_steam_genres_tags(&app_ids)
+                        .await
+                        .unwrap_or_default();
+                    gs.into_iter()
+                        .map(|g| {
+                            let gt = g.steam_app_id.and_then(|id| caches.get(&id));
+                            let genres = gt
+                                .map(|c| c.genres.iter().take(5).cloned().collect())
+                                .unwrap_or_default();
+                            // Stored tags are already capped at 10 — no take() here.
+                            let tags = gt.map(|c| c.tags.clone()).unwrap_or_default();
+                            GameView::from_game(g, genres, tags)
+                        })
+                        .collect()
+                }
+            }
         },
         async {
             let cs = match s.store.claims_for_link(&token).await {
@@ -669,6 +765,7 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
             claims_allowed: link.claims_allowed,
             claims_used: link.claims_used,
             state,
+            curated: is_curated,
             games,
             claims,
             unlocks_in_seconds: None,

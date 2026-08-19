@@ -2696,3 +2696,182 @@ async fn game_detail_refuses_sealed_link() {
         "sealed detail 404 must be byte-identical to not-found"
     );
 }
+
+#[tokio::test]
+async fn curated_link_serves_the_set_in_ben_order_with_ghosts() {
+    let Some(store) = store_or_skip("curated-view").await else {
+        return;
+    };
+    // three games: g2 stays live, g1 is GIFTED (a decided state → ghost),
+    // g3 is hidden by ben (ghost). Pick order: g3, g1, g2 — order must survive.
+    // ⚠️ Do NOT seed the ghost by claiming via another link at the store layer:
+    // that leaves the game Pending, which is LIVE by live_on_link (spec §2) —
+    // the adversarial review caught exactly that in this test's first draft.
+    store.put_game(&test_game(2)).await.unwrap();
+    let mut gifted = test_game(1);
+    gifted.status = domain::GameStatus::Gifted;
+    store.put_game(&gifted).await.unwrap();
+    let mut hidden = test_game(3);
+    hidden.hidden = true;
+    store.put_game(&hidden).await.unwrap();
+
+    let mut lnk = test_link("curated-tok");
+    lnk.curated_game_ids = Some(vec![test_game(3).id, test_game(1).id, test_game(2).id]);
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(
+            Request::get("/api/l/curated-tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(j["curated"], serde_json::json!(true));
+    let games = j["games"].as_array().unwrap();
+    assert_eq!(
+        games.len(),
+        3,
+        "partitioned, never filtered — ghosts included"
+    );
+    // ben's pick order: g3 (ghost), g1 (ghost), g2 (live)
+    assert_eq!(games[0]["id"], serde_json::json!(test_game(3).id));
+    assert_eq!(games[0]["gone"], serde_json::json!(true));
+    assert_eq!(games[1]["id"], serde_json::json!(test_game(1).id));
+    assert_eq!(games[1]["gone"], serde_json::json!(true));
+    assert_eq!(games[2]["id"], serde_json::json!(test_game(2).id));
+    assert!(
+        games[2].get("gone").is_none(),
+        "live cards carry no gone key at all"
+    );
+    // cause-blind wire (spec §2): no status/cause field on any card
+    for g in games {
+        assert!(g.get("status").is_none() && g.get("cause").is_none());
+    }
+}
+
+#[tokio::test]
+async fn pending_curated_game_rides_live_not_ghost() {
+    let Some(store) = store_or_skip("curated-pending").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let other = test_link("oth-p");
+    store.create_link(&other).await.unwrap();
+    // a claim on ANOTHER link parks g1 in Pending (MockInvoker not consulted by claim_game)
+    store
+        .claim_game(
+            "oth-p",
+            &test_game(1).id,
+            "c-p",
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    // NOTE for the executor: claim_game leaves the game Pending only until
+    // fulfillment resolves it; at the store layer with no invoker involved it
+    // STAYS Pending — exactly the in-flight state the spec wants live. Verify
+    // with a get_game assert before relying on it:
+    assert_eq!(
+        store
+            .get_game(&test_game(1).id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        domain::GameStatus::Pending
+    );
+
+    let mut lnk = test_link("cur-p");
+    lnk.curated_game_ids = Some(vec![test_game(1).id]);
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(Request::get("/api/l/cur-p").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        j["games"][0].get("gone").is_none(),
+        "Pending is in flight — nobody decided it; it rides live (spec §2)"
+    );
+}
+
+#[tokio::test]
+async fn open_shelf_wire_shape_is_unchanged_no_curated_key() {
+    let Some(store) = store_or_skip("open-shelf-pin").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    store.create_link(&test_link("plain-tok")).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(
+            Request::get("/api/l/plain-tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        !raw.contains("curated"),
+        "open shelf serializes byte-identically to today"
+    );
+    assert!(!raw.contains("gone"));
+}
+
+#[tokio::test]
+async fn sealed_curated_link_withholds_curation_entirely() {
+    let Some(store) = store_or_skip("sealed-curated").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut lnk = test_link("sealed-cur");
+    lnk.unlock_at = Some(time::OffsetDateTime::now_utc() + time::Duration::seconds(3600));
+    lnk.curated_game_ids = Some(vec![test_game(1).id]);
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(
+            Request::get("/api/l/sealed-cur")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let raw = std::str::from_utf8(&bytes).unwrap();
+    // raw-substring on purpose: over-matching is the safe direction for a
+    // withholding pin — any future curated-ish key leaking into a sealed
+    // payload should trip this.
+    assert!(
+        !raw.contains("curated"),
+        "the seal withholds even the mode (spec §2)"
+    );
+    let j: serde_json::Value = serde_json::from_str(raw).unwrap();
+    assert_eq!(j["games"], serde_json::json!([]));
+}
