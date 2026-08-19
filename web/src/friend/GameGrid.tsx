@@ -5,6 +5,8 @@ import { titleColorClass, titleHueVar } from '../titleColor';
 
 interface GameGridProps {
   games: GameView[];
+  /** curated link: server order is ben's pick order — no shuffle upstream, no dedupe here. */
+  curated?: boolean;
   /** Set of Steam appids the viewer already owns — shows "you own this" pill. */
   owned?: Set<number>;
   /** Opens the detail modal — via the details button or the card body. Claiming
@@ -13,8 +15,9 @@ interface GameGridProps {
   onDetail: (game: GameView) => void;
 }
 
-function GameGridImpl({ games, owned, onDetail }: GameGridProps) {
-  // Group by title; preserve server order — first occurrence wins the card
+// Group by title; preserve server order — first occurrence wins the card.
+// The open-shelf storefront affordance only — curated links skip this (see below).
+function dedupedByTitle(games: GameView[]): { game: GameView; count: number }[] {
   const seen = new Map<string, { game: GameView; count: number }>();
   for (const game of games) {
     const entry = seen.get(game.title);
@@ -24,10 +27,21 @@ function GameGridImpl({ games, owned, onDetail }: GameGridProps) {
       seen.set(game.title, { game, count: 1 });
     }
   }
+  return Array.from(seen.values());
+}
+
+function GameGridImpl({ games, curated, owned, onDetail }: GameGridProps) {
+  // Curated: ben picked ids, not titles — two copies of one title are two
+  // gifts (spec §5). Dedupe is the open-shelf storefront affordance only.
+  const entries = curated
+    ? games.map((game) => ({ game, count: 1 }))
+    : dedupedByTitle(games);
 
   return (
-    <section className="grid grid-cols-1 gap-4 p-6 sm:grid-cols-2 lg:grid-cols-3">
-      {Array.from(seen.values()).map(({ game, count }) => {
+    <section className={curated
+      ? `grid grid-cols-1 gap-4 p-6 ${entries.length >= 2 ? 'sm:grid-cols-2' : ''} ${entries.length >= 3 ? 'lg:grid-cols-3' : ''}`
+      : 'grid grid-cols-1 gap-4 p-6 sm:grid-cols-2 lg:grid-cols-3'}>
+      {entries.map(({ game, count }) => {
         const youOwnThis =
           game.steam_app_id !== null &&
           owned !== undefined &&
@@ -111,13 +125,46 @@ function GameGridImpl({ games, owned, onDetail }: GameGridProps) {
           </div>
         );
 
+        const cardKey = curated ? game.id : game.title;
+
+        // A ghost is an acknowledgment, not a control: dimmed art, neutral
+        // copy, no button — the gate 404s it anyway (the surface mirrors
+        // the boundary). The wire carries `gone: true` and never the
+        // cause — the ghost never invents or implies a reason.
+        if (game.gone === true) {
+          return (
+            <div
+              key={cardKey}
+              className="block w-full rounded-[6px_6px_20px_6px] overflow-hidden text-left opacity-50 grayscale"
+              style={{ background: `color-mix(in oklch, ${shellHue}, var(--color-shelf) 80%)` }}
+            >
+              <div
+                aria-hidden="true"
+                className="h-2.5"
+                style={{
+                  background: `repeating-linear-gradient(90deg, color-mix(in oklch, ${shellHue}, var(--color-control) 72%) 0 10px, color-mix(in oklch, ${shellHue}, var(--color-shelf) 80%) 10px 20px)`,
+                }}
+              />
+              <div className="px-3 pt-2">{art}</div>
+              <div className="p-4">
+                {titleBlock}
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  <span className="rounded bg-floor px-2 py-0.5 text-xs text-dust">
+                    this one&apos;s spoken for
+                  </span>
+                </div>
+              </div>
+            </div>
+          );
+        }
+
         return (
           /* the game card is a clear-shell DMG cartridge (ben's pick, live
              session 2026-07-07): see-through plastic tinted by the game's
              title-hash hue, grip ridges, label art, asymmetric corner. The
              whole cart IS the details control — no separate button. */
           <button
-            key={game.title}
+            key={cardKey}
             type="button"
             aria-label={`${game.title} — details`}
             onClick={() => onDetail(game)}

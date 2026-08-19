@@ -213,6 +213,7 @@ fn test_link(token: &str) -> Link {
         revoked: false,
         expires_at: None,
         unlock_at: None,
+        curated_game_ids: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }
@@ -604,6 +605,177 @@ async fn create_link_overlong_gift_note_returns_422() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// game_ids stores the admin's pick order verbatim — never sorted, never deduped-by-reorder.
+#[tokio::test]
+async fn cur_create_stores_pick_order() {
+    let Some(store) = store_or_skip("cur-create-ok").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    for n in 1..=3 {
+        store.put_game(&test_game(n)).await.unwrap();
+    }
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "for maya", "claims_allowed": 2,
+            "game_ids": [test_game(3).id, test_game(1).id]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let token = j["token"].as_str().unwrap();
+    let stored = store.get_link(token).await.unwrap().unwrap();
+    assert_eq!(
+        stored.curated_game_ids.as_deref(),
+        Some(&[test_game(3).id, test_game(1).id][..]),
+        "pick order stored verbatim"
+    );
+}
+
+/// An id in game_ids that doesn't exist in the store → 422 naming it.
+#[tokio::test]
+async fn cur_create_unknown_game_id_is_422_naming_it() {
+    let Some(store) = store_or_skip("cur-create-unknown").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    store.put_game(&test_game(1)).await.unwrap();
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1,
+            "game_ids": [test_game(1).id, "ghost-id"]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"].as_str().unwrap().contains("ghost-id"),
+        "error must name the unknown id, got: {j}"
+    );
+}
+
+/// An id in game_ids that exists but isn't listable (hidden) → 422 naming it.
+#[tokio::test]
+async fn cur_create_unlistable_game_is_422_naming_it() {
+    let Some(store) = store_or_skip("cur-create-unlist").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let mut g = test_game(1);
+    g.hidden = true;
+    store.put_game(&g).await.unwrap();
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1, "game_ids": [g.id]}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(j["error"].as_str().unwrap().contains(&g.id));
+}
+
+/// game_ids input-shape 422s: empty, duplicate, claims_allowed > set size, set > CURATED_GAMES_MAX.
+/// Each arm gets its own named assertion (spec testing rule).
+#[tokio::test]
+async fn cur_create_422_arms_empty_dupes_overpromise_toolarge() {
+    let Some(store) = store_or_skip("cur-create-arms").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    store.put_game(&test_game(1)).await.unwrap();
+    // empty
+    let r = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1, "game_ids": []}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body_json(r).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("game_ids")
+    );
+    // duplicate
+    let r = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1,
+            "game_ids": [test_game(1).id, test_game(1).id]}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body_json(r).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate")
+    );
+    // claims_allowed > set size
+    let r = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 2,
+            "game_ids": [test_game(1).id]}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body_json(r).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("claims_allowed")
+    );
+    // set larger than CURATED_GAMES_MAX — every 422 arm gets its own named
+    // assertion (spec testing rule; the cap is kept deliberately: the claims
+    // cap does NOT bound the set size, and an unbounded admin array is still
+    // an unbounded array).
+    let big: Vec<String> = (0..101).map(|i| format!("id-{i}")).collect();
+    let r = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1, "game_ids": big}),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body_json(r).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("at most")
+    );
 }
 
 /// gift_note round-trips trimmed; empty/whitespace-only collapses to ABSENT (not ""), so

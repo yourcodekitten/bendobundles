@@ -155,4 +155,36 @@ describe('GameGrid', () => {
     render(<GameGrid games={[makeGame({ id: '1', title: 'Game' })]} onDetail={vi.fn()} />);
     expect(screen.getByText('steam')).toBeInTheDocument();
   });
+
+  it('curated: keeps server order, skips dedupe, keys by id', () => {
+    const games = [
+      makeGame({ id: 'a', title: 'Twin' }),
+      makeGame({ id: 'b', title: 'Twin' }), // two copies picked on purpose = two cards
+      makeGame({ id: 'c', title: 'Solo' }),
+    ];
+    render(<GameGrid games={games} curated onDetail={vi.fn()} />);
+    expect(screen.queryByText(/copies/)).toBeNull();
+    expect(screen.getAllByText('Twin')).toHaveLength(2);
+  });
+
+  it('curated: a gone game renders as a non-interactive ghost', async () => {
+    const onDetail = vi.fn();
+    const games = [
+      makeGame({ id: 'a', title: 'Kept' }),
+      makeGame({ id: 'b', title: 'Gone', gone: true }),
+    ];
+    render(<GameGrid games={games} curated onDetail={onDetail} />);
+    expect(screen.getByText("this one's spoken for")).toBeInTheDocument();
+    // the ghost offers no details control; the live card still does
+    expect(screen.getAllByRole('button', { name: /details/i })).toHaveLength(1);
+  });
+
+  it('open shelf: dedupe and copies chip unchanged', () => {
+    const games = [
+      makeGame({ id: 'a', title: 'Twin' }),
+      makeGame({ id: 'b', title: 'Twin' }),
+    ];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.getByText('×2 copies')).toBeInTheDocument();
+  });
 });

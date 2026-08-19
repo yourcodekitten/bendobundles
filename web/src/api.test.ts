@@ -515,6 +515,23 @@ describe('adminCreateLink', () => {
 
     await expect(adminCreateLink('Link', 10)).rejects.toThrow(/create link/);
   });
+
+  it('adminCreateLink sends game_ids as the request-body key', async () => {
+    // The wire key is the contract with admin-api's CreateLinkBody — a typo'd
+    // key here ships the whole feature open-shelf-only with every task green
+    // (OMBB, sign-off): downstream tests all mock this fn away.
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ token: 't', url_path: '/l/t' }),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+
+    await adminCreateLink('l', 1, undefined, undefined, undefined, ['g-2', 'g-1']);
+    const [, init] = mockFetch.mock.calls.at(-1)!;
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.game_ids).toEqual(['g-2', 'g-1']);
+  });
 });
 
 describe('adminLinks', () => {

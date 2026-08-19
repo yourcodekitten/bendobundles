@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import {
   adminLinks,
   adminCreateLink,
@@ -61,6 +61,7 @@ function isSealed(link: AdminLink): boolean {
 
 export function Links() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [state, setState] = useState<PageState>({ phase: 'loading' });
 
   // Create form state
@@ -70,8 +71,15 @@ export function Links() {
   const [unlockAt, setUnlockAt] = useState('');
   const [giftNote, setGiftNote] = useState('');
   const [creating, setCreating] = useState(false);
+  // picks arrive from the catalog's "wrap these into a link" (router state) —
+  // order is ben's pick order and is the order sent to the api.
+  const [picked, setPicked] = useState<{ id: string; title: string }[]>(
+    () => (location.state as { picked?: { id: string; title: string }[] } | null)?.picked ?? [],
+  );
   // Stored after successful create — separate from page state so reload doesn't clear it
-  const [createdInfo, setCreatedInfo] = useState<{ fullUrl: string; label: string } | null>(null);
+  const [createdInfo, setCreatedInfo] = useState<
+    { fullUrl: string; label: string; chosen?: string[] } | null
+  >(null);
   // Create failure — creating a link is a spend-adjacent action; a silent catch
   // leaves the admin with zero signal whether a link now exists (mirrors the
   // revoke-error pattern below). A 422 carries the violated bound verbatim.
@@ -124,18 +132,24 @@ export function Links() {
     // an absolute instant here, at write time (family review: a bare date is
     // how a gift opens at 7pm).
     const unlock = unlockAt !== '' ? new Date(unlockAt).toISOString() : undefined;
+    const gameIds = picked.length > 0 ? picked.map((p) => p.id) : undefined;
     withAuth(
-      () => adminCreateLink(trimmedLabel, claimsAllowed, expires, note, unlock),
+      () => adminCreateLink(trimmedLabel, claimsAllowed, expires, note, unlock, gameIds),
       navigate,
     )
       .then((result) => {
-        setCreatedInfo({ fullUrl: inviteUrl(result.token), label: trimmedLabel });
+        setCreatedInfo({
+          fullUrl: inviteUrl(result.token),
+          label: trimmedLabel,
+          chosen: picked.map((p) => p.title),
+        });
         setCreateError(null);
         setFormLabel('');
         setClaimsAllowed(1);
         setExpiresDays('');
         setUnlockAt('');
         setGiftNote('');
+        setPicked([]);
         // Reload to prepend the new link into the list
         load();
       })
@@ -393,6 +407,41 @@ export function Links() {
             </span>
           )}
         </label>
+        {picked.length > 0 && (
+          <div className="flex flex-col gap-1 text-xs text-dust">
+            <span>chosen for this gift ({picked.length})</span>
+            <ul className="flex flex-wrap gap-1.5">
+              {picked.map((p, i) => (
+                <li key={p.id}
+                  className="flex items-center gap-1 rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
+                  {p.title}
+                  <button type="button" aria-label={`move ${p.title} earlier`}
+                    disabled={i === 0} className="disabled:opacity-40"
+                    onClick={() => setPicked((cur) => {
+                      const next = [...cur];
+                      // safe: the button is disabled at i===0, so i-1 is in bounds here
+                      const tmp = next[i - 1]!;
+                      next[i - 1] = next[i]!;
+                      next[i] = tmp;
+                      return next;
+                    })}>↑</button>
+                  <button type="button" aria-label={`move ${p.title} later`}
+                    disabled={i === picked.length - 1} className="disabled:opacity-40"
+                    onClick={() => setPicked((cur) => {
+                      const next = [...cur];
+                      // safe: the button is disabled at the last index, so i+1 is in bounds here
+                      const tmp = next[i + 1]!;
+                      next[i + 1] = next[i]!;
+                      next[i] = tmp;
+                      return next;
+                    })}>↓</button>
+                  <button type="button" aria-label={`remove ${p.title} from this gift`}
+                    onClick={() => setPicked((cur) => cur.filter((q) => q.id !== p.id))}>×</button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <button
           type="submit"
           disabled={creating}
@@ -429,6 +478,9 @@ export function Links() {
               copy
             </button>
           </div>
+          {info.chosen !== undefined && info.chosen.length > 0 && (
+            <p className="text-xs text-dust">wrapped: {info.chosen.join(', ')}</p>
+          )}
         </div>
       )}
 
@@ -473,6 +525,12 @@ export function Links() {
                 {isSealed(link) && link.unlock_at !== undefined && (
                   <span className="rounded bg-give-soft px-2 py-0.5 text-xs text-give-ink">
                     🎁 sealed until {formatDateTime(link.unlock_at)}
+                  </span>
+                )}
+
+                {link.curated_game_ids !== undefined && (
+                  <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
+                    {link.curated_game_ids.length} chosen
                   </span>
                 )}
 

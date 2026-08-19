@@ -111,6 +111,11 @@ pub fn link_body(l: &Link) -> String {
         revoked,
         expires_at,
         unlock_at: _,
+        // Stripped: lives ONLY in the top-level `curated_game_ids` attribute.
+        // Body-carried curation dies by rollback: a pre-field binary's Link
+        // deserialize drops the unknown field and its SET body write-back
+        // erases it. Top-level is structurally out of that blast radius.
+        curated_game_ids: _,
         created_at,
     } = l;
     let stripped = Link {
@@ -124,6 +129,7 @@ pub fn link_body(l: &Link) -> String {
         revoked: *revoked,
         expires_at: *expires_at,
         unlock_at: None,
+        curated_game_ids: None,
         created_at: *created_at,
     };
     serde_json::to_string(&stripped).expect("link serializes")
@@ -174,6 +180,16 @@ pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
     // though this one is display-only today.
     if let Some(at) = l.thanked_at {
         item.insert("thanked_at".into(), epoch_s(at));
+    }
+    // Top-level, order-preserving L (a String Set would sort/dedupe — order is
+    // ben's pick order and duplicates were already 422'd at create). Written
+    // once here; no update expression anywhere names this attribute, which is
+    // the rollback immunity the spec pins.
+    if let Some(ids) = &l.curated_game_ids {
+        item.insert(
+            "curated_game_ids".into(),
+            AttributeValue::L(ids.iter().map(s).collect()),
+        );
     }
     item
 }

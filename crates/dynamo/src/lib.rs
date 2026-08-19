@@ -452,6 +452,18 @@ fn link_from_item(
             )
         }
     };
+    // Top-level attr is the ONLY source (body never carries it). Absent = open
+    // shelf. Malformed entries are a Corrupt read, not a silent skip.
+    link.curated_game_ids = match item.get("curated_game_ids") {
+        None => None,
+        Some(aws_sdk_dynamodb::types::AttributeValue::L(list)) => Some(
+            list.iter()
+                .map(|v| v.as_s().cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| StoreError::Corrupt("curated_game_ids holds a non-string"))?,
+        ),
+        Some(_) => return Err(StoreError::Corrupt("curated_game_ids is not a list")),
+    };
     Ok(link)
 }
 
@@ -655,6 +667,14 @@ impl Store {
     /// `get_link` overrides body's (possibly stale) counter on read. A full-item put would clobber
     /// the enforcer's truth — hence this narrow SET/REMOVE. expires_at is written numerically
     /// (epoch seconds) when Some and REMOVEd when None, matching `link_item`.
+    ///
+    /// DEFERRED INVARIANT (spec §4) — enforced at CREATE (422), NOT here: on a
+    /// curated link, claims_allowed <= set length. No endpoint edits
+    /// claims_allowed today (revoke is this fn's only caller and never moves
+    /// the number). WHOEVER ADDS a claims_allowed editor owns re-checking it
+    /// with a 422 — and must NOT add the check here: this fn's callers
+    /// include revoke, which must never be refused over an unrelated
+    /// invariant (a drifted record still gets to be revoked).
     pub async fn update_link_meta(&self, l: &Link) -> Result<(), StoreError> {
         let (pk, sk) = schema::key_pair(link_pk(&l.token), "META");
         let expr = if l.expires_at.is_some() {

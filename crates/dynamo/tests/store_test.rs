@@ -89,6 +89,7 @@ fn link(token: &str) -> Link {
         revoked: false,
         expires_at: None,
         unlock_at: None,
+        curated_game_ids: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }
@@ -330,6 +331,147 @@ async fn gift_note_never_persisted_in_body_blob() {
             .contains("between us"),
         "cleared note must leave no copy at rest"
     );
+}
+
+#[tokio::test]
+async fn curated_ids_round_trip_in_order_and_never_in_body() {
+    let Some(store) = store_or_skip("curated-roundtrip").await else {
+        return;
+    };
+    let raw = raw_client("curated-roundtrip").await;
+    let mut l = link("cur-tok");
+    // Deliberately NOT sorted: order is ben's pick order and must survive verbatim.
+    l.curated_game_ids = Some(vec!["g-3".into(), "g-1".into(), "g-2".into()]);
+    store.create_link(&l).await.unwrap();
+
+    let got = store.get_link("cur-tok").await.unwrap().unwrap();
+    assert_eq!(
+        got.curated_game_ids.as_deref(),
+        Some(&["g-3".to_string(), "g-1".into(), "g-2".into()][..]),
+        "attribute must round-trip in pick order"
+    );
+
+    // The body blob NEVER carries the field (top-level attr is the only home —
+    // spec §1, dynamo doctrine lib.rs:379: enforcement fields go top-level).
+    let item = raw
+        .get_item()
+        .table_name("t-curated-roundtrip")
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S("LINK#cur-tok".into()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    let body = item["body"].as_s().unwrap();
+    assert!(
+        !body.contains("curated_game_ids"),
+        "body blob must not carry the set: {body}"
+    );
+    assert!(
+        item.contains_key("curated_game_ids"),
+        "top-level attribute must exist"
+    );
+}
+
+#[tokio::test]
+async fn open_shelf_link_stores_no_curated_attribute() {
+    let Some(store) = store_or_skip("curated-absent").await else {
+        return;
+    };
+    let raw = raw_client("curated-absent").await;
+    store.create_link(&link("open-tok")).await.unwrap();
+    let item = raw
+        .get_item()
+        .table_name("t-curated-absent")
+        .key(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S("LINK#open-tok".into()),
+        )
+        .key(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        )
+        .send()
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert!(
+        !item.contains_key("curated_game_ids"),
+        "absent attribute is the single representation of open shelf (spec §1)"
+    );
+    let got = store.get_link("open-tok").await.unwrap().unwrap();
+    assert_eq!(got.curated_game_ids, None);
+}
+
+#[tokio::test]
+async fn claim_leaves_curated_attribute_standing() {
+    let Some(store) = store_or_skip("curated-claim-pin").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let mut l = link("cur-claim");
+    l.curated_game_ids = Some(vec![game(1, true).id]);
+    store.create_link(&l).await.unwrap();
+    store
+        .claim_game(
+            "cur-claim",
+            &game(1, true).id,
+            "claim-1",
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    let got = store.get_link("cur-claim").await.unwrap().unwrap();
+    assert_eq!(
+        got.curated_game_ids.as_deref().map(<[String]>::len),
+        Some(1),
+        "claim's SET body rewrite must not touch the top-level attribute"
+    );
+}
+
+#[tokio::test]
+async fn stale_binary_write_back_cannot_erase_curation() {
+    // THE ROLLBACK PIN (spec §1, Lilith): a pre-field binary deserializes this link
+    // with curated_game_ids: None and calls update_link_meta (revoke does exactly
+    // this). The attribute must survive, because update_link_meta's SET expression
+    // does not name it. If this test ever fails, someone routed the attribute
+    // through a write path a stale binary also runs — undo that.
+    let Some(store) = store_or_skip("curated-rollback-pin").await else {
+        return;
+    };
+    let mut l = link("cur-stale");
+    l.curated_game_ids = Some(vec!["g-1".into(), "g-2".into()]);
+    store.create_link(&l).await.unwrap();
+
+    let mut stale_view = store.get_link("cur-stale").await.unwrap().unwrap();
+    stale_view.curated_game_ids = None; // what a pre-field Link deserialize produces
+    stale_view.revoked = true; // the realistic stale write: a revoke
+    store.update_link_meta(&stale_view).await.unwrap();
+
+    let got = store.get_link("cur-stale").await.unwrap().unwrap();
+    assert!(got.revoked, "the stale write itself must land");
+    assert_eq!(
+        got.curated_game_ids.as_deref().map(<[String]>::len),
+        Some(2),
+        "recoverable-and-loud: the attribute survives a pre-field binary's write-back"
+    );
+}
+
+#[test]
+fn pre_field_link_body_json_parses_with_none_curation() {
+    // A body blob written before the field existed — the exact fields
+    // schema::link_body keeps, nothing more. Must deserialize clean.
+    let legacy = r#"{"token":"t","label":"l","claims_allowed":1,"claims_used":0,"revoked":false,"expires_at":null,"created_at":"2026-01-01T00:00:00Z"}"#;
+    let l: domain::Link = serde_json::from_str(legacy).expect("legacy body parses");
+    assert_eq!(l.curated_game_ids, None);
 }
 
 /// `set_link_thanks` is write-once by construction: the conditional update refuses a
@@ -1356,6 +1498,7 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
         revoked: true,
         expires_at: Some(datetime!(2020-01-01 00:00 UTC)),
         unlock_at: None,
+        curated_game_ids: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     };
     // Top-level attrs are the AUTHORITATIVE truth: allowed=5, used=2, revoked=false, no expiry.

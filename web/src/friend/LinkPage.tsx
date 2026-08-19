@@ -46,6 +46,11 @@ export function LinkPage() {
   );
 }
 
+const DIALOG_BODY_SHELF =
+  "games from ben's humble stash, picked for you ♡ open one for details, claim it, and the key is yours.";
+const DIALOG_BODY_CURATED =
+  "ben picked these out just for you ♡ open one for details, claim it, and the key is yours.";
+
 /** The dialog box's blinking block cursor — one definition for all beats. */
 function TwCursor() {
   return (
@@ -61,8 +66,13 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   const [claimingGame, setClaimingGame] = useState<GameView | null>(null);
   const viewLoaded = view.kind === "loaded";
   // ── dialog-box typewriter (the page's one entrance; see DESIGN.md motion) ──
+  // both referents are module constants, so the useMemo([DIALOG_BODY]) dep
+  // stays stable per mode; the existing playedKeyRef snap logic already
+  // handles a mid-session body swap by snapping, not retyping.
   const DIALOG_BODY =
-    "games from ben's humble stash, picked for you \u2661 open one for details, claim it, and the key is yours.";
+    view.kind === "loaded" && view.data.curated === true
+      ? DIALOG_BODY_CURATED
+      : DIALOG_BODY_SHELF;
   const typedLabel = view.kind === "loaded" ? view.data.label : "";
   // ben's personal note types as a third beat after the standard body —
   // absent on most links, so everything is length-0-safe
@@ -280,6 +290,11 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   const shuffleRanksRef = useRef<Map<string, number> | null>(null);
   const shelfGames = useMemo(() => {
     if (view.kind !== "loaded") return [];
+    if (view.data.curated === true) {
+      // ben's pick order IS the presentation order (spec §5). Do not populate
+      // the shuffle ranks: a mode flip must not inherit stale ranks.
+      return view.data.games;
+    }
     const games = view.data.games;
     if (shuffleRanksRef.current === null) {
       const ids = games.map((g) => g.id);
@@ -555,6 +570,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       {!dead && (
         <GameGrid
           games={shelfGames}
+          curated={data.curated === true}
           owned={ownedSet}
           onDetail={setDetailGame}
         />

@@ -43,6 +43,17 @@ function renderLinks() {
   );
 }
 
+function renderLinksWithPicks(picked: { id: string; title: string }[]) {
+  return render(
+    <MemoryRouter initialEntries={[{ pathname: '/admin/links', state: { picked } }]}>
+      <Routes>
+        <Route path="/admin/links" element={<Links />} />
+        <Route path="/admin/login" element={<div>login page</div>} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
 const link1: AdminLink = {
   token: 'tok-abc123',
   label: 'Alice',
@@ -320,7 +331,9 @@ describe('Links', () => {
       // Wait for both: api called AND full URL in DOM (after reload settles)
       const expectedUrl = `${window.location.origin}/l/tok-new`;
       await waitFor(() => {
-        expect(adminCreateLink).toHaveBeenCalledWith('Charlie', 1, undefined, undefined, undefined);
+        expect(adminCreateLink).toHaveBeenCalledWith(
+          'Charlie', 1, undefined, undefined, undefined, undefined,
+        );
         expect(screen.getByText(expectedUrl)).toBeInTheDocument();
       });
 
@@ -352,6 +365,7 @@ describe('Links', () => {
           1,
           undefined,
           'enjoy the trove!',
+          undefined,
           undefined,
         );
       });
@@ -481,6 +495,67 @@ describe('Links', () => {
       expect(
         screen.queryByText(`${window.location.origin}/l/tok-bob`),
       ).not.toBeInTheDocument();
+    });
+
+    it('shows picked games as chips and sends their ids in pick order', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockResolvedValue({ token: 't1', url_path: '/l/t1' });
+      renderLinksWithPicks([{ id: 'g-3', title: 'Celeste' }, { id: 'g-1', title: 'Hades' }]);
+      await waitFor(() => screen.getByText('Celeste'));
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'for maya');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      await waitFor(() => {
+        expect(adminCreateLink).toHaveBeenCalledWith(
+          'for maya', 1, undefined, undefined, undefined, ['g-3', 'g-1'],
+        );
+      });
+    });
+
+    it('removes a chip and reorders with the arrow buttons', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockResolvedValue({ token: 't1', url_path: '/l/t1' });
+      renderLinksWithPicks([
+        { id: 'g-1', title: 'Hades' }, { id: 'g-2', title: 'Celeste' }, { id: 'g-3', title: 'Ori' },
+      ]);
+      await waitFor(() => screen.getByText('Ori'));
+      await user.click(screen.getByRole('button', { name: 'remove Celeste from this gift' }));
+      expect(screen.queryByText('Celeste')).toBeNull();
+      await user.click(screen.getByRole('button', { name: 'move Ori earlier' }));
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'x');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      await waitFor(() => {
+        expect(adminCreateLink).toHaveBeenCalledWith(
+          'x', 1, undefined, undefined, undefined, ['g-3', 'g-1'],
+        );
+      });
+    });
+
+    it('clears the picks after a successful create and confirms the wrapped titles', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminLinks).mockResolvedValue([]);
+      vi.mocked(adminCreateLink).mockResolvedValue({ token: 't1', url_path: '/l/t1' });
+      renderLinksWithPicks([{ id: 'g-1', title: 'Hades' }]);
+      await waitFor(() => screen.getByText('Hades'));
+      await user.type(screen.getByRole('textbox', { name: 'label' }), 'x');
+      await user.click(screen.getByRole('button', { name: /create invite link/i }));
+      // chips gone (exact-text query misses the longer confirmation string)…
+      await waitFor(() => expect(screen.queryByText('Hades')).toBeNull());
+      // …but the success card confirms what got wrapped (spec §4: the
+      // confirmation lives at create time, at zero fetch cost).
+      expect(screen.getByText('wrapped: Hades')).toBeInTheDocument();
+    });
+
+    it('shows a chosen-count chip on curated links in the list', async () => {
+      vi.mocked(adminLinks).mockResolvedValue([
+        { ...link1, token: 'a', label: 'open one' },
+        { ...link1, token: 'b', label: 'curated one', curated_game_ids: ['g1', 'g2', 'g3'] },
+      ]);
+      renderLinks();
+      await waitFor(() => screen.getByText('curated one'));
+      expect(screen.getByText('3 chosen')).toBeInTheDocument();
+      expect(screen.queryAllByText(/chosen/)).toHaveLength(1);
     });
   });
 

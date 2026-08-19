@@ -4,7 +4,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { LinkPage } from "./LinkPage";
 import { ThanksCard } from "./ThanksCard";
-import type { LinkView } from "../api";
+import type { GameView, LinkView } from "../api";
 
 // Partial mock: fetch functions mocked, error classes REAL so instanceof
 // checks in LinkPage exercise the production classes.
@@ -48,6 +48,20 @@ function renderLinkPage(token = "abc123") {
   );
 }
 
+// copied verbatim from GameGrid.test.tsx:7 — local const there, not exported
+const makeGame = (overrides: Partial<GameView> & { id: string }): GameView => ({
+  title: "Default Game",
+  bundle: "Default Bundle",
+  key_type: "steam",
+  artwork_url: null,
+  steam_app_id: null,
+  ...overrides,
+});
+
+function mockLink(link: LinkView) {
+  vi.mocked(fetchLink).mockResolvedValue(link);
+}
+
 const baseLink: LinkView = {
   label: "Test Bundle",
   claims_allowed: 3,
@@ -88,6 +102,35 @@ describe("LinkPage", () => {
       expect(screen.getByText("Test Bundle")).toBeInTheDocument();
     });
     expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
+  });
+
+  it("curated link renders games in server order without shuffling", async () => {
+    // 4 games: a preserved order under the open-shelf shuffle would be a 1/24
+    // coincidence — this asserts the shuffle is BYPASSED, not merely lucky.
+    mockLink({
+      ...baseLink,
+      curated: true,
+      games: [
+        makeGame({ id: "g-3", title: "Ccc" }),
+        makeGame({ id: "g-1", title: "Aaa" }),
+        makeGame({ id: "g-4", title: "Ddd" }),
+        makeGame({ id: "g-2", title: "Bbb" }),
+      ],
+    });
+    renderLinkPage();
+    await waitFor(() => screen.getByText("Ccc"));
+    const labels = screen
+      .getAllByRole("button", { name: /details/i })
+      .map((b) => b.getAttribute("aria-label"));
+    expect(labels).toEqual([
+      "Ccc — details", "Aaa — details", "Ddd — details", "Bbb — details",
+    ]);
+  });
+
+  it("curated link swaps the dialog body copy", async () => {
+    mockLink({ ...baseLink, curated: true, games: [makeGame({ id: "g-1" })] });
+    renderLinkPage();
+    await waitFor(() => screen.getByText(/picked these out just for you/));
   });
 
   describe("say-thanks card", () => {
