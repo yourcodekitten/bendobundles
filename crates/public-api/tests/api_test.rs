@@ -2875,3 +2875,200 @@ async fn sealed_curated_link_withholds_curation_entirely() {
     let j: serde_json::Value = serde_json::from_str(raw).unwrap();
     assert_eq!(j["games"], serde_json::json!([]));
 }
+
+#[tokio::test]
+async fn claim_of_out_of_set_game_is_409_and_leaves_world_untouched() {
+    let Some(store) = store_or_skip("curated-claim-gate").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    store.put_game(&test_game(2)).await.unwrap();
+    let mut lnk = test_link("cur-gate");
+    lnk.curated_game_ids = Some(vec![test_game(1).id]);
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(
+            Request::post("/api/l/cur-gate/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"game_id":"{}"}}"#,
+                    test_game(2).id
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        j["error"],
+        serde_json::json!("that one isn't part of this gift")
+    );
+    // the surface is not the boundary — prove the world didn't move:
+    assert_eq!(
+        store
+            .get_game(&test_game(2).id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        domain::GameStatus::Available
+    );
+    assert_eq!(
+        store
+            .get_link("cur-gate")
+            .await
+            .unwrap()
+            .unwrap()
+            .claims_used,
+        0
+    );
+    // MockInvoker's real API (api_test.rs:118) — there is no .requests():
+    assert!(
+        mock.captured_request().await.is_none(),
+        "fulfillment never invoked"
+    );
+}
+
+#[tokio::test]
+async fn claim_of_in_set_game_flows_normally() {
+    let Some(store) = store_or_skip("curated-claim-ok").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut lnk = test_link("cur-ok");
+    lnk.curated_game_ids = Some(vec![test_game(1).id]);
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(
+            Request::post("/api/l/cur-ok/claim")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"game_id":"{}"}}"#,
+                    test_game(1).id
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn detail_gate_opens_for_curated_pending_only() {
+    let Some(store) = store_or_skip("curated-detail-gate").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap(); // will go Pending via other link
+    store.put_game(&test_game(2)).await.unwrap(); // will be HIDDEN (decided) — stays 404
+    let mut hidden = test_game(2);
+    hidden.hidden = true;
+    store.put_game(&hidden).await.unwrap();
+    let other = test_link("oth-d");
+    store.create_link(&other).await.unwrap();
+    store
+        .claim_game(
+            "oth-d",
+            &test_game(1).id,
+            "c-d",
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+
+    let mut lnk = test_link("cur-d");
+    lnk.curated_game_ids = Some(vec![test_game(1).id, test_game(2).id]);
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+
+    // live Pending curated card → modal must load
+    let ok = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(
+            Request::get(format!("/api/l/cur-d/games/{}/detail", test_game(1).id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "gate mirrors what the grid offers live"
+    );
+
+    // ghost (hidden = decided) → byte-identical 404, no oracle
+    let no = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(
+            Request::get(format!("/api/l/cur-d/games/{}/detail", test_game(2).id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        no.status(),
+        StatusCode::NOT_FOUND,
+        "ghosts stay non-interactive"
+    );
+
+    // hidden + Pending → GHOST, so 404: Pending rescues only the status axis
+    // (ben hid it while a claim was in flight; no resolution path re-lists it)
+    let mut hp = store.get_game(&test_game(1).id).await.unwrap().unwrap();
+    hp.hidden = true;
+    store.put_game(&hp).await.unwrap();
+    let mock3 = mock.clone();
+    let hpr = plain_router(Arc::clone(&store), mock3)
+        .oneshot(
+            Request::get(format!("/api/l/cur-d/games/{}/detail", test_game(1).id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hpr.status(), StatusCode::NOT_FOUND);
+    // un-hide to keep the earlier live-Pending arm's world intact for the
+    // cross-link arm below (ordering: run this arm AFTER the live-Pending
+    // assert above, which it is).
+    let mut unh = store.get_game(&test_game(1).id).await.unwrap().unwrap();
+    unh.hidden = false;
+    store.put_game(&unh).await.unwrap();
+
+    // a LISTABLE game NOT in the curated set → 404: a curated token cannot
+    // enumerate the catalog (spec §2's deliberate tightening).
+    let mock2 = mock.clone();
+    store.put_game(&test_game(4)).await.unwrap();
+    let tight = plain_router(Arc::clone(&store), mock2)
+        .oneshot(
+            Request::get(format!("/api/l/cur-d/games/{}/detail", test_game(4).id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tight.status(), StatusCode::NOT_FOUND);
+
+    // and a Pending game NOT in this link's set → still 404 (not one id more)
+    let mut lnk2 = test_link("cur-d2");
+    lnk2.curated_game_ids = Some(vec![test_game(2).id]);
+    store.create_link(&lnk2).await.unwrap();
+    let cross = plain_router(Arc::clone(&store), mock)
+        .oneshot(
+            Request::get(format!("/api/l/cur-d2/games/{}/detail", test_game(1).id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross.status(), StatusCode::NOT_FOUND);
+}

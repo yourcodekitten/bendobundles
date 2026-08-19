@@ -819,6 +819,20 @@ async fn handle_post_claim(
             .into_response();
     }
 
+    // 2.5 Curation gate: a curated link claims only its own games. Server-side —
+    // the grid never offers the button, but the surface is not the boundary.
+    // Pre-check is race-free BECAUSE the set is create-time-only: no edit exists
+    // to race the freshly-read link (spec §3).
+    if let Some(ids) = &link.curated_game_ids
+        && !ids.contains(&body.game_id)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "that one isn't part of this gift"})),
+        )
+            .into_response();
+    }
+
     // 3. Atomic claim intake: GAME available→pending, LINK counter +1, CLAIM created.
     let claim_id = uuid::Uuid::new_v4().to_string();
     if let Err(e) = s
@@ -1244,9 +1258,13 @@ async fn handle_game_detail(
         }
     };
 
-    // 3. Friend access gate: currently listable OR game id in THIS link's claims history.
-    //    Inaccessible → same byte-identical 404 (no oracle: friend learns nothing).
-    let accessible = if game.is_listable() {
+    // 3. Friend access gate: live on THIS link's grid (the shared live_on_link
+    //    computation — the gate serves exactly what the grid offers, by
+    //    construction) OR in THIS link's claims history. Everything else is the
+    //    byte-identical 404, no oracle. NOTE the deliberate tightening on curated
+    //    links: a listable NON-member is not on this grid, so it 404s here — a
+    //    curated token cannot enumerate the whole catalog's details (spec §2).
+    let accessible = if live_on_link(&link, &game) {
         true
     } else {
         match s.store.claims_for_link(&token).await {
