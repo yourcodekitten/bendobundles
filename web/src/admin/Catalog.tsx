@@ -96,6 +96,12 @@ export function Catalog() {
   // Detail modal — opens on row click
   const [detailGame, setDetailGame] = useState<AdminGame | null>(null);
 
+  // Multi-select → wrap these into a link. The array IS the order — ben's
+  // click order, sent verbatim as `location.state.picked` (Task 6's contract).
+  // Membership check is id-keyed, so the duplicated rows a grouping view
+  // creates stay in sync by construction — no per-row state to reconcile.
+  const [picked, setPicked] = useState<{ id: string; title: string }[]>([]);
+
   // Stable loader identity (#51): the modal's load effect honestly lists loadDetail in its
   // deps, so an inline arrow here re-fired the effect on EVERY parent render — cancelling
   // an in-flight load and re-calling the API while the detail was still loading.
@@ -280,6 +286,25 @@ export function Catalog() {
         excludedNoData={visible.excludedNoData}
         onChange={setToolkit}
       />
+
+      {picked.length > 0 && (
+        <div className="my-4 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => navigate('/admin/links', { state: { picked } })}
+            className="rounded bg-control px-4 py-2 text-sm hover:bg-control-bright"
+          >
+            wrap these into a link ({picked.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setPicked([])}
+            className="text-xs text-dust hover:text-ink-soft"
+          >
+            clear picks
+          </button>
+        </div>
+      )}
 
       <div className="space-y-4">
         {visible.groups.map((group) => {
@@ -489,6 +514,26 @@ export function Catalog() {
                     className="h-4 w-4 cursor-pointer accent-give"
                   />
                   <span className="text-xs text-dust">hidden</span>
+                </label>
+
+                {/* Pick for a link — every row is pickable, listable or not: create-time
+                    422 names any unlistable pick, so the admin sees exactly what the API
+                    refuses rather than a catalog that silently disagrees with itself. */}
+                <label className="flex cursor-pointer items-center gap-1.5">
+                  <input
+                    type="checkbox"
+                    aria-label={`pick ${game.title} for a link`}
+                    checked={picked.some((p) => p.id === game.id)}
+                    onChange={() =>
+                      setPicked((cur) =>
+                        cur.some((p) => p.id === game.id)
+                          ? cur.filter((p) => p.id !== game.id)
+                          : [...cur, { id: game.id, title: game.title }],
+                      )
+                    }
+                    className="h-4 w-4 cursor-pointer accent-give"
+                  />
+                  <span className="text-xs text-dust">pick</span>
                 </label>
 
                 {/* not-silent auto-hide (#71): sync-hidden rows say so */}

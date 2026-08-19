@@ -1,7 +1,7 @@
 import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { Catalog } from './Catalog';
 import type { AdminGame, SelfClaimView } from '../api';
 import { Unauthorized } from '../api';
@@ -11,12 +11,20 @@ import { adminCatalog, adminGameDetail, adminSetHidden, adminSelfClaim, adminSel
 import type { AdminGameDetailResponse } from '../api';
 import { clearGameDetailCache } from '../gameDetailCache';
 
+// The wrap-these-into-a-link probe — lands on a real <Route> so the pick
+// order can be asserted across the navigation boundary, not against a mock.
+function PickProbe() {
+  const { state } = useLocation() as { state: { picked: { id: string; title: string }[] } };
+  return <div>{state.picked.map((p) => p.title).join('|')}</div>;
+}
+
 function renderCatalog() {
   return render(
     <MemoryRouter initialEntries={['/admin/catalog']}>
       <Routes>
         <Route path="/admin/catalog" element={<Catalog />} />
         <Route path="/admin/login" element={<div>login page</div>} />
+        <Route path="/admin/links" element={<PickProbe />} />
       </Routes>
     </MemoryRouter>,
   );
@@ -39,6 +47,13 @@ const gameFixture: AdminGame = {
   hidden_source: null,
   steam: null,
 };
+
+const makeAdminGame = (o: Partial<AdminGame> & { id: string; title: string }): AdminGame => ({
+  ...gameFixture,
+  giftable: true,
+  hidden: false,
+  ...o,
+});
 
 const gameAvailable: AdminGame = {
   id: 'g1',
@@ -931,5 +946,44 @@ describe('detail loader stability', () => {
     // Pre-fix, the fresh inline-loader identity re-fired the effect here → 2 calls.
     expect(adminGameDetail).toHaveBeenCalledTimes(1);
     resolveDetail({ game: gameAvailable, steam: null });
+  });
+});
+
+// ── Multi-select → wrap these into a link ──────────────────────────────────
+// Order is meaning: picked order = the order ben clicked, sent verbatim to
+// `location.state.picked` (Task 6's contract) — never sorted.
+describe('catalog multi-select wrap', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(adminSelfClaims).mockResolvedValue([]);
+    vi.mocked(adminSteamIdentity).mockResolvedValue(null);
+  });
+
+  it('picks games across groups and wraps them into a link in pick order', async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminCatalog).mockResolvedValue([
+      makeAdminGame({ id: 'g-1', title: 'Hades' }),
+      makeAdminGame({ id: 'g-2', title: 'Celeste' }),
+    ]);
+    renderCatalog();
+    await waitFor(() => screen.getByText('Hades'));
+    await user.click(screen.getByRole('checkbox', { name: 'pick Celeste for a link' }));
+    await user.click(screen.getByRole('checkbox', { name: 'pick Hades for a link' }));
+    await user.click(screen.getByRole('button', { name: 'wrap these into a link (2)' }));
+    await waitFor(() => screen.getByText('Celeste|Hades'));
+  });
+
+  it('pick toggles off and the wrap bar hides when empty', async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminCatalog).mockResolvedValue([
+      makeAdminGame({ id: 'g-1', title: 'Hades' }),
+    ]);
+    renderCatalog();
+    await waitFor(() => screen.getByText('Hades'));
+    const box = screen.getByRole('checkbox', { name: 'pick Hades for a link' });
+    await user.click(box);
+    expect((box as HTMLInputElement).checked).toBe(true);
+    await user.click(box);
+    expect(screen.queryByRole('button', { name: /wrap these into a link/i })).toBeNull();
   });
 });
