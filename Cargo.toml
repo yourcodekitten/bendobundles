@@ -14,3 +14,11 @@ thiserror = "2"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }
+
+# Linker-memory diet (2026-08-19, after the 10:12 OOM killed a session's ld at 2786M on a 3.8G
+# box): dev/test carried cargo's default FULL DWARF, and debug info is the dominant input to
+# linker peak. line-tables-only keeps backtraces readable; unpacked keeps DWARF out of the final
+# link entirely. Release (CI lambda zips) is unaffected. Measured receipt in the PR that added this.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
