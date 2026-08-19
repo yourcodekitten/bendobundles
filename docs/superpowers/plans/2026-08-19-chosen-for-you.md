@@ -99,6 +99,26 @@ async fn claim_leaves_curated_attribute_standing() {
 }
 
 #[tokio::test]
+async fn update_link_meta_refuses_curated_overpromise() {
+    // The invariant guard at the choke point (OMBB, sign-off): a NEW binary
+    // raising claims_allowed past a curated set's size is refused HERE, not
+    // just at the create endpoint's 422. ⚠️ CAVEAT, stated on purpose: this
+    // guard cannot see a STALE binary's None — the rollback pin below covers
+    // that direction (survival, not refusal). Two pins, two threats.
+    let Some(store) = store_or_skip("curated-overpromise-guard").await else { return };
+    let mut l = link("cur-guard");
+    l.claims_allowed = 1;
+    l.curated_game_ids = Some(vec!["g-1".into(), "g-2".into()]);
+    store.create_link(&l).await.unwrap();
+    let mut edit = store.get_link("cur-guard").await.unwrap().unwrap();
+    edit.claims_allowed = 5; // exceeds the 2-game set
+    let err = store.update_link_meta(&edit).await;
+    assert!(err.is_err(), "raising claims_allowed past the curated set must refuse");
+    // and the stored record is untouched:
+    assert_eq!(store.get_link("cur-guard").await.unwrap().unwrap().claims_allowed, 1);
+}
+
+#[tokio::test]
 async fn stale_binary_write_back_cannot_erase_curation() {
     // THE ROLLBACK PIN (spec §1, Lilith): a pre-field binary deserializes this link
     // with curated_game_ids: None and calls update_link_meta (revoke does exactly
@@ -164,6 +184,24 @@ Expected: compile error `no field curated_game_ids on type Link` (exit!=0).
             AttributeValue::L(ids.iter().map(|id| s(id)).collect()),
         );
     }
+```
+
+`crates/dynamo/src/lib.rs` — `update_link_meta` (:658), FIRST thing in the fn body — the
+invariant guard at the choke point:
+```rust
+        // Invariant guard (spec §4): a curated link's claims_allowed must not
+        // exceed its set size. Refused here so no future editor endpoint can
+        // ship the overpromise by forgetting its own 422. ⚠️ This cannot see a
+        // STALE binary's Link (its curated_game_ids deserializes to None and
+        // the guard passes vacuously) — that direction is covered by the
+        // attribute's structural immunity, pinned in store_test.
+        if let Some(ids) = &l.curated_game_ids {
+            if l.claims_allowed as usize > ids.len() {
+                return Err(StoreError::Corrupt(
+                    "claims_allowed exceeds curated set size — editor must 422 first",
+                ));
+            }
+        }
 ```
 
 `crates/dynamo/src/lib.rs` — `link_from_item`, with the other top-level overrides (after the `gift_note` override):
@@ -810,18 +848,21 @@ In `handle_create_link`, after `body.validate()` (:647) and before the Link lite
 ```
 Link literal (:678-693): replace Task 1's stopgap `curated_game_ids: None` with `curated_game_ids: body.game_ids.clone(),`.
 
-`crates/dynamo/src/lib.rs` — extend `update_link_meta`'s doc-comment (:652-657):
+`crates/dynamo/src/lib.rs` — extend `update_link_meta`'s doc-comment (:652-657) to match the
+guard Task 1 installed in its body:
 ```rust
-    /// INVARIANT OWED BY ANY FUTURE claims_allowed EDITOR: on a curated link
-    /// (curated_game_ids: Some), claims_allowed must stay <= the set's length —
-    /// the create path 422s this; an edit endpoint that raises the number must
-    /// re-check it (there is no such endpoint today; revoke is the only caller
-    /// and never moves the number). This fn will NOT check it for you.
+    /// INVARIANT (spec §4): on a curated link, claims_allowed <= set length.
+    /// This fn REFUSES a new-binary write that violates it (guard at the top
+    /// of the body, pinned by update_link_meta_refuses_curated_overpromise).
+    /// A future claims_allowed editor endpoint must still 422 first — the
+    /// guard is a backstop with an ugly error, not a UX. ⚠️ The guard cannot
+    /// see a STALE binary's None; that direction is the attribute's
+    /// structural immunity (rollback pin, store_test).
 ```
 
 - [ ] **Step 4: Run:** `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p admin-api --test api_test 2>&1 | tail -5; echo "exit=${PIPESTATUS[0]}"` → green.
 - [ ] **Step 5: Full rust gates** (pipefail so a failing suite cannot hide behind `tail`): `set -o pipefail && export DYNAMODB_LOCAL_URL=http://localhost:8000 && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --no-fail-fast 2>&1 | tail -5` → exit 0, green.
-- [ ] **Step 6: Commit:** `git add -A && git commit -S -m "feat(admin-api): create accepts game_ids — five 422 arms, pick order stored verbatim"`
+- [ ] **Step 6: Commit:** `git add -A && git commit -S -m "feat(admin-api): create accepts game_ids — six 422 arms, pick order stored verbatim"`
 
 ---
 
@@ -835,6 +876,25 @@ Link literal (:678-693): replace Task 1's stopgap `curated_game_ids: None` with 
 **Interfaces:**
 - Consumes: wire fields from Tasks 2/4.
 - Produces (Tasks 6-8 import these): `GameView.gone?: boolean` · `LinkView.curated?: boolean` · `AdminLink.curated_game_ids?: string[]` · `adminCreateLink(label, claims, expiresDays?, giftNote?, unlockAt?, gameIds?)` sending `game_ids` in the JSON body.
+
+- [ ] **Step 0: Write the failing body-key test** (in `web/src/api.test.ts`, which already
+stubs fetch via `vi.stubGlobal('fetch', mockFetch)` (:36) — follow that file's existing
+adminCreateLink test shape for the mock's resolved Response):
+```ts
+it('adminCreateLink sends game_ids as the request-body key', async () => {
+  // The wire key is the contract with admin-api's CreateLinkBody — a typo'd
+  // key here ships the whole feature open-shelf-only with every task green
+  // (OMBB, sign-off): downstream tests all mock this fn away.
+  mockFetch.mockResolvedValueOnce(okJson({ token: 't', url_path: '/l/t' }));
+  await adminCreateLink('l', 1, undefined, undefined, undefined, ['g-2', 'g-1']);
+  const [, init] = mockFetch.mock.calls.at(-1)!;
+  const body = JSON.parse((init as RequestInit).body as string);
+  expect(body.game_ids).toEqual(['g-2', 'g-1']);
+});
+```
+(Executor: `okJson` — use whatever response-builder helper the file's existing tests use;
+grep the first adminCreateLink test and copy its mock line verbatim. Run it: FAILS —
+`body.game_ids` is `undefined` before Step 1 adds the param.)
 
 - [ ] **Step 1: Make the type/arg changes.**
 `GameView`: add `/** ghost marker (curated links): a chosen game in a decided non-listable state. cause-blind by decision (spec §2). */ gone?: boolean;`
@@ -863,6 +923,7 @@ Link literal (:678-693): replace Task 1's stopgap `curated_game_ids: None` with 
 - [ ] **Step 1: Write the failing tests** (partial-mock pattern per :10-33; `renderLinks` helper — extend it to accept an `initialEntries` override so router state can be injected):
 
 ```tsx
+// sits beside the file's existing renderLinks() helper, same shape, one addition
 function renderLinksWithPicks(picked: { id: string; title: string }[]) {
   return render(
     <MemoryRouter initialEntries={[{ pathname: '/admin/links', state: { picked } }]}>
@@ -1061,7 +1122,14 @@ const makeAdminGame = (o: Partial<AdminGame> & { id: string; title: string }): A
   ...o,
 });
 ```
-The navigation assertion goes through a real `<Route>`, not a navigate mock — the automock covers `../api` only. To assert pick ORDER crosses the boundary, replace the `'links page'` div with a probe component that reads `useLocation().state` and renders `JSON.stringify(state.picked)`, then assert Celeste-before-Hades in the rendered text.)
+The navigation assertion goes through a real `<Route>`, not a navigate mock — the automock covers `../api` only. The ORDER pin is code, not prose — use this probe as the `/admin/links` route element:
+```tsx
+function PickProbe() {
+  const { state } = useLocation() as { state: { picked: { id: string; title: string }[] } };
+  return <div>{state.picked.map((p) => p.title).join('|')}</div>;
+}
+```
+and end the first test with `await waitFor(() => screen.getByText('Celeste|Hades'));` — pick order, asserted across the navigation boundary.)
 
 - [ ] **Step 2: Run to verify failure:** `cd web && npx vitest run src/admin/Catalog.test.tsx 2>&1 | tail -8`.
 
@@ -1287,7 +1355,7 @@ gh pr edit -R yourcodekitten/bendobundles --body-file /tmp/chosen-for-you-pr.md
 gh pr ready -R yourcodekitten/bendobundles
 ```
 
-- [ ] **Step 4: Watch CI to green:** `gh pr checks --watch` — and confirm in the run log that the new store-backed test NAMES appear as executed (they SKIP on the local box by design; CI is their only receipt).
+- [ ] **Step 4: Watch CI to green:** `gh pr checks --watch` — and confirm in the run log that the new store-backed test NAMES appear as executed (they SKIP on the local box by design; CI is their only receipt). Also confirm the spec+plan docs ride the PR diff: `git log --oneline origin/main..HEAD -- docs/superpowers | head` — they were committed during planning, before any task ran; no task re-commits them.
 
 ---
 
