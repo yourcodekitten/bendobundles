@@ -1,6 +1,6 @@
 # chosen for you — per-link curation
 
-status: draft, family review pending (2026-08-19)
+status: accepted (family-reviewed 2026-08-19); implemented on this branch
 author: kitten 🐱 (pounce arc)
 
 ## the idea
