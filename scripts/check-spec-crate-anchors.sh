@@ -21,18 +21,18 @@
 set -uo pipefail
 
 LOCK="${LOCK:-Cargo.lock}"
-shift_docs=("$@")
-if [ ${#shift_docs[@]} -eq 0 ]; then
+corpus=("$@")
+if [ ${#corpus[@]} -eq 0 ]; then
   # Docs AND source: a stale crate citation in a `//` comment reads exactly as current as one
   # in a spec. OMBB found `aws-sdk-dynamodb 1.116.0` cited at crates/dynamo/src/lib.rs:1150 with
   # the lock resolving 1.119.0 — invisible to a docs-only scan.
-  mapfile -t shift_docs < <(
+  mapfile -t corpus < <(
     { find docs/superpowers -name '*.md' -type f 2>/dev/null
       find crates -name '*.rs' -type f 2>/dev/null; } | sort -u)
 fi
 
 [ -r "$LOCK" ] || { echo "NOT MEASURED — cannot read $LOCK"; exit 2; }
-[ ${#shift_docs[@]} -gt 0 ] || { echo "NOT MEASURED — no docs to check"; exit 2; }
+[ ${#corpus[@]} -gt 0 ] || { echo "NOT MEASURED — no docs to check"; exit 2; }
 
 # Vacuous-pass guard: if the lock has no packages we would pass every comparison trivially.
 [ "$(grep -c '^name = ' "$LOCK")" -ge 50 ] || {
@@ -41,7 +41,8 @@ fi
 fail=0
 checked=0
 anchors_seen=0
-for doc in "${shift_docs[@]}"; do
+skipped=0
+for doc in "${corpus[@]}"; do
   [ -r "$doc" ] || continue
   # crate-name-X.Y.Z anchors, e.g. aws-smithy-runtime-api-1.15.0
   while read -r anchor; do
@@ -53,17 +54,40 @@ for doc in "${shift_docs[@]}"; do
       $0==c {want=1; next}
       want && /^version = / {gsub(/version = |"/,""); print; want=0}
     ' "$LOCK")
-    [ -n "$resolved" ] || continue          # crate not in this lock — not our anchor to police
+    # A skip is legitimate (the cited crate simply is not in this lock) but it is
+    # INDISTINGUISHABLE from the extraction having failed for that crate. Counted and printed,
+    # so a silent drop in coverage is visible instead of being something a reader would have to
+    # remember the previous number to notice. This script exists to fight exactly that class.
+    [ -n "$resolved" ] || { skipped=$((skipped+1)); continue; }
     checked=$((checked+1))
     if ! grep -qx "$cited" <<< "$resolved"; then
       echo "🔴 ANCHOR DRIFT in $doc: cites ${crate}-${cited}, lock resolves $(tr '\n' ' ' <<< "$resolved")"
       fail=1
     fi
-    # Two citation forms, both live in this tree:
-    #   `crate-1.2.3`  (spec/plan prose, registry-dir style)
-    #   `crate 1.2.3`  (source comments, e.g. "In aws-sdk-dynamodb 1.116.0 there is no ...")
+    # TWO CITATION FORMS, AND THEY ARE NOT APPLIED TO THE SAME FILES — deliberately.
+    #
+    #   `crate-1.2.3`  registry-dir style. A strong signal. Matched EVERYWHERE.
+    #   `crate 1.2.3`  space form. Matched in SOURCE ONLY.
+    #
+    # The space form cannot be applied to prose. Measured: a `.md` sentence like
+    # "we removed rustls 0.21.12 from the tree" parses as a citation of `rustls` and is
+    # reported as drift against the resolved 0.23 — a FALSE RED, produced by ordinary
+    # English about a crate. And false reds are not harmless: they bury the true ones.
+    # Retraction and changelog prose talks about old versions constantly, which is exactly
+    # the writing this repo does most.
+    # In a source comment the same shape IS a citation ("In aws-sdk-dynamodb 1.116.0 there
+    # is no ..."), which is the real specimen this arm was added for, so it stays there.
+    #
+    # 📉 WHAT THIS COSTS, stated rather than left as a quietly smaller number: scoping the
+    # space form to source dropped 4 real markdown citations from coverage — axum, lambda_http,
+    # reqwest and tower (all matching the lock at the time of the change). A `.md` citation is
+    # only verified if it uses the `crate-x.y.z` form. That is a deliberate trade: a false red
+    # buries true ones, and these four were correct anyway. **If you widen this again, re-run
+    # the prose control first** — `"we removed rustls 0.21.12"` in a `.md` must NOT go red.
   done < <( { grep -ohE '[a-z0-9_-]+-[0-9]+\.[0-9]+\.[0-9]+' "$doc"
-              grep -ohE '[a-z0-9_-]+ [0-9]+\.[0-9]+\.[0-9]+' "$doc" | tr ' ' '-'; } | sort -u)
+              case "$doc" in
+                *.rs) grep -ohE '[a-z0-9_-]+ [0-9]+\.[0-9]+\.[0-9]+' "$doc" | tr ' ' '-';;
+              esac; } | sort -u)
 done
 
 # Split deliberately: "we found no citations" and "we found citations but none named a crate the
@@ -71,7 +95,7 @@ done
 # Collapsing two causes into one sentence is how a printer ends up naming a cause nobody verified.
 if [ "$checked" -eq 0 ]; then
   if [ "$anchors_seen" -eq 0 ]; then
-    echo "NOT MEASURED — scanned ${#shift_docs[@]} file(s) and found NO crate-version citations at all."
+    echo "NOT MEASURED — scanned ${#corpus[@]} file(s) and found NO crate-version citations at all."
     echo "  (corpus moved/renamed, or the citation pattern no longer matches anything)"
   else
     echo "NOT MEASURED — found $anchors_seen citation(s), but none named a crate present in $LOCK."
@@ -80,4 +104,4 @@ if [ "$checked" -eq 0 ]; then
   exit 2
 fi
 [ "$fail" -eq 0 ] || exit 1
-echo "✅ all $checked crate anchor(s) match Cargo.lock"
+echo "✅ all $checked crate anchor(s) match Cargo.lock (${skipped} citation(s) skipped — not crates in this lock)"
