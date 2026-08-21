@@ -27,7 +27,7 @@
 |---|---|
 | `crates/dynamo/src/aws_fault.rs` *(create)* | The `AwsFault` type, its `Display`, and the single `from_sdk_error` extractor. One responsibility: turn an opaque SDK error into a bounded, printable fault. |
 | `crates/dynamo/src/lib.rs` *(modify)* | `StoreError` variant change; the 23 capture sites; `mod aws_fault;` |
-| `terraform/aws-cloudwatch-logs.tf` *(create)* | Pin `retention_in_days` on the three lambda log groups, so L1's "CloudWatch is the safe surface" rests on managed config. |
+| `terraform/aws-cloudwatch-logs.tf` *(create)* | Pin `retention_in_days` on **all four** bendobundles log groups (3 lambda + 1 apigateway), so L1's "CloudWatch is the safe surface" rests on managed config. |
 
 ---
 
@@ -122,10 +122,14 @@ Top of `crates/dynamo/src/aws_fault.rs`:
 //! The modeled `.message()` is **IN**. `.item()` is **NEVER**.
 //!
 //! `StoreError::Aws` used to hold `format!("{e:?}")` — an *unbounded* capture of a `Debug`
-//! we do not own. `SdkError` is `#[non_exhaustive]` and three of its five arms carry
-//! opaque payloads (`ConstructionFailure`/`TimeoutError` hold `BoxError`, `DispatchFailure`
-//! holds `ConnectorError`), so whatever the SDK puts there, we adopted — into a value that
+//! we do not own. `SdkError` is `#[non_exhaustive]` and **four of its five arms** carry an
+//! unbounded payload: `ConstructionFailure` and `TimeoutError` hold `BoxError`,
+//! `DispatchFailure` holds a `ConnectorError` that is itself a `BoxError`, and
+//! `ResponseError` holds a `BoxError` beside the raw response. `ServiceError` — the modeled
+//! one — is the only bounded arm. So whatever the SDK boxed, we adopted, into a value that
 //! reaches the operator Discord channel. This type bounds that capture.
+//!
+//! Verified against `aws-smithy-runtime-api` 1.14.0, the version `Cargo.lock` resolves.
 //!
 //! Nothing was leaking when this was written; see the spec's honesty section.
 

@@ -45,6 +45,13 @@ independent reasons:
 > were the build. **`ls ~/.cargo/registry` is not a measurement of what you compile; the lockfile
 > is.** Re-verified against 1.14.0: shapes identical, so the conclusion held and only the anchor was
 > wrong. *(Lilith's catch.)*
+> 🔪 **AND THE CITATION WAS SELF-DISPROVING.** I cited `result.rs:241,267` as proof of the *safe*
+> side. **`:241` IS `ResponseError` — and `:243`, two lines below my own citation, is its
+> `source: BoxError`.** *I cited the struct and stopped one field short of its disproof.* (Lilith.)
+> ⇒ **Not a research failure — a place the eye stops.** Same shape three times this morning:
+> **I enumerated 2 arms, Lilith corrected to 3, OMBB corrected to 4 — every correction stopping at
+> the first number sufficient to make the point.** ***An enumeration that stops when it is SUFFICIENT
+> is not an enumeration.***
 > ⚖️ **Scoreboard for this review, worth keeping: `AllOld: 2` (counted a docstring) · smithy
 > `1.15.0` (wrong version) · `2 unbounded arms` (short by one). EVERY CONCLUSION SURVIVED; NOT ONE
 > CITATION DID.** Three of us reading the source is the only reason we know that.
