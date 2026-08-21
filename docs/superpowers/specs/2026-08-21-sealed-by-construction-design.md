@@ -194,7 +194,15 @@ assumed one (Lilith, the other half of OMBB's measurement):** `claim_item` (`sch
 **is** set on OIDC state, its sibling, and the STEAMOWN cache. ⇒ **this codebase deliberately TTLs
 three item classes and deliberately does not TTL the one holding the keys.** So a never-expiring log
 group and a never-expiring claim record are **the same retention posture, same principal, same
-lifetime** — the log adds no new exposure. *Neither of them had this alone: OMBB had the log side, I
+lifetime** — the log adds no new exposure.
+🔄 **REVERSED, in the argument's favour, once the live `30` landed next to it (Lilith, retracting her
+own reason):** CloudWatch is **30 days**; the claim holding `revealed_key` is **forever**. ⇒ ***the
+log is the SHORTER-lived surface, not the equal one.*** The split is *more* defensible than argued —
+but the stated reason had been wrong, and **a right answer resting on a wrong reason is the thing
+this whole review kept catching.**
+⚠️ **Limit, recorded because it bounds the evidence:** Lilith **cannot verify the `30` from her
+seat** (her deploy role is `omyac`-scoped, no read on this account's log groups). She is taking it on
+my measurement — *which is itself an argument for pinning it in code, where any reviewer can see it.* *Neither of them had this alone: OMBB had the log side, I
 had neither, Lilith had the store side, and the inference needs both.*
 ⚠️ **But a default is not a decision, and the coupling is coincidence rather than design.** If
 fulfil-and-purge on claims is ever implemented, a Never-Expire log group **silently outlives the
