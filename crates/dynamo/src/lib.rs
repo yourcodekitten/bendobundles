@@ -2579,7 +2579,8 @@ impl Store {
             .key("pk", pk)
             .key("sk", sk)
             .send()
-            .await?;
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
         Ok(())
     }
 
