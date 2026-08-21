@@ -355,8 +355,6 @@ pub enum ClaimTxError {
     Store(#[from] StoreError),
 }
 
-
-
 /// Single home for the "a PutItem's condition failed" test. A failed condition on a guarded put is
 /// the designed idempotent-no-op / dedup signal (marker already consumed, item already exists,
 /// ownership already moved) — everywhere that policy lives, it asks this one predicate.
@@ -571,7 +569,7 @@ impl Store {
             .set_item(Some(game_item(g, 1)))
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
         Ok(())
     }
 
@@ -595,7 +593,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
         let Some(item) = out.item else {
             return Ok(None);
         };
@@ -637,7 +635,7 @@ impl Store {
                     .request_items(&self.table, ka)
                     .send()
                     .await
-                        .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+                    .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
                 for item in resp
                     .responses()
                     .and_then(|tables| tables.get(&self.table))
@@ -676,7 +674,9 @@ impl Store {
                 if is_ccf_put(&sdk_err) {
                     Err(StoreError::Corrupt("link token already exists"))
                 } else {
-                    Err(StoreError::Aws(AwsFault::from_sdk_error("put_item", &sdk_err)))
+                    Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "put_item", &sdk_err,
+                    )))
                 }
             }
         }
@@ -722,7 +722,8 @@ impl Store {
         if let Some(exp) = l.expires_at {
             req = req.expression_attribute_values(":exp", schema::epoch_s(exp));
         }
-        req.send().await
+        req.send()
+            .await
             .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("update_item", &e)))?;
         Ok(())
     }
@@ -756,7 +757,10 @@ impl Store {
         match req.send().await {
             Ok(_) => Ok(true),
             Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
-            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error("update_item", &sdk_err))),
+            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error(
+                "update_item",
+                &sdk_err,
+            ))),
         }
     }
 
@@ -788,7 +792,10 @@ impl Store {
         match req.send().await {
             Ok(_) => Ok(true),
             Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
-            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error("update_item", &sdk_err))),
+            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error(
+                "update_item",
+                &sdk_err,
+            ))),
         }
     }
 
@@ -813,7 +820,10 @@ impl Store {
         match req.send().await {
             Ok(_) => Ok(true),
             Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
-            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error("update_item", &sdk_err))),
+            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error(
+                "update_item",
+                &sdk_err,
+            ))),
         }
     }
 
@@ -907,7 +917,10 @@ impl Store {
                     Err(StoreError::Corrupt("thanks CCF with no classifiable cause"))
                 }
             }
-            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error("update_item", &sdk_err))),
+            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error(
+                "update_item",
+                &sdk_err,
+            ))),
         }
     }
 
@@ -921,7 +934,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
         // Enforcer fields (claims_used/claims_allowed/revoked/expires_at) come from the
         // authoritative top-level attributes, never the possibly-stale body — see link_from_item.
         out.item.map(|item| link_from_item(&item)).transpose()
@@ -934,7 +947,7 @@ impl Store {
             .set_item(Some(claim_item(c)))
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
         Ok(())
     }
 
@@ -952,7 +965,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
         out.item.map(|i| parse_body(&i)).transpose()
     }
 
@@ -990,7 +1003,9 @@ impl Store {
             if let Some(limit) = page_limit {
                 req = req.limit(limit);
             }
-            let out = req.send().await
+            let out = req
+                .send()
+                .await
                 .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("query", &e)))?;
             for item in out.items() {
                 games.push(parse_body(item)?);
@@ -1019,7 +1034,7 @@ impl Store {
             )
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("query", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("query", &e)))?;
         out.items().iter().map(parse_body).collect()
     }
 
@@ -1036,7 +1051,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
         out.item.map(|i| parse_body(&i)).transpose()
     }
 
@@ -1345,7 +1360,9 @@ impl Store {
             Ok(_) => {}
             Err(sdk_err) => {
                 if !is_ccf_put(&sdk_err) {
-                    return Err(StoreError::Aws(AwsFault::from_sdk_error("put_item", &sdk_err)));
+                    return Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "put_item", &sdk_err,
+                    )));
                 }
                 let current = self
                     .get_claim(link_token, claim_id)
@@ -1395,7 +1412,9 @@ impl Store {
             Ok(_) => {}
             Err(sdk_err) => {
                 if !is_ccf_put(&sdk_err) {
-                    return Err(StoreError::Aws(AwsFault::from_sdk_error("put_item", &sdk_err)));
+                    return Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "put_item", &sdk_err,
+                    )));
                 }
                 let current = self
                     .get_claim(domain::SELF_LINK_TOKEN, claim_id)
@@ -1515,7 +1534,10 @@ impl Store {
                 if is_ccf_update(&sdk_err) {
                     Ok(()) // already flipped / ownership moved: idempotent no-op
                 } else {
-                    Err(StoreError::Aws(AwsFault::from_sdk_error("update_item", &sdk_err)))
+                    Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "update_item",
+                        &sdk_err,
+                    )))
                 }
             }
         }
@@ -1560,7 +1582,9 @@ impl Store {
                         "record_choice_intent: claim no longer pending — refusing to choose",
                     ))
                 } else {
-                    Err(StoreError::Aws(AwsFault::from_sdk_error("put_item", &sdk_err)))
+                    Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "put_item", &sdk_err,
+                    )))
                 }
             }
         }
@@ -2034,7 +2058,9 @@ impl Store {
                 if is_ccf_put(&sdk_err) {
                     Ok(GuardedWrite::Contested)
                 } else {
-                    Err(StoreError::Aws(AwsFault::from_sdk_error("put_item", &sdk_err)))
+                    Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "put_item", &sdk_err,
+                    )))
                 }
             }
         }
@@ -2189,7 +2215,9 @@ impl Store {
                         if is_ccf_put(&sdk_err) {
                             Ok(SyncWrite::SkippedInFlight)
                         } else {
-                            Err(StoreError::Aws(AwsFault::from_sdk_error("put_item", &sdk_err)))
+                            Err(StoreError::Aws(AwsFault::from_sdk_error(
+                                "put_item", &sdk_err,
+                            )))
                         }
                     }
                 }
@@ -2246,7 +2274,9 @@ impl Store {
             if let Some(limit) = page_limit {
                 req = req.limit(limit);
             }
-            let out = req.send().await
+            let out = req
+                .send()
+                .await
                 .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("query", &e)))?;
             for item in out.items() {
                 claims.push(parse_body(item)?);
@@ -2286,7 +2316,7 @@ impl Store {
                 .set_exclusive_start_key(last_key.take())
                 .send()
                 .await
-                    .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
+                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
             for item in out.items() {
                 games.push(parse_body(item)?);
             }
@@ -2324,7 +2354,7 @@ impl Store {
                 .set_exclusive_start_key(last_key.take())
                 .send()
                 .await
-                    .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
+                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
             for item in out.items() {
                 // Same enforcer-field override as `get_link` — top-level attrs win over body.
                 links.push(link_from_item(item)?);
@@ -2345,7 +2375,7 @@ impl Store {
             .set_item(Some(sync_state_item(state)))
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
         Ok(())
     }
 
@@ -2398,7 +2428,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
         Ok(())
     }
 
@@ -2414,7 +2444,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
         out.item
             .map(|item| {
                 item.get("started_epoch")
@@ -2437,7 +2467,7 @@ impl Store {
             .set_item(Some(session_item(token, expires_epoch)))
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
         Ok(())
     }
 
@@ -2454,7 +2484,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
         out.item
             .map(|item| {
                 item.get("expires_epoch")
@@ -2480,7 +2510,7 @@ impl Store {
             .set_item(Some(oidc_state_item(nonce, ctx, expires_epoch)))
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
         Ok(())
     }
 
@@ -2504,7 +2534,7 @@ impl Store {
             .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
         let Some(item) = out.attributes else {
             return Ok(None); // nonce never existed (or already consumed)
         };
@@ -2533,7 +2563,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
         Ok(())
     }
 
@@ -2562,7 +2592,7 @@ impl Store {
             .set_item(Some(steam_identity_item(steamid)))
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
         Ok(())
     }
 
@@ -2581,7 +2611,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("delete_item", &e)))?;
         Ok(())
     }
 
@@ -2600,7 +2630,7 @@ impl Store {
             .set_item(Some(steam_owned_item(steamid, appids, now_epoch)))
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))?;
         Ok(())
     }
 
@@ -2698,9 +2728,7 @@ impl Store {
             if is_ccf_put(&e) {
                 SteamAppPutError::LostRace
             } else {
-                SteamAppPutError::Store(StoreError::Aws(AwsFault::from_sdk_error(
-                    "put_item", &e,
-                )))
+                SteamAppPutError::Store(StoreError::Aws(AwsFault::from_sdk_error("put_item", &e)))
             }
         })?;
         Ok(())
@@ -2722,7 +2750,7 @@ impl Store {
             .key("sk", sk)
             .send()
             .await
-                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
         let Some(item) = out.item else {
             return Ok(None);
         };
@@ -2775,7 +2803,7 @@ impl Store {
                     .request_items(&self.table, ka)
                     .send()
                     .await
-                        .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+                    .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
                 for item in resp
                     .responses()
                     .and_then(|tables| tables.get(&self.table))
@@ -2828,7 +2856,7 @@ impl Store {
                     .request_items(&self.table, ka)
                     .send()
                     .await
-                        .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+                    .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
                 for item in resp
                     .responses()
                     .and_then(|tables| tables.get(&self.table))
@@ -2871,7 +2899,7 @@ impl Store {
                 .set_exclusive_start_key(last_key.take())
                 .send()
                 .await
-                    .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
+                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
             for item in out.items() {
                 // Parse app_id from the pk attribute ("STEAMAPP#<id>") — avoids decoding the
                 // full body JSON just to extract the id.
@@ -3040,7 +3068,10 @@ impl Store {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     }
-                    return Err(StoreError::Aws(AwsFault::from_sdk_error("describe_table", &e)));
+                    return Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "describe_table",
+                        &e,
+                    )));
                 }
             }
         }
@@ -3063,11 +3094,18 @@ impl Store {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
-                Err(e) => return Err(StoreError::Aws(AwsFault::from_sdk_error("describe_table", &e))),
+                Err(e) => {
+                    return Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "describe_table",
+                        &e,
+                    )));
+                }
             };
             let Some(table) = table_state else {
                 if std::time::Instant::now() >= deadline {
-                    return Err(StoreError::Internal("describe_table returned no table".to_string()));
+                    return Err(StoreError::Internal(
+                        "describe_table returned no table".to_string(),
+                    ));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;

@@ -157,8 +157,10 @@ mod tests {
             aws_sdk_dynamodb::operation::put_item::PutItemError::ConditionalCheckFailedException(
                 ccf,
             );
-        let raw =
-            aws_smithy_runtime_api::http::Response::new(400u16.try_into().unwrap(), SdkBody::empty());
+        let raw = aws_smithy_runtime_api::http::Response::new(
+            400u16.try_into().unwrap(),
+            SdkBody::empty(),
+        );
         aws_sdk_dynamodb::error::SdkError::service_error(op_err, raw)
     }
 
@@ -180,7 +182,10 @@ mod tests {
     fn fault_still_says_which_call_and_what_aws_said() {
         let fault = AwsFault::from_sdk_error("put_item", &ccf_sdk_error_with_item());
         let rendered = format!("{fault}");
-        assert!(rendered.contains("put_item"), "lost the operation: {rendered}");
+        assert!(
+            rendered.contains("put_item"),
+            "lost the operation: {rendered}"
+        );
         assert!(
             rendered.contains("ConditionalCheckFailedException"),
             "lost the error code: {rendered}"
@@ -233,11 +238,9 @@ mod tests {
             ("TimeoutError", E::timeout_error(Nosy)),
             (
                 "DispatchFailure",
-                E::dispatch_failure(
-                    aws_smithy_runtime_api::client::result::ConnectorError::io(
-                        Box::new(Nosy),
-                    ),
-                ),
+                E::dispatch_failure(aws_smithy_runtime_api::client::result::ConnectorError::io(
+                    Box::new(Nosy),
+                )),
             ),
             ("ResponseError", E::response_error(Nosy, raw())),
         ];
