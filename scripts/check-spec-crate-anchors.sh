@@ -108,6 +108,21 @@ fi
 # dropped bucket survives: on 2026-08-21 three of us confirmed a census of "31" that was really
 # 28 + 3, with both operands on screen and the partition rule filed. Nobody ran the addition.
 # Nobody should have to remember an addition they cannot avoid reading.
+# HOW TO SABOTAGE-CONTROL THE PARTITION ARM — TWO STEPS, AND THE ORDER MATTERS:
+#
+#   1. printf '\ncites nonexistent-crate-9.9.9\n' >> docs/superpowers/specs/<any>.md
+#      (the skip bucket must be NON-EMPTY first: -> "N checked + 1 skipped")
+#   2. sed -i 's/skipped=$((skipped+1)); continue/continue/' scripts/check-spec-crate-anchors.sh
+#      -> PARTITION DOES NOT CLOSE, rc=2
+#
+# ⭐ LANDED != REACHABLE. Step 2 ALONE is a null experiment: the live tree usually has
+# skipped=0, so deleting the bucket changes no arithmetic and the check stays GREEN — and a
+# reviewer following a one-step sabotage concludes the GUARD is broken. The read is inverted.
+# That is exactly what the first published description of this control said, and it was wrong
+# while the control that had actually been RUN was two-step and valid: the DESCRIPTION was the
+# defect, not the artifact. A control nobody else can reproduce is not a control.
+# (OMBB, 2026-08-21, post-approval on #204.)
+#
 # Partition check runs BEFORE the tick. A red inside a green-looking block is invisible —
 # printing "✅ all N match" and then a failure underneath is how a red gets read past.
 if [ "$((checked + skipped))" -ne "$anchors_seen" ]; then
