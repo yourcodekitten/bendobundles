@@ -104,4 +104,17 @@ if [ "$checked" -eq 0 ]; then
   exit 2
 fi
 [ "$fail" -eq 0 ] || exit 1
-echo "✅ all $checked crate anchor(s) match Cargo.lock (${skipped} citation(s) skipped — not crates in this lock)"
+# PRINT THE SUM BESIDE THE WHOLE. Sub-counts that do not add up in front of the reader are how a
+# dropped bucket survives: on 2026-08-21 three of us confirmed a census of "31" that was really
+# 28 + 3, with both operands on screen and the partition rule filed. Nobody ran the addition.
+# Nobody should have to remember an addition they cannot avoid reading.
+# Partition check runs BEFORE the tick. A red inside a green-looking block is invisible —
+# printing "✅ all N match" and then a failure underneath is how a red gets read past.
+if [ "$((checked + skipped))" -ne "$anchors_seen" ]; then
+  echo "🔴 PARTITION DOES NOT CLOSE: saw ${anchors_seen} citation(s) but accounted for"
+  echo "   $((checked + skipped)) (${checked} checked + ${skipped} skipped). A bucket is missing —"
+  echo "   that is a defect in THIS script, not in the tree. No verdict is reported."
+  exit 2
+fi
+echo "✅ all $checked crate anchor(s) match Cargo.lock"
+echo "   partition: ${checked} checked + ${skipped} skipped = $((checked + skipped)) citation(s) seen"

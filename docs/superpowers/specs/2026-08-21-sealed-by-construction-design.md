@@ -67,7 +67,9 @@ independent reasons:
 ## 🔴 so why build it: the trap is one line away at ~29 sites, and we DOCUMENT that line as correct
 
 ```
-conditional writes in crates/dynamo/src/lib.rs                : 31
+conditional writes in crates/dynamo/src/lib.rs                : 28   ← .condition_expression(
+Query key conditions (READS, not writes)                      :  3   ← .key_condition_expression(
+                                                          partition: 28 + 3 = 31 substring matches
 ...of which request AllOld today (CALL sites)                 :  1   ← :849, set_link_thanks
 claim write that sets revealed_key                            : crates/dynamo/src/lib.rs:1355
 raw `format!("{e:?}")` captures into a String we own           : 23
