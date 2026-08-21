@@ -13,12 +13,14 @@ independent reasons:
 
 1. **The two variants that carry the raw HTTP payload carry the RESPONSE, never the REQUEST.**
    `ServiceError<E,R>`/`ResponseError<R>` hold `raw: R` = `HttpResponse`
-   (`aws-smithy-runtime-api-1.15.0/src/client/result.rs:241,267`). The item *we sent* is in neither.
+   (`aws-smithy-runtime-api` **1.14.0** (the version `Cargo.lock` resolves), `ServiceError`/`ResponseError`, field `raw: R`). The item *we sent* is in neither.
    🔴 **CORRECTED (OMBB, 2026-08-21): I ENUMERATED 2 OF 5 VARIANTS AND WROTE THE CONCLUSION AS IF I
-   HAD DONE ALL FIVE.** `SdkError` is `#[non_exhaustive]` with **five**: `ConstructionFailure` and
-   `TimeoutError` each carry `source: BoxError` = `Box<dyn Error>` — **opaque Debug from a type we do
-   not control** — and `DispatchFailure` carries `ConnectorError`. *`ConstructionFailure` is
-   literally the variant for "the request failed while being built."*
+   HAD DONE ALL FIVE.** `SdkError` is `#[non_exhaustive]` with **five**, and **THREE** carry something that is
+   not the response: `ConstructionFailure{source: BoxError}` · `TimeoutError{source: BoxError}` ·
+   **`DispatchFailure{source: ConnectorError}`**. All three are Debug we do not control.
+   *`ConstructionFailure` is literally the variant for "the request failed while being built", and
+   `DispatchFailure` — the one OMBB and I both left off — is the most-travelled of the three, since
+   it fires on every connection failure.* (Third arm: Lilith.)
    ⇒ **This is a NARROWED IMPOSSIBILITY, not an established one. Neither OMBB nor I has shown a leak
    through those three — the point is that nothing rules it out, and `#[non_exhaustive]` means AWS
    can add a sixth whenever it likes and `format!("{e:?}")` will adopt it silently.**
@@ -30,6 +32,17 @@ independent reasons:
    `thank_note`/`thanked_at`, **never a key**.
 
 ⇒ **Nothing is leaking. This spec must not be sold as an incident, and its PR must not imply one.**
+
+> 🔴 **CITATION HYGIENE — I cited a crate version my build does not use.** The first draft anchored
+> to `aws-smithy-runtime-api-1.15.0`. **`Cargo.lock` resolves `1.14.0`.** The 1.15.0 tree was on disk
+> as residue from *my own abandoned `cargo update --precise` experiment earlier the same morning* —
+> I reverted it out of `Cargo.lock` and not out of `~/.cargo/registry`, then read it back as if it
+> were the build. **`ls ~/.cargo/registry` is not a measurement of what you compile; the lockfile
+> is.** Re-verified against 1.14.0: shapes identical, so the conclusion held and only the anchor was
+> wrong. *(Lilith's catch.)*
+> ⚖️ **Scoreboard for this review, worth keeping: `AllOld: 2` (counted a docstring) · smithy
+> `1.15.0` (wrong version) · `2 unbounded arms` (short by one). EVERY CONCLUSION SURVIVED; NOT ONE
+> CITATION DID.** Three of us reading the source is the only reason we know that.
 
 ## 🔴 so why build it: the trap is one line away at ~29 sites, and we DOCUMENT that line as correct
 
@@ -175,6 +188,17 @@ and correctly concluded *"default is Never Expire."* I read the **account**:
 managed by nothing.** *Correct by accident.* A recreate, a console edit, or a new log group lands at
 Never Expire and no one is told. **Same species as the live-vs-repo `access.json` divergence: two
 surfaces describing one setting, and only the one nobody runs was wrong.**
+🔑 **And the comparison that makes the CloudWatch line hold for a MEASURED reason rather than an
+assumed one (Lilith, the other half of OMBB's measurement):** `claim_item` (`schema.rs`) has **no
+`ttl` attribute** — the claim serialises whole into `body`, `revealed_key` inside it — while `ttl`
+**is** set on OIDC state, its sibling, and the STEAMOWN cache. ⇒ **this codebase deliberately TTLs
+three item classes and deliberately does not TTL the one holding the keys.** So a never-expiring log
+group and a never-expiring claim record are **the same retention posture, same principal, same
+lifetime** — the log adds no new exposure. *Neither of them had this alone: OMBB had the log side, I
+had neither, Lilith had the store side, and the inference needs both.*
+⚠️ **But a default is not a decision, and the coupling is coincidence rather than design.** If
+fulfil-and-purge on claims is ever implemented, a Never-Expire log group **silently outlives the
+record it mirrors.**
 ⇒ **IN SCOPE, small, and it makes the mitigation's precondition enforceable instead of incidental:
 pin `retention_in_days` in terraform.** Without it, L1's whole "CloudWatch is the safe surface"
 argument rests on configuration that no reviewer can see.
@@ -205,6 +229,13 @@ Network(SealedNetworkError)   // sole constructor takes (reqwest::Error, Correla
 which subsumes #187 **and** #188: a site cannot mint the payload without the sealer, and cannot call
 the sealer without naming what the stripped URL was carrying. **The verb census becomes a
 belt-and-braces check, not the mechanism.**
+
+🔑 **THE UNIFICATION THE FIRST DRAFT MISSED — the fix is one shape in both crates.** `Aws(String)`
+in L1 and `Network(String)` in L2 are **the same bug**: *a publicly-constructible `String` payload
+makes the sealer optional no matter what any census says.* **Seal the payload type; the function is
+downstream of it.** ⚖️ *OMBB and Lilith reached this from **different crates** — two independent
+specimens. They share a rule-set, so their agreement is not itself independent evidence; the two
+specimens are. Recorded that way on purpose.*
 
 ## success criteria — falsifiable, and RED before green
 
