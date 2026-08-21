@@ -67,13 +67,26 @@ independent reasons:
 ## 🔴 so why build it: the trap is one line away at ~29 sites, and we DOCUMENT that line as correct
 
 ```
-conditional writes in crates/dynamo/src/lib.rs                : 28   ← .condition_expression(
-Query key conditions (READS, not writes)                      :  3   ← .key_condition_expression(
-                                                          partition: 28 + 3 = 31 substring matches
-...of which request AllOld today (CALL sites)                 :  1   ← :849, set_link_thanks
-claim write that sets revealed_key                            : crates/dynamo/src/lib.rs:1355
-raw `format!("{e:?}")` captures into a String we own           : 23
+conditional writes            : 28   ← grep -c '\.condition_expression('        crates/dynamo/src/lib.rs
+Query key conditions (READS)  :  3   ← grep -c '\.key_condition_expression('
+                          partition : 28 + 3 = 31 naive 'condition_expression' matches
+AllOld call site              :  1   ← the sole `.return_values_on_condition_check_failure(` call
+                                        (in `set_link_thanks`)
+claim write setting a key     :      ← the `claim.revealed_key = Some(` assignment
+raw `format!("{e:?}")` captures:  23  ← AS MEASURED ON THE PRE-FIX BRANCH. On main after this
+                                        change the count is 0 — that is the point of the change.
 ```
+
+> 🔴 **EVERY LINE NUMBER THIS TABLE ONCE CARRIED WAS STALE WITHIN HOURS — MOVED BY THE VERY PR THIS
+> SPEC DESCRIBES.** `:849 → :888`, `:1355 → :1408`, and the `23` became `0`. **The counts and the
+> function names survived; only the line numbers rotted.** (OMBB, who then ran the same check on his
+> own `CLAUDE.md` and found a citation with a line and *no path* — *"worse than one with neither: it
+> looks precise and sends you to the wrong file."* Lilith found all four of her checkpoint's
+> citations dead, `+39` to `+94`, same PR.)
+> ⇒ ***CITE BY NAME, BY A COMMAND THAT FINDS IT, OR BY A SHA — never by a line number in a file that
+> moves.*** `CLAUDE.md` has carried that rule for days; all three of us wrote integers anyway.
+> 📌 And say which measurements are **historical**: the `23` above is true of the pre-fix branch and
+> false of `main`. *A count in a document is a claim with a timestamp.*
 
 > 🔴 **CORRECTED after Lilith's review (2026-08-21).** This table first said **2** AllOld sites. **It
 > is 1.** My grep was `ReturnValuesOnConditionCheckFailure::AllOld`, which matched `:850` (the real
