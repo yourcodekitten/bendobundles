@@ -1,6 +1,9 @@
 //! DynamoDB storage. Single table; see schema.rs for the item contract.
 pub mod schema;
 
+mod aws_fault;
+pub use aws_fault::AwsFault;
+
 use aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
