@@ -14,19 +14,20 @@
 # SAME advisory stayed unpatched below 8.3.0, so an 8.x upgrade would have re-entered
 # the bug against a green check. Re-check the conditions below whenever you touch
 # these deps; do not assume a parked entry is still earning its place.
-# Verified unfired 2026-08-08: hyper-rustls 0.24.2, rustls 0.21.12 and
-# rustls-webpki 0.101.7 are all still in Cargo.lock, and lru 0.13.0 still arrives
-# under wreq 5.3.0. All four entries remain justified.
+# Verified 2026-08-21: the three legacy-TLS entries' condition has FIRED (all three
+# crates at 0 occurrences after #199) and they have been retired — see below. The lru
+# entry's condition has NOT fired: lru 0.13.0 still arrives under wreq, measured 1
+# occurrence, so it remains justified. Re-measure both before trusting this line.
 [advisories]
 ignore = [
-    # rustls 0.21.12 / rustls-webpki 0.101.7 — the aws-sdk's LEGACY TLS path, still
-    # shipped by aws-smithy-http-client 1.2.0 even at aws-config 1.10.1 (verified
-    # 2026-08-03; the 0.23/0.103 modern path is also present and is what runs).
-    # No CRLs are used and AWS endpoints aren't behind name-constrained CAs.
-    # Retire these three when an SDK bump drops hyper-rustls 0.24 from the lock.
-    "RUSTSEC-2026-0104", # reachable panic in CRL parsing
-    "RUSTSEC-2026-0098", # URI name-constraint incorrectly accepted
-    "RUSTSEC-2026-0099", # wildcard name-constraint accepted
+    # RETIRED 2026-08-21. The three legacy-TLS ignores that lived here (a CRL-parsing
+    # panic and two name-constraint advisories) were parked on the condition "retire when
+    # an SDK bump drops the legacy chain from the lock". PR #199 dropped it: hyper-rustls
+    # 0.24, rustls 0.21 and rustls-webpki 0.101 are all at 0 occurrences in Cargo.lock.
+    # Per this file's own header a FIRED retire condition is a live hole, not stale
+    # documentation — `ignore` matches on advisory ID with no version awareness, so those
+    # three IDs would have been waved through at ANY future version this repo resolves.
+    # scripts/no-legacy-http-stack.sh now asserts that chain stays out.
     # lru 0.13.0 IterMut unsoundness (informational). Pinned by wreq 5.3 → lru 0.13;
     # not expressible as a direct bump. Retire on a wreq release that moves lru.
     "RUSTSEC-2026-0002",

@@ -5,6 +5,18 @@ module "lambda_fulfillment" {
   context = module.context.shared
   name    = "fulfillment"
 
+  # Pinned explicitly rather than inherited. The module defaults this to 30 and production is
+  # already at 30, so this is a no-op today — its job is to make a module version bump that
+  # changes the default show up as a diff instead of as silence. The operator ping deliberately
+  # carries only a bounded AwsFault while full SDK Debug is allowed to reach CloudWatch, so the
+  # lifetime of these logs is part of that argument and should be visible to a reviewer.
+  #
+  # The "no-op today" is MEASURED, not assumed: before this, var.cloudwatch_logs was null, so
+  # the module fell through to the deprecated enable_cloudwatch_logs / cloudwatch_retention_in_days,
+  # which default to true / 30 — identical to what this object resolves to, and no call site
+  # sets either. Live groups read 30 (2026-08-21).
+  cloudwatch_logs = { retention_in_days = 30 }
+
   description   = "Sole humble-toucher: gift fulfillment, daily sync, cookie validation"
   filename      = "${path.module}/artifacts/fulfillment.zip"
   handler       = "bootstrap"
@@ -64,6 +76,9 @@ module "lambda_public_api" {
   context = module.context.shared
   name    = "public-api"
 
+  # Retention pinned explicitly — see the note on lambda_fulfillment above.
+  cloudwatch_logs = { retention_in_days = 30 }
+
   description   = "Friend surface: link view + claim intake"
   filename      = "${path.module}/artifacts/public-api.zip"
   handler       = "bootstrap"
@@ -111,6 +126,9 @@ module "lambda_admin_api" {
   version = "0.4.0"
   context = module.context.shared
   name    = "admin-api"
+
+  # Retention pinned explicitly — see the note on lambda_fulfillment above.
+  cloudwatch_logs = { retention_in_days = 30 }
 
   description   = "Admin surface: login, links, hidden toggles, sync-now"
   filename      = "${path.module}/artifacts/admin-api.zip"
