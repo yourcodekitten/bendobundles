@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-aws-sdk-dynamodb = "1"
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # session_pk hashes tokens at rest (#88): a table read yields digests, never replayable
 # bearer tokens. Version matches the workspace lockfile.
 sha2 = "0.11"
