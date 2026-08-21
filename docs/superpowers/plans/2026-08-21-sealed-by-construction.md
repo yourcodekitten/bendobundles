@@ -480,6 +480,21 @@ For the **one non-SDK site** at `lib.rs:3021`:
                     return Err(StoreError::Internal("describe_table returned no table"));
 ```
 
+📌 **While you are at `:1149`, fix the stale citation two lines below it.** The comment names an
+**older minor of `aws-sdk-dynamodb` than the lockfile resolves** and says that version lacks
+`as_transaction_canceled_exception()`. *(The stale version string is deliberately NOT reproduced
+here: `scripts/check-spec-crate-anchors.sh` scans `docs/` **and** `crates/`, so quoting a bad anchor
+in the instructions for fixing it makes the fix's own documentation fail the check. That has now
+happened three times in this repo in one morning — it is the rule, not the exception:*
+***a checked surface may not carry the string it is checking for.***) The **guidance is still correct** — that method is absent in 1.119.0 too,
+verified by grepping the resolved tree — so this is a citation defect, not a correctness one.
+Drop the version rather than bumping it, because the claim is not version-specific:
+
+```rust
+                // No `as_transaction_canceled_exception()` on this error type; pattern-match
+                // the public enum variants directly.
+```
+
 ⚠️ **Do not touch `is_ccf_put`, `is_ccf_update`, or the `as_service_error()` match arms.** They take `&SdkError` and run before this conversion. If a diff of this task touches them, it is wrong.
 ⚠️ **`set_link_thanks` (~`:857`) must keep `ccf.item.clone()`.** Reading the item is correct; only capturing it into the error type is forbidden.
 
@@ -620,9 +635,17 @@ mechanism.
 ```bash
 cd ~/bendobundles
 ./scripts/check-spec-crate-anchors.sh; echo "expect rc=0"
-printf '\nsabotage: aws-smithy-runtime-api-9.9.9\n' >> docs/superpowers/specs/2026-08-21-sealed-by-construction-design.md
-./scripts/check-spec-crate-anchors.sh; echo "expect rc=1"
-git checkout -- docs/superpowers/specs/2026-08-21-sealed-by-construction-design.md
+
+# Sabotage a COPY, and BUILD the bad anchor from variables so this file never contains a
+# literal `crate-x.y.z` string. The script scans docs/ AND crates/, so a hard-coded sabotage
+# example written here would be found by the very check it demonstrates — that happened, and
+# it is the same "a checked surface may not carry the string it retired" defect this repo hit
+# twice already today.
+tmp=$(mktemp -d); cp -r docs scripts crates Cargo.lock "$tmp"/
+printf '\nsabotage: %s-%s\n' "aws-smithy-runtime-api" "9.9.9" >> "$tmp"/docs/superpowers/specs/2026-08-21-sealed-by-construction-design.md
+( cd "$tmp" && ./scripts/check-spec-crate-anchors.sh ); echo "expect rc=1"
+rm -rf "$tmp"
+
 LOCK=/nonexistent ./scripts/check-spec-crate-anchors.sh; echo "expect rc=2"
 ```
 Expected: `0`, then `1`, then `2`. **If the sabotage run does not go RED, stop** — the check is a
