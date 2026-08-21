@@ -15,9 +15,9 @@ fulfillment = { path = "../fulfillment" }
 steam-client = { path = "../steam-client" }
 axum = "0.8"
 lambda_http = "1.3"
-aws-sdk-lambda = "1"
-aws-sdk-dynamodb = "1"
-aws-sdk-ssm = "1"
+aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 async-trait = "0.1"
 argon2 = { version = "0.5", features = ["std"] }

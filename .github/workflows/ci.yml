@@ -73,6 +73,10 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+      # Architecture guard, not a vuln scan: `cargo audit` only objects while an advisory is
+      # open, so it cannot keep us OFF the legacy hyper-0.14 / rustls-0.21 stack once one is
+      # withdrawn or backported. See the script header.
+      - run: ./scripts/no-legacy-http-stack.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
