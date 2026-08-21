@@ -333,6 +333,13 @@ pub enum StoreError {
     /// 🔴 **RULE: never put an SDK error's `Display` or `Debug` in here.** That is what
     /// [`AwsFault`] is for. Operational context this crate composes itself — a table name,
     /// a bounded status enum, a budget that expired — is fine.
+    ///
+    /// ⚠️ **This rule is NOT enforced, and that is stated rather than hidden.**
+    /// `scripts/check-store-error-sealed.sh` seals [`StoreError::Aws`]; it says nothing about
+    /// this variant, because there is no stable textual shape for "a variable holding an SDK
+    /// error" to grep for. **Do not read the guard's green as covering this line.** What makes
+    /// it tolerable is that the easy wrong path is shut: a stray `?` can no longer dump an SDK
+    /// error anywhere, so misusing this variant takes a deliberate act.
     #[error("internal: {0}")]
     Internal(String),
 }

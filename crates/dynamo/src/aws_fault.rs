@@ -24,6 +24,30 @@ use aws_sdk_dynamodb::config::http::HttpResponse;
 use aws_sdk_dynamodb::error::ProvideErrorMetadata;
 
 /// A bounded description of a failed DynamoDB call.
+///
+/// # Which guarantee each field carries — they are NOT all the same
+///
+/// **Read this before treating `AwsFault` as a redactor. It is not one.** It is a bounded
+/// *extraction*: it can only carry fields named here, which is what stops an SDK `Debug` from
+/// walking into the operator channel. That is a different and weaker claim than "nothing in
+/// here can ever have come from our request."
+///
+/// | field | guarantee |
+/// |---|---|
+/// | `op` | **structural** — a `&'static str` we pass in. Cannot carry runtime data. |
+/// | `code` | **structural** — AWS's error shape name, from a fixed vocabulary. |
+/// | `request_id` | **structural** — an opaque AWS correlation id. |
+/// | `http_status` | **structural** — a `u16`. |
+/// | `retryable` | **structural** — a `bool` we compute. |
+/// | `message` | 🔴 **BEHAVIOURAL, not structural.** AWS-authored free text. |
+///
+/// `message` is the one joint that is not closed by construction. DynamoDB error messages
+/// routinely echo attribute *names* and expression fragments back (`ValidationException` is the
+/// realistic case), and nothing in the service contract forbids a supplied value appearing
+/// there. **No leak has been demonstrated** — item attributes travel in `.item()`, which this
+/// type never reads — and the field is kept because it is the most diagnostic thing in the
+/// struct. But it is safe *because of how AWS behaves*, while every other field is safe
+/// *because of how this struct is built*, and a future reader must not confuse the two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsFault {
     op: &'static str,
@@ -91,7 +115,10 @@ impl AwsFault {
     pub fn from_build_error(op: &'static str, e: &aws_sdk_dynamodb::error::BuildError) -> Self {
         AwsFault {
             op,
-            code: Some("BuildError".to_string()),
+            // OURS, not AWS's — this failure never reached the service. Prefixed so a reader
+            // cannot mistake it for a code AWS actually sent, since this field otherwise
+            // carries exactly that.
+            code: Some("local:BuildError".to_string()),
             message: Some(e.to_string()),
             request_id: None,
             http_status: None,
