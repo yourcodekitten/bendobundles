@@ -490,19 +490,31 @@ legitimate non-SDK message moves to StoreError::Internal."
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: managed `aws_cloudwatch_log_group` resources for the three lambdas.
+- Produces: managed `aws_cloudwatch_log_group` resources for the three lambdas **and the API Gateway access log group**.
 
 **Why this is in this PR:** L1's mitigation is *"full Debug may go to CloudWatch, never to Discord."* That argument rests on the log group's retention. Measured 2026-08-21: the three groups are at **30 days** in the account, but `terraform/` sets no retention at all — so the safe state is **correct by accident and managed by nothing.** A recreate lands at Never Expire and nobody is told.
 
 - [ ] **Step 1: Confirm the current live state before changing anything**
 
-Run:
+🔴 **Do NOT filter by `/aws/lambda/`. That prefix is how I got this wrong the first time** — it
+excluded a whole group *by construction*, and the command still exited 0 with a well-formed answer.
+**A succeeding command can be showing a filtered slice.** Enumerate, then filter in the query:
+
 ```bash
-AWS_PROFILE=kitten-debug aws logs describe-log-groups \
-  --log-group-name-prefix /aws/lambda/brd-prod-ue1-bendobundles \
-  --query 'logGroups[].[logGroupName,retentionInDays]' --output text
+AWS_PROFILE=kitten-debug aws logs describe-log-groups --log-group-name-prefix /aws \
+  --query 'logGroups[?contains(logGroupName,`brd-prod-ue1-bendobundles`)].[logGroupName,retentionInDays]' \
+  --output text
 ```
-Expected: three rows, each `30`. **Record the output in the PR.** If any row differs, stop and report — the spec's premise has moved.
+Expected, measured 2026-08-21 (OMBB found the fourth; my `/aws/lambda/` prefix hid it):
+
+```
+/aws/apigateway/brd-prod-ue1-bendobundles-api-access-logs   7
+/aws/lambda/brd-prod-ue1-bendobundles-admin-api            30
+/aws/lambda/brd-prod-ue1-bendobundles-fulfillment          30
+/aws/lambda/brd-prod-ue1-bendobundles-public-api           30
+```
+
+**Record the output in the PR.** If any row differs, stop and report — the spec's premise has moved.
 
 - [ ] **Step 2: Write the terraform**
 
@@ -527,6 +539,17 @@ resource "aws_cloudwatch_log_group" "lambda" {
   for_each          = local.lambda_log_groups
   name              = "/aws/lambda/${var.name_prefix}-${each.value}"
   retention_in_days = 30
+}
+
+# The API Gateway access log group. Found only because enumerating without a
+# `/aws/lambda/` prefix returned a group the prefix had excluded by construction.
+# Pinned at its current 7 days — deliberately NOT raised to 30: access logs carry
+# request paths, and `/api/l/{token}` puts a bearer link token in the path. Shorter
+# is the safer default there, and changing it is a separate decision with its own
+# argument, not a side effect of this PR.
+resource "aws_cloudwatch_log_group" "apigateway_access" {
+  name              = "/aws/apigateway/${var.name_prefix}-api-access-logs"
+  retention_in_days = 7
 }
 ```
 

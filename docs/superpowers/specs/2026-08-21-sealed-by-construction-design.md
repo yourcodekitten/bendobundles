@@ -15,9 +15,14 @@ independent reasons:
    `ServiceError<E,R>`/`ResponseError<R>` hold `raw: R` = `HttpResponse`
    (`aws-smithy-runtime-api` **1.14.0** (the version `Cargo.lock` resolves), `ServiceError`/`ResponseError`, field `raw: R`). The item *we sent* is in neither.
    🔴 **CORRECTED (OMBB, 2026-08-21): I ENUMERATED 2 OF 5 VARIANTS AND WROTE THE CONCLUSION AS IF I
-   HAD DONE ALL FIVE.** `SdkError` is `#[non_exhaustive]` with **five**, and **THREE** carry something that is
-   not the response: `ConstructionFailure{source: BoxError}` · `TimeoutError{source: BoxError}` ·
-   **`DispatchFailure{source: ConnectorError}`**. All three are Debug we do not control.
+   HAD DONE ALL FIVE.** `SdkError` is `#[non_exhaustive]` with **five**, and **FOUR** carry an unbounded
+   payload: `ConstructionFailure{source: BoxError}` · `TimeoutError{source: BoxError}` ·
+   `DispatchFailure{source: ConnectorError}` · **`ResponseError{source: BoxError, raw: R}`** — the
+   variant this spec originally cited *for the safe side*, which carries a `BoxError` next to the
+   response I was pointing at. **`ServiceError{source: E, raw: R}` is the ONLY bounded arm — and it
+   is the one the entire AllOld analysis is about.** *Three of us spent a morning on the single
+   closed variant.* (2→3 Lilith, 3→4 OMBB. **I had `ResponseError`'s struct on screen in my own
+   first read and reasoned only about `raw: R`.**)
    *`ConstructionFailure` is literally the variant for "the request failed while being built", and
    `DispatchFailure` — the one OMBB and I both left off — is the most-travelled of the three, since
    it fires on every connection failure.* (Third arm: Lilith.)
