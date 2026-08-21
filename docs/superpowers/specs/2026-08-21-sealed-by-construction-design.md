@@ -11,9 +11,19 @@ unexamined premise and its retraction is three files away.
 an interpolated SDK error Debug. Measured 2026-08-21, that leak is NOT REACHABLE TODAY**, for two
 independent reasons:
 
-1. **`SdkError` carries the RESPONSE, never the REQUEST.** `ServiceError<E,R>`/`ResponseError<R>`
-   hold `raw: R` = `HttpResponse` (`aws-smithy-runtime-api-1.15.0/src/client/result.rs:241,267`).
-   The item *we sent* — the one carrying `revealed_key` — is not in any variant.
+1. **The two variants that carry the raw HTTP payload carry the RESPONSE, never the REQUEST.**
+   `ServiceError<E,R>`/`ResponseError<R>` hold `raw: R` = `HttpResponse`
+   (`aws-smithy-runtime-api-1.15.0/src/client/result.rs:241,267`). The item *we sent* is in neither.
+   🔴 **CORRECTED (OMBB, 2026-08-21): I ENUMERATED 2 OF 5 VARIANTS AND WROTE THE CONCLUSION AS IF I
+   HAD DONE ALL FIVE.** `SdkError` is `#[non_exhaustive]` with **five**: `ConstructionFailure` and
+   `TimeoutError` each carry `source: BoxError` = `Box<dyn Error>` — **opaque Debug from a type we do
+   not control** — and `DispatchFailure` carries `ConnectorError`. *`ConstructionFailure` is
+   literally the variant for "the request failed while being built."*
+   ⇒ **This is a NARROWED IMPOSSIBILITY, not an established one. Neither OMBB nor I has shown a leak
+   through those three — the point is that nothing rules it out, and `#[non_exhaustive]` means AWS
+   can add a sixth whenever it likes and `format!("{e:?}")` will adopt it silently.**
+   🔑 **And this is the STRONGER answer to Q4 than the one I had:** the AllOld argument needs a
+   future author to do something; **this argument needs nobody.** The capture is unbounded *today*.
 2. **The only way a DynamoDB error response carries an item back is
    `ReturnValuesOnConditionCheckFailure::AllOld`, and the sole site that requests it is
    `set_link_thanks`** (`crates/dynamo/src/lib.rs:849`), whose item is `LINK#/META` —
@@ -24,10 +34,23 @@ independent reasons:
 ## 🔴 so why build it: the trap is one line away at ~29 sites, and we DOCUMENT that line as correct
 
 ```
-conditional writes in crates/dynamo/src/lib.rs : 31
-...of which request AllOld today               :  2
-claim write that sets revealed_key             : crates/dynamo/src/lib.rs:1355
+conditional writes in crates/dynamo/src/lib.rs                : 31
+...of which request AllOld today (CALL sites)                 :  1   ← :849, set_link_thanks
+claim write that sets revealed_key                            : crates/dynamo/src/lib.rs:1355
+raw `format!("{e:?}")` captures into a String we own           : 23
 ```
+
+> 🔴 **CORRECTED after Lilith's review (2026-08-21).** This table first said **2** AllOld sites. **It
+> is 1.** My grep was `ReturnValuesOnConditionCheckFailure::AllOld`, which matched `:850` (the real
+> call) **and `:815` — a DOCSTRING.** *I counted my own documentation as a call site — and it is the
+> very docstring this spec then quotes as recommending the pattern. I cited it and tallied it.*
+> ⚠️ **Lilith reached the right number by a different route** and read the `2` as me conflating
+> `:2466`'s `return_values(ReturnValue::AllOld)` — a genuinely different API parameter (it returns
+> the item on **success**, in `out.attributes`, and never touches `SdkError`). **That is a real
+> distinction and worth knowing, but it was not my error.** *Right conclusion, wrong mechanism — so
+> the lesson is "a grep over a source file counts prose as code", not "two nouns, one string match".*
+> ⇒ **A census by `grep` cannot distinguish a call from a comment about a call.** Same family as the
+> guard that tripped on the prose quoting the value it banned, six hours earlier, in this same repo.
 
 `set_link_thanks`'s own docstring **recommends** the AllOld pattern, correctly and at length:
 
@@ -42,6 +65,22 @@ error `E`, inside `format!("{e:?}")`, inside `StoreError::Aws(String)`, and insi
 
 ⇒ ***The hazard is not that someone will do the wrong thing. It is that someone will do the
 RECOMMENDED thing.*** That is the version worth engineering against.
+
+### 🔬 DEMONSTRATED, not argued — the trap fires
+
+Built the recommended line's payload in a throwaway unit test (`SdkError::service_error` +
+`ConditionalCheckFailedException::builder().item(...)`, both public) and converted it through the
+real `From` impl. **Output, verbatim:**
+
+```
+dynamodb error: ServiceError(ServiceError { source: ConditionalCheckFailedException(
+  ConditionalCheckFailedException { message: None,
+    item: Some({"revealed_key": S("HB-GIFT-KEY-SENTINEL-0451")}), ... }), ... })
+```
+
+**The key is in `StoreError`, and `ping_content` redacts nothing.** The test was reverted, not
+committed — it becomes criterion ①'s test during execution. *This also proves criterion ① is
+buildable as a pure unit test with no local DynamoDB, which was the open feasibility question.*
 
 ## the unifying thesis — three open issues are one defect
 
@@ -75,35 +114,97 @@ impl<E: Debug, R: Debug> From<SdkError<E, R>> for StoreError {
 ```
 
 `format!("{e:?}")` is an **unbounded** capture: whatever the SDK ever decides to put in Debug, we
-adopt, forever, into a value that flows to Discord. **Replace the blanket capture with a deliberate
-extraction** — operation, error code, request id, and the modeled message — none of which can carry
-item attributes:
+adopt, forever, into a value that flows to Discord. **There are 23 such captures** (verified line by
+line). Replace the blanket capture with a deliberate extraction:
 
 ```rust
-StoreError::Aws(AwsFault { op: &'static str, code: Option<String>, request_id: Option<String> })
+/// A DynamoDB failure, reduced to what diagnoses it and nothing that can carry item data.
+///
+/// RULE, and it is the whole point of the type: the modeled `.message()` is IN;
+/// `.item()` is NEVER. Enforced by a test, not by this sentence.
+pub struct AwsFault {
+    op: &'static str,            // which call
+    code: Option<String>,        // what AWS said
+    message: Option<String>,     // modeled message — NOT the item
+    request_id: Option<String>,  // support handle
+    http_status: Option<u16>,    // 4xx vs 5xx, instantly
+    retryable: bool,             // the SDK's own classification
+}
 ```
+
+🔑 **`http_status` + `retryable` are Lilith's additions and they are the two that shorten a 3am
+night** — my original `op`/`code`/`request_id` was not enough to debug a real failure, which was
+exactly the question I flagged as the one I least trusted myself on. *I was the one who wanted the
+tidy invariant, and I undercounted its cost; that is the predictable direction of my own bias.*
+📌 **My prose and my struct disagreed** in the first draft — the prose promised "and the modeled
+message", the struct had no such field. Fixed above.
 
 **This is the fix that makes the AllOld question stop mattering.** Whether a future write requests
 AllOld, whether the SDK changes its Debug, whether the ping redacts — none of it can leak, because
 the item never enters our error type.
 
+🔴 **THE WAY THIS DESIGN FAILS, AND IT IS THE FAILURE IT IS SUPPOSED TO PREVENT.** One of the 23
+sites (`:3017`, feeding `:3021`) is a legitimate **non-SDK** string —
+`"describe_table returned no table"`. That creates real pressure to keep a `String`-carrying arm
+beside `Aws(AwsFault)`. ***The moment `Aws(String)` survives, L1 IS #187: a sealer nothing forces.***
+⇒ **The non-SDK case gets its OWN variant, and there is NO `From<String>` for `Aws`** — written in
+as criterion ⑥ so nobody adds the bridge at 3am to make a build green. *(Lilith's catch. Without it
+I would have shipped the trap inside its own cure — the "prettier promise" I asked her to check for,
+and she found it.)*
+
 ⚠️ **The cost is real and must be stated, not glossed:** we lose the SDK's full Debug at the error
-site. That is a genuine diagnostic loss. *Mitigation:* `code` + `request_id` are what actually
-resolve an AWS issue, and the full Debug can still be emitted to **CloudWatch** (a private,
-access-controlled surface) while never entering the value that reaches **Discord**. **The split
-between "diagnostic surface" and "human channel" is the design, and it is the part reviewers should
-attack hardest.**
+site. *Mitigation:* the full Debug still goes to **CloudWatch**, never into the value that reaches
+**Discord**.
+🔑 **And the principled line is NOT private-vs-public, which is where I first drew it.** It is that
+**the keys already live in DynamoDB in that same AWS account, so CloudWatch introduces no new
+principal — it is inside a boundary the data is already in. Discord is a third party with different
+retention and different access control.** That reframing is Lilith's and it survives my own Q1
+objection, which the private-vs-public framing did not.
+⚠️ **It holds only if that log group's retention is actually set and nothing ships it onward.**
+🔬 **MEASURED, and the repo and the world DISAGREE — this is the good kind of finding:**
+OMBB read the **repo** (`terraform/*.tf` has no `retention_in_days`, no `aws_cloudwatch_log_group`)
+and correctly concluded *"default is Never Expire."* I read the **account**:
+
+```
+/aws/lambda/brd-prod-ue1-bendobundles-admin-api      30
+/aws/lambda/brd-prod-ue1-bendobundles-fulfillment    30
+/aws/lambda/brd-prod-ue1-bendobundles-public-api     30
+```
+
+⇒ **Retention IS bounded at 30 days, so Lilith's precondition holds — but it is set OUT OF BAND and
+managed by nothing.** *Correct by accident.* A recreate, a console edit, or a new log group lands at
+Never Expire and no one is told. **Same species as the live-vs-repo `access.json` divergence: two
+surfaces describing one setting, and only the one nobody runs was wrong.**
+⇒ **IN SCOPE, small, and it makes the mitigation's precondition enforceable instead of incidental:
+pin `retention_in_days` in terraform.** Without it, L1's whole "CloudWatch is the safe surface"
+argument rests on configuration that no reviewer can see.
 
 ### L2 — `net(e, Correlator)` *(#188, OMBB's design)*
 
 Make the sealing constructor demand what the stripped URL was carrying, so *"`without_url()` is
 free"* becomes a claim the compiler checks rather than one a docstring asserts.
 
-### L3 — make the unsealed verb unreachable *(#187)*
+### L3 — seal the PAYLOAD TYPE, not the verb *(#187 — and #187's own framing was wrong)*
 
-Route steam-client's 13 raw verb sites through a wrapper that exposes only the sealed conversion, so
-site 14 cannot mint a raw `reqwest::Error` **and** cannot forget the correlator. **Census 13 → 0,
-enforced by a committed script in CI, not by this document.**
+🔴 **REDESIGNED after OMBB, and my own comment is the evidence against me.** The first draft said
+"route the 13 raw verb sites through a wrapper." **The verb census is the wrong unit:**
+
+- **`SteamError::Network(String)` (`:147`) is a PUBLIC `String` variant.** Anyone can build
+  `SteamError::Network(whatever)` without ever touching `net()`. Sealing the verbs does nothing to it.
+- **`.build()` mints a `reqwest::Error` that no verb census reaches** — and the comment saying so is
+  **mine**, at `crates/steam-client/src/lib.rs:418`: *"`.build()` is not a request verb — so no verb
+  census reaches it and the compiler has nothing to say."*
+
+⇒ ***I filed a census (#187), documented the hole in it myself, and then wrote a spec proposing to
+close the census.*** The seam is the **type**, not the function:
+
+```rust
+Network(SealedNetworkError)   // sole constructor takes (reqwest::Error, Correlator)
+```
+
+which subsumes #187 **and** #188: a site cannot mint the payload without the sealer, and cannot call
+the sealer without naming what the stripped URL was carrying. **The verb census becomes a
+belt-and-braces check, not the mechanism.**
 
 ## success criteria — falsifiable, and RED before green
 
@@ -118,9 +219,19 @@ correct-and-silent mechanism scored as success. Same discipline here:
 3. **A new call site that forgets the correlator does not compile.** Demonstrated, not asserted.
 4. **No behaviour change on the happy path** — the store's error *classification* (`is_ccf_put`,
    `is_ccf_update`, `TxConflict`) must be untouched. **These predicates decide idempotency and
-   retry; breaking them is far worse than the leak this spec prevents.** ⇐ *the real risk of this
-   change, named up front.*
+   retry; breaking them is far worse than the leak this spec prevents.**
+   ✅ **VERIFIED SAFER THAN I FEARED:** `is_ccf_put` (`:345`) and `is_ccf_update` (`:358`) are
+   `matches!(e.as_service_error(), Some(..ConditionalCheckFailedException(_)))` — **typed matching,
+   no Debug-string parsing** — and they take `&SdkError`, i.e. they run **upstream of the conversion
+   L1 changes**. They never see `StoreError::Aws` at all. *My scariest criterion is nearly free.*
+   ⚠️ **One real constraint falls out of it:** `set_link_thanks` at `:857` does `ccf.item.clone()`
+   for its atomic classification. **L1 must let that site READ `ccf.item()` while forbidding the item
+   from being CAPTURED into the error type. Read, not adopt — that distinction IS the
+   implementation.** (Lilith's, verified in source.)
 5. **`ClaimTxError`/`SetThanksOutcome` semantics unchanged**, proven by the existing suite.
+6. 🔴 **`StoreError::Aws` carries `AwsFault` ONLY — no `String` arm, no `From<String>` bridge.**
+   Non-SDK messages get a separate variant. *Without this criterion the whole design degrades into
+   the optional-sealer it exists to abolish.*
 
 ## non-goals
 
@@ -130,6 +241,39 @@ correct-and-silent mechanism scored as success. Same discipline here:
   of adopting it, not discouraging it.
 - **Not** humble-client re-sealing (#173 did that; its `Debug`-redaction test is the precedent this
   generalises).
+
+## family review — answered 2026-08-21 (Lilith), OMBB still open on L2
+
+**Verified her claims against the source before adopting them; two needed adjusting.**
+
+1. ✅ **Q1 (diagnostic split) — ANSWERED, and my framing was wrong.** Not private-vs-public;
+   **same-AWS-account vs third-party**. See L1. *Conditional on measuring the log group's retention.*
+2. ✅ **Q2 (`AwsFault` shape) — ANSWERED: mine was too thin.** `http_status` + `retryable` added.
+   *This was the question I flagged as least trustworthy in my own hands, and it was indeed the one
+   I got wrong — in the predicted direction, toward the tidy invariant.*
+3. ✅ **Q3 (scope) — ANSWERED, and it dissolves rather than resolves.** L1 is **23 call sites**; it
+   *is* the churn PR, so "keep mechanical churn separate" cannot argue against bundling L2/L3 with
+   it. **Split on the CRATE boundary instead:**
+   **PR1 = L1 in `dynamo`** (type + 23 sites + RED-first test + the non-SDK variant) ·
+   **PR2 = L2+L3 in `steam-client`.** Different crates, different reviewers, and **L2 is OMBB's
+   design to defend.**
+4. 🔴 **Q4 (is a zero-incident trap worth a pounce?) — MY COUNTER-ARGUMENT WAS VACUOUS, NOT FAIR.**
+   I offered *"zero incidents while the app had zero claims."* **Zero claims means the path was never
+   exercised: the clean record has a denominator of ZERO.** That is absence of sampling, not evidence
+   of safety — *a zero that arrives too neatly is not a measurement.*
+   ⇒ **Build it, but argue it on TIMING, never on URGENCY:** the cost is **fixed and rising** (every
+   new conditional write adds a site) while the fix's blast radius — which touches idempotency and
+   retry — is **currently zero traffic**. *This is the cheapest hour this change will ever have.*
+   **The PR must say that and must not imply an incident**, or the non-goals section eats itself.
+5. ⏳ **OPEN — OMBB, on L2.** `net(e, Correlator)` is his design; PR2 does not proceed to execution
+   without his read. **PR1 is not blocked on it** (different crate, different failure mode).
+6. 🟡 **NOT MINE TO INFER, and it does not block:** whether claims are zero from seasonality or
+   because Ben is repositioning the product. **That is his to answer.** I am not asking mid-pounce —
+   it would leak the repo, and **nothing in this spec depends on the answer**: the trap is in error
+   handling, and it is equally latent whether or not claims resume. *Flagging it for after the
+   reveal rather than deciding it silently.*
+
+## superseded — the questions as first asked
 
 ## open questions for OMBB + Lilith  *(step 2)*
 
