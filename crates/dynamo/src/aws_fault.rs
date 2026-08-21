@@ -80,6 +80,24 @@ impl AwsFault {
             ),
         }
     }
+
+    /// A request we failed to BUILD — our own bug, not AWS's.
+    ///
+    /// Captures `Display`, deliberately, and NOT `Debug`. `BuildError`'s `Display` names the
+    /// offending *field* (`"invalid field in input: {field}"`, `"{field} was missing"`) and
+    /// never the value bound to it, so it is safe and genuinely diagnostic. Its `Debug` is not
+    /// an audited surface and is therefore not adopted — the same rule as everywhere else in
+    /// this module: capture what is bounded, never what merely happens to look small today.
+    pub fn from_build_error(op: &'static str, e: &aws_sdk_dynamodb::error::BuildError) -> Self {
+        AwsFault {
+            op,
+            code: Some("BuildError".to_string()),
+            message: Some(e.to_string()),
+            request_id: None,
+            http_status: None,
+            retryable: false,
+        }
+    }
 }
 
 impl std::fmt::Display for AwsFault {
