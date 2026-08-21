@@ -1,3 +1,15 @@
 [toolchain]
-channel = "stable"
+# PINNED, deliberately. This line used to float on the stable channel, and that broke the
+# `artifacts` job on 2026-08-21 with no commit of ours: rustc 1.98.0 began passing `--fix-cortex-a53-843419` on aarch64-unknown-linux-gnu,
+# and zig's linker (cargo-zigbuild 0.20.1, driven by cargo-lambda) rejects the flag outright.
+# Proven environmental, not a code regression: re-running the `artifacts` job at main's UNCHANGED
+# head 04b1e77 went success (2026-08-19, attempt 1) -> failure (2026-08-21, attempt 2) with a
+# byte-identical error.
+#
+# This repo pins its GitHub Actions by SHA and its linters by version; the compiler was the one
+# load-bearing input still floating. An unpinned `stable` means any Rust release day can turn the
+# build red for reasons no diff explains.
+#
+# TO BUMP: raise this deliberately and let CI prove the aarch64 link still works (see #200).
+channel = "1.97.1"
 components = ["rustfmt", "clippy"]
