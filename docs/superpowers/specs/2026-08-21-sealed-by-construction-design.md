@@ -11,9 +11,13 @@ unexamined premise and its retraction is three files away.
 an interpolated SDK error Debug. Measured 2026-08-21, that leak is NOT REACHABLE TODAY**, for two
 independent reasons:
 
-1. **The two variants that carry the raw HTTP payload carry the RESPONSE, never the REQUEST.**
-   `ServiceError<E,R>`/`ResponseError<R>` hold `raw: R` = `HttpResponse`
-   (`aws-smithy-runtime-api` **1.14.0** (the version `Cargo.lock` resolves), `ServiceError`/`ResponseError`, field `raw: R`). The item *we sent* is in neither.
+1. **The raw HTTP payload an `SdkError` carries is the RESPONSE, never the REQUEST.** In
+   `aws-smithy-runtime-api` **1.14.0** — the version `Cargo.lock` resolves — `ServiceError<E,R>` and
+   `ResponseError<R>` each hold a field `raw: R` = `HttpResponse`. **The item *we sent*, the one
+   carrying `revealed_key`, is in no variant of `SdkError` at all.**
+   ⚠️ **`ResponseError` is named here for its `raw` field ONLY. It is NOT a "safe" arm** — it also
+   holds a `source: BoxError`, and it belongs in the unbounded list below. *The first draft used it
+   as proof of the safe side; see the correction.*
    🔴 **CORRECTED (OMBB, 2026-08-21): I ENUMERATED 2 OF 5 VARIANTS AND WROTE THE CONCLUSION AS IF I
    HAD DONE ALL FIVE.** `SdkError` is `#[non_exhaustive]` with **five**, and **FOUR** carry an unbounded
    payload: `ConstructionFailure{source: BoxError}` · `TimeoutError{source: BoxError}` ·
@@ -39,8 +43,11 @@ independent reasons:
 ⇒ **Nothing is leaking. This spec must not be sold as an incident, and its PR must not imply one.**
 
 > 🔴 **CITATION HYGIENE — I cited a crate version my build does not use.** The first draft anchored
-> to `aws-smithy-runtime-api-1.15.0`. **`Cargo.lock` resolves `1.14.0`.** The 1.15.0 tree was on disk
-> as residue from *my own abandoned `cargo update --precise` experiment earlier the same morning* —
+> to a **newer minor of `aws-smithy-runtime-api` than the lockfile resolves** (the retired version
+> string is deliberately DESCRIBED, not quoted — `scripts/check-spec-crate-anchors.sh` greps this
+> file, and a quote of a bad anchor is indistinguishable from the bad anchor). **`Cargo.lock`
+> resolves `1.14.0`.** That newer tree was on disk as residue from *my own abandoned
+> `cargo update --precise` experiment earlier the same morning* —
 > I reverted it out of `Cargo.lock` and not out of `~/.cargo/registry`, then read it back as if it
 > were the build. **`ls ~/.cargo/registry` is not a measurement of what you compile; the lockfile
 > is.** Re-verified against 1.14.0: shapes identical, so the conclusion held and only the anchor was
@@ -53,7 +60,8 @@ independent reasons:
 > the first number sufficient to make the point.** ***An enumeration that stops when it is SUFFICIENT
 > is not an enumeration.***
 > ⚖️ **Scoreboard for this review, worth keeping: `AllOld: 2` (counted a docstring) · smithy
-> `1.15.0` (wrong version) · `2 unbounded arms` (short by one). EVERY CONCLUSION SURVIVED; NOT ONE
+> **wrong crate version** (see above; not quoted, for the same reason) · `2 unbounded arms`
+> (short by one). EVERY CONCLUSION SURVIVED; NOT ONE
 > CITATION DID.** Three of us reading the source is the only reason we know that.
 
 ## 🔴 so why build it: the trap is one line away at ~29 sites, and we DOCUMENT that line as correct
@@ -196,10 +204,21 @@ and correctly concluded *"default is Never Expire."* I read the **account**:
 /aws/lambda/brd-prod-ue1-bendobundles-public-api     30
 ```
 
-⇒ **Retention IS bounded at 30 days, so Lilith's precondition holds — but it is set OUT OF BAND and
-managed by nothing.** *Correct by accident.* A recreate, a console edit, or a new log group lands at
-Never Expire and no one is told. **Same species as the live-vs-repo `access.json` divergence: two
-surfaces describing one setting, and only the one nobody runs was wrong.**
+🔴 **AND THIS WHOLE PARAGRAPH WAS WRONG — CORRECTED 2026-08-21 BY READING THE MODULE.**
+The claim was *"managed by nothing, correct by accident."* **It is managed.**
+`terraform/.terraform/modules/lambda_admin_api/main.tf:75` — the `bendoerr-terraform-modules/lambda/aws`
+module **declares `aws_cloudwatch_log_group "this"` itself**, with
+`retention_in_days = local.cloudwatch_retention_in_days`, whose variable defaults to **30**
+(`variables.tf:209`, `optional(number, 30)`). ⇒ **the live 30 is the module's managed default, not
+console drift.**
+⚖️ **How BOTH of us missed it, and it is the same miss:** OMBB grepped `terraform/*.tf` and found no
+`retention_in_days`; I read the *account*. **Neither of us read the MODULE** — the thing that actually
+owns the resource. *A repo-vs-world comparison has a third surface when the resource is module-owned,
+and we each checked one of the two we could see.*
+⇒ **The "correct by accident" finding is RETRACTED. Terraform Task 4 shrinks accordingly** — from
+"declare four log groups" (which would have **collided with the module's own resource**) to, at most,
+**pinning `cloudwatch_logs.retention_in_days` explicitly at the module call sites** so a module
+version bump cannot move it silently. **That is a much weaker argument and is labelled as one.**
 🔑 **And the comparison that makes the CloudWatch line hold for a MEASURED reason rather than an
 assumed one (Lilith, the other half of OMBB's measurement):** `claim_item` (`schema.rs`) has **no
 `ttl` attribute** — the claim serialises whole into `body`, `revealed_key` inside it — while `ttl`
@@ -219,9 +238,9 @@ had neither, Lilith had the store side, and the inference needs both.*
 ⚠️ **But a default is not a decision, and the coupling is coincidence rather than design.** If
 fulfil-and-purge on claims is ever implemented, a Never-Expire log group **silently outlives the
 record it mirrors.**
-⇒ **IN SCOPE, small, and it makes the mitigation's precondition enforceable instead of incidental:
-pin `retention_in_days` in terraform.** Without it, L1's whole "CloudWatch is the safe surface"
-argument rests on configuration that no reviewer can see.
+⇒ **IN SCOPE only in its reduced form** (explicit pin at the module call). L1's "CloudWatch is the
+safe surface" argument **already rests on managed configuration** — it just rests on a module
+*default* rather than an explicit value.
 
 ### L2 — `net(e, Correlator)` *(#188, OMBB's design)*
 

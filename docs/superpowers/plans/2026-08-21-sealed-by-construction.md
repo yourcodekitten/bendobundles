@@ -26,8 +26,9 @@
 | File | Responsibility |
 |---|---|
 | `crates/dynamo/src/aws_fault.rs` *(create)* | The `AwsFault` type, its `Display`, and the single `from_sdk_error` extractor. One responsibility: turn an opaque SDK error into a bounded, printable fault. |
-| `crates/dynamo/src/lib.rs` *(modify)* | `StoreError` variant change; the 23 capture sites; `mod aws_fault;` |
-| `terraform/aws-cloudwatch-logs.tf` *(create)* | Pin `retention_in_days` on **all four** bendobundles log groups (3 lambda + 1 apigateway), so L1's "CloudWatch is the safe surface" rests on managed config. |
+| `crates/dynamo/src/lib.rs` *(modify)* | `StoreError` variant change; 23 explicit capture sites **+ 3 `?`-dependent sites** (`:704`, `:968`, `:2220`); `mod aws_fault;` |
+| `terraform/aws-lambda.tf` *(modify)* | Pin `cloudwatch_logs.retention_in_days` explicitly at the three module call sites. **The module owns the log-group resource — do not declare one.** |
+| `.github/workflows/ci.yml` *(modify)* | Add `scripts/check-spec-crate-anchors.sh` to the `audit` job. |
 
 ---
 
@@ -161,8 +162,17 @@ impl AwsFault {
             op,
             code: svc.and_then(|s| s.code().map(str::to_string)),
             message: svc.and_then(|s| s.message().map(str::to_string)),
-            request_id: svc.and_then(|s| s.meta().request_id().map(str::to_string)),
+            // NOT `.meta().request_id()` — that does not exist. `ErrorMetadata` exposes
+            // `code`/`message`/`extra`; the `RequestId` trait lives in `aws-types`, which is
+            // NOT a dependency of this crate. `extra("aws_request_id")` needs no new dep and
+            // yields `None` when absent, which is the honest answer.
+            request_id: svc.and_then(|s| s.meta().extra("aws_request_id").map(str::to_string)),
             http_status: None,
+            // A DELIBERATE APPROXIMATION, not "the SDK's own classification" — say so, because
+            // an earlier draft of this plan claimed the latter. Transport-level timeouts and
+            // dispatch failures are retryable; a throttling *service* error is retryable too and
+            // this does NOT catch it. Under-reporting is the safe direction (a missing
+            // `[retryable]` costs a reader nothing; a false one sends them down a wrong path).
             retryable: matches!(
                 e,
                 aws_sdk_dynamodb::error::SdkError::TimeoutError(_)
@@ -294,20 +304,19 @@ and add to the imports at the top of the file:
 use aws_smithy_runtime_api::client::result::SdkError as _;
 ```
 
-**If `raw_response()` is not in scope on the pinned 1.14.0**, obtain the status from the service-error path instead:
+**If `raw_response()` is not in scope on the pinned 1.14.0**, match the two variants that carry a
+response directly — this is the whole fallback, not a sketch:
 
 ```rust
-            http_status: svc.and_then(|s| s.meta().code()).and(None).or_else(|| {
-                match e {
-                    aws_sdk_dynamodb::error::SdkError::ServiceError(se) => {
-                        Some(se.raw().status().as_u16())
-                    }
-                    aws_sdk_dynamodb::error::SdkError::ResponseError(re) => {
-                        Some(re.raw().status().as_u16())
-                    }
-                    _ => None,
+            http_status: match e {
+                aws_sdk_dynamodb::error::SdkError::ServiceError(se) => {
+                    Some(se.raw().status().as_u16())
                 }
-            }),
+                aws_sdk_dynamodb::error::SdkError::ResponseError(re) => {
+                    Some(re.raw().status().as_u16())
+                }
+                _ => None,
+            },
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -325,7 +334,7 @@ git commit -S -m "feat(dynamo): capture http status; pin the opaque arms with a 
 
 ---
 
-### Task 3: Flip the variant and let the compiler find all 23 sites
+### Task 3: Flip the variant and let the compiler find every site (23 explicit + 3 via `?`)
 
 **Files:**
 - Modify: `crates/dynamo/src/lib.rs` (the `StoreError` enum, and every capture site the compiler rejects)
@@ -424,7 +433,23 @@ impl<E: std::fmt::Debug, R: std::fmt::Debug> From<aws_sdk_dynamodb::error::SdkEr
 Run: `cd ~/bendobundles && PATH="$HOME/.cargo/bin:$PATH" cargo check -p dynamo -j2 2>&1 | tee /tmp/sealed-sites.txt | tail -40`
 Expected: a long list of type errors. Count them:
 `grep -c '^error' /tmp/sealed-sites.txt`
-**This list IS the task.** The 23 known capture sites are at `lib.rs` lines 338 (deleted in Step 4), 613, 658, 737, 769, 794, 888, 1149, 1260, 1319, 1369, 1489, 1534, 1633, 1718, 1836, 1921, 2008, 2163, 2725, 2777, 2994, 3017.
+**This list IS the task, and it is LONGER than the 23 explicit captures.**
+
+- **23 explicit `format!("{e:?}")` captures** at `lib.rs` lines 338 (deleted in Step 4), 613, 658, 737, 769, 794, 888, 1149, 1260, 1319, 1369, 1489, 1534, 1633, 1718, 1836, 1921, 2008, 2163, 2725, 2777, 2994, 3017.
+- 🔴 **PLUS 3 sites that never mention `format!` at all** — `lib.rs:704`, `:968`, `:2220` — which use
+  `req.send().await?` and rely on the blanket `From` impl for the `?` operator. **Deleting the impl
+  breaks these too.** Rewrite each as:
+
+```rust
+        req.send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("update_item", &e)))?;
+```
+
+🔴 **DO NOT "FIX" THESE BY RE-ADDING A `From<SdkError> for StoreError` IMPL.** That is the cheapest
+way to make the build green and it **reintroduces the exact defect this plan exists to remove** (see
+Global Constraints and spec criterion ⑥). If the error count surprises you, the plan is right and the
+surprise is the point — the compiler is enumerating work that review would have missed.
 
 - [ ] **Step 6: Rewrite each site**
 
@@ -487,102 +512,140 @@ legitimate non-SDK message moves to StoreError::Internal."
 
 ---
 
-### Task 4: Pin CloudWatch log retention
+### Task 4: Make log retention an explicit decision at the module call sites
 
 **Files:**
-- Create: `terraform/aws-cloudwatch-logs.tf`
+- Modify: `terraform/aws-lambda.tf` (the three `module "lambda_*"` blocks)
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
-- Produces: managed `aws_cloudwatch_log_group` resources for the three lambdas **and the API Gateway access log group**.
+- Produces: nothing consumed by later tasks.
 
-**Why this is in this PR:** L1's mitigation is *"full Debug may go to CloudWatch, never to Discord."* That argument rests on the log group's retention. Measured 2026-08-21: the three groups are at **30 days** in the account, but `terraform/` sets no retention at all — so the safe state is **correct by accident and managed by nothing.** A recreate lands at Never Expire and nobody is told.
+🔴 **THIS TASK WAS REWRITTEN AFTER PLAN REVIEW. THE FIRST VERSION WOULD HAVE BROKEN `terraform apply`.**
+It declared `resource "aws_cloudwatch_log_group"` for each lambda. **The
+`bendoerr-terraform-modules/lambda/aws` module already declares one** —
+`.terraform/modules/lambda_admin_api/main.tf:75`, `aws_cloudwatch_log_group "this"`, with
+`retention_in_days = local.cloudwatch_retention_in_days`. Declaring our own would have produced a
+**duplicate resource for the same log group name**.
+📌 **And the premise was wrong too:** the spec claimed retention was *"managed by nothing, correct by
+accident."* **It is managed** — the module's `cloudwatch_logs.retention_in_days` defaults to `30`
+(`variables.tf:209`), which is exactly the live value. *OMBB grepped `terraform/*.tf`; I read the
+account; **neither of us read the MODULE**, which is the thing that owns the resource.*
+⇒ **What remains is genuinely smaller, and is labelled as the weaker argument it is:** a module
+*default* can move under a version bump without a diff anyone reads. Pinning it explicitly at the
+call site makes the value visible to a reviewer. **This is tidiness with a rationale, not a fix.**
 
-- [ ] **Step 1: Confirm the current live state before changing anything**
+- [ ] **Step 1: Confirm the live state and the module default before changing anything**
 
-🔴 **Do NOT filter by `/aws/lambda/`. That prefix is how I got this wrong the first time** — it
-excluded a whole group *by construction*, and the command still exited 0 with a well-formed answer.
-**A succeeding command can be showing a filtered slice.** Enumerate, then filter in the query:
-
+Run:
 ```bash
 AWS_PROFILE=kitten-debug aws logs describe-log-groups --log-group-name-prefix /aws \
   --query 'logGroups[?contains(logGroupName,`brd-prod-ue1-bendobundles`)].[logGroupName,retentionInDays]' \
   --output text
+grep -n 'retention_in_days' ~/bendobundles/terraform/.terraform/modules/lambda_admin_api/variables.tf
 ```
-Expected, measured 2026-08-21 (OMBB found the fourth; my `/aws/lambda/` prefix hid it):
+🔴 **Do NOT filter by `/aws/lambda/`. That prefix is how this was got wrong the first time** — it
+excluded a group *by construction* while the command still exited 0 with a well-formed answer.
+**A succeeding command can be showing a filtered slice.**
 
+Expected, measured 2026-08-21:
 ```
 /aws/apigateway/brd-prod-ue1-bendobundles-api-access-logs   7
-/aws/lambda/brd-prod-ue1-bendobundles-admin-api            30
-/aws/lambda/brd-prod-ue1-bendobundles-fulfillment          30
-/aws/lambda/brd-prod-ue1-bendobundles-public-api           30
+/aws/lambda/brd-prod-ue1-bendobundles-admin-api           30
+/aws/lambda/brd-prod-ue1-bendobundles-fulfillment         30
+/aws/lambda/brd-prod-ue1-bendobundles-public-api          30
 ```
+**Record this in the PR.** If any lambda row is not `30`, **stop** — it would mean the value is NOT
+the module default and the premise has moved again.
 
-**Record the output in the PR.** If any row differs, stop and report — the spec's premise has moved.
+- [ ] **Step 2: Pin the value at each of the three module call sites**
 
-- [ ] **Step 2: Write the terraform**
-
-Create `terraform/aws-cloudwatch-logs.tf`:
+In `terraform/aws-lambda.tf`, add this argument to **each** of `module "lambda_fulfillment"`,
+`module "lambda_public_api"`, and `module "lambda_admin_api"`, immediately after their `name = ...`
+line:
 
 ```hcl
-# Log retention is load-bearing, not housekeeping.
-#
-# The operator ping deliberately carries only a bounded `AwsFault`; the full SDK Debug is
-# allowed to reach CloudWatch instead. That split is only defensible while these groups have
-# a retention policy someone decided on. Measured 2026-08-21: all three were already at 30
-# days in the account while terraform set nothing — correct by accident. A recreate would
-# have landed at Never Expire silently.
-#
-# 30 matches what production already had, so applying this is a no-op today and a guarantee
-# tomorrow.
-locals {
-  lambda_log_groups = toset(["admin-api", "public-api", "fulfillment"])
-}
-
-resource "aws_cloudwatch_log_group" "lambda" {
-  for_each          = local.lambda_log_groups
-  name              = "/aws/lambda/${var.name_prefix}-${each.value}"
-  retention_in_days = 30
-}
-
-# The API Gateway access log group. Found only because enumerating without a
-# `/aws/lambda/` prefix returned a group the prefix had excluded by construction.
-# Pinned at its current 7 days — deliberately NOT raised to 30: access logs carry
-# request paths, and `/api/l/{token}` puts a bearer link token in the path. Shorter
-# is the safer default there, and changing it is a separate decision with its own
-# argument, not a side effect of this PR.
-resource "aws_cloudwatch_log_group" "apigateway_access" {
-  name              = "/aws/apigateway/${var.name_prefix}-api-access-logs"
-  retention_in_days = 7
-}
+  # Pinned explicitly rather than inherited. The module defaults this to 30 and production is
+  # already at 30, so this is a no-op today — its job is to make a module version bump that
+  # changes the default show up as a diff instead of as silence. The operator ping deliberately
+  # carries only a bounded AwsFault while full SDK Debug is allowed to reach CloudWatch, so the
+  # lifetime of these logs is part of that argument and should be visible to a reviewer.
+  cloudwatch_logs = { retention_in_days = 30 }
 ```
 
-- [ ] **Step 3: Confirm the name prefix variable actually resolves**
+⚠️ **Do NOT touch the API Gateway access log group.** It is at 7 days, it is a different resource,
+and access logs carry request paths — `/api/l/{token}` puts a bearer link token in the path, so
+shorter is the safer default there. **Raising or managing it is a separate decision with its own
+argument, not a side effect of this PR.**
+
+- [ ] **Step 3: Validate**
 
 Run:
 ```bash
-cd ~/bendobundles/terraform
-grep -n 'name_prefix' tf-variables.tf *.tf | head
+cd ~/bendobundles/terraform && terraform fmt -check && terraform validate
 ```
-Expected: a `var.name_prefix` (or equivalent) exists and composes to `brd-prod-ue1-bendobundles`. **If the variable has a different name, use the real one** — do not invent one. Cross-check against the live group names from Step 1.
+Expected: both clean. **Do not run `terraform plan` or `apply`** — the box's default AWS identity is
+OMBB's, and CI's `terraform` job is the gate for this.
 
-- [ ] **Step 4: Validate**
-
-Run: `cd ~/bendobundles/terraform && terraform fmt -check && terraform validate`
-Expected: both clean. **Do not run `terraform plan` or `apply`** — the box's default AWS identity is OMBB's and plan/apply is not this task's job; CI's `terraform` job validates.
-
-⚠️ **These groups already exist in the account.** A future `apply` will need `terraform import` for each, or it will fail with `ResourceAlreadyExistsException`. **Say so in the PR body** — do not leave it for whoever applies.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 cd ~/bendobundles
-git add terraform/aws-cloudwatch-logs.tf
-git commit -S -m "infra: manage lambda log retention explicitly (30d, matching production)
+git add terraform/aws-lambda.tf
+git commit -S -m "infra: pin lambda log retention explicitly at the module call sites
 
-L1 lets full SDK Debug reach CloudWatch instead of Discord. That split rests on
-retention, which was set to 30d in the account and to nothing in terraform.
-Correct by accident is not correct. Requires terraform import; see PR body."
+The module already manages these log groups and already defaults to 30, which is what
+production has. This changes nothing today; it makes a future change to that default
+visible as a diff rather than as silence."
+```
+
+---
+
+### Task 5: Wire the crate-anchor check into CI
+
+**Files:**
+- Modify: `.github/workflows/ci.yml` (the `audit` job)
+
+**Interfaces:**
+- Consumes: `scripts/check-spec-crate-anchors.sh` (already committed on this branch).
+- Produces: nothing consumed by later tasks.
+
+**Why:** this plan's spec cited a crate version the lockfile does not resolve, and the bad anchor
+**survived a revision whose entire subject was that section** — the fix landed on the count and never
+reached the citation under it. Three people reading source caught it; that is an accident, not a
+mechanism.
+
+- [ ] **Step 1: Prove the script still discriminates, before trusting it in CI**
+
+```bash
+cd ~/bendobundles
+./scripts/check-spec-crate-anchors.sh; echo "expect rc=0"
+printf '\nsabotage: aws-smithy-runtime-api-9.9.9\n' >> docs/superpowers/specs/2026-08-21-sealed-by-construction-design.md
+./scripts/check-spec-crate-anchors.sh; echo "expect rc=1"
+git checkout -- docs/superpowers/specs/2026-08-21-sealed-by-construction-design.md
+LOCK=/nonexistent ./scripts/check-spec-crate-anchors.sh; echo "expect rc=2"
+```
+Expected: `0`, then `1`, then `2`. **If the sabotage run does not go RED, stop** — the check is a
+comment and wiring it in would be worse than not having it.
+
+- [ ] **Step 2: Add the step to the `audit` job**
+
+In `.github/workflows/ci.yml`, in the `audit` job, immediately after the
+`- run: ./scripts/no-legacy-http-stack.sh` line, add:
+
+```yaml
+      # Specs and plans cite crate versions. Those citations rot silently and read current
+      # forever. This asserts every `crate-x.y.z` anchor in docs/superpowers matches what
+      # Cargo.lock actually resolves.
+      - run: ./scripts/check-spec-crate-anchors.sh
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+cd ~/bendobundles
+git add .github/workflows/ci.yml
+git commit -S -m "ci: assert spec crate anchors match the lockfile"
 ```
 
 ---
@@ -597,9 +660,21 @@ Correct by accident is not correct. Requires terraform import; see PR body."
 - Criterion ⑥ no `String` arm → Task 3 Steps 3, 8 ✅
 - `AwsFault` shape incl. `http_status`/`retryable` → Tasks 1–2 ✅
 - Read-not-adopt at `:857` → Task 3 Step 6 ✅
-- Retention pin → Task 4 ✅
+- Retention pin → Task 4 ✅ *(reduced after review: the module owns the resource and already
+  defaults to 30, so the original "declare four log groups" task would have collided and its
+  premise was false)*
+- Crate-anchor drift → Task 5 ✅ *(added after review — the defect it catches occurred in this
+  spec and survived a revision of the very section it was in)*
 - Three opaque arms → Task 2 `opaque_arms_do_not_leak_their_payload` ✅
 - **L2/L3 (`steam-client`, sealed payload type) → NOT IN THIS PLAN.** Deliberate: different crate, and it is OMBB's design and gated on his read. **Filed as a follow-up issue with the agreed design before this PR merges** — an unrecorded deferral is indistinguishable from an oversight.
+
+**1b. Plan-review findings folded in (2026-08-21).** Four blockers found by reviewing this plan
+cold against the codebase, all in my own draft: `ErrorMetadata::request_id()` **does not exist**
+(Task 1) · deleting the `From` impl also breaks **3 `?`-dependent sites** the 23-line list never
+mentioned, and the cheapest repair is the one thing the plan forbids (Task 3) · Task 4 declared a
+log-group resource **the module already declares** and rested on a **false** "managed by nothing"
+premise · Task 2's fallback snippet was **malformed code** a subagent would have pasted verbatim.
+*A plan review that found nothing would have been the failed one.*
 
 **2. Placeholder scan.** No TBDs. Every code step carries real code. The two "if the pinned SDK differs" notes (Task 1 Step 3, Task 2 Step 3) give an exact fallback rather than "handle appropriately", and both forbid relaxing the assertion.
 
