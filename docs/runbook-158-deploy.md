@@ -12,9 +12,30 @@ Deploy sequence for #158 (out-of-band redemption). Follow each step in order. A 
 ### Step 1: Terraform Deploy
 Run terraform deploy per `terraform/README.md` ("Deploying as kitten" → "Full deploy"). `boundary_arn`
 and `admin_hash` are not real variable names — the real ones are `lambda_permissions_boundary_arn` and
-`admin_password_hash`, and both are already carried in `production.tfvars` (the boundary ARN is a
-constant; the admin hash is the live value pulled verbatim — see the README, never re-hash it).
-`ops_alarm_email` is also in `production.tfvars`. Run from repo root:
+`admin_password_hash`.
+
+🔴 **CORRECTED 2026-08-21. THIS PARAGRAPH USED TO SAY BOTH WERE ALREADY IN `production.tfvars`.
+ONE OF THEM IS NOT, AND THE ERROR STRANDS YOU MID-DEPLOY.** Measured: `production.tfvars` carries
+**6 keys** — `aws_account_id`, `domain_zone_id`, `lambda_permissions_boundary_arn`,
+`humble_username`, `discord_webhook_enabled`, `ops_alarm_email` — and **not**
+`admin_password_hash`. A `terraform plan` therefore stops on *"No value for required variable"*,
+at the exact moment the surrounding prose is shouting **never re-hash it** and offering no working
+source. *A runbook that names the wrong file is worse than one that names none: it sends you looking
+in a place that will never have the answer.*
+
+⇒ **Pull the live hash from SSM and pass it back verbatim (a no-op).** This is what
+`terraform/README.md` §3 has said all along, and it recommends the env var over `tfvars`
+*specifically because a tfvars value ends up in plan output*:
+
+```bash
+export TF_VAR_admin_password_hash="$(AWS_PROFILE=kitten-deploy aws ssm get-parameter \
+  --name /brd-prod-ue1-bendobundles-param/admin-hash --with-decryption \
+  --query Parameter.Value --output text)"
+```
+
+⚠️ **Never argon2 the plaintext for a routine apply.** The SSM param has no `ignore_changes`, so a
+fresh salt produces a different PHC string and terraform will **silently reset Ben's live admin
+login**. Verified working 2026-08-21. Run from repo root:
 
 ```bash
 git checkout main && git pull        # post-merge
