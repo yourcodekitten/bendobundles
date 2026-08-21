@@ -77,6 +77,12 @@ jobs:
       # open, so it cannot keep us OFF the legacy hyper-0.14 / rustls-0.21 stack once one is
       # withdrawn or backported. See the script header.
       - run: ./scripts/no-legacy-http-stack.sh
+      # Specs, plans AND source comments cite crate versions. Those citations rot silently
+      # and read current forever. Asserts every anchor matches what Cargo.lock resolves.
+      - run: ./scripts/check-spec-crate-anchors.sh
+      # StoreError::Aws must keep carrying only the bounded AwsFault. A free-text payload
+      # would make the sealer optional again, in one line that does not look like a regression.
+      - run: ./scripts/check-store-error-sealed.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'

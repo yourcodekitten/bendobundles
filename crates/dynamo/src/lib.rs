@@ -1175,8 +1175,9 @@ impl Store {
                 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError as TwiErr;
                 // Capture debug string before borrowing sdk_err via as_service_error()
                 let err_str = AwsFault::from_sdk_error("transact_write_items", &sdk_err);
-                // In aws-sdk-dynamodb 1.116.0 there is no as_transaction_canceled_exception();
-                // pattern-match directly on the public enum variants instead.
+                // No `as_transaction_canceled_exception()` on this error type; pattern-match the
+                // public enum variants directly. (Version dropped deliberately: the claim is not
+                // version-specific, and a pinned version here goes stale while reading current.)
                 match sdk_err.as_service_error() {
                     Some(TwiErr::TransactionCanceledException(tce)) => {
                         // Positional CCF mapping + TransactionConflict → TxConflict; see

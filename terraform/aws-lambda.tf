@@ -5,6 +5,13 @@ module "lambda_fulfillment" {
   context = module.context.shared
   name    = "fulfillment"
 
+  # Pinned explicitly rather than inherited. The module defaults this to 30 and production is
+  # already at 30, so this is a no-op today — its job is to make a module version bump that
+  # changes the default show up as a diff instead of as silence. The operator ping deliberately
+  # carries only a bounded AwsFault while full SDK Debug is allowed to reach CloudWatch, so the
+  # lifetime of these logs is part of that argument and should be visible to a reviewer.
+  cloudwatch_logs = { retention_in_days = 30 }
+
   description   = "Sole humble-toucher: gift fulfillment, daily sync, cookie validation"
   filename      = "${path.module}/artifacts/fulfillment.zip"
   handler       = "bootstrap"
@@ -64,6 +71,13 @@ module "lambda_public_api" {
   context = module.context.shared
   name    = "public-api"
 
+  # Pinned explicitly rather than inherited. The module defaults this to 30 and production is
+  # already at 30, so this is a no-op today — its job is to make a module version bump that
+  # changes the default show up as a diff instead of as silence. The operator ping deliberately
+  # carries only a bounded AwsFault while full SDK Debug is allowed to reach CloudWatch, so the
+  # lifetime of these logs is part of that argument and should be visible to a reviewer.
+  cloudwatch_logs = { retention_in_days = 30 }
+
   description   = "Friend surface: link view + claim intake"
   filename      = "${path.module}/artifacts/public-api.zip"
   handler       = "bootstrap"
@@ -111,6 +125,13 @@ module "lambda_admin_api" {
   version = "0.4.0"
   context = module.context.shared
   name    = "admin-api"
+
+  # Pinned explicitly rather than inherited. The module defaults this to 30 and production is
+  # already at 30, so this is a no-op today — its job is to make a module version bump that
+  # changes the default show up as a diff instead of as silence. The operator ping deliberately
+  # carries only a bounded AwsFault while full SDK Debug is allowed to reach CloudWatch, so the
+  # lifetime of these logs is part of that argument and should be visible to a reviewer.
+  cloudwatch_logs = { retention_in_days = 30 }
 
   description   = "Admin surface: login, links, hidden toggles, sync-now"
   filename      = "${path.module}/artifacts/admin-api.zip"
