@@ -253,8 +253,13 @@ fn http_status_is_captured() {
     );
 }
 
-/// The three arms that carry payloads we do not control must not smuggle their
-/// opaque Debug into the fault. This is the arm that needs no future author to go wrong.
+/// ALL FOUR unbounded arms must be exercised, not one.
+///
+/// An earlier draft constructed only `construction_failure` under a plural name. Its
+/// rationale — "this catches a `_ => format!(..)` fallback" — was true and INSUFFICIENT:
+/// it cannot catch a PER-ARM capture, and `from_sdk_error` hand-writes `ResponseError(re) =>`
+/// as its own arm, the one likeliest to grow a Debug capture.
+/// *An arm that has never printed is a decoration.* (OMBB, step-5 gate.)
 #[test]
 fn opaque_arms_do_not_leak_their_payload() {
     const OPAQUE: &str = "OPAQUE-BOXERROR-PAYLOAD-9142";
@@ -268,27 +273,51 @@ fn opaque_arms_do_not_leak_their_payload() {
     }
     impl std::error::Error for Nosy {}
 
-    let e: aws_sdk_dynamodb::error::SdkError<
+    type E = aws_sdk_dynamodb::error::SdkError<
         aws_sdk_dynamodb::operation::put_item::PutItemError,
         aws_smithy_runtime_api::http::Response,
-    > = aws_sdk_dynamodb::error::SdkError::construction_failure(Nosy);
+    >;
 
-    let fault = AwsFault::from_sdk_error("put_item", &e);
-    assert!(
-        !format!("{fault}").contains(OPAQUE),
-        "ConstructionFailure payload reached the fault: {fault}"
-    );
-    assert!(
-        !format!("{fault:?}").contains(OPAQUE),
-        "ConstructionFailure payload reached the fault Debug: {fault:?}"
-    );
+    fn raw() -> aws_smithy_runtime_api::http::Response {
+        aws_smithy_runtime_api::http::Response::new(
+            500u16.try_into().unwrap(),
+            aws_smithy_types::body::SdkBody::empty(),
+        )
+    }
+
+    let cases: Vec<(&str, E)> = vec![
+        ("ConstructionFailure", E::construction_failure(Nosy)),
+        ("TimeoutError", E::timeout_error(Nosy)),
+        (
+            "DispatchFailure",
+            E::dispatch_failure(
+                aws_smithy_runtime_api::client::orchestrator::error::ConnectorError::io(
+                    Box::new(Nosy),
+                ),
+            ),
+        ),
+        ("ResponseError", E::response_error(Nosy, raw())),
+    ];
+
+    for (name, e) in cases {
+        let fault = AwsFault::from_sdk_error("put_item", &e);
+        assert!(
+            !format!("{fault}").contains(OPAQUE),
+            "{name} payload reached the fault Display: {fault}"
+        );
+        assert!(
+            !format!("{fault:?}").contains(OPAQUE),
+            "{name} payload reached the fault Debug: {fault:?}"
+        );
+    }
 }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cd ~/bendobundles && PATH="$HOME/.cargo/bin:$PATH" cargo test -p dynamo --lib aws_fault -j2`
-Expected: `http_status_is_captured` FAILS with "lost the http status". `opaque_arms_do_not_leak_their_payload` should already PASS — Task 1 never reads those arms. **That is a legitimate green, and you must still run it:** it is a regression guard, and its value is that it fails if someone later "improves" the extractor by adding a `_ => format!("{e:?}")` fallback.
+Expected: `http_status_is_captured` FAILS with "lost the http status". `opaque_arms_do_not_leak_their_payload` should already PASS across **all four** arms — Task 1 never reads them. **That is a legitimate green, and you must still run it:** it guards against both a catch-all `_` capture AND a per-arm capture added later to any one of the four.
+⚠️ **If `ConnectorError::io` is not the right constructor on the pinned crate, find the one that is — do NOT drop the `DispatchFailure` case.** Quietly reducing the arm count is exactly how this test became a decoration the first time.
 
 - [ ] **Step 3: Populate `http_status`**
 
@@ -673,6 +702,82 @@ git commit -S -m "ci: assert spec crate anchors match the lockfile"
 
 ---
 
+### Task 6: Retire the three `cargo audit` ignores whose condition has fired
+
+**Files:**
+- Modify: `.cargo/audit.toml`
+
+**Interfaces:** consumes nothing; produces nothing.
+
+🔴 **This is fallout from PR #199, merged this morning, and the file predicted it.** `.cargo/audit.toml`
+says in its own header:
+
+> *"a retire condition that has FIRED is not stale documentation, it is a live hole: the advisory can
+> come back through a different version and this list will wave it through silently."*
+
+Three ignores are parked on the condition *"retire when an SDK bump drops the legacy TLS chain from
+the lock."* **#199 dropped it.** Measured 2026-08-21 — `hyper-rustls 0.24` → **0**, `rustls 0.21` →
+**0**, `rustls-webpki 0.101` → **0** occurrences in `Cargo.lock`. ⇒ `RUSTSEC-2026-0104`,
+`RUSTSEC-2026-0098` and `RUSTSEC-2026-0099` now suppress those advisory IDs **unconditionally, for
+every version this repo will ever resolve.** *(Found by OMBB auditing his own checker for the
+narrowness he had criticised in Lilith's — #202.)*
+⚠️ **`RUSTSEC-2026-0002` (lru 0.13) STAYS.** Its condition has NOT fired: `lru 0.13` is still in the
+lock (measured, 1 occurrence). **Do not "tidy" it out with the others.**
+
+- [ ] **Step 1: Re-measure before removing — the premise must still hold**
+
+```bash
+cd ~/bendobundles
+for c in "hyper-rustls 0.24" "rustls 0.21" "rustls-webpki 0.101" "lru 0.13"; do
+  n=${c%% *}; v=${c##* }
+  hits=$(awk -v k="name = \"$n\"" '$0==k{w=1;next} w&&/^version = /{gsub(/version = |"/,"");print;w=0}' Cargo.lock | grep -c "^$v")
+  echo "$c -> $hits"
+done
+```
+Expected: the first three `0`, and **`lru 0.13 -> 1`**. **If `lru` reads 0, stop** — that entry would
+also need retiring and this task's scope has changed.
+
+- [ ] **Step 2: Remove the three fired entries, keep `lru`, and record why**
+
+Edit `.cargo/audit.toml` so `ignore` contains only the `lru` entry, and replace the legacy-TLS
+comment block with:
+
+```toml
+    # The three legacy-TLS ignores (CRL parsing panic + two name-constraint advisories)
+    # were RETIRED on 2026-08-21: PR #199 dropped the legacy chain, so hyper-rustls 0.24,
+    # rustls 0.21 and rustls-webpki 0.101 are all at 0 occurrences in Cargo.lock. Their
+    # retire condition had fired, which per this file's own header is a live hole and not
+    # stale documentation — `ignore` matches on advisory ID with no version awareness, so
+    # they would have waved those IDs through at ANY future version.
+    # scripts/no-legacy-http-stack.sh now asserts that chain stays out.
+```
+
+Also update the header's dated verification line — it says the four entries were verified unfired on
+2026-08-08, which is **no longer true** of three of them.
+
+- [ ] **Step 3: Prove the suite still passes without them**
+
+```bash
+cd ~/bendobundles && PATH="$HOME/.cargo/bin:$PATH" cargo audit
+```
+Expected: **no new findings.** If any of the three advisories now fires, **stop and report** — that
+would mean the chain is back and `scripts/no-legacy-http-stack.sh` should have caught it first.
+
+- [ ] **Step 4: Commit**
+
+```bash
+cd ~/bendobundles
+git add .cargo/audit.toml
+git commit -S -m "audit: retire three ignores whose condition fired in #199
+
+hyper-rustls 0.24, rustls 0.21 and rustls-webpki 0.101 are all at 0 occurrences
+now. Per this file's own header a fired retire condition is a live hole, since
+ignore matches on advisory ID with no version awareness. The lru entry stays --
+its condition has not fired."
+```
+
+---
+
 ## Self-Review
 
 **1. Spec coverage.**
@@ -686,9 +791,10 @@ git commit -S -m "ci: assert spec crate anchors match the lockfile"
 - Retention pin → Task 4 ✅ *(reduced after review: the module owns the resource and already
   defaults to 30, so the original "declare four log groups" task would have collided and its
   premise was false)*
-- Crate-anchor drift → Task 5 ✅ *(added after review — the defect it catches occurred in this
+- Crate-anchor drift → Task 5 ✅
+- Fired audit ignores (fallout from #199) → Task 6 ✅ *(off-plan find, OMBB #202)* *(added after review — the defect it catches occurred in this
   spec and survived a revision of the very section it was in)*
-- Three opaque arms → Task 2 `opaque_arms_do_not_leak_their_payload` ✅
+- **All four** opaque arms → Task 2 `opaque_arms_do_not_leak_their_payload` ✅ *(was 1-of-4 under a plural name until OMBB's step-5 gate)*
 - **L2/L3 (`steam-client`, sealed payload type) → NOT IN THIS PLAN.** Deliberate: different crate, and it is OMBB's design and gated on his read. **Filed as a follow-up issue with the agreed design before this PR merges** — an unrecorded deferral is indistinguishable from an oversight.
 
 **1b. Plan-review findings folded in (2026-08-21).** Four blockers found by reviewing this plan
