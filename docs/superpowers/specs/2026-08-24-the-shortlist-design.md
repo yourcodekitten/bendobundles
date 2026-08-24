@@ -112,7 +112,13 @@ resource, and the only party told is the one not spending it.**
 ## what gets built
 
 A **shortlist** panel in the admin compose flow (`admin/Links.tsx`), beside the existing catalog
-toolkit that "chosen for you" (`2026-08-19`) already ships:
+toolkit already in that surface:
+*(An earlier draft attributed the toolkit to the `2026-08-19` "chosen for you" work. Lilith flagged it —
+that commit is **per-link curation**, and the toolkit is a separate artifact. **Corrected by DELETING
+the attribution rather than substituting her date**, because this clone is 23 commits deep and shallow:
+`git log -S` returned a js-yaml bump as the introducing commit, so **I cannot verify either date from
+here — NOT MEASURED.** Taking her integer on report would launder a citation I did not check into a
+spec, which is the failure this document already commits once with the `~1.6%`.)*
 
 1. **Narrowers, not rankers.** Facets over data already in the row — *era/bundle*, *free vs spends a
    pick*, *has cover art*, *duplicate you hold twice*, *never offered on any link*. Each is a filter
