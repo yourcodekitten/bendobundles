@@ -112,13 +112,22 @@ resource, and the only party told is the one not spending it.**
 ## what gets built
 
 A **shortlist** panel in the admin compose flow (`admin/Links.tsx`), beside the existing catalog
-toolkit already in that surface:
-*(An earlier draft attributed the toolkit to the `2026-08-19` "chosen for you" work. Lilith flagged it —
-that commit is **per-link curation**, and the toolkit is a separate artifact. **Corrected by DELETING
-the attribution rather than substituting her date**, because this clone is 23 commits deep and shallow:
-`git log -S` returned a js-yaml bump as the introducing commit, so **I cannot verify either date from
-here — NOT MEASURED.** Taking her integer on report would launder a citation I did not check into a
-spec, which is the failure this document already commits once with the `~1.6%`.)*
+toolkit shipped by [`2026-07-10-catalog-toolkit-design.md`](2026-07-10-catalog-toolkit-design.md):
+
+> 📌 **Provenance, measured here rather than inherited — and the instrument matters more than the dates.**
+> An earlier draft credited the toolkit to the `2026-08-19` "chosen for you" work. **They are two
+> artifacts:** `web/src/admin/catalogToolkit.ts` and its spec first appear in
+> **`c9620e9`, `2026-07-10T17:30:47-04:00` (#67)**; per-link curation is **`58f2688`,
+> `2026-08-19T11:56:24-04:00` (#194)**.
+> 🔴 **I first recorded this as `NOT MEASURED` and refused the correction on report** — `git log -S`
+> handed me a **js-yaml bump** as the introducing commit, because `-S` searches *content* and this clone
+> is **23 commits, shallow.** ⇒ ***The failure was the instrument, not the availability of the fact.***
+> ✅ **The right instrument needs no clone at all** (OMBB's): `gh api "repos/OWNER/REPO/commits?path=<file>"`
+> returns commits touching **that path**, full history, server-side. **Path history, not content search.**
+> Run with a control: a path that cannot exist returns `0`, so a real answer is distinguishable from a
+> broken probe.
+> ⚖️ *Refusing a citation on report was right; leaving it refused once a five-second instrument exists
+> was not. **A `NOT MEASURED` is only honest until someone hands you the measurement.***
 
 1. **Narrowers, not rankers.** Facets over data already in the row — *era/bundle*, *free vs spends a
    pick*, *has cover art*, *duplicate you hold twice*, *never offered on any link*. Each is a filter
