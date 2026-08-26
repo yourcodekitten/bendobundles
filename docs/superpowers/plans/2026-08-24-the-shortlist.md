@@ -43,6 +43,10 @@
   ⚖️ **The finding was never the string; it was the ASYMMETRY** (OMBB's): I escalated a one-boolean type change to a peer gate and rewrote approved user-facing copy **without a word about it**. ***Both are amendments to an approved artifact; only one got announced.*** *The change I felt nervous about got a gate; the change I felt confident about got silence — and confidence is not a review.*
 - **A new FILTER key must be added to `FILTER_KEYS`** or `filtersActive()` and the ToolkitBar "clear filters" readout silently miss it. This is the documented bug class in `catalogToolkit.ts:24-26`.
 - Reuse `controlClass` from `ToolkitBar.tsx:12` for any new control.
+- 🔴 **TYPECHECK WITH `npm run typecheck`. NEVER `npx tsc --noEmit`. MEASURED 2026-08-26, and this is not a style preference — the second command CHECKS NOTHING.**
+  `web/tsconfig.json` is a solution file: `"files": []` plus `references`. So `npx tsc --noEmit` resolves **zero** input files (`--listFiles` prints **0**) and **exits 0 unconditionally, forever.** The repo's own script is `tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit`, which is what CI runs (`ci.yml:55`).
+  ⚠️ **This plan said `npx tsc --noEmit` in 4 places and every one was inert.** It cost a real bug: the `cost` facet shipped wired to nothing because `Catalog.tsx` builds its `ToolkitState` from URL params as an object literal and the new key was missing — **`npm run typecheck` reports `TS2741: Property 'cost' is missing`** and the inert command reported success. *Positive-controlled both ways before this line was written.*
+  ⇒ ***An exit 0 from a command with an empty input set is indistinguishable from a passing check, and it is the failure that flatters you.*** Run `npm run lint` too — CI does (`ci.yml:53`).
 
 ---
 
@@ -164,7 +168,7 @@ Expected: PASS, all pre-existing tests still green.
 - [ ] **Step 5: Typecheck and commit**
 
 ```bash
-cd web && npx tsc --noEmit
+cd web && npm run typecheck
 git add web/src/admin/catalogToolkit.ts web/src/admin/catalogToolkit.test.ts
 git commit -S -m "feat(admin): cost facet — filter the catalog by whether a claim spends a humble pick"
 ```
@@ -250,7 +254,7 @@ Expected: PASS.
 - [ ] **Step 5: Typecheck and commit**
 
 ```bash
-cd web && npx tsc --noEmit
+cd web && npm run typecheck
 git add web/src/admin/ToolkitBar.tsx web/src/admin/ToolkitBar.test.tsx
 git commit -S -m "feat(admin): pick-cost control in the toolkit bar"
 ```
@@ -361,7 +365,7 @@ type level.
 
 - [ ] **Step 4: Run the full web suite**
 
-Run: `cd web && npx vitest run && npx tsc --noEmit`
+Run: `cd web && npx vitest run && npm run typecheck && npm run lint`
 Expected: PASS, no type errors. The existing order test (`:954`, *"never sorted"*) must still pass —
 **that is the half of the DEFINED contract actually under test, and the half this amendment does not touch — its green is the proof.**
 
@@ -621,7 +625,7 @@ one event and is already this file's idiom for exactly this (`Links.test.tsx:307
 
 - [ ] **Step 7: Run the full web suite**
 
-Run: `cd web && npx vitest run && npx tsc --noEmit`
+Run: `cd web && npx vitest run && npm run typecheck && npm run lint`
 Expected: PASS, no type errors.
 
 - [ ] **Step 8: Commit**

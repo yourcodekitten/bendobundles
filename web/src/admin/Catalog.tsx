@@ -19,6 +19,7 @@ import { stateBadgeClass } from '../stateBadge';
 import { selfClaimLabel } from '../selfClaimLabel';
 import { GameDetailModal } from '../GameDetailModal';
 import {
+  type CostFilter,
   type MatureFilter,
   applyToolkit,
   collectTagOptions,
@@ -41,6 +42,7 @@ const RATING_KEYS: readonly RatingFloor[] = [
 const SORT_KEYS: readonly SortKey[] = ['title', 'rating', 'date-new', 'date-old'];
 const GROUP_KEYS: readonly GroupKey[] = ['none', 'publisher', 'studio', 'bundle'];
 const MATURE_KEYS: readonly MatureFilter[] = ['all', 'hide', 'only'];
+const COST_KEYS: readonly CostFilter[] = ['all', 'free', 'spends-pick'];
 
 function keyOf<T extends string>(raw: string | null, known: readonly T[], idle: T): T {
   return raw !== null && (known as readonly string[]).includes(raw) ? (raw as T) : idle;
@@ -68,6 +70,7 @@ export function Catalog() {
       sort: keyOf(params.get('sort'), SORT_KEYS, 'title'),
       group: keyOf(params.get('group'), GROUP_KEYS, 'none'),
       mature: keyOf(params.get('mature'), MATURE_KEYS, 'all'),
+      cost: keyOf(params.get('cost'), COST_KEYS, 'all'),
     }),
     [params],
   );
@@ -79,6 +82,7 @@ export function Catalog() {
     if (next.sort !== 'title') p.set('sort', next.sort);
     if (next.group !== 'none') p.set('group', next.group);
     if (next.mature !== 'all') p.set('mature', next.mature);
+    if (next.cost !== 'all') p.set('cost', next.cost);
     setParams(p, { replace: true });
   };
   // Per-row inline error for toggle refusals (mid-claim 409 from server)

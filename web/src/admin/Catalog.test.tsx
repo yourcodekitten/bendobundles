@@ -984,6 +984,23 @@ describe('catalog multi-select wrap', () => {
     await waitFor(() => screen.getByText('Celeste|Hades'));
   });
 
+  it('the pick-cost facet actually filters the rendered catalog', async () => {
+    // 🔴 REGRESSION. Every other cost test drives applyToolkit or ToolkitBar with a
+    // COMPLETE ToolkitState. Catalog builds its own state from URL params, so it is
+    // the one caller that can be missing a key — and it is the only one production
+    // uses. The unit tests could all be green while the control does nothing.
+    const user = userEvent.setup();
+    vi.mocked(adminCatalog).mockResolvedValue([
+      makeAdminGame({ id: 'g-1', title: 'Choice Game', requires_choice: true }),
+      makeAdminGame({ id: 'g-2', title: 'Free Game', requires_choice: false }),
+    ]);
+    renderCatalog();
+    await waitFor(() => screen.getByText('Choice Game'));
+    await user.selectOptions(screen.getByLabelText('pick cost'), 'free');
+    await waitFor(() => expect(screen.queryByText('Choice Game')).toBeNull());
+    expect(screen.getByText('Free Game')).toBeInTheDocument();
+  });
+
   it('carries requires_choice across the wrap boundary, per game', async () => {
     const user = userEvent.setup();
     // Two games with DIFFERENT requires_choice. A pair that AGREES would produce
