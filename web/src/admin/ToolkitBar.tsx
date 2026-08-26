@@ -2,6 +2,7 @@ import {
   IDLE_TOOLKIT,
   filtersActive,
   type GroupKey,
+  type CostFilter,
   type MatureFilter,
   type RatingFloor,
   type SortKey,
@@ -24,6 +25,11 @@ const SORT_OPTIONS: { value: SortKey; label: string }[] = [
   { value: 'rating', label: 'rating' },
   { value: 'date-new', label: 'newest' },
   { value: 'date-old', label: 'oldest' },
+];
+const COST_OPTIONS: { value: CostFilter; label: string }[] = [
+  { value: 'all', label: 'any' },
+  { value: 'free', label: 'free to give' },
+  { value: 'spends-pick', label: 'spends a pick' },
 ];
 const GROUP_OPTIONS: { value: GroupKey; label: string }[] = [
   { value: 'none', label: 'none' },
@@ -96,6 +102,22 @@ export function ToolkitBar({
           className={controlClass}
         >
           {RATING_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className="flex items-center gap-2 text-sm text-dust">
+        pick cost
+        <select
+          aria-label="pick cost"
+          value={state.cost}
+          onChange={(e) => onChange({ ...state, cost: e.target.value as CostFilter })}
+          className={controlClass}
+        >
+          {COST_OPTIONS.map((o) => (
             <option key={o.value} value={o.value}>
               {o.label}
             </option>

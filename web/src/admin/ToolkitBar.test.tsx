@@ -108,3 +108,23 @@ describe('ToolkitBar', () => {
     expect(screen.queryByRole('button', { name: 'clear filters' })).toBeNull();
   });
 });
+
+describe('pick-cost control', () => {
+  // 🩹 Written in THIS FILE'S idiom, not the plan's first draft. That draft used
+  // `userEvent.selectOptions` and a bare `render(<ToolkitBar …/>)` — but this file
+  // imports `fireEvent`, never `userEvent`, and every other control test goes
+  // through `renderBar`. The draft would not have resolved `userEvent` at all.
+  it('offers a pick-cost filter and reports the choice upward', () => {
+    const { onChange, state } = renderBar();
+    fireEvent.change(screen.getByLabelText('pick cost'), { target: { value: 'free' } });
+    expect(onChange).toHaveBeenCalledWith({ ...state, cost: 'free' });
+  });
+
+  it('labels the costly option in ben-facing words, lowercase', () => {
+    renderBar();
+    const cost = screen.getByLabelText('pick cost') as HTMLSelectElement;
+    expect([...cost.options].map((o) => o.value)).toEqual(['all', 'free', 'spends-pick']);
+    expect(screen.getByRole('option', { name: 'spends a pick' })).toBeInTheDocument();
+  });
+});
+

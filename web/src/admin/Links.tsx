@@ -14,6 +14,7 @@ import {
   type AdminClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
+import { exposureLabel } from './pickExposure';
 import { stateBadgeClass } from '../stateBadge';
 import { clampCodePoints, codePointCount } from '../text';
 import { inviteUrl } from '../inviteUrl';
@@ -73,8 +74,19 @@ export function Links() {
   const [creating, setCreating] = useState(false);
   // picks arrive from the catalog's "wrap these into a link" (router state) —
   // order is ben's pick order and is the order sent to the api.
-  const [picked, setPicked] = useState<{ id: string; title: string }[]>(
-    () => (location.state as { picked?: { id: string; title: string }[] } | null)?.picked ?? [],
+  // `requiresChoice` is OPTIONAL on purpose: router state is not persisted, so a
+  // reload already yields []. ABSENT must mean UNKNOWN, never false — the exposure
+  // readout depends on telling those apart, and a required boolean would erase the
+  // distinction at the type level.
+  const [picked, setPicked] = useState<
+    { id: string; title: string; requiresChoice?: boolean }[]
+  >(
+    () =>
+      (
+        location.state as {
+          picked?: { id: string; title: string; requiresChoice?: boolean }[];
+        } | null
+      )?.picked ?? [],
   );
   // Stored after successful create — separate from page state so reload doesn't clear it
   const [createdInfo, setCreatedInfo] = useState<
@@ -358,6 +370,7 @@ export function Links() {
               type="number"
               min={1}
               aria-label="claims allowed"
+              aria-describedby="pick-exposure"
               value={claimsAllowed}
               onChange={(e) => {
                 const n = parseInt(e.target.value, 10);
@@ -366,6 +379,29 @@ export function Links() {
               className="w-24 rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
             />
           </label>
+          {/* 🎟️ What this link exposes of ben's monthly picks. ONE LINE OF TEXT, not a
+              card — PRODUCT.md: the admin is a workbench, not a dashboard.
+              🔴 RENDERS UNCONDITIONALLY. Do NOT wrap this in `picked.length > 0 &&`.
+              The empty case IS the finding: every link ben has ever sent is an open
+              shelf exposing his whole allowance, and nothing has ever said so.
+              ♿ `id` + `aria-describedby` on the allowance input, NOT a data-testid.
+              This repo queries by role/label/text everywhere and had zero test ids in
+              production markup — and the accessible route is the point, not the style:
+              the line DESCRIBES the control, so a screen reader reads it out when ben
+              focuses the field. A PR about telling the person who is spending must not
+              ship the telling as pixels only.
+              🔊 `aria-live="polite"` because aria-describedby is announced ON FOCUS and is then
+              SILENT: ben changes the allowance while the field is focused, so the number moves
+              with nothing spoken — the exact case the readout exists for. Polite, not assertive:
+              it updates on deliberate acts (a pick removed, an allowance retyped), never in a loop.
+              ⚠️ EPISTEMIC STATUS, stated because it matters: this is reasoned from the ARIA spec
+              and has NOT been observed with a real screen reader by me or by the reviewer who
+              raised it. The known risk is double-announcement on ATs that speak both the live
+              region and the description. If anyone ever tests it and it doubles, drop aria-live
+              and move the text into an aria-live sibling instead. */}
+          <p className="self-end text-xs text-dust" id="pick-exposure" aria-live="polite">
+            {exposureLabel(picked, claimsAllowed)}
+          </p>
           <label className="flex flex-col gap-1 text-xs text-dust">
             expires in days (optional)
             <input
