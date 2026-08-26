@@ -1,5 +1,20 @@
 # Steam Integration Implementation Plan (OpenID + Ownership Badges + the Steam Foundation)
 
+> 🔴 **CORRECTION 2026-08-26 — THIS PLAN PRESCRIBES `npx tsc --noEmit`, WHICH IS INERT IN THIS REPO. DO NOT COPY IT.**
+> `web/tsconfig.json` is a *solution* file (`"files": []` + `references`), so that invocation resolves
+> **zero input files** and **exits 0 unconditionally** — measured with `--listFiles`: `0`. Use
+> **`npm run typecheck`** (`tsc -p tsconfig.app.json --noEmit && tsc -p tsconfig.node.json --noEmit`),
+> which is what CI runs (`ci.yml:55`), plus `npm run lint`.
+> ⚠️ **It matters MOST while authoring on a branch:** `ci.yml`'s `push:` trigger is scoped
+> `branches: [main]`, so **CI cannot see feature-branch commits at all** until a PR exists — measured:
+> 0 runs on three of my own branch commits, 1 from the moment the PR existed. **Until then the local
+> command is the only guard there is, and the inert one is not a guard.**
+> 📌 *Placed at the TOP rather than beside each site, deliberately: this file has more than one, and a
+> per-site note only defends the site it sits under. The instruction below is a record of what was
+> run — left intact; this banner is what stops it being copied.*
+> *(Blast radius of a find on `#208`, OMBB's rule: a retirement's radius is every CITER, not the file
+> you edited.)*
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ben and gift-link friends sign in through Steam; the catalog shows `owned_by_ben` badges (admin) and "you own this" badges (friends) — plus this plan builds the shared Steam foundation (steam-client crate + appid mapper) that the modal plan consumes.

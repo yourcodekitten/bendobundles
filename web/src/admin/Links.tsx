@@ -389,8 +389,17 @@ export function Links() {
               production markup — and the accessible route is the point, not the style:
               the line DESCRIBES the control, so a screen reader reads it out when ben
               focuses the field. A PR about telling the person who is spending must not
-              ship the telling as pixels only. */}
-          <p className="self-end text-xs text-dust" id="pick-exposure">
+              ship the telling as pixels only.
+              🔊 `aria-live="polite"` because aria-describedby is announced ON FOCUS and is then
+              SILENT: ben changes the allowance while the field is focused, so the number moves
+              with nothing spoken — the exact case the readout exists for. Polite, not assertive:
+              it updates on deliberate acts (a pick removed, an allowance retyped), never in a loop.
+              ⚠️ EPISTEMIC STATUS, stated because it matters: this is reasoned from the ARIA spec
+              and has NOT been observed with a real screen reader by me or by the reviewer who
+              raised it. The known risk is double-announcement on ATs that speak both the live
+              region and the description. If anyone ever tests it and it doubles, drop aria-live
+              and move the text into an aria-live sibling instead. */}
+          <p className="self-end text-xs text-dust" id="pick-exposure" aria-live="polite">
             {exposureLabel(picked, claimsAllowed)}
           </p>
           <label className="flex flex-col gap-1 text-xs text-dust">
