@@ -43,7 +43,7 @@ function renderLinks() {
   );
 }
 
-function renderLinksWithPicks(picked: { id: string; title: string }[]) {
+function renderLinksWithPicks(picked: { id: string; title: string; requiresChoice?: boolean }[]) {
   return render(
     <MemoryRouter initialEntries={[{ pathname: '/admin/links', state: { picked } }]}>
       <Routes>
@@ -872,3 +872,50 @@ describe('seal controls', () => {
     expect(await screen.findByText(/create-time-only/)).toBeInTheDocument();
   });
 });
+
+describe('pick exposure readout', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(adminLinks).mockResolvedValue([]);
+  });
+
+  it('says what an uncurated link exposes, with nothing picked', async () => {
+    renderLinks(); // no router state ⇒ picked === []
+    // REQUIRED: Links.tsx returns early while phase === 'loading', so the create
+    // form does not exist until adminLinks resolves.
+    await waitFor(() => screen.getByLabelText('claims allowed'));
+    fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '3' } });
+    expect(screen.getByTestId('pick-exposure')).toHaveTextContent(
+      'open shelf — whoever holds this link can spend up to 3 of your monthly picks',
+    );
+  });
+
+  it('tracks the allowance, and the ceiling, the moment ben changes it', async () => {
+    renderLinksWithPicks([
+      { id: 'a', title: 'A', requiresChoice: true },
+      { id: 'b', title: 'B', requiresChoice: true },
+    ]);
+    await waitFor(() => screen.getByLabelText('claims allowed'));
+    fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '5' } });
+    expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 2 of your monthly picks');
+    // THE CEILING, in the UI: two choice games behind an allowance of one.
+    fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '1' } });
+    expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 1 of your monthly picks');
+  });
+
+  it('drops the exposure when ben removes a pick', async () => {
+    // The mutation that makes a precomputed count wrong — the entire reason the
+    // contract carries a per-pick field instead of Catalog passing a number.
+    const user = userEvent.setup();
+    renderLinksWithPicks([
+      { id: 'a', title: 'A', requiresChoice: true },
+      { id: 'b', title: 'B', requiresChoice: true },
+    ]);
+    await waitFor(() => screen.getByLabelText('claims allowed'));
+    fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '5' } });
+    expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 2 of your monthly picks');
+    await user.click(screen.getByRole('button', { name: 'remove A from this gift' }));
+    expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 1 of your monthly picks');
+  });
+});
+

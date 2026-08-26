@@ -14,6 +14,7 @@ import {
   type AdminClaimView,
 } from '../api';
 import { withAuth } from './withAuth';
+import { exposureLabel } from './pickExposure';
 import { stateBadgeClass } from '../stateBadge';
 import { clampCodePoints, codePointCount } from '../text';
 import { inviteUrl } from '../inviteUrl';
@@ -377,6 +378,14 @@ export function Links() {
               className="w-24 rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
             />
           </label>
+          {/* 🎟️ What this link exposes of ben's monthly picks. ONE LINE OF TEXT, not a
+              card — PRODUCT.md: the admin is a workbench, not a dashboard.
+              🔴 RENDERS UNCONDITIONALLY. Do NOT wrap this in `picked.length > 0 &&`.
+              The empty case IS the finding: every link ben has ever sent is an open
+              shelf exposing his whole allowance, and nothing has ever said so. */}
+          <p className="self-end text-xs text-dust" data-testid="pick-exposure">
+            {exposureLabel(picked, claimsAllowed)}
+          </p>
           <label className="flex flex-col gap-1 text-xs text-dust">
             expires in days (optional)
             <input
