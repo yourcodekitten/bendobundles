@@ -186,39 +186,25 @@ git commit -S -m "feat(admin): cost facet — filter the catalog by whether a cl
 Append to `web/src/admin/ToolkitBar.test.tsx`:
 
 ```tsx
-it('offers a pick-cost filter and reports the choice upward', async () => {
-  const onChange = vi.fn();
-  render(
-    <ToolkitBar
-      state={IDLE_TOOLKIT}
-      tagOptions={[]}
-      shown={2}
-      total={2}
-      excludedNoData={0}
-      onChange={onChange}
-    />,
-  );
-  const select = screen.getByLabelText('pick cost');
-  await userEvent.selectOptions(select, 'free');
-  expect(onChange).toHaveBeenCalledWith({ ...IDLE_TOOLKIT, cost: 'free' });
-});
+describe('pick-cost control', () => {
+  it('offers a pick-cost filter and reports the choice upward', () => {
+    const { onChange, state } = renderBar();
+    fireEvent.change(screen.getByLabelText('pick cost'), { target: { value: 'free' } });
+    expect(onChange).toHaveBeenCalledWith({ ...state, cost: 'free' });
+  });
 
-it('labels the costly option in ben-facing words, lowercase', () => {
-  render(
-    <ToolkitBar
-      state={IDLE_TOOLKIT}
-      tagOptions={[]}
-      shown={0}
-      total={0}
-      excludedNoData={0}
-      onChange={() => {}}
-    />,
-  );
-  expect(screen.getByRole('option', { name: 'spends a pick' })).toBeInTheDocument();
+  it('labels the costly option in ben-facing words, lowercase', () => {
+    renderBar();
+    const cost = screen.getByLabelText('pick cost') as HTMLSelectElement;
+    expect([...cost.options].map((o) => o.value)).toEqual(['all', 'free', 'spends-pick']);
+    expect(screen.getByRole('option', { name: 'spends a pick' })).toBeInTheDocument();
+  });
 });
 ```
 
-Match the existing import style at the top of that test file (`render`, `screen`, `userEvent`, `vi`, `IDLE_TOOLKIT`).
+🩹 **REVIEW ROUND 3 (2026-08-26, found while EXECUTING) — this task's test did not compile as first written, and the defect is mine twice over.** The draft called `userEvent.selectOptions` and rendered `<ToolkitBar …/>` inline. **`ToolkitBar.test.tsx` imports `render, screen, fireEvent` and `describe, it, expect, vi` — there is NO `userEvent` in that file at all**, and every control test goes through the `renderBar(over, extra)` helper at `:11`, which returns `{ onChange, state }`.
+🔴 **THE LESSON IS ABOUT THE REVIEW, NOT THE TEST.** Round 2 caught this exact class three times — a symbol referenced with nothing in scope to supply it — in Tasks 1, 3 and 4. **It missed Task 2 because Task 2 was the one I had not rewritten.** ⇒ ***A review scoped to what you changed cannot see what you didn't***, and the unchanged parts are exactly where nobody is looking. *The same shape as a placeholder scan whose population is its own artifact.*
+✅ `renderBar` `:11` · `fireEvent` `:1` · the `aria-label` idiom (`'rating'`, `'sort'`, `'mature'`) `:70`,`:86` — all opened before being written here.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
