@@ -14,8 +14,19 @@ import { clearGameDetailCache } from '../gameDetailCache';
 // The wrap-these-into-a-link probe — lands on a real <Route> so the pick
 // order can be asserted across the navigation boundary, not against a mock.
 function PickProbe() {
-  const { state } = useLocation() as { state: { picked: { id: string; title: string }[] } };
-  return <div>{state.picked.map((p) => p.title).join('|')}</div>;
+  const { state } = useLocation() as {
+    state: { picked: { id: string; title: string; requiresChoice?: boolean }[] };
+  };
+  return (
+    <div>
+      <div>{state.picked.map((p) => p.title).join('|')}</div>
+      {/* rendered as `title:true|title:false` so an ABSENT boolean shows as
+          `undefined` and cannot pass as `false` — the whole point of the field. */}
+      <div data-testid="pick-choice">
+        {state.picked.map((p) => `${p.title}:${String(p.requiresChoice)}`).join('|')}
+      </div>
+    </div>
+  );
 }
 
 function renderCatalog() {
@@ -971,6 +982,27 @@ describe('catalog multi-select wrap', () => {
     await user.click(screen.getByRole('checkbox', { name: 'pick Hades for a link' }));
     await user.click(screen.getByRole('button', { name: 'wrap these into a link (2)' }));
     await waitFor(() => screen.getByText('Celeste|Hades'));
+  });
+
+  it('carries requires_choice across the wrap boundary, per game', async () => {
+    const user = userEvent.setup();
+    // Two games with DIFFERENT requires_choice. A pair that AGREES would produce
+    // the expected string under a hardcoded literal exactly as under the real
+    // field — two reasons to pass is zero tests.
+    vi.mocked(adminCatalog).mockResolvedValue([
+      makeAdminGame({ id: 'g-1', title: 'Choice Game', requires_choice: true }),
+      makeAdminGame({ id: 'g-2', title: 'Free Game', requires_choice: false }),
+    ]);
+    renderCatalog();
+    await waitFor(() => screen.getByText('Choice Game'));
+    await user.click(screen.getByRole('checkbox', { name: 'pick Choice Game for a link' }));
+    await user.click(screen.getByRole('checkbox', { name: 'pick Free Game for a link' }));
+    await user.click(screen.getByRole('button', { name: 'wrap these into a link (2)' }));
+    await waitFor(() =>
+      expect(screen.getByTestId('pick-choice')).toHaveTextContent(
+        'Choice Game:true|Free Game:false',
+      ),
+    );
   });
 
   it('pick toggles off and the wrap bar hides when empty', async () => {

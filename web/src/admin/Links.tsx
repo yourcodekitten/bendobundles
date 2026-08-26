@@ -73,8 +73,19 @@ export function Links() {
   const [creating, setCreating] = useState(false);
   // picks arrive from the catalog's "wrap these into a link" (router state) —
   // order is ben's pick order and is the order sent to the api.
-  const [picked, setPicked] = useState<{ id: string; title: string }[]>(
-    () => (location.state as { picked?: { id: string; title: string }[] } | null)?.picked ?? [],
+  // `requiresChoice` is OPTIONAL on purpose: router state is not persisted, so a
+  // reload already yields []. ABSENT must mean UNKNOWN, never false — the exposure
+  // readout depends on telling those apart, and a required boolean would erase the
+  // distinction at the type level.
+  const [picked, setPicked] = useState<
+    { id: string; title: string; requiresChoice?: boolean }[]
+  >(
+    () =>
+      (
+        location.state as {
+          picked?: { id: string; title: string; requiresChoice?: boolean }[];
+        } | null
+      )?.picked ?? [],
   );
   // Stored after successful create — separate from page state so reload doesn't clear it
   const [createdInfo, setCreatedInfo] = useState<

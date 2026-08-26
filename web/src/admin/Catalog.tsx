@@ -100,7 +100,7 @@ export function Catalog() {
   // click order, sent verbatim as `location.state.picked` (Task 6's contract).
   // Membership check is id-keyed, so the duplicated rows a grouping view
   // creates stay in sync by construction — no per-row state to reconcile.
-  const [picked, setPicked] = useState<{ id: string; title: string }[]>([]);
+  const [picked, setPicked] = useState<{ id: string; title: string; requiresChoice?: boolean }[]>([]);
 
   // Stable loader identity (#51): the modal's load effect honestly lists loadDetail in its
   // deps, so an inline arrow here re-fired the effect on EVERY parent render — cancelling
@@ -528,7 +528,7 @@ export function Catalog() {
                       setPicked((cur) =>
                         cur.some((p) => p.id === game.id)
                           ? cur.filter((p) => p.id !== game.id)
-                          : [...cur, { id: game.id, title: game.title }],
+                          : [...cur, { id: game.id, title: game.title, requiresChoice: game.requires_choice }],
                       )
                     }
                     className="h-4 w-4 cursor-pointer accent-give"
