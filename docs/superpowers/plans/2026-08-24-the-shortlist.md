@@ -61,13 +61,13 @@ describe('cost filter', () => {
   it('free keeps only requires_choice=false', () => {
     const s: ToolkitState = { ...IDLE_TOOLKIT, cost: 'free' };
     const r = applyToolkit([free, costly], s);
-    expect(r.groups[0].games.map((g) => g.id)).toEqual(['free']);
+    expect(r.groups[0]!.games.map((g) => g.id)).toEqual(['free']);
   });
 
   it('spends-pick keeps only requires_choice=true', () => {
     const s: ToolkitState = { ...IDLE_TOOLKIT, cost: 'spends-pick' };
     const r = applyToolkit([free, costly], s);
-    expect(r.groups[0].games.map((g) => g.id)).toEqual(['costly']);
+    expect(r.groups[0]!.games.map((g) => g.id)).toEqual(['costly']);
   });
 
   it('does NOT count filtered-out rows as excludedNoData', () => {
@@ -87,10 +87,30 @@ describe('cost filter', () => {
 
 Add `FILTER_KEYS` and `filtersActive` to the existing import block at the top of the test file.
 
+⚠️ **The `!` on `groups[0]` is REQUIRED, not stylistic.** `web/tsconfig.app.json:20` sets
+`noUncheckedIndexedAccess: true`, so `r.groups[0]` is `T | undefined` and `.games` will fail Step 5's
+`tsc --noEmit`. **This is the file's own idiom** — `catalogToolkit.test.ts:206` and `:217` already
+write `r.groups[0]!`. *Do not "fix" a type error here with `?.`: that turns a failed assertion into
+`undefined` and the test passes on nothing.*
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cd web && npx vitest run src/admin/catalogToolkit.test.ts`
-Expected: FAIL — `cost` is not a property of `ToolkitState`; `FILTER_KEYS` does not contain `'cost'`.
+
+**Expected: 3 of the 5 new tests FAIL. Know which, and why — vitest transpiles without typechecking,
+so a missing `ToolkitState` property is NOT what reds here.** At this point `state.cost` is simply
+`undefined` at runtime:
+- 🔴 `free keeps only requires_choice=false` — nothing filters yet, so both ids come back.
+- 🔴 `spends-pick keeps only requires_choice=true` — same.
+- 🔴 `registers in FILTER_KEYS` — `toContain('cost')` fails.
+- ✅ `idles to all and shows both` — **passes already.** It is a control, not a driver.
+- ✅ `does NOT count filtered-out rows as excludedNoData` — **passes already**, because nothing is
+  filtered yet. It is a REGRESSION guard against copying the tags/rating branch in Step 3, and it can
+  only fail if Step 3 is written wrongly.
+
+⚠️ **Two tests green at RED time is expected here and is written down so you do not go looking for a
+bug.** *An arm that cannot fail before the implementation is a guard, not a red — the distinction is
+the difference between "I have not started" and "I have broken something."*
 
 - [ ] **Step 3: Implement**
 
@@ -282,18 +302,36 @@ using that section's existing fixture/selection helpers:
 
 ```tsx
 it('carries requires_choice across the wrap boundary, per game', async () => {
-  // Two games, DIFFERENT requires_choice — a fixture where both share a value
-  // would pass under a hardcoded constant as readily as under the real field.
-  await pickTwoGamesWithMixedChoice();   // one true, one false
+  const user = userEvent.setup();
+  // Two games with DIFFERENT requires_choice. A pair that AGREES would produce
+  // the expected string under a hardcoded literal exactly as under the real
+  // field — two reasons to pass is zero tests.
+  vi.mocked(adminCatalog).mockResolvedValue([
+    makeAdminGame({ id: 'g-1', title: 'Choice Game', requires_choice: true }),
+    makeAdminGame({ id: 'g-2', title: 'Free Game', requires_choice: false }),
+  ]);
+  renderCatalog();
+  await waitFor(() => screen.getByText('Choice Game'));
+  await user.click(screen.getByRole('checkbox', { name: 'pick Choice Game for a link' }));
+  await user.click(screen.getByRole('checkbox', { name: 'pick Free Game for a link' }));
   await user.click(screen.getByRole('button', { name: 'wrap these into a link (2)' }));
-  expect(screen.getByTestId('pick-choice')).toHaveTextContent('Choice Game:true|Free Game:false');
+  await waitFor(() =>
+    expect(screen.getByTestId('pick-choice'))
+      .toHaveTextContent('Choice Game:true|Free Game:false'),
+  );
 });
 ```
 
-⚠️ **The mixed fixture is the test.** A pair that agrees on `requires_choice` yields the expected
-string under both the real implementation and a hardcoded literal — **two reasons to pass is zero
-tests.** Replace `pickTwoGamesWithMixedChoice()` with the section's existing two-game selection
-helper, overriding `requires_choice` per game off `gameFixture` (`Catalog.test.tsx:33`).
+✅ **Every symbol above was verified present before it was written here.** `makeAdminGame`
+`Catalog.test.tsx:51` · `renderCatalog` `:21` · the checkbox's accessible name `pick <title> for a
+link` (`Catalog.tsx:524`) · the `adminCatalog` mock and the `beforeEach` that resets it,
+`Catalog.test.tsx:956`.
+🔴 **There is NO selection helper in this file and you must not write one.** The section's two
+existing tests select inline exactly as above; a first draft of this task told you to *"use the
+section's existing two-game selection helper"*, **and no such helper exists** — a cold executor would
+have invented one, or reached for `gameFixture` (`:33`), which this section does not use.
+⚠️ **`const user = userEvent.setup()` is per-test in this file** — every test declares its own. There
+is no shared `user` in scope.
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -509,36 +547,68 @@ tests, because the readout has two live inputs and a single test cannot show it 
 
 ```tsx
 it('says what an uncurated link exposes, with nothing picked', async () => {
-  renderLinks();                       // no router state ⇒ picked === []
-  await user.clear(screen.getByLabelText('claims allowed'));
-  await user.type(screen.getByLabelText('claims allowed'), '3');
+  vi.mocked(adminLinks).mockResolvedValue([]);
+  renderLinks();                                   // no router state ⇒ picked === []
+  // REQUIRED: Links.tsx:316 returns early while phase === 'loading', so the
+  // create form (:341) does not exist until adminLinks resolves.
+  await waitFor(() => screen.getByLabelText('claims allowed'));
+  fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '3' } });
   expect(screen.getByTestId('pick-exposure'))
     .toHaveTextContent('open shelf — whoever holds this link can spend up to 3 of your monthly picks');
 });
 
-it('tracks the allowance the moment ben changes it', async () => {
+it('tracks the allowance, and the ceiling, the moment ben changes it', async () => {
+  vi.mocked(adminLinks).mockResolvedValue([]);
   // Arrive WITH picks, via router state, exactly as the catalog sends them.
   renderLinksWithPicks([
     { id: 'a', title: 'A', requiresChoice: true },
     { id: 'b', title: 'B', requiresChoice: true },
   ]);
+  await waitFor(() => screen.getByLabelText('claims allowed'));
+  fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '5' } });
   expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 2 of your monthly picks');
-  await user.clear(screen.getByLabelText('claims allowed'));
-  await user.type(screen.getByLabelText('claims allowed'), '1');
-  // the CEILING, in the UI: two choice games behind an allowance of one.
+  // THE CEILING, in the UI: two choice games behind an allowance of one.
+  fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '1' } });
+  expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 1 of your monthly picks');
+});
+
+it('drops the exposure when ben removes a pick', async () => {
+  vi.mocked(adminLinks).mockResolvedValue([]);
+  const user = userEvent.setup();
+  renderLinksWithPicks([
+    { id: 'a', title: 'A', requiresChoice: true },
+    { id: 'b', title: 'B', requiresChoice: true },
+  ]);
+  await waitFor(() => screen.getByLabelText('claims allowed'));
+  fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '5' } });
+  expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 2 of your monthly picks');
+  await user.click(screen.getByRole('button', { name: 'remove A from this gift' }));
   expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 1 of your monthly picks');
 });
 ```
 
-✅ **Both helpers ALREADY EXIST and are named here as measured, not guessed** — `renderLinks()` at
-`Links.test.tsx:35` and `renderLinksWithPicks(picked)` at `:46`, which already seeds a `MemoryRouter`
-with `{ pathname: '/admin/links', state: { picked } }`. **Do not write a third.**
-⚠️ **One edit is required:** `renderLinksWithPicks`' parameter is typed `{ id: string; title: string }[]`
-(`:46`) and must be widened with `requiresChoice?: boolean` or the fixtures above will not typecheck.
+🔴 **THE THIRD TEST IS NOT OPTIONAL, and an earlier draft of this task made it a "if the helper makes
+it cheap" aside.** The remove button (`Links.tsx:439`, `aria-label="remove {title} from this gift"`)
+is **the mutation that makes a precomputed count wrong** — it is the entire reason Task 3 carries a
+per-pick field instead of Catalog passing a number. *A justification with no assertion behind it is
+the first thing a later refactor deletes.*
 
-⚠️ **One more assertion is owed if the helper makes it cheap:** remove a pick via the `×` button
-(`Links.tsx:439`) and assert the readout drops. **That is the mutation that made a precomputed number
-wrong**, and it is the reason the field is carried rather than the count.
+✅ **Verified present before being written here:** `renderLinks` `Links.test.tsx:35` ·
+`renderLinksWithPicks` `:46` · the `vi.mock('../api', …)` partial mock and the `adminLinks` stub
+`:10`–`:23` · `fireEvent` imported at `:1` · `aria-label="claims allowed"` `Links.tsx:360` ·
+`aria-label="remove … from this gift"` `Links.tsx:437`.
+
+⚠️ **ONE EDIT TO AN EXISTING HELPER IS REQUIRED:** `renderLinksWithPicks`' parameter is typed
+`{ id: string; title: string }[]` (`Links.test.tsx:46`) and must gain `requiresChoice?: boolean`, or
+the fixtures above will not typecheck under `strict` (`web/tsconfig.app.json:19`).
+
+🔴 **USE `fireEvent.change`, NOT `user.clear()` + `user.type()`, AND THIS IS A CORRECTNESS BUG, NOT A
+STYLE NOTE.** `claims allowed` is a **controlled** input that clamps (`Links.tsx:362`–`:364`): an
+empty value parses to `NaN` and is rewritten to `1`. So `clear()` does not leave the field empty — it
+**repopulates it with "1"** — and the digit you then type is appended, yielding `13` where the test
+asserts `3`. The failure looks like a bug in the readout, and the natural "fix" is to change the
+assertion to match, which bakes the wrong number into the suite. `fireEvent.change` sets the value in
+one event and is already this file's idiom for exactly this (`Links.test.tsx:307`).
 
 - [ ] **Step 7: Run the full web suite**
 
@@ -571,7 +641,16 @@ git commit -S -m "feat(admin): show what a link exposes of ben's monthly picks, 
 
 **Interface change:** exactly one, Task 3, `location.state.picked` gains an optional `requiresChoice`. Isolated in its own task with its own cross-boundary test, and the ORDER half of the frozen contract (`Catalog.test.tsx:954`) is asserted untouched. **Flagged for OMBB's step-5 sign-off.**
 
-**Placeholder scan:** **one** soft reference remains and it names its exact fallback — the two-game mixed-choice selection helper in Task 3 Step 1. Every other named symbol was verified to exist at the line cited: `renderLinks` `Links.test.tsx:35`, `renderLinksWithPicks` `:46`, `PickProbe` `Catalog.test.tsx:15`, `gameFixture` `:33`, `claimsAllowed` `Links.tsx:69`, `picked` `:76`, the `×` remove `:439`, the allowance clamp `:364`. *The previous version's two soft references both pointed at things on the wrong screen.*
+**Placeholder scan: ZERO soft references remain.** Every step carries literal code, and every named symbol was opened at the line cited before it was written here: `renderLinks` `Links.test.tsx:35` · `renderLinksWithPicks` `:46` · the `adminLinks` partial mock `:10`–`:23` · `fireEvent` `:1` · `PickProbe` `Catalog.test.tsx:15` · `makeAdminGame` `:51` · `renderCatalog` `:21` · `claimsAllowed` `Links.tsx:69` · `picked` `:76` · the loading early-return `:316` · the flex-wrap row `:343` · `aria-label="claims allowed"` `:360` · the allowance clamp `:362`–`:364` · `aria-label="remove … from this gift"` `:437` · the pick checkbox's accessible name `Catalog.tsx:524` · the pick literal `:530`.
+
+**Review round 2 (2026-08-26, `implementation-plan-review`) — five defects that would have broken a cold executor, all confirmed against the code rather than suspected:**
+1. **`groups[0].games` under `noUncheckedIndexedAccess: true`** (`web/tsconfig.app.json:20`) fails Task 1's own `tsc --noEmit`. The repo idiom is `groups[0]!` (`catalogToolkit.test.ts:206`, `:217`). *A plan whose Step 5 fails on the code Step 1 told you to write is a plan that stalls a subagent with no way to ask.*
+2. **Task 3 named a selection helper that does not exist.** The section selects inline; the executor would have invented one — or used `gameFixture`, which that section does not use.
+3. **`user` was referenced with no `userEvent.setup()`** — it is per-test in both test files.
+4. **`renderLinks()` with no `adminLinks` mock never renders the form at all** — `Links.tsx:316` returns early while loading, so every `getByLabelText` in Task 4 would have thrown.
+5. **`user.clear()` on the clamped, controlled allowance input yields `13`, not `3`** — empty parses to `NaN` and is rewritten to `1`, then the typed digit appends. **The failure would have looked like a bug in the readout**, and the obvious repair is to change the assertion — baking a wrong number into the suite.
+
+⚖️ **What the round-1 self-review got wrong, and it is the reusable part:** it certified the old Task 3 as clean on a *placeholder scan* — and that was **true**. Every step had real code and no TBDs. **A placeholder scan sees a missing WORD; it cannot see a missing REQUIREMENT** (the open-shelf case) or a symbol that does not exist at the other end (`pickCostLabel` against a screen with no games array). ***The checks that pass most easily are the ones that never ask the code anything.***
 
 **Type consistency:** `CostFilter` is defined in Task 1 and consumed by name in Task 2. `FILTER_KEYS` gains `'cost'` in Task 1, which is what makes the Task 1 `filtersActive` test pass. `exposureLabel(picked, claimsAllowed)` is defined and consumed in Task 4 only, and takes `{ requiresChoice?: boolean }[]` — **structurally satisfied by the Task 3 pick shape without importing it**, so Task 4 has no compile-time dependency on Task 3's type beyond the field existing.
 
