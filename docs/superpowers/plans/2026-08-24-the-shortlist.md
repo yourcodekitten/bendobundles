@@ -13,8 +13,15 @@
 > - `Links.tsx:76` seeds `picked` from `location.state` as `{ id, title }[]`, and then **mutates it**: reorder `:420`/`:430`, remove `:439`. ⇒ **a count computed once in `Catalog.tsx` and passed as a number goes stale the moment ben removes a pick.**
 > - `claims_allowed` is `Links.tsx:69`, clamped `Math.max(1, n)` at `:364`.
 >
-> ⇒ **`min( #requires_choice among picked , claims_allowed )` needs both operands, and exactly one screen can ever hold both.** The three routes and why two lose: **(a) carry `requiresChoice` in the router state** — recomputes correctly on every mutation, one extra boolean, additive; **(b) fetch the catalog inside `Links.tsx`** — a cross-page fetch, which is the *same* cost this plan already refused when it deferred the "never offered" facet, plus the readout cannot render until a second request lands; **(c) precompute a number in `Catalog.tsx`** — **wrong**, stale on the first removal.
-> ⇒ **(a). The contract is amended, additively and backward-compatibly, in Task 3.** Flagged explicitly for OMBB's step-5 sign-off: it is the one thing in this plan that touches an interface a previous plan froze.
+> ⇒ **`min( #requires_choice among picked , claims_allowed )` needs both operands, and exactly one screen can ever hold both.** The three routes and why two lose: **(a) carry `requiresChoice` in the router state** — recomputes correctly on every mutation, one extra boolean, additive; **(b) fetch the catalog inside `Links.tsx`**; **(c) precompute a number in `Catalog.tsx`** — **wrong**, stale on the first removal (four mutation sites, not three: `:420`, `:430`, `:439`, and `setPicked([])` at `:152` after create — OMBB's addition).
+>
+> 🔑 **WHY (a) BEATS (b), and this is OMBB's argument replacing mine — mine was a COST argument and cost arguments lose to "just fetch it".** The deciding one is **correctness**, and it comes from the spec's own rule *no number is ever printed that could be wrong in the understating direction*:
+> - **(a) carries a safe UNKNOWN state per element.** `requiresChoice?: boolean` — absent ⇒ `undefined` ⇒ the label reports it and never counts it as free. **The type carries the uncertainty.**
+> - **(b) has no unknown state to carry.** One of the readout's two live inputs would arrive asynchronously, so **while the fetch is in flight the exposure is unknown on EVERY compose** — the honest render is the dangerous-direction copy, shown constantly, **which trains Ben to ignore it.** And it pulls 670 rows to answer a question about ~6.
+> - 🚫 **(d) — REJECTED EXPLICITLY, and it is the trap, because it looks like the conservative option:** a sibling `location.state.requiresChoiceIds: string[]`, leaving `picked`'s element shape literally untouched. ***A set has no unknown state: "not in the set" silently means `false`*** — precisely the understating direction — and two parallel structures can desync where one annotated structure cannot.
+> ⇒ ***The field travels with the thing it describes, and it can say "I don't know."*** **(a).**
+>
+> ✅ **BLESSED at step 5, 2026-08-26, head `0296ce1`** — with four MAJORS, all of them prose, no task step changed. They are fixed below and each is marked.
 
 **Tech Stack:** TypeScript, React, vitest + @testing-library/react, Tailwind classes already in the file.
 
@@ -25,10 +32,15 @@
 - **Voice is lowercase.** All user-facing copy in this codebase is lowercase (`PRODUCT.md`: "the voice is lowercase and affectionate"). No sentence case in labels.
 - **No dashboard chrome.** `PRODUCT.md` anti-references forbid metric-card grids and BI styling **on the admin too** — "a workbench, not a dashboard". The cost readout is one line of text beside the existing "wrap these into a link" button, not a card.
 - **No ranking, no score, no "recommended".** Design Principle 2 is *chosen-for-you, never shopping*. Facets narrow; they never order by cleverness.
-- **`location.state.picked` — AMENDED 2026-08-26, and the amendment is the only interface change in this plan.** Now `{ id: string; title: string; requiresChoice?: boolean }[]`, ben's click order. `Links.tsx` consumes it.
-  - **The ORDER contract is untouched** — that is what the freeze was protecting (`Catalog.test.tsx:954`: *"never sorted"*), and nothing here sorts.
+- **`location.state.picked` — AMENDED 2026-08-26; the only interface change in this plan.** Now `{ id: string; title: string; requiresChoice?: boolean }[]`, ben's click order. `Links.tsx` consumes it.
+  - 🩹 **M3 (OMBB, and he is right): this used to call the shape FROZEN, and no prior artifact does.** Measured: `grep -icE 'froz|freeze'` over `2026-08-19-chosen-for-you.md` → **0** (control: `picked` → **36**, so the file is being read). What `:888` actually says is *"Produces (and **DEFINES**): the `picked` router-state contract"* — **a definition, not a prohibition.**
+    📌 **Provenance, because it makes the lesson sharper than "you used the wrong word": the word was MINE, twice.** It appears **once** in this plan at `c1e7393` — my own 08-24 draft — and my 08-26 revision then said it **six** times. ⇒ ***I inherited a word from my own earlier draft and amplified it, and by the second pass it read like an external constraint.***
+    ⚖️ **Escalating to a peer gate was cheap and correct; describing it as breaking a freeze made the bar look higher than any artifact set it.** ***Over-escalation is the direction nobody audits*** — a reviewer who is told the bar is high does not go and check that it is.
+  - **The ORDER half is the part actually under test** (`Catalog.test.tsx:954` *"never sorted"*; `2026-08-19:47` *"Deliberately NOT sorted"*) **and is untouched** — Task 3 Step 4 asserts that test still passes. **No prior artifact forbids additive fields.**
   - **`requiresChoice` is OPTIONAL on purpose.** Router state is not persisted, so a reload of `/admin/links` already yields `picked === []`; the field cannot introduce a durability hazard that the contract did not already have. **Absent ⇒ UNKNOWN ⇒ the readout says so and never says zero.**
-  - **Add no OTHER fields.** The amendment is one boolean with a named consumer; the freeze still governs everything else.
+  - **Add no OTHER fields.** The amendment is one boolean with a named consumer; the definition still governs everything else.
+- 🩹 **M4 — SPEC COPY AMENDED, and this line exists because the first version changed it in silence.** The spec (`…-design.md:140`) mandates the unknown case print *"reload to see pick exposure"*. **Task 4 prints `"…and N not costed — reopen from the catalog"` instead.** Kept, because it carries **how many** are uncosted — which the spec's wording cannot — and names a specific action.
+  ⚖️ **The finding was never the string; it was the ASYMMETRY** (OMBB's): I escalated a one-boolean type change to a peer gate and rewrote approved user-facing copy **without a word about it**. ***Both are amendments to an approved artifact; only one got announced.*** *The change I felt nervous about got a gate; the change I felt confident about got silence — and confidence is not a review.*
 - **A new FILTER key must be added to `FILTER_KEYS`** or `filtersActive()` and the ToolkitBar "clear filters" readout silently miss it. This is the documented bug class in `catalogToolkit.ts:24-26`.
 - Reuse `controlClass` from `ToolkitBar.tsx:12` for any new control.
 
@@ -262,8 +274,9 @@ git commit -S -m "feat(admin): pick-cost control in the toolkit bar"
 ### Task 3: carry `requiresChoice` across the compose boundary
 
 > 🔴 **NEW 2026-08-26.** The interface change the exposure readout needs. It is small, additive and
-> backward-compatible — and it is still an amendment to a contract a previous plan froze, so it is
-> **its own task with its own test**, not a line smuggled into the next one.
+> backward-compatible — and it is still an amendment to a contract a previous plan **DEFINED**
+> (`2026-08-19-chosen-for-you.md:888`), so it is **its own task with its own test**, not a line
+> smuggled into the next one. *No prior artifact forbids additive fields; only ORDER has a test.*
 
 **Files:**
 - Modify: `web/src/admin/Catalog.tsx` (one object literal), `web/src/admin/Links.tsx` (one type)
@@ -275,7 +288,7 @@ git commit -S -m "feat(admin): pick-cost control in the toolkit bar"
 
 - [ ] **Step 1: Write the failing test**
 
-`Catalog.test.tsx:15` already carries a `PickProbe` that renders on a **real** `<Route>`, so the
+`Catalog.test.tsx` already carries a `PickProbe` (at `:16` — 🩹 m4, an earlier draft said `:15`; **cite by NAME in a file that moves, and let the line number be the hint**) that renders on a **real** `<Route>`, so the
 contract is asserted **across the navigation boundary** rather than against a mocked `navigate`. Extend
 it — *do not add a second probe*:
 
@@ -364,7 +377,7 @@ type level.
 
 Run: `cd web && npx vitest run && npx tsc --noEmit`
 Expected: PASS, no type errors. The existing order test (`:954`, *"never sorted"*) must still pass —
-**that is the half of the frozen contract this amendment does not touch, and its green is the proof.**
+**that is the half of the DEFINED contract actually under test, and the half this amendment does not touch — its green is the proof.**
 
 - [ ] **Step 5: Commit**
 
@@ -425,7 +438,11 @@ describe('exposureLabel', () => {
     expect(exposureLabel([], 3)).toBe('open shelf — whoever holds this link can spend up to 3 of your monthly picks');
   });
 
-  it('uses the singular for an allowance of one', () => {
+  it('interpolates the allowance into the open-shelf row', () => {
+    // 🩹 m1 (OMBB): this was named "uses the singular for an allowance of one" and asserted no
+    // such thing — "up to 1 …picks" is identical in form to the plural, and exposureLabel has no
+    // singular handling. A copy rule that exists only in a test title is worse than no rule: it
+    // reads as covered. What it DOES prove is that the number interpolates, so that is its name.
     expect(exposureLabel([], 1)).toBe('open shelf — whoever holds this link can spend up to 1 of your monthly picks');
   });
 
@@ -451,6 +468,12 @@ describe('exposureLabel', () => {
 
   it('reports unknowns even when nothing known spends', () => {
     expect(exposureLabel([free, unknown], 5)).toBe('up to 0 of your monthly picks, and 1 not costed — reopen from the catalog');
+  });
+
+  it('reports every pick as uncosted when NONE of them is known', () => {
+    // 🩹 m3 (OMBB): same branch as [free, unknown], so coverage was already real — but the
+    // all-unknown case is the one where "0 known spends" is most likely to be mistaken for "free".
+    expect(exposureLabel([unknown, unknown], 5)).toBe('up to 0 of your monthly picks, and 2 not costed — reopen from the catalog');
   });
 
   it('is total for a nonsense allowance rather than printing a negative', () => {
@@ -626,7 +649,11 @@ git commit -S -m "feat(admin): show what a link exposes of ben's monthly picks, 
 
 ## Explicitly out of scope for this plan
 
-**"never offered on any link"** — spec §what-gets-built item 3. It needs `adminLinks()` data inside `Catalog.tsx` (a cross-page fetch) and, at n=18 links, will read approximately "everything", which is open question ② to the family. **Deferred pending that answer** — recorded as a decision, not an oversight. If the answer is "ship it", it is a fourth task of the same shape: a `neverOffered` facet fed by a `Set<string>` of every id in every link's `curated_game_ids`.
+**"never offered on any link" — NOT BUILT, and NOT deferred. The spec DELETED it.**
+🩹 **M1+M2 (OMBB). This paragraph described the facet as awaiting an answer that had already been given, and the plan header then cited it as a live precedent.** The spec's §deleted section killed it **for VACUITY, with a measurement**: `curated_game_ids` is absent from all 18 links ⇒ "never offered" is true of **670/670 = 100%**, and *"a badge on everything is furniture that reads as signal."* The spec's §the-three-questions records question ② as **closed — "Dead — 100% vacuous."**
+⇒ **Listed here only so a future reader does not re-propose it.** *A "deferred" item quietly restores a killed feature to the backlog.*
+
+📌 **THE MECHANISM IS WORTH MORE THAN THE FIX, and it is a correction to how the finding was framed: the precedent was not INVENTED — it was CITED ACCURATELY FROM A DEAD PARAGRAPH.** The header's rejected-route argument pointed at this very sentence, and this sentence was real, in-repo, and had been **stale since the spec's revision**. ⇒ ***A stale paragraph inside the artifact you are editing is a live-looking precedent, and it survives a citation check* — the check confirms the text exists and cannot see that its authority lapsed.** *That is strictly worse than an invented citation, which fails the moment anyone looks.*
 
 ## Self-review
 
@@ -639,7 +666,7 @@ git commit -S -m "feat(admin): show what a link exposes of ben's monthly picks, 
 
 **Spec coverage:** §narrowers → Tasks 1+2 (cost facet; era/art/duplicate facets are additional instances of the identical pattern and are deliberately not multiplied here — one facet proves the shape). §exposure-honest-at-compose-time → Task 4, **including the open-shelf row the spec requires to render first** (`exposureLabel` has no null case, and the Links.tsx render carries no `picked.length > 0` guard). §the-ceiling (`min(…, claims_allowed)`) → Task 4 unit test *"is CEILINGED by claims_allowed"* **and** the UI test that retypes the allowance — a pure-function assertion alone would not show the readout is wired to the live input. §never-offered → explicitly deferred above with a reason.
 
-**Interface change:** exactly one, Task 3, `location.state.picked` gains an optional `requiresChoice`. Isolated in its own task with its own cross-boundary test, and the ORDER half of the frozen contract (`Catalog.test.tsx:954`) is asserted untouched. **Flagged for OMBB's step-5 sign-off.**
+**Interface change:** exactly one, Task 3, `location.state.picked` gains an optional `requiresChoice`. Isolated in its own task with its own cross-boundary test, and the ORDER half — **the only half with a test behind it** (`Catalog.test.tsx:954`) — is asserted untouched. **Blessed at step 5, 2026-08-26.** *No prior artifact forbids additive fields; see the M3 note in Global Constraints for why this plan claimed otherwise.*
 
 **Placeholder scan: ZERO soft references remain.** Every step carries literal code, and every named symbol was opened at the line cited before it was written here: `renderLinks` `Links.test.tsx:35` · `renderLinksWithPicks` `:46` · the `adminLinks` partial mock `:10`–`:23` · `fireEvent` `:1` · `PickProbe` `Catalog.test.tsx:15` · `makeAdminGame` `:51` · `renderCatalog` `:21` · `claimsAllowed` `Links.tsx:69` · `picked` `:76` · the loading early-return `:316` · the flex-wrap row `:343` · `aria-label="claims allowed"` `:360` · the allowance clamp `:362`–`:364` · `aria-label="remove … from this gift"` `:437` · the pick checkbox's accessible name `Catalog.tsx:524` · the pick literal `:530`.
 
