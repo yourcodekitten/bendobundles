@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import type { AdminGame, SteamSummary } from '../api';
 import {
+  FILTER_KEYS,
   IDLE_TOOLKIT,
   applyToolkit,
   collectTagOptions,
+  filtersActive,
   type ToolkitState,
 } from './catalogToolkit';
 
@@ -267,5 +269,40 @@ describe('mature filter (#71)', () => {
   it("'all' is the idle default and filters nothing", () => {
     expect(IDLE_TOOLKIT.mature).toBe('all');
     expect(ids(applyToolkit(games, state({})))).toHaveLength(3);
+  });
+});
+
+describe('cost filter', () => {
+  const free: AdminGame = { ...base, id: 'free', title: 'Free Key', requires_choice: false };
+  const costly: AdminGame = { ...base, id: 'costly', title: 'Choice Key', requires_choice: true };
+
+  it('idles to all and shows both', () => {
+    const r = applyToolkit([free, costly], IDLE_TOOLKIT);
+    expect(r.shown).toBe(2);
+  });
+
+  it('free keeps only requires_choice=false', () => {
+    const s: ToolkitState = { ...IDLE_TOOLKIT, cost: 'free' };
+    const r = applyToolkit([free, costly], s);
+    expect(r.groups[0]!.games.map((g) => g.id)).toEqual(['free']);
+  });
+
+  it('spends-pick keeps only requires_choice=true', () => {
+    const s: ToolkitState = { ...IDLE_TOOLKIT, cost: 'spends-pick' };
+    const r = applyToolkit([free, costly], s);
+    expect(r.groups[0]!.games.map((g) => g.id)).toEqual(['costly']);
+  });
+
+  it('does NOT count filtered-out rows as excludedNoData', () => {
+    // requires_choice is always present on AdminGame, so a cost filter can
+    // never exclude for missing data. Guards against copying the tags/rating
+    // branch, which increments excludedNoData.
+    const s: ToolkitState = { ...IDLE_TOOLKIT, cost: 'free' };
+    expect(applyToolkit([free, costly], s).excludedNoData).toBe(0);
+  });
+
+  it('registers in FILTER_KEYS so filtersActive and clear-filters see it', () => {
+    expect(FILTER_KEYS).toContain('cost');
+    expect(filtersActive({ ...IDLE_TOOLKIT, cost: 'free' })).toBe(true);
   });
 });

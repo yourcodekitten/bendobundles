@@ -10,6 +10,11 @@ export type RatingFloor =
 export type SortKey = 'title' | 'rating' | 'date-new' | 'date-old';
 export type MatureFilter = 'all' | 'hide' | 'only';
 export type GroupKey = 'none' | 'publisher' | 'studio' | 'bundle';
+/** 🎟️ Humble Choice cost: claiming a requires_choice game spends one of ben's
+ * finite monthly picks (domain/src/lib.rs:979). The friend surface has always
+ * said "confirm? spends 1 pick" at claim time; this is the same fact, moved to
+ * where ben composes. */
+export type CostFilter = 'all' | 'free' | 'spends-pick';
 
 export type ToolkitState = {
   q: string;
@@ -19,12 +24,14 @@ export type ToolkitState = {
   group: GroupKey;
   /** 🔞 policy over content_descriptor_ids (#71): show all / hide flagged / only flagged. */
   mature: MatureFilter;
+  /** 🎟️ filter by whether a claim spends one of ben's monthly humble picks. */
+  cost: CostFilter;
 };
 
 /** The keys that FILTER rows (sort/group are view prefs — 'clear filters' keeps them).
  * ToolkitBar derives its active-filter readout from this list, so filter N+1 registers
  * in exactly one file (review round 2 — the forgotten-mature bug class). */
-export const FILTER_KEYS = ['q', 'tags', 'rating', 'mature'] as const;
+export const FILTER_KEYS = ['q', 'tags', 'rating', 'mature', 'cost'] as const;
 
 /** True when any FILTER key differs from its idle value. */
 export function filtersActive(state: ToolkitState): boolean {
@@ -40,6 +47,7 @@ export const IDLE_TOOLKIT: ToolkitState = {
   sort: 'title',
   group: 'none',
   mature: 'all',
+  cost: 'all',
 };
 
 // Steam's review ladder, worst→best. Rank = index. An unknown desc (Steam's
@@ -119,6 +127,10 @@ export function applyToolkit(
       if (g.steam === null || g.steam.content_descriptor_ids === undefined) excludedNoData++;
       return false;
     }
+    // No excludedNoData here: requires_choice is non-optional on AdminGame, so
+    // this filter can never exclude a row for missing data.
+    if (state.cost === 'free' && g.requires_choice) return false;
+    if (state.cost === 'spends-pick' && !g.requires_choice) return false;
     return true;
   });
 
