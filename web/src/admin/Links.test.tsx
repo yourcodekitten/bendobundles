@@ -874,6 +874,11 @@ describe('seal controls', () => {
 });
 
 describe('pick exposure readout', () => {
+  // These assert the ACCESSIBLE DESCRIPTION of the allowance input, not merely that
+  // text is on screen: the readout is wired with id + aria-describedby, so a screen
+  // reader speaks it when ben focuses the field. It is also a STRICTER assertion —
+  // toHaveAccessibleDescription matches the whole string where toHaveTextContent
+  // matched substrings, which is how it caught that these were pinning prefixes.
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(adminLinks).mockResolvedValue([]);
@@ -885,7 +890,7 @@ describe('pick exposure readout', () => {
     // form does not exist until adminLinks resolves.
     await waitFor(() => screen.getByLabelText('claims allowed'));
     fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '3' } });
-    expect(screen.getByTestId('pick-exposure')).toHaveTextContent(
+    expect(screen.getByLabelText('claims allowed')).toHaveAccessibleDescription(
       'open shelf — whoever holds this link can spend up to 3 of your monthly picks',
     );
   });
@@ -897,10 +902,10 @@ describe('pick exposure readout', () => {
     ]);
     await waitFor(() => screen.getByLabelText('claims allowed'));
     fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '5' } });
-    expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 2 of your monthly picks');
+    expect(screen.getByLabelText('claims allowed')).toHaveAccessibleDescription('up to 2 of your monthly picks, if they claim');
     // THE CEILING, in the UI: two choice games behind an allowance of one.
     fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '1' } });
-    expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 1 of your monthly picks');
+    expect(screen.getByLabelText('claims allowed')).toHaveAccessibleDescription('up to 1 of your monthly picks, if they claim');
   });
 
   it('drops the exposure when ben removes a pick', async () => {
@@ -913,9 +918,9 @@ describe('pick exposure readout', () => {
     ]);
     await waitFor(() => screen.getByLabelText('claims allowed'));
     fireEvent.change(screen.getByLabelText('claims allowed'), { target: { value: '5' } });
-    expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 2 of your monthly picks');
+    expect(screen.getByLabelText('claims allowed')).toHaveAccessibleDescription('up to 2 of your monthly picks, if they claim');
     await user.click(screen.getByRole('button', { name: 'remove A from this gift' }));
-    expect(screen.getByTestId('pick-exposure')).toHaveTextContent('up to 1 of your monthly picks');
+    expect(screen.getByLabelText('claims allowed')).toHaveAccessibleDescription('up to 1 of your monthly picks, if they claim');
   });
 });
 

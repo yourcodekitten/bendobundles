@@ -370,6 +370,7 @@ export function Links() {
               type="number"
               min={1}
               aria-label="claims allowed"
+              aria-describedby="pick-exposure"
               value={claimsAllowed}
               onChange={(e) => {
                 const n = parseInt(e.target.value, 10);
@@ -382,8 +383,14 @@ export function Links() {
               card — PRODUCT.md: the admin is a workbench, not a dashboard.
               🔴 RENDERS UNCONDITIONALLY. Do NOT wrap this in `picked.length > 0 &&`.
               The empty case IS the finding: every link ben has ever sent is an open
-              shelf exposing his whole allowance, and nothing has ever said so. */}
-          <p className="self-end text-xs text-dust" data-testid="pick-exposure">
+              shelf exposing his whole allowance, and nothing has ever said so.
+              ♿ `id` + `aria-describedby` on the allowance input, NOT a data-testid.
+              This repo queries by role/label/text everywhere and had zero test ids in
+              production markup — and the accessible route is the point, not the style:
+              the line DESCRIBES the control, so a screen reader reads it out when ben
+              focuses the field. A PR about telling the person who is spending must not
+              ship the telling as pixels only. */}
+          <p className="self-end text-xs text-dust" id="pick-exposure">
             {exposureLabel(picked, claimsAllowed)}
           </p>
           <label className="flex flex-col gap-1 text-xs text-dust">
