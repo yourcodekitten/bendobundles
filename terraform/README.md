@@ -24,11 +24,13 @@
 ### Web-only deploy (the common case — no `terraform apply`)
 
 A friend-facing web change (merged PR that only touches `web/`) needs just S3 sync + CloudFront
-invalidation. Kitten can do this **fully self-serve — no secrets required.** The box is Node 18 and the
-SPA build needs Node 22, so the clean path is **pull the CI-built `web-dist` artifact** (CI builds on
-Node 22 on every green push to `main`). (A Node 22 is also installed at `~/.local/node22/bin` if you ever
-must build locally — `export PATH="$HOME/.local/node22/bin:$PATH"`, and `rm -rf node_modules && npm ci`
-under it first — but the CI artifact avoids all of that.)
+invalidation. Kitten can do this **fully self-serve — no secrets required.** The clean path is
+**pull the CI-built `web-dist` artifact**: it is the exact bytes CI tested, and a local build — even
+on the right Node — is a different artifact that merely agrees with them. (CI builds on Node 22 on
+every green push to `main`. The box can build locally if it must — a CI-matching Node 22 lives at
+`~/.local/node22/bin`: `export PATH="$HOME/.local/node22/bin:$PATH"`, then
+`rm -rf node_modules && npm ci` under it first — but the CI artifact avoids all of that, and
+"the box can't build it" was never the load-bearing reason.)
 
 ```bash
 # 1. Grab the CI-built SPA from the latest green run on main (find it: gh run list -R yourcodekitten/bendobundles --branch main)
