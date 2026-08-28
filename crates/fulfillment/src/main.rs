@@ -117,6 +117,25 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     };
     let notify_disabled = std::env::var("NOTIFY_DISABLED").as_deref() == Ok("1");
     let notify = Notify::resolve(webhook_read, notify_disabled);
+
+    // The WHISPER register — a second webhook param, same SecureString/UNSET machinery, resolved
+    // ONCE at startup like the ops one. Suppression flag is WHISPER_DISABLED, NEVER the global
+    // NOTIFY_DISABLED: reusing the global would re-couple the registers the second param exists
+    // to separate (quieting ops must not silently kill the gift feature).
+    let whisper_param = std::env::var("WHISPER_WEBHOOK_PARAM").ok();
+    let whisper_read: SecretRead = if let Some(ref param) = whisper_param {
+        get_secret(&ssm_client, param).await
+    } else {
+        SecretRead::DeliberatelyOff
+    };
+    let whisper_disabled = std::env::var("WHISPER_DISABLED").as_deref() == Ok("1");
+    let whisper_notify = Notify::resolve(whisper_read, whisper_disabled);
+    // Carried for the DARK announcement's one-liner: the message must always name something
+    // actionable, so an unwired env gets a literal saying exactly that.
+    let whisper_param_name =
+        whisper_param.unwrap_or_else(|| "(WHISPER_WEBHOOK_PARAM env unset)".to_string());
+    let whisper_site_url =
+        std::env::var("WHISPER_SITE_URL").unwrap_or_else(|_| "https://bendobundles.com".into());
     match notify {
         // LOUD, not CLOSED. This structured line is the metric-filter/alarm target: it pages
         // "this deploy is running with notifications unresolvable" WITHOUT coupling fulfilment to
@@ -140,6 +159,9 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let table = table.clone();
         let cookie_param = cookie_param.clone();
         let notify = notify.clone();
+        let whisper_notify = whisper_notify.clone();
+        let whisper_param_name = whisper_param_name.clone();
+        let whisper_site_url = whisper_site_url.clone();
         let base_url = base_url.clone();
         let step_up_username = step_up_username.clone();
         let password_param = password_param.clone();
@@ -252,6 +274,9 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     store: Store::new(dynamo_client, table),
                     humble,
                     notify,
+                    whisper_notify,
+                    whisper_site_url,
+                    whisper_param_name,
                     http: http_client,
                     session_store,
                     steam: steam.clone(),

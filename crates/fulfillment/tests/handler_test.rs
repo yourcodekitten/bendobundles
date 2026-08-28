@@ -140,6 +140,11 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
             Some(u) => fulfillment::Notify::Webhook(u),
             None => fulfillment::Notify::Disabled,
         },
+        // Whisper register defaults for existing tests: dark, with placeholder identity —
+        // whisper arms use deps_whisper() below, which overrides these.
+        whisper_notify: fulfillment::Notify::Disabled,
+        whisper_site_url: String::new(),
+        whisper_param_name: String::new(),
         http: reqwest::Client::new(),
         // No self-login in these handler tests — a dead session keeps the flag-and-ping path.
         session_store: None,
@@ -527,6 +532,11 @@ async fn deps_with_selfheal(
             Some(u) => fulfillment::Notify::Webhook(u),
             None => fulfillment::Notify::Disabled,
         },
+        // Whisper register defaults for existing tests: dark, with placeholder identity —
+        // whisper arms use deps_whisper() below, which overrides these.
+        whisper_notify: fulfillment::Notify::Disabled,
+        whisper_site_url: String::new(),
+        whisper_param_name: String::new(),
         http: reqwest::Client::new(),
         session_store: Some(SessionStore {
             ssm: ssm_at(ssm_uri).await,
@@ -9057,4 +9067,193 @@ async fn disabled_notify_posts_absolutely_nothing() {
         "the control did not fire — this server never receives POSTs at all, so the assert_eq!(0) \
          above measured nothing and this test is blind"
     );
+}
+
+// ── the attic whispers (spec: docs/spec-attic-whispers.md) ───────────────────────────────────
+// Every no-send cause is an arm here; the wiremock .expect(N) pins are load-bearing (a
+// double-send on any path would fail the mock's verify on drop — the idempotence thesis,
+// enforced by the harness rather than asserted in prose).
+
+/// Whisper-arm Deps: ops webhook and whisper webhook are SEPARATE registers by design.
+fn deps_whisper(
+    store: Store,
+    humble_uri: &str,
+    ops_webhook: Option<String>,
+    whisper_webhook: Option<String>,
+) -> Deps {
+    let mut d = deps(store, humble_uri, ops_webhook);
+    d.whisper_notify = match whisper_webhook {
+        Some(u) => fulfillment::Notify::Webhook(u),
+        None => fulfillment::Notify::Disabled,
+    };
+    d.whisper_site_url = "https://bendobundles.example".into();
+    d.whisper_param_name = "/test/whisper-webhook".into();
+    d
+}
+
+/// A listable game: Available, giftable, visible — the whisper's raw material.
+fn available_game(id: &str, title: &str) -> domain::Game {
+    domain::Game {
+        id: id.into(),
+        title: title.into(),
+        bundle: "Humble Test Bundle".into(),
+        gamekey: "gk".into(),
+        machine_name: id.into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 0,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+    }
+}
+
+#[test]
+fn whisper_envelope_parses() {
+    let r: FulfillRequest = serde_json::from_value(serde_json::json!({"op":"whisper"})).unwrap();
+    assert!(matches!(r, FulfillRequest::Whisper));
+}
+
+#[tokio::test]
+async fn whisper_dark_param_writes_nothing_and_pings_ops() {
+    let Some(store) = store_or_skip("whisper-dark").await else {
+        return;
+    };
+    let ops = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1) // exactly one light-it one-liner
+        .mount(&ops)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &ops.uri(), Some(ops.uri()), None); // ops on, whisper DARK
+    let r = handle(&d, FulfillRequest::Whisper).await;
+    assert!(matches!(r, FulfillResponse::Whispered));
+    assert!(store.list_whispers().await.unwrap().is_empty()); // 🔴 ZERO WRITES — the ①×two-write arm
+    let body = String::from_utf8(ops.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    assert!(body.contains("DARK")); // cause ①a wording
+    assert!(body.contains("put-parameter")); // …with the actionable one-liner
+}
+
+#[tokio::test]
+async fn whisper_unresolved_param_is_not_told_to_overwrite() {
+    let Some(store) = store_or_skip("whisper-unresolved").await else {
+        return;
+    };
+    let ops = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&ops)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let mut d = deps_whisper(store.clone(), &ops.uri(), Some(ops.uri()), None);
+    d.whisper_notify = fulfillment::Notify::Unresolved; // configured but UNREADABLE
+    handle(&d, FulfillRequest::Whisper).await;
+    assert!(store.list_whispers().await.unwrap().is_empty()); // still zero writes
+    let body = String::from_utf8(ops.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    assert!(body.contains("UNREADABLE")); // cause ①b: its own face…
+    assert!(!body.contains("put-parameter")); // …and NOT the destructive overwrite advice
+}
+
+#[tokio::test]
+async fn whisper_happy_path_records_sends_marks() {
+    let Some(store) = store_or_skip("whisper-happy").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1) // exactly ONE send — the idempotence thesis
+        .mount(&wh)
+        .await;
+    store
+        .put_game(&available_game("g1", "Overgrowth"))
+        .await
+        .unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    let ws = store.list_whispers().await.unwrap();
+    assert_eq!(ws.len(), 1);
+    assert_eq!(ws[0].game_id, "g1");
+    assert!(ws[0].delivered); // record → send → MARK completed
+    let body = String::from_utf8(wh.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    assert!(body.contains("Overgrowth"));
+    assert!(body.contains("from the attic")); // the friend voice, not the ops voice
+}
+
+#[tokio::test]
+async fn whisper_send_failure_leaves_a_receipt_and_pings_ops() {
+    let Some(store) = store_or_skip("whisper-sendfail").await else {
+        return;
+    };
+    let wh = MockServer::start().await; // whisper webhook: fails
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1) // exactly one attempt — a double-send on the FAILURE path must fail here (gate-5 nit)
+        .mount(&wh)
+        .await;
+    let ops = MockServer::start().await; // ops webhook: must receive the ④ line
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&ops)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &ops.uri(), Some(ops.uri()), Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    let ws = store.list_whispers().await.unwrap();
+    assert_eq!(ws.len(), 1);
+    assert!(!ws[0].delivered); // cause ④: visible receipt; the game stays eligible next tick
+    let body = String::from_utf8(ops.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    assert!(body.contains("SEND FAILED")); // ④'s REQUIRED ops face — the never-ran alarm is blind here
+}
+
+#[tokio::test]
+async fn whisper_second_run_same_slot_is_a_quiet_loser() {
+    let Some(store) = store_or_skip("whisper-loser").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1) // exactly ONE send across BOTH runs
+        .mount(&wh)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    handle(&d, FulfillRequest::Whisper).await; // same ISO-week slot ⇒ conditional loser, cause ③
+    assert_eq!(store.list_whispers().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn whisper_empty_pool_pings_ops_distinctly() {
+    let Some(store) = store_or_skip("whisper-empty").await else {
+        return;
+    };
+    let ops = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&ops)
+        .await;
+    // no games at all — empty attic; whisper webhook is LIVE so the dark arm cannot be the cause
+    let d = deps_whisper(
+        store.clone(),
+        &ops.uri(),
+        Some(ops.uri()),
+        Some("http://127.0.0.1:9/dead".into()),
+    );
+    handle(&d, FulfillRequest::Whisper).await;
+    assert!(store.list_whispers().await.unwrap().is_empty()); // empty ⇒ no record either
+    let body = String::from_utf8(ops.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    assert!(body.contains("NOTHING to say")); // cause ② wording, distinct from ①'s DARK/UNREADABLE
+    assert!(body.contains("0 listable")); // per-stage pool sizes, so a vacuous predicate shows its work
 }
