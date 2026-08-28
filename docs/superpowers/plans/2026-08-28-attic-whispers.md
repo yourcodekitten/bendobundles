@@ -68,7 +68,7 @@ async fn whisper_mark_delivered_flips_exactly_that_slot() {
 - [ ] **Step 2: Run to verify failure** — `cargo test -p dynamo --test store_test whisper` → compile error (methods don't exist). If no dynamodb-local: tests skip at runtime, but the COMPILE failure is the red we need here.
 - [ ] **Step 3: Implement** `WhisperRecord` in domain (plain struct, `Serialize, Deserialize, Debug, Clone, PartialEq, Eq`) and the three Store methods: `record_whisper` = PutItem with `condition_expression("attribute_not_exists(pk)")`, mapping `ConditionalCheckFailedException` to `Ok(false)` (follow how the crate already classifies conditional failures — grep `ConditionalCheckFailed` in `crates/dynamo/src/lib.rs` and reuse that exact match arm shape); `mark_whisper_delivered` = UpdateItem `SET delivered = :t` conditioned `attribute_exists(pk)`; `list_whispers` = Scan `begins_with(pk, "WHISPER#") AND sk = :meta`, mapping items manually like the link/game scans do.
 - [ ] **Step 4: Run** `cargo test -p dynamo --test store_test whisper` (compiles; skips or passes locally) and `cargo clippy -p dynamo -p domain`.
-- [ ] **Step 5: Commit** — `whisper log: write-once-per-date item + delivered receipt (domain + dynamo)`
+- [ ] **Step 5: Commit** — `whisper log: write-once-per-slot item + delivered receipt (domain + dynamo)`
 
 ---
 
@@ -88,7 +88,40 @@ async fn whisper_mark_delivered_flips_exactly_that_slot() {
   - `pub fn select<'a>(pool: &[&'a Game], julian_day: i64) -> Option<&'a Game>` (artwork-preferred subset first; index = `(julian_day.unsigned_abs().wrapping_mul(2654435761)) as usize % len`)
   - `pub fn whisper_message(game: &Game, site_url: &str) -> String`
 
-- [ ] **Step 1: Write the failing tests** (in `whisper.rs`'s `#[cfg(test)] mod tests`; build fixtures with the same field-literal style as `handler_test.rs`'s `link()` helper — a local `fn game(id: &str, title: &str, art: Option<&str>) -> Game` filling every field, `status: GameStatus::Available, giftable: true, hidden: false`, rest default-ish):
+- [ ] **Step 1: Write the failing tests** in `whisper.rs`'s `#[cfg(test)] mod tests`, with these exact fixtures at the top of the module:
+
+```rust
+fn game(id: &str, title: &str, art: Option<&str>) -> Game {
+    Game {
+        id: id.into(), title: title.into(), bundle: "Humble Test Bundle".into(),
+        gamekey: "gk".into(), machine_name: id.into(), key_type: "steam".into(),
+        giftable: true, hidden: false, status: GameStatus::Available,
+        claim_id: None, artwork_url: art.map(Into::into), keyindex: 0,
+        requires_choice: false, steam_app_id: None, appid_source: None,
+        owned_by_ben: false, hidden_source: None,
+    }
+}
+
+fn game_with_bundle(id: &str, title: &str, bundle: &str, art: Option<&str>) -> Game {
+    let mut g = game(id, title, art);
+    g.bundle = bundle.into();
+    g
+}
+
+fn test_link(token: &str) -> Link {
+    Link {
+        token: token.into(), label: "t".into(), gift_note: None, thank_note: None,
+        thanked_at: None, claims_allowed: 3, claims_used: 0, revoked: false,
+        expires_at: None, unlock_at: None, curated_game_ids: None,
+        created_at: OffsetDateTime::now_utc(),
+    }
+}
+
+fn wr(slot: &str, game_id: &str, cycle: u32, delivered: bool) -> WhisperRecord {
+    WhisperRecord { slot: slot.into(), game_id: game_id.into(), cycle, delivered }
+}
+```
+
 
 ```rust
 #[test]
@@ -111,7 +144,7 @@ fn active_promise_excludes_curated_only() {
 
 #[test]
 fn cycle_rolls_over_instead_of_going_quiet() {
-    let ws = vec![wr("2026-08-01", "g1", 0, true), wr("2026-08-08", "g2", 0, true)];
+    let ws = vec![wr("2026-W31", "g1", 0, true), wr("2026-W32", "g2", 0, true)];
     assert_eq!(current_cycle(&ws), 0);
     let excluded = delivered_ids(&ws, 0);
     let games = [game("g1", "a", None), game("g2", "b", None)];
@@ -124,7 +157,7 @@ fn cycle_rolls_over_instead_of_going_quiet() {
 
 #[test]
 fn undelivered_whisper_is_a_receipt_not_an_exclusion() {
-    let ws = vec![wr("2026-08-01", "g1", 0, false)]; // recorded, send FAILED
+    let ws = vec![wr("2026-W31", "g1", 0, false)]; // recorded, send FAILED
     assert!(delivered_ids(&ws, 0).is_empty()); // g1 stays eligible — OMBB's ①×two-write arm
 }
 
@@ -170,7 +203,7 @@ fn deeplink_urlencodes_the_title() {
 ### Task 3: The Whisper arm — envelope, Deps, orchestration, handler tests
 
 **Files:**
-- Modify: `crates/fulfillment/src/lib.rs` (`FulfillRequest::Whisper` variant; `FulfillResponse::Whispered` fieldless variant mirroring the Sync one; `Deps` gains `whisper_notify: Notify` and `whisper_site_url: String`; `handle` gains the arm; new `async fn handle_whisper(deps: &Deps) -> FulfillResponse`)
+- Modify: `crates/fulfillment/src/lib.rs` (`FulfillRequest::Whisper` variant; `FulfillResponse::Whispered` fieldless variant beside the measured `FulfillResponse::SyncDone` (lib.rs:181) and shaped like it; `Deps` gains THREE fields — `whisper_notify: Notify`, `whisper_site_url: String`, `whisper_param_name: String` (the SSM param name for the dark one-liner; main.rs passes the `WHISPER_WEBHOOK_PARAM` env value through, or the literal `"(WHISPER_WEBHOOK_PARAM env unset)"` when absent, so the dark message always names something actionable); `handle` gains the arm; new `async fn handle_whisper(deps: &Deps) -> FulfillResponse`)
 - Modify: `crates/fulfillment/src/main.rs` (env `WHISPER_WEBHOOK_PARAM` optional + `WHISPER_SITE_URL` defaulting to `https://bendobundles.com`; resolve a second `Notify` at startup exactly like `webhook_read` → `notify`; thread both into `Deps`)
 - Test: `crates/fulfillment/tests/handler_test.rs` (extend; every `Deps` literal in the tree gains the two fields — the compiler enumerates the sites)
 
@@ -185,9 +218,11 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
     // cause ① — DARK: zero writes, loud, and the ops register carries the light-it one-liner.
     let Notify::Webhook(whisper_url) = &deps.whisper_notify else {
         tracing::warn!(outcome = "whisper_dark", "whisper webhook unconfigured — no-op, zero writes");
+        // OperatorMessage has NO runtime-String constructor BY DESIGN (trust boundary,
+        // operator_message.rs module docs). Runtime values enter ONLY as Part::Id(&str).
         ping_msg(deps, &OperatorMessage::fmt(
             "whisper is DARK — the attic has a voice and no throat. Light it: aws ssm put-parameter --name {} --type SecureString --overwrite --value <discord webhook url>",
-            &[Part::Text(&deps.whisper_param_name)],
+            &[Part::Id(&deps.whisper_param_name)],
         )).await;
         return FulfillResponse::Whispered;
     };
@@ -208,9 +243,13 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
         // cause ② — EMPTY-BY-PREDICATE, even after rollover: a vacuous predicate must not
         // wear a quiet week's face. Per-stage sizes in the line.
         tracing::warn!(outcome = "whisper_empty", "whisper pool empty after rollover");
+        // Counts are runtime values: format them to Strings and pass as Part::Id (the only
+        // runtime-&str Part). Bind the Strings BEFORE the call so the borrows live long enough.
+        let n_listable = games.len().to_string();
+        let n_promised = promises.len().to_string();
         ping_msg(deps, &OperatorMessage::fmt(
             "whisper found NOTHING to say — {} listable, {} promise-excluded, pool 0 after rollover. That is a predicate problem or an empty attic, never a quiet week.",
-            &[/* counts as Parts */],
+            &[Part::Id(&n_listable), Part::Id(&n_promised)],
         )).await;
         return FulfillResponse::Whispered;
     };
@@ -234,9 +273,53 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
 }
 ```
 
-(`whisper_send` = a thin wrapper over the same chunk/`deliver` machinery `ping_msg` uses, but pointed at the whisper URL; `Deps` also carries `whisper_param_name: String` for the dark one-liner — main.rs passes the env value through. Adjust `OperatorMessage::fmt` calls to its real `Part` API — read `operator_message.rs` before writing them; the templates above are the CONTENT contract, not the exact call shape.)
+`whisper_send` — exact contract, because `deliver`'s convention is INVERTED (in `ping_msg`, `deliver(...).await == 1` is the FAILURE branch — verify at `deliver`'s definition before assuming):
 
-- [ ] **Step 1: Write the failing handler tests** (append to `handler_test.rs`; follow its `deps(...)` builder — extend that builder with `whisper_webhook: Option<String>` the same way `webhook_url` threads, defaulting existing call sites to `None` via a second builder fn or parameter):
+```rust
+/// Send one whisper. true ⇔ the POST landed. Calls `deliver` directly — NOT `ping_msg` — because
+/// the whisper is not an operator message: different webhook, different register, no PING_PREFIX,
+/// and its body is runtime text that must not (and cannot) pass through OperatorMessage.
+async fn whisper_send(http: &reqwest::Client, url: &str, text: &str) -> bool {
+    deliver(http, url, text).await == 0
+}
+```
+
+(If `deliver`'s parameter/return types differ at the definition site, follow the definition and keep THIS truth table: true = landed, false = failed. The templates above are the CONTENT contract; adjust `OperatorMessage::fmt` arities to the real `Part` API at the call site.)
+
+- [ ] **Step 1: Write the failing handler tests.** First add two fixtures to `handler_test.rs` (the existing `deps(...)` builder stays untouched so its 100+ call sites don't move — `deps_whisper` wraps it):
+
+```rust
+/// Whisper-arm Deps: ops webhook and whisper webhook are SEPARATE registers by design.
+fn deps_whisper(
+    store: Store,
+    humble_uri: &str,
+    ops_webhook: Option<String>,
+    whisper_webhook: Option<String>,
+) -> Deps {
+    let mut d = deps(store, humble_uri, ops_webhook);
+    d.whisper_notify = match whisper_webhook {
+        Some(u) => fulfillment::Notify::Webhook(u),
+        None => fulfillment::Notify::Disabled,
+    };
+    d.whisper_site_url = "https://bendobundles.example".into();
+    d.whisper_param_name = "/test/whisper-webhook".into();
+    d
+}
+
+/// A listable game: Available, giftable, visible. Fill every remaining field literally,
+/// matching the Game struct — same style as this file's `link()` helper.
+fn available_game(id: &str, title: &str) -> Game {
+    Game {
+        id: id.into(), title: title.into(), bundle: "Humble Test Bundle".into(),
+        gamekey: "gk".into(), machine_name: id.into(), key_type: "steam".into(),
+        giftable: true, hidden: false, status: GameStatus::Available,
+        claim_id: None, artwork_url: None, keyindex: 0, requires_choice: false,
+        steam_app_id: None, appid_source: None, owned_by_ben: false, hidden_source: None,
+    }
+}
+```
+
+(The `deps()` builder keeps its current signature; because `Deps` gains three fields, `deps()` itself must initialize them — `whisper_notify: fulfillment::Notify::Disabled`, `whisper_site_url: String::new()`, `whisper_param_name: String::new()` — so every existing test compiles unchanged.) Then the tests:
 
 ```rust
 #[tokio::test]
