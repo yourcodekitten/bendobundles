@@ -4752,8 +4752,12 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
         return FulfillResponse::Whispered;
     };
     // ISO week = the tick identity. The schedule speaks America/New_York and a UTC DATE key would
-    // let a midnight-crossing retry double-send; the ISO week is stable across the whole weekend
-    // in either zone. ⚠️ Grain coupled to the weekly cadence BY NAME (spec §idempotence): a
+    // let a midnight-crossing retry double-send. ⚠️ The week is stable across the weekend FOR THE
+    // MORNING TICKS ONLY — this derivation is UTC, so a Sunday tick at >=20:00 ET (EDT) or >=19:00 ET
+    // (EST) lands on MONDAY UTC and takes a DIFFERENT slot, which is a double-send. The earlier
+    // wording said "stable ... in either zone", which reads as a property of the weekend rather than
+    // of the 10:00 schedule and reassured exactly where tf-variables.tf warns.
+    // ⚠️ Grain coupled to the weekly cadence BY NAME (spec §idempotence): a
     // sub-weekly schedule must change this derivation in the same commit.
     let slot = {
         let (y, w, _) = now.date().to_iso_week_date();
