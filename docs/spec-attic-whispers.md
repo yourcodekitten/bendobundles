@@ -43,8 +43,13 @@ A whisperable treasure is a game where **all** of:
 2. **Not promised on an active curated link.** OMBB's rule — *"unspent ≠ unpromised"*: a link cut
    Tuesday and redeemed in three weeks must not be whispered in the window. Refined against the
    schema, because the naive form is the vacuous-exclusion trap: `Link.curated_game_ids: None` =
-   **open shelf = the whole listable catalog** (18 of 18 live links today), so excluding every game
-   "offered on a link" empties the attic forever. **A curated pick is a promise; an open shelf is
+   **open shelf = the whole listable catalog** — measured **18 of 18 links open-shelf, 0 curated,
+   as of 2026-08-28** (a census is a script, not a paragraph — re-derive:
+   `aws dynamodb scan --table-name brd-prod-ue1-bendobundles-table --filter-expression
+   'begins_with(pk, :l) AND sk = :m' --expression-attribute-values
+   '{":l":{"S":"LINK#"},":m":{"S":"META"}}' --projection-expression 'pk, curated_game_ids'` and
+   count the items lacking `curated_game_ids`). The RULE survives any number; the number needs a
+   date. Excluding every game "offered on a link" would empty the attic forever. **A curated pick is a promise; an open shelf is
    not.** Exclusion set = ⋃ `curated_game_ids` over links that are ACTIVE: `!revoked` ∧
    (`expires_at` absent or future) ∧ `claims_used < claims_allowed`. (A sealed link is active —
    the promise is made before the unwrap.)
@@ -54,8 +59,11 @@ A whisperable treasure is a game where **all** of:
 
 Ranking: candidates with `artwork_url` outrank artless; artless still eligible when they're all
 that's left (delight never gates — PRODUCT.md principle 5). Pick: deterministic index over the
-title-sorted pool — `(julian_day × 2654435761) mod len` — so a same-day retry re-derives the same
-winner; the conditional put is the hard gate, the determinism is the belt.
+title-sorted pool — `(julian_day × 2654435761) mod len`. ⚠️ Scope of that determinism, said out
+loud (Lilith): it re-derives the same winner **only over an unchanged pool** — a claim landing
+between attempts remaps the index. The conditional put is the guarantee; the hash is a belt. And
+**coverage across a cycle is carried by the exclusion log, never by the hash** — do not "improve"
+the distribution believing it owns coverage; it doesn't and it doesn't need to.
 
 **Exhaustion (both reviewers, OMBB's words kept):** *corpus size IS the period, and silence reads
 as broken.* When the pool for the current cycle empties, the cycle number increments and the attic
@@ -79,9 +87,15 @@ EventBridge can double-fire and lambdas restart mid-flight; the **act** (a Disco
 - **The dark state announces itself (Lilith):** that same arm sends ONE line to the *existing ops
   webhook*: whisper is dark + the exact `aws ssm put-parameter` one-liner to light it. The ops
   register doing what the ops register is for; the whisper register stays warm-only.
-- The whisper-log item is put **conditionally** on `attribute_not_exists(pk)`, keyed by the run
-  date (UTC). Only the winner sends. A loser exits quietly — that tick's whisper already belongs
-  to someone.
+- The whisper-log item is put **conditionally** on `attribute_not_exists(pk)`, keyed by the
+  **slot identity: the ISO week** (`WHISPER#2026-W35`). Not the UTC date — the schedule speaks
+  America/New_York and a date key speaks UTC, and *two clocks disagreeing about what "a day" is*
+  means a retry crossing UTC midnight would mint a fresh key and double-send (Lilith, round 4 —
+  her own timezone recommendation created the mismatch and she flagged it). The ISO week is stable
+  across the whole weekend in either zone, and it IS the tick's identity for a weekly cadence.
+  ⚠️ NAMED COUPLING: the key grain equals the cadence grain — a future sub-weekly schedule must
+  change the slot derivation in the same commit, or ticks collide silently. Only the winner sends;
+  a loser exits quietly — that slot's whisper already belongs to someone.
 - Order is record → send → mark-delivered. A crash between record and send loses at most one
   whisper (that date's item sits `delivered=false` — visible as exactly what it is — and the GAME
   stays eligible next tick, because exclusions read `delivered=true` only). It can never
