@@ -53,6 +53,33 @@ fn secret_value(r: SecretRead) -> Option<String> {
     }
 }
 
+/// Is the WHISPER register suppressed? Reads `WHISPER_DISABLED` and ONLY `WHISPER_DISABLED` —
+/// never the global `NOTIFY_DISABLED` (gate-5 MAJOR 2: reusing the global flag re-couples the
+/// registers the second webhook param exists to separate, so quieting ops would silently kill
+/// the gift feature). Injected env lookup so the flag NAMES are pinned by test — the defect this
+/// guards against is precisely someone reaching for the other variable.
+fn whisper_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
+    env("WHISPER_DISABLED").as_deref() == Some("1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::whisper_suppressed;
+
+    #[test]
+    fn whisper_disabled_flag_suppresses() {
+        let env = |k: &str| (k == "WHISPER_DISABLED").then(|| "1".to_string());
+        assert!(whisper_suppressed(env));
+    }
+
+    #[test]
+    fn global_notify_disabled_does_not_touch_the_whisper() {
+        // THE register-decoupling pin: quieting ops must not silently kill the gift feature.
+        let env = |k: &str| (k == "NOTIFY_DISABLED").then(|| "1".to_string());
+        assert!(!whisper_suppressed(env));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
     tracing_subscriber::fmt()
@@ -128,7 +155,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     } else {
         SecretRead::DeliberatelyOff
     };
-    let whisper_disabled = std::env::var("WHISPER_DISABLED").as_deref() == Ok("1");
+    let whisper_disabled = whisper_suppressed(|k| std::env::var(k).ok());
     let whisper_notify = Notify::resolve(whisper_read, whisper_disabled);
     // Carried for the DARK announcement's one-liner: the message must always name something
     // actionable, so an unwired env gets a literal saying exactly that.
