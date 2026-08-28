@@ -13,6 +13,7 @@
 /// test suite runs it; only the `delete_game` call in the bin is `heal`-feature-gated.
 pub mod heal_pairs;
 pub mod operator_message;
+pub mod whisper;
 
 use crate::operator_message::{ErrorSummary, OperatorMessage, Part};
 use domain::{AppidSource, Claim, Game, GameStatus};

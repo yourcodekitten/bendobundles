@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+urlencoding = "2"   # already in the workspace via public-api — same version, same lock entry
 domain = { path = "../domain" }
 humble-client = { path = "../humble-client" }
 dynamo = { path = "../dynamo" }
