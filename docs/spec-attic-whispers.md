@@ -96,6 +96,14 @@ EventBridge can double-fire and lambdas restart mid-flight; the **act** (a Disco
   vacuous predicate looks exactly like a well-behaved quiet week"* · ③ **conditional-put loser**
   (this date already whispered) → log-only, benign by design · ④ **send failed** → the
   `delivered=false` receipt plus the existing failure log line. Each cause is a tested arm.
+- **Cause ⑤ is structurally out of the mechanism's reach (Lilith, round 3): the run that never
+  happened** — schedule not firing, cold-start crash, lapsed permission. *"A monitor whose alert
+  path runs through the monitored channel reports healthy and silent identically"* — the no-send
+  announcement rides the thing being announced. So ⑤ gets an instrument OUTSIDE the whisper: a
+  CloudWatch alarm in the repo's existing `aws-cloudwatch-alarms.tf` on the Scheduler's own
+  invocation metrics (`AWS/Scheduler` `InvocationAttemptCount` < 1 over the schedule period, with
+  missing data treated as breaching, plus `TargetErrorCount > 0`) — a different trigger, so it
+  cannot inherit the failure it watches for.
 
 ## the message itself
 
