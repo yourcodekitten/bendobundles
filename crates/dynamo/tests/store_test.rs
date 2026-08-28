@@ -3916,3 +3916,36 @@ async fn create_table_for_tests_is_idempotent_under_immediate_recreate() {
         .expect("GSI must be ACTIVE on return");
     assert!(games.is_empty(), "virgin table");
 }
+
+// ── whisper log (the attic whispers, 2026-08-28) ─────────────────────────────────────────────
+// One item per SLOT (ISO week), write-once by condition; `delivered` flips only via
+// mark_whisper_delivered. A slot key rather than a date key: the schedule speaks
+// America/New_York and a UTC date key would let a midnight-crossing retry double-send.
+
+#[tokio::test]
+async fn whisper_record_is_write_once_per_slot() {
+    let Some(store) = store_or_skip("whisper-once").await else {
+        return;
+    };
+    assert!(store.record_whisper("2026-W35", "g1", 0).await.unwrap()); // first write wins
+    assert!(!store.record_whisper("2026-W35", "g2", 0).await.unwrap()); // same slot: loser, Ok(false)
+    let all = store.list_whispers().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].game_id, "g1");
+    assert_eq!(all[0].cycle, 0);
+    assert!(!all[0].delivered); // born undelivered — a receipt, not an exclusion
+}
+
+#[tokio::test]
+async fn whisper_mark_delivered_flips_exactly_that_slot() {
+    let Some(store) = store_or_skip("whisper-mark").await else {
+        return;
+    };
+    store.record_whisper("2026-W35", "g1", 0).await.unwrap();
+    store.record_whisper("2026-W36", "g2", 0).await.unwrap();
+    store.mark_whisper_delivered("2026-W35").await.unwrap();
+    let mut all = store.list_whispers().await.unwrap();
+    all.sort_by(|a, b| a.slot.cmp(&b.slot));
+    assert!(all[0].delivered);
+    assert!(!all[1].delivered);
+}

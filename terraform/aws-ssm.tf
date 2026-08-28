@@ -108,9 +108,29 @@ resource "aws_ssm_parameter" "discord_webhook" {
   }
 }
 
+# The WHISPER webhook — a SECOND container, deliberately never shared with discord_webhook:
+# push fails silent where pull fails loud, so sharing one webhook means an ops-side rotation
+# kills whispers for a month before anyone notices (family review 2026-08-28). Same container
+# pattern as above: SecureString, UNSET placeholder, value set out of band. Until an operator
+# PutParameters a real URL the whisper runs DARK — a loud no-op with zero writes that announces
+# itself on the ops register (spec: docs/spec-attic-whispers.md).
+resource "aws_ssm_parameter" "whisper_webhook" {
+  count = var.whisper_enabled ? 1 : 0
+  name  = "/${module.label_param.id}/whisper-webhook"
+  type  = "SecureString"
+  value = "UNSET"
+  tags  = module.label_param.tags
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 locals {
   discord_webhook_param_name = var.discord_webhook_enabled ? aws_ssm_parameter.discord_webhook[0].name : null
   discord_webhook_param_arn  = var.discord_webhook_enabled ? aws_ssm_parameter.discord_webhook[0].arn : null
+  whisper_webhook_param_name = var.whisper_enabled ? aws_ssm_parameter.whisper_webhook[0].name : null
+  whisper_webhook_param_arn  = var.whisper_enabled ? aws_ssm_parameter.whisper_webhook[0].arn : null
 
   # Secure-area step-up is opt-in via humble_username: null → the whole feature is
   # off (no params, no env vars, no extra SSM grant) and a gated redeem parks as

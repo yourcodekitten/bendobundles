@@ -13,6 +13,7 @@
 /// test suite runs it; only the `delete_game` call in the bin is `heal`-feature-gated.
 pub mod heal_pairs;
 pub mod operator_message;
+pub mod whisper;
 
 use crate::operator_message::{ErrorSummary, OperatorMessage, Part};
 use domain::{AppidSource, Claim, Game, GameStatus};
@@ -152,6 +153,11 @@ pub enum FulfillRequest {
     /// scheduled healthcheck. (A dedicated EventBridge validate schedule for a cheap mid-day heal
     /// is a tracked follow-up, deliberately out of this teardown.)
     ValidateCookie,
+    /// The attic whispers (spec: docs/spec-attic-whispers.md): surface ONE forgotten treasure
+    /// into Ben's Discord. Fired by the EventBridge Scheduler with a static `{"op":"whisper"}`
+    /// input — caught by this typed parse BEFORE main.rs's `aws.events`→Sync fallback, so a
+    /// whisper payload cannot contaminate sync.
+    Whisper,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,6 +185,11 @@ pub enum FulfillResponse {
     /// purpose: sync is only ever invoked async (`Event`), whose return payload Lambda discards —
     /// the run's real results live in the persisted `SyncState`, not on the wire.
     SyncDone,
+    /// The whisper ran (sent, or declined for one of its NAMED no-send causes — each announces
+    /// itself distinctly; see `handle_whisper`). Fieldless like [`Self::SyncDone`] and for the
+    /// same reason: Scheduler invokes async and the payload is discarded; the run's truth lives
+    /// in the whisper log and the ops/whisper channels.
+    Whispered,
     CookieStatus {
         ok: bool,
     },
@@ -472,6 +483,18 @@ pub struct Deps {
     pub store: Store,
     pub humble: HumbleClient,
     pub notify: Notify,
+    /// The WHISPER register — a SECOND webhook, never the ops one (push fails silent where pull
+    /// fails loud: sharing one webhook means an ops-side rotation kills whispers for a month
+    /// before anyone notices). Resolved in main.rs under `WHISPER_DISABLED`, NEVER the global
+    /// `NOTIFY_DISABLED` — reusing the global flag would re-couple the registers this field
+    /// exists to separate.
+    pub whisper_notify: Notify,
+    /// Base URL for the whisper's cut-a-link deep-link (`{site}/admin/catalog?q=…`).
+    pub whisper_site_url: String,
+    /// The whisper webhook's SSM parameter name, carried so the DARK announcement can hand the
+    /// operator an actionable one-liner. When the env isn't even wired, main.rs passes a literal
+    /// that says so — the message must always name something actionable.
+    pub whisper_param_name: String,
     pub http: reqwest::Client,
     /// SSM client + the humble-cookie parameter name, so the app can self-heal its own session:
     /// on a dead session it logs in (via `humble.login()`) and persists the fresh cookie here,
@@ -680,6 +703,7 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
         }
         FulfillRequest::Sync => handle_sync(deps).await,
         FulfillRequest::ValidateCookie => handle_validate_cookie(deps).await,
+        FulfillRequest::Whisper => handle_whisper(deps).await,
     }
 }
 
@@ -4611,6 +4635,171 @@ async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
             );
         }
     }
+}
+
+/// Send one whisper. `true` ⇔ the POST landed. Calls [`deliver`] directly — NOT `ping_msg` —
+/// because the whisper is not an operator message: different webhook, different register, no
+/// PING_PREFIX, and its body is runtime text that must not (and cannot) pass through
+/// `OperatorMessage`. `deliver` returns a FAILURE count (its `== 1` is `ping_msg`'s error
+/// branch), so landed is `== 0` — the polarity is pinned here because a guess ships
+/// success-on-failure and every "it sent" assertion still passes.
+async fn whisper_send(http: &reqwest::Client, url: &str, text: &str) -> bool {
+    deliver(http, url, text).await == 0
+}
+
+/// The attic whispers — one forgotten treasure, warmly, then quiet (spec:
+/// `docs/spec-attic-whispers.md`). Order is RECORD → SEND → MARK (the choosecontent two-write
+/// shape): a crash between record and send loses at most one whisper and can never double-send.
+/// Every no-send cause announces itself DISTINCTLY — silences must not share a face:
+///   ①a dark-Disabled  → ops one-liner with the put-parameter command, ZERO writes
+///   ①b dark-Unresolved → ops line saying UNREADABLE (never overwrite advice), ZERO writes
+///   ②  empty-by-predicate → ops line with per-stage pool sizes (a vacuous predicate must not
+///       wear a quiet week's face)
+///   ③  conditional-put loser → log-only, benign by design (that slot's whisper exists)
+///   ④  send-failed → delivered=false receipt AND its own ops line — REQUIRED, because the
+///       never-ran alarm is BLIND to this cause by construction (invocation fired, target didn't
+///       error, the metric bucket reads healthy)
+///   ⑤  the-run-never-happened → cannot be announced from here at all; owned by the CloudWatch
+///       alarm on the Scheduler's own metrics (terraform), a trigger OUTSIDE this lambda.
+/// Whisper errors are their own: this arm never touches sync, and a store failure here is a loud
+/// no-op, not a crash.
+async fn handle_whisper(deps: &Deps) -> FulfillResponse {
+    // cause ① — DARK, two faces. Notify is three-state and `Unresolved` means configured but
+    // UNREADABLE (IAM/KMS/read-path): advising `put-parameter --overwrite` there is DESTRUCTIVE —
+    // the stored value may be right and the fault is the read path. Match all three; never
+    // flatten with a let-else. ZERO writes on either dark face — record-then-skip-send would
+    // burn treasures into the exclusion log on a dark deploy's happy path.
+    let whisper_url = match &deps.whisper_notify {
+        Notify::Webhook(u) => u.clone(),
+        Notify::Disabled => {
+            tracing::warn!(
+                outcome = "whisper_dark",
+                "whisper webhook unconfigured — no-op, zero writes"
+            );
+            ping_msg(deps, &OperatorMessage::fmt(
+                "whisper is DARK — the attic has a voice and no throat. Light it: aws ssm put-parameter --name {} --type SecureString --overwrite --value <discord webhook url>",
+                &[Part::Id(&deps.whisper_param_name)],
+            ))
+            .await;
+            return FulfillResponse::Whispered;
+        }
+        Notify::Unresolved => {
+            tracing::error!(
+                outcome = "whisper_unresolved",
+                "whisper webhook configured but UNREADABLE — no-op, zero writes"
+            );
+            ping_msg(deps, &OperatorMessage::fmt(
+                "whisper webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value; the stored secret may be fine and the fault is the read path.",
+                &[Part::Id(&deps.whisper_param_name)],
+            ))
+            .await;
+            return FulfillResponse::Whispered;
+        }
+    };
+    let games = match deps.store.list_listable_games().await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::error!(error = ?e, "whisper: cannot list games — no-op");
+            return FulfillResponse::Whispered;
+        }
+    };
+    let links = match deps.store.list_links().await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(error = ?e, "whisper: cannot list links — no-op");
+            return FulfillResponse::Whispered;
+        }
+    };
+    let whispers = match deps.store.list_whispers().await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(error = ?e, "whisper: cannot list whisper log — no-op");
+            return FulfillResponse::Whispered;
+        }
+    };
+    let now = OffsetDateTime::now_utc();
+    let promises = whisper::active_promises(&links, now);
+    let mut cycle = whisper::current_cycle(&whispers);
+    let mut pool = whisper::eligible(&games, &promises, &whisper::delivered_ids(&whispers, cycle));
+    if pool.is_empty() {
+        // exhaustion ⇒ rollover, never silence: corpus size IS the period, and silence reads as
+        // broken. The new cycle is persisted implicitly by the next record_whisper's cycle field.
+        cycle += 1;
+        pool = whisper::eligible(&games, &promises, &whisper::delivered_ids(&whispers, cycle));
+    }
+    tracing::info!(
+        listable = games.len(),
+        promised = promises.len(),
+        pool = pool.len(),
+        cycle,
+        "whisper pool"
+    );
+    let Some(pick) = whisper::select(&pool, i64::from(now.date().to_julian_day())) else {
+        // cause ② — EMPTY-BY-PREDICATE, even after rollover: a vacuous predicate must not wear a
+        // quiet week's face. Per-stage sizes ride Part::Id (the only runtime-&str Part —
+        // OperatorMessage has no runtime-String constructor BY DESIGN).
+        tracing::warn!(
+            outcome = "whisper_empty",
+            "whisper pool empty after rollover"
+        );
+        let n_listable = games.len().to_string();
+        let n_promised = promises.len().to_string();
+        ping_msg(deps, &OperatorMessage::fmt(
+            "whisper found NOTHING to say — {} listable, {} promise-excluded, pool 0 after rollover. That is a predicate problem or an empty attic, never a quiet week.",
+            &[Part::Id(&n_listable), Part::Id(&n_promised)],
+        ))
+        .await;
+        return FulfillResponse::Whispered;
+    };
+    // ISO week = the tick identity. The schedule speaks America/New_York and a UTC DATE key would
+    // let a midnight-crossing retry double-send; the ISO week is stable across the whole weekend
+    // in either zone. ⚠️ Grain coupled to the weekly cadence BY NAME (spec §idempotence): a
+    // sub-weekly schedule must change this derivation in the same commit.
+    let slot = {
+        let (y, w, _) = now.date().to_iso_week_date();
+        format!("{y}-W{w:02}")
+    };
+    match deps.store.record_whisper(&slot, &pick.id, cycle).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // cause ③ — this slot already whispered; the conditional put is the idempotence gate
+            // and losing it is the designed quiet exit, not an error.
+            tracing::info!(
+                outcome = "whisper_already_recorded",
+                slot,
+                "cause ③: this slot already whispered — loser exits"
+            );
+            return FulfillResponse::Whispered;
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "whisper: record failed — NOT sending (record precedes act)");
+            return FulfillResponse::Whispered;
+        }
+    }
+    let text = whisper::whisper_message(pick, &deps.whisper_site_url);
+    if whisper_send(&deps.http, &whisper_url, &text).await {
+        if let Err(e) = deps.store.mark_whisper_delivered(&slot).await {
+            tracing::error!(error = ?e, slot, "whisper sent but mark failed — item stays a receipt; the game re-eligible next tick");
+        }
+    } else {
+        // cause ④ — SEND FAILED: delivered=false receipt, game stays eligible (exclusions read
+        // delivered=true only) — AND a REQUIRED ops line: the never-ran alarm is BLIND to this
+        // cause by construction (invocation fired, target didn't error, bucket reads healthy),
+        // so without this ping Ben's only detector is noticing he didn't get a whisper — the
+        // faculty this feature exists because he lacks.
+        tracing::error!(
+            outcome = "whisper_send_failed",
+            slot,
+            game = %pick.id,
+            "whisper POST failed"
+        );
+        ping_msg(deps, &OperatorMessage::fmt(
+            "whisper SEND FAILED for slot {} — recorded, undelivered, will not retry until next slot. Check the whisper webhook URL / Discord status.",
+            &[Part::Id(&slot)],
+        ))
+        .await;
+    }
+    FulfillResponse::Whispered
 }
 
 /// Test seam: drive the REAL `ping_msg` — `Notify` gate, chunking, delivery, failure record — from
