@@ -273,6 +273,24 @@ pub struct Claim {
     pub failure_reason: Option<String>,
 }
 
+/// One whisper-log row: "the attic spoke in this SLOT, about this game" (the attic whispers,
+/// 2026-08-28). The slot is an ISO week (`2026-W35`), not a date — the schedule speaks
+/// America/New_York and a UTC date key would let a retry that crosses UTC midnight mint a fresh
+/// key and double-send; the ISO week is stable across the whole weekend in either zone.
+/// ⚠️ NAMED COUPLING: the slot grain equals the cadence grain (weekly). A sub-weekly schedule
+/// must change the slot derivation in the same commit, or ticks collide silently.
+///
+/// `delivered` is the load-bearing bit: **an undelivered row is a failure receipt, never an
+/// exclusion** — selection excludes only `delivered == true` rows, so a treasure whose whisper
+/// failed to send stays eligible for the next slot instead of being silently burned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WhisperRecord {
+    pub slot: String,
+    pub game_id: String,
+    pub cycle: u32,
+    pub delivered: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ClaimRefusal {
     #[error("link revoked")]

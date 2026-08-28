@@ -2374,6 +2374,168 @@ impl Store {
         Ok(links)
     }
 
+    /// Record the whisper for one SLOT (ISO week) — the idempotence gate of the attic whispers.
+    /// PutItem conditioned `attribute_not_exists(pk)`: exactly ONE whisper per slot, and only the
+    /// winner of this write may send. `Ok(false)` = the slot already has a whisper (a same-slot
+    /// retry or a double-fire lost the race) — the designed quiet-loser signal, not an error.
+    /// The row is born `delivered = false`: a receipt, never an exclusion, until
+    /// [`Store::mark_whisper_delivered`] flips it after the send actually lands.
+    pub async fn record_whisper(
+        &self,
+        slot: &str,
+        game_id: &str,
+        cycle: u32,
+    ) -> Result<bool, StoreError> {
+        let mut item: HashMap<String, aws_sdk_dynamodb::types::AttributeValue> = HashMap::new();
+        item.insert(
+            "pk".into(),
+            aws_sdk_dynamodb::types::AttributeValue::S(format!("WHISPER#{slot}")),
+        );
+        item.insert(
+            "sk".into(),
+            aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+        );
+        item.insert(
+            "game_id".into(),
+            aws_sdk_dynamodb::types::AttributeValue::S(game_id.into()),
+        );
+        item.insert(
+            "cycle".into(),
+            aws_sdk_dynamodb::types::AttributeValue::N(cycle.to_string()),
+        );
+        item.insert(
+            "delivered".into(),
+            aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+        );
+        item.insert(
+            "created_at".into(),
+            aws_sdk_dynamodb::types::AttributeValue::S(
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            ),
+        );
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(true),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "put_item", &sdk_err,
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Flip one slot's whisper to delivered — the third write of record → send → mark.
+    /// Conditioned `attribute_exists(pk)`: marking a slot that was never recorded is a caller
+    /// bug, not an upsert.
+    pub async fn mark_whisper_delivered(&self, slot: &str) -> Result<(), StoreError> {
+        let res = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(format!("WHISPER#{slot}")),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+            )
+            .update_expression("SET delivered = :t")
+            .expression_attribute_values(":t", aws_sdk_dynamodb::types::AttributeValue::Bool(true))
+            .condition_expression("attribute_exists(pk)")
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                if is_ccf_update(&sdk_err) {
+                    Err(StoreError::Corrupt(
+                        "mark_whisper_delivered on a slot never recorded",
+                    ))
+                } else {
+                    Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "update_item",
+                        &sdk_err,
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Every whisper-log row. Scan `begins_with(pk, "WHISPER#") AND sk = "META"` — the whisper
+    /// population stays small (one row per week), so a filtered scan is the right tool and no
+    /// GSI is spent on it. Attributes are read from the item directly (no body blob: these rows
+    /// have no enforcer/identity split to manage).
+    pub async fn list_whispers(&self) -> Result<Vec<domain::WhisperRecord>, StoreError> {
+        let mut out_rows: Vec<domain::WhisperRecord> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .filter_expression("begins_with(pk, :pfx) AND sk = :meta")
+                .expression_attribute_values(
+                    ":pfx",
+                    aws_sdk_dynamodb::types::AttributeValue::S("WHISPER#".into()),
+                )
+                .expression_attribute_values(
+                    ":meta",
+                    aws_sdk_dynamodb::types::AttributeValue::S("META".into()),
+                )
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await
+                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
+            for item in out.items() {
+                let slot = item
+                    .get("pk")
+                    .and_then(|v| v.as_s().ok())
+                    .and_then(|s| s.strip_prefix("WHISPER#"))
+                    .ok_or(StoreError::Corrupt("whisper row without WHISPER# pk"))?
+                    .to_string();
+                let game_id = item
+                    .get("game_id")
+                    .and_then(|v| v.as_s().ok())
+                    .ok_or(StoreError::Corrupt("whisper row without game_id"))?
+                    .to_string();
+                let cycle: u32 = item
+                    .get("cycle")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse().ok())
+                    .ok_or(StoreError::Corrupt("whisper row without numeric cycle"))?;
+                let delivered = *item
+                    .get("delivered")
+                    .and_then(|v| v.as_bool().ok())
+                    .ok_or(StoreError::Corrupt("whisper row without delivered flag"))?;
+                out_rows.push(domain::WhisperRecord {
+                    slot,
+                    game_id,
+                    cycle,
+                    delivered,
+                });
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(out_rows)
+    }
+
     /// Persist a catalog-sync run summary. Unconditional upsert — only one SYNC#STATE item exists.
     pub async fn put_sync_state(&self, state: &SyncState) -> Result<(), StoreError> {
         self.client
