@@ -15,7 +15,7 @@
 - Workspace toolchain per `rust-toolchain.toml`; `cargo fmt --all` and `cargo clippy --workspace` clean; full `cargo test --workspace` (dynamo-local tests SKIP locally by design — CI is the receipt, never a local pass).
 - All commits GPG-signed (`git commit -S`) as `code kitten <yourcodekitten@gmail.com>`, lowercase descriptive messages, branch `feat/attic-whispers`.
 - Whisper failures must never touch the sync/gift paths: `Whisper` is its own match arm, its errors its own.
-- The five no-send causes (spec §failure-honesty) each get a TESTED arm: ① dark param (zero writes) · ② empty-by-predicate (ops line with per-stage pool sizes) · ③ conditional-put loser (log-only) · ④ send-failed (`delivered=false` receipt) · ⑤ never-ran (CloudWatch alarm, Task 4).
+- The no-send causes (spec §failure-honesty) each get a TESTED arm: ①a dark-Disabled (zero writes, light-it one-liner) · ①b dark-Unresolved (zero writes, UNREADABLE wording, NO overwrite advice) · ② empty-by-predicate (ops line with per-stage pool sizes) · ③ conditional-put loser (log-only) · ④ send-failed (`delivered=false` receipt AND its own ops line — the never-ran alarm is blind to ④ by construction) · ⑤ never-ran (CloudWatch alarm, Task 4). And the whisper's suppression flag is `WHISPER_DISABLED`, never the global `NOTIFY_DISABLED` — the registers stay decoupled.
 - The whisper register is the friend-surface voice (lowercase, ♡); the ops register carries only dark/empty announcements.
 
 ---
@@ -204,8 +204,8 @@ fn deeplink_urlencodes_the_title() {
 
 **Files:**
 - Modify: `crates/fulfillment/src/lib.rs` (`FulfillRequest::Whisper` variant; `FulfillResponse::Whispered` fieldless variant beside the measured `FulfillResponse::SyncDone` (lib.rs:181) and shaped like it; `Deps` gains THREE fields — `whisper_notify: Notify`, `whisper_site_url: String`, `whisper_param_name: String` (the SSM param name for the dark one-liner; main.rs passes the `WHISPER_WEBHOOK_PARAM` env value through, or the literal `"(WHISPER_WEBHOOK_PARAM env unset)"` when absent, so the dark message always names something actionable); `handle` gains the arm; new `async fn handle_whisper(deps: &Deps) -> FulfillResponse`)
-- Modify: `crates/fulfillment/src/main.rs` (env `WHISPER_WEBHOOK_PARAM` optional + `WHISPER_SITE_URL` defaulting to `https://bendobundles.com`; resolve a second `Notify` at startup exactly like `webhook_read` → `notify`; thread both into `Deps`)
-- Test: `crates/fulfillment/tests/handler_test.rs` (extend; every `Deps` literal in the tree gains the two fields — the compiler enumerates the sites)
+- Modify: `crates/fulfillment/src/main.rs` (env `WHISPER_WEBHOOK_PARAM` optional + `WHISPER_SITE_URL` defaulting to `https://bendobundles.com`; resolve a second `Notify` at startup with the SAME `get_secret`/`Notify::resolve` machinery as `webhook_read` → `notify` — **but the suppression flag is `WHISPER_DISABLED`, NEVER the global `NOTIFY_DISABLED`** (gate 5, MAJOR 2: reusing the global flag re-couples the registers the second param exists to separate — quieting ops would silently kill the gift feature): `let whisper_disabled = std::env::var("WHISPER_DISABLED").as_deref() == Ok("1"); let whisper_notify = Notify::resolve(whisper_read, whisper_disabled);` — and thread all three Deps fields)
+- Test: `crates/fulfillment/tests/handler_test.rs` (extend; every `Deps` literal in the tree gains the three fields — the compiler enumerates the sites)
 
 **Interfaces:**
 - Consumes: Task 1's Store methods, Task 2's pure functions, existing `Notify`, `ping_msg`-adjacent `deliver` machinery, `Store::{list_listable_games, list_links}`.
@@ -215,16 +215,30 @@ fn deeplink_urlencodes_the_title() {
 
 ```rust
 async fn handle_whisper(deps: &Deps) -> FulfillResponse {
-    // cause ① — DARK: zero writes, loud, and the ops register carries the light-it one-liner.
-    let Notify::Webhook(whisper_url) = &deps.whisper_notify else {
-        tracing::warn!(outcome = "whisper_dark", "whisper webhook unconfigured — no-op, zero writes");
-        // OperatorMessage has NO runtime-String constructor BY DESIGN (trust boundary,
-        // operator_message.rs module docs). Runtime values enter ONLY as Part::Id(&str).
-        ping_msg(deps, &OperatorMessage::fmt(
-            "whisper is DARK — the attic has a voice and no throat. Light it: aws ssm put-parameter --name {} --type SecureString --overwrite --value <discord webhook url>",
-            &[Part::Id(&deps.whisper_param_name)],
-        )).await;
-        return FulfillResponse::Whispered;
+    // cause ① — DARK: zero writes, loud, and dark itself has TWO faces (gate 5, MAJOR 1):
+    // Notify is three-state, and `Unresolved` = configured-but-UNREADABLE. Advising
+    // put-parameter --overwrite there is DESTRUCTIVE — the stored value may be right and the
+    // fault is the read path. Match all three; never flatten with a let-else.
+    // (OperatorMessage has NO runtime-String constructor BY DESIGN — trust boundary,
+    // operator_message.rs module docs. Runtime values enter ONLY as Part::Id(&str).)
+    let whisper_url = match &deps.whisper_notify {
+        Notify::Webhook(u) => u,
+        Notify::Disabled => {
+            tracing::warn!(outcome = "whisper_dark", "whisper webhook unconfigured — no-op, zero writes");
+            ping_msg(deps, &OperatorMessage::fmt(
+                "whisper is DARK — the attic has a voice and no throat. Light it: aws ssm put-parameter --name {} --type SecureString --overwrite --value <discord webhook url>",
+                &[Part::Id(&deps.whisper_param_name)],
+            )).await;
+            return FulfillResponse::Whispered;
+        }
+        Notify::Unresolved => {
+            tracing::error!(outcome = "whisper_unresolved", "whisper webhook configured but UNREADABLE — no-op, zero writes");
+            ping_msg(deps, &OperatorMessage::fmt(
+                "whisper webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value; the stored secret may be fine and the fault is the read path.",
+                &[Part::Id(&deps.whisper_param_name)],
+            )).await;
+            return FulfillResponse::Whispered;
+        }
     };
     let games = match deps.store.list_listable_games().await { Ok(g) => g, Err(e) => { tracing::error!(error = ?e, "whisper: cannot list games"); return FulfillResponse::Whispered; } };
     let links = match deps.store.list_links().await { Ok(l) => l, Err(e) => { tracing::error!(error = ?e, "whisper: cannot list links"); return FulfillResponse::Whispered; } };
@@ -265,9 +279,18 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
             tracing::error!(error = ?e, slot, "whisper sent but mark failed — item stays a receipt; next tick re-eligible");
         }
     } else {
-        // cause ④ — SEND FAILED: the item stays delivered=false, a visible receipt; the GAME
-        // stays eligible because exclusions read delivered=true only.
+        // cause ④ — SEND FAILED: delivered=false receipt, GAME stays eligible (exclusions read
+        // delivered=true only) — AND a REQUIRED ops line (gate 5, upgraded by Lilith from
+        // droppable to structural): the never-ran alarm is BLIND to this cause by construction
+        // (invocation fired, target didn't error, bucket reads healthy), so without this ping
+        // Ben's only detector is noticing he didn't get a whisper — the faculty this feature
+        // exists because he lacks.
         tracing::error!(outcome = "whisper_send_failed", slot, game = %pick.id, "whisper POST failed");
+        let slot_s = slot.clone();
+        ping_msg(deps, &OperatorMessage::fmt(
+            "whisper SEND FAILED for slot {} — recorded, undelivered, will not retry until next slot. Check the whisper webhook URL / Discord status.",
+            &[Part::Id(&slot_s)],
+        )).await;
     }
     FulfillResponse::Whispered
 }
@@ -351,16 +374,35 @@ async fn whisper_happy_path_records_sends_marks() {
 }
 
 #[tokio::test]
-async fn whisper_send_failure_leaves_a_receipt_not_an_exclusion() {
+async fn whisper_send_failure_leaves_a_receipt_and_pings_ops() {
     let Some(store) = store_or_skip("whisper-sendfail").await else { return };
-    let wh = MockServer::start().await;
+    let wh = MockServer::start().await;   // whisper webhook: fails
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(500)).mount(&wh).await;
+    let ops = MockServer::start().await;  // ops webhook: must receive the ④ line
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&ops).await;
     store.put_game(&available_game("g1", "Aaa")).await.unwrap();
-    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let d = deps_whisper(store.clone(), &ops.uri(), Some(ops.uri()), Some(wh.uri()));
     handle(&d, FulfillRequest::Whisper).await;
     let ws = store.list_whispers().await.unwrap();
     assert_eq!(ws.len(), 1);
     assert!(!ws[0].delivered); // cause ④: visible receipt; the game stays eligible next tick
+    let body = String::from_utf8(ops.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    assert!(body.contains("SEND FAILED")); // ④'s REQUIRED ops face — the never-ran alarm is blind here
+}
+
+#[tokio::test]
+async fn whisper_unresolved_param_is_not_told_to_overwrite() {
+    let Some(store) = store_or_skip("whisper-unresolved").await else { return };
+    let ops = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&ops).await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let mut d = deps_whisper(store.clone(), &ops.uri(), Some(ops.uri()), None);
+    d.whisper_notify = fulfillment::Notify::Unresolved; // configured but UNREADABLE
+    handle(&d, FulfillRequest::Whisper).await;
+    assert!(store.list_whispers().await.unwrap().is_empty()); // still zero writes
+    let body = String::from_utf8(ops.received_requests().await.unwrap()[0].body.clone()).unwrap();
+    assert!(body.contains("UNREADABLE"));       // its own face…
+    assert!(!body.contains("put-parameter"));   // …and NOT the destructive overwrite advice
 }
 
 #[tokio::test]
@@ -500,7 +542,7 @@ resource "aws_cloudwatch_metric_alarm" "whisper_never_ran" {
   threshold           = 1
   comparison_operator = "LessThanThreshold"
   treat_missing_data  = "breaching" # silence from the metric IS the alarm condition
-  datapoints_to_alarm = 8
+  datapoints_to_alarm = 8 # ALL eight must breach, pinned against "tuning": 7 days would also always contain a Saturday — with ZERO slack; 8 buys one day of margin against a tick crossing a bucket edge. Lower this and 6 missing-data-as-breaching weekdays make it alarm EVERY week.
   alarm_actions       = [aws_sns_topic.ops_alarms.arn]
   ok_actions          = [aws_sns_topic.ops_alarms.arn]
   tags                = module.label_whisper.tags

@@ -84,6 +84,17 @@ EventBridge can double-fire and lambdas restart mid-flight; the **act** (a Disco
   anything but a live URL, the run is a **loud no-op with ZERO writes** — no selection recorded, no
   log item, nothing marked. `param absent ⇒ skip send, do NOT mark` is an explicit tested arm.
   Inert is fine; inert-and-marking is data loss.
+  🔴 **And dark itself has two faces (OMBB, gate 5, MAJOR 1):** `Notify` is three-state —
+  `Webhook / Disabled / Unresolved` — and `Unresolved` means *configured but UNREADABLE* (IAM/KMS/
+  read-path fault). Telling Ben `put-parameter --overwrite` there is wrong and DESTRUCTIVE: the
+  stored value may be right and overwriting replaces a good secret while fixing nothing. The dark
+  arm matches all three: `Disabled` → the light-it one-liner · `Unresolved` → "configured but
+  UNREADABLE — check ssm:GetParameter + the KMS grant". Distinct wording, both tested.
+- 🔴 **The whisper's off-switch is its OWN (OMBB, gate 5, MAJOR 2):** the ops `Notify` resolves
+  under the global `NOTIFY_DISABLED`; reusing that flag for the whisper would re-couple the
+  registers the second param exists to separate — quieting ops would silently kill the gift
+  feature. The whisper `Notify` resolves under `WHISPER_DISABLED`, and a tested arm asserts
+  `NOTIFY_DISABLED=1` does NOT dark the whisper.
 - **The dark state announces itself (Lilith):** that same arm sends ONE line to the *existing ops
   webhook*: whisper is dark + the exact `aws ssm put-parameter` one-liner to light it. The ops
   register doing what the ops register is for; the whisper register stays warm-only.
@@ -94,7 +105,10 @@ EventBridge can double-fire and lambdas restart mid-flight; the **act** (a Disco
   her own timezone recommendation created the mismatch and she flagged it). The ISO week is stable
   across the whole weekend in either zone, and it IS the tick's identity for a weekly cadence.
   ⚠️ NAMED COUPLING: the key grain equals the cadence grain — a future sub-weekly schedule must
-  change the slot derivation in the same commit, or ticks collide silently. Only the winner sends;
+  change the slot derivation in the same commit, or ticks collide silently. And the margin is a
+  property of the SLOT, not the key (Lilith): Saturday morning sits ~38h from the ISO-week
+  boundary, but a Sunday-evening ET run computes into the NEXT ISO week in UTC (Sun 20:00 ET =
+  Mon 01:00 UTC) — anyone moving the cadence re-checks the boundary distance. Only the winner sends;
   a loser exits quietly — that slot's whisper already belongs to someone.
 - Order is record → send → mark-delivered. A crash between record and send loses at most one
   whisper (that date's item sits `delivered=false` — visible as exactly what it is — and the GAME
@@ -109,7 +123,13 @@ EventBridge can double-fire and lambdas restart mid-flight; the **act** (a Disco
   case) → its own ops-register line naming the pool sizes at each filter stage, because *"a
   vacuous predicate looks exactly like a well-behaved quiet week"* · ③ **conditional-put loser**
   (this date already whispered) → log-only, benign by design · ④ **send failed** → the
-  `delivered=false` receipt plus the existing failure log line. Each cause is a tested arm.
+  `delivered=false` receipt AND **its own ops-register line — REQUIRED, not optional (Lilith,
+  gate-5 round, structurally forced):** the never-ran alarm is BLIND to ④ by construction — the
+  invocation fired, the lambda ran, the target didn't error, so the bucket has data and reads
+  healthy, and `TargetErrorCount` stays 0. A failed send pings nothing else, won't retry until
+  next week's slot, and Ben's only remaining detector would be *noticing he didn't get a whisper —
+  the exact faculty this feature exists because he lacks.* The thesis eats itself without this
+  line. Each cause is a tested arm.
 - **Cause ⑤ is structurally out of the mechanism's reach (Lilith, round 3): the run that never
   happened** — schedule not firing, cold-start crash, lapsed permission. *"A monitor whose alert
   path runs through the monitored channel reports healthy and silent identically"* — the no-send
