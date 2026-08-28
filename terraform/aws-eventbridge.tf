@@ -39,6 +39,11 @@ module "label_whisper" {
 resource "aws_iam_role" "whisper_scheduler" {
   count = var.whisper_enabled ? 1 : 0
   name  = "${module.label_whisper.id}-scheduler"
+  # REQUIRED, not tidy: the kitten-deploy role's iam:CreateRole carries a condition that an app
+  # role can only be BORN wearing the app boundary (terraform-iam/iam-deploy-role.tf
+  # IamAppRolesSetBoundary). Without this line the apply is DENIED at CreateRole — measured
+  # against the deploy-role source before first apply, not discovered mid-deploy.
+  permissions_boundary = var.lambda_permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

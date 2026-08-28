@@ -156,7 +156,10 @@ data "aws_iam_policy_document" "deploy" {
     condition {
       test     = "StringEquals"
       variable = "iam:PassedToService"
-      values   = ["lambda.amazonaws.com", "apigateway.amazonaws.com"]
+      # scheduler.amazonaws.com added 2026-08-28 for the attic-whispers schedule (#210): the
+      # schedule target carries an invoke role, and creating it PASSES that role to the
+      # Scheduler service. Still app-prefix-scoped; still floored by NeverTouchKittenIam.
+      values = ["lambda.amazonaws.com", "apigateway.amazonaws.com", "scheduler.amazonaws.com"]
     }
   }
   # HARD FLOOR: never any IAM action on this stack's own identities or ceiling.
@@ -237,6 +240,32 @@ data "aws_iam_policy_document" "deploy" {
   }
 
   # ── EventBridge (the daily-sync rule) ───────────────────────────────────────
+  # ── EventBridge SCHEDULER (the attic whispers, #210, 2026-08-28) — a different service
+  # from classic Events: its own actions, its own ARN shapes (schedule/GROUP/NAME and
+  # schedule-group/NAME), both app-prefix-scoped like everything else here. Without this
+  # statement the whisper apply is DENIED at CreateScheduleGroup — measured against this file
+  # before the first apply rather than discovered mid-deploy.
+  statement {
+    sid    = "Scheduler"
+    effect = "Allow"
+    actions = [
+      "scheduler:CreateSchedule",
+      "scheduler:UpdateSchedule",
+      "scheduler:DeleteSchedule",
+      "scheduler:GetSchedule",
+      "scheduler:CreateScheduleGroup",
+      "scheduler:DeleteScheduleGroup",
+      "scheduler:GetScheduleGroup",
+      "scheduler:ListTagsForResource",
+      "scheduler:TagResource",
+      "scheduler:UntagResource",
+    ]
+    resources = [
+      "arn:aws:scheduler:${local.region}:${local.account}:schedule/${local.app_prefix}*/${local.app_prefix}*",
+      "arn:aws:scheduler:${local.region}:${local.account}:schedule-group/${local.app_prefix}*",
+    ]
+  }
+
   statement {
     sid    = "Events"
     effect = "Allow"
