@@ -62,7 +62,6 @@ fn whisper_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
     env("WHISPER_DISABLED").as_deref() == Some("1")
 }
 
-
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
     tracing_subscriber::fmt()
