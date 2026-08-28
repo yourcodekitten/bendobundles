@@ -952,6 +952,28 @@
         ]
       }
     ],
+    "list_links": [
+      {
+        "action": "dynamodb:Scan",
+        "leading_keys": [],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "list_listable_games": [
+      {
+        "action": "dynamodb:Query",
+        "index": "listable",
+        "leading_keys": [
+          "LISTABLE"
+        ],
+        "attributes": [
+          "gsi1pk"
+        ]
+      }
+    ],
     "list_pending_claims": [
       {
         "action": "dynamodb:Query",
@@ -961,6 +983,32 @@
         ],
         "attributes": [
           "gsi2pk"
+        ]
+      }
+    ],
+    "list_whispers": [
+      {
+        "action": "dynamodb:Scan",
+        "leading_keys": [],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "mark_whisper_delivered": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "WHISPER#"
+        ],
+        "attributes": [
+          "delivered",
+          "pk",
+          "sk"
+        ],
+        "update_attributes": [
+          "delivered"
         ]
       }
     ],
@@ -1025,6 +1073,22 @@
           "body",
           "gsi2pk",
           "gsi2sk",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
+    "record_whisper": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "WHISPER#"
+        ],
+        "attributes": [
+          "created_at",
+          "cycle",
+          "delivered",
+          "game_id",
           "pk",
           "sk"
         ]

@@ -907,6 +907,34 @@ async fn drive_fulfillment(rig: &Rig) -> MethodOps {
             .unwrap();
     })
     .await;
+    // the attic whispers (handle_whisper, fulfillment/src/lib.rs): FIVE new fulfillment calls.
+    // list_listable_games and list_links were captured only under public/admin respectively —
+    // fulfillment had never called either until the whisper. Found in review pass 1 of #210: all
+    // five shipped with CI green because this map is an ENUMERATION and an absent entry cannot
+    // fail the match — the corpus silently became a roster. (My first draft of THIS comment
+    // claimed the two list calls were "already captured above via their other fulfillment
+    // callers" — attributing public's and admin's captures to fulfillment. A roster error inside
+    // the fix for a roster error; caught by checking which drive fn owns the line numbers.)
+    capture(cap, &mut m, "list_listable_games", async {
+        s.list_listable_games().await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "list_links", async {
+        s.list_links().await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "list_whispers", async {
+        s.list_whispers().await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "record_whisper", async {
+        s.record_whisper("2026-W35", &gid(4), 0).await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "mark_whisper_delivered", async {
+        s.mark_whisper_delivered("2026-W35").await.unwrap();
+    })
+    .await;
     m
 }
 
