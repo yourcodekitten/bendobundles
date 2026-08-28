@@ -135,9 +135,19 @@ EventBridge can double-fire and lambdas restart mid-flight; the **act** (a Disco
   path runs through the monitored channel reports healthy and silent identically"* — the no-send
   announcement rides the thing being announced. So ⑤ gets an instrument OUTSIDE the whisper: a
   CloudWatch alarm in the repo's existing `aws-cloudwatch-alarms.tf` on the Scheduler's own
-  invocation metrics (`AWS/Scheduler` `InvocationAttemptCount` < 1 over the schedule period, with
-  missing data treated as breaching, plus `TargetErrorCount > 0`) — a different trigger, so it
-  cannot inherit the failure it watches for.
+  invocation metrics (`AWS/Scheduler` `InvocationAttemptCount` < 1, missing data treated as
+  breaching, plus `TargetErrorCount > 0`) — a different trigger, so it cannot inherit the failure
+  it watches for. 🔴 AMENDED AT FIRST APPLY (2026-08-28): AWS refuses evaluation windows over one
+  week ("Metrics cannot be checked across more than a week" — the 8-day design had a day of slack
+  the platform does not sell, found by the API, not the reviews). Under the 7-day cap a weekly
+  tick has ZERO slack (the window and the spacing are equal, so ingestion lag false-fires weekly).
+  ⇒ **The slack moved from the ALARM into the SCHEDULE: a Sunday HEARTBEAT tick**
+  (`cron(0 10 ? * SAT,SUN *)`). Saturday always wins the ISO-week slot (it precedes Sunday in an
+  ISO week), so Sunday exits as the DESIGNED cause-③ quiet loser — it keeps the invocation metric
+  present at ≤6-day gaps under a 7×daily alarm (one full day of slack), exercises the loser path
+  weekly, and doubles as the retry day if a Saturday tick outright fails. The cadence Ben sees is
+  unchanged: whispers happen on Saturdays (Sunday can only ever whisper if Saturday's tick never
+  ran — a self-heal, not a second whisper).
 
 ## the message itself
 
