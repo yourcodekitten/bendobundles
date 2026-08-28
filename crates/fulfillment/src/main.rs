@@ -62,23 +62,6 @@ fn whisper_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
     env("WHISPER_DISABLED").as_deref() == Some("1")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::whisper_suppressed;
-
-    #[test]
-    fn whisper_disabled_flag_suppresses() {
-        let env = |k: &str| (k == "WHISPER_DISABLED").then(|| "1".to_string());
-        assert!(whisper_suppressed(env));
-    }
-
-    #[test]
-    fn global_notify_disabled_does_not_touch_the_whisper() {
-        // THE register-decoupling pin: quieting ops must not silently kill the gift feature.
-        let env = |k: &str| (k == "NOTIFY_DISABLED").then(|| "1".to_string());
-        assert!(!whisper_suppressed(env));
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
@@ -320,4 +303,22 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         }
     }))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::whisper_suppressed;
+
+    #[test]
+    fn whisper_disabled_flag_suppresses() {
+        let env = |k: &str| (k == "WHISPER_DISABLED").then(|| "1".to_string());
+        assert!(whisper_suppressed(env));
+    }
+
+    #[test]
+    fn global_notify_disabled_does_not_touch_the_whisper() {
+        // THE register-decoupling pin: quieting ops must not silently kill the gift feature.
+        let env = |k: &str| (k == "NOTIFY_DISABLED").then(|| "1".to_string());
+        assert!(!whisper_suppressed(env));
+    }
 }
