@@ -83,12 +83,12 @@ resource "aws_cloudwatch_metric_alarm" "whisper_never_ran" {
     ScheduleGroup = aws_scheduler_schedule_group.whisper[0].name
   }
   statistic           = "Sum"
-  period              = 86400 # 8 daily buckets ⇒ a whole weekly tick plus a day of grace
-  evaluation_periods  = 8
+  period              = 86400 # 7 daily buckets — AWS's HARD CAP: the API refused 8×86400 with "Metrics cannot be checked across more than a week" (measured at first apply, 2026-08-28; the 8-day design had a day of slack the platform does not sell).
+  evaluation_periods  = 7
   threshold           = 1
   comparison_operator = "LessThanThreshold"
   treat_missing_data  = "breaching" # silence from the metric IS the alarm condition
-  datapoints_to_alarm = 8           # ALL eight must breach, pinned against "tuning": 7 days would also always contain a Saturday — with ZERO slack; 8 buys one day of margin against a tick crossing a bucket edge. Lower this and 6 missing-data-as-breaching weekdays make it alarm EVERY week.
+  datapoints_to_alarm = 7           # ALL seven must breach. The slack the 8th bucket used to buy now comes from the SCHEDULE: the Sunday heartbeat tick (see whisper_schedule_expression) keeps the metric present at ≤6-day gaps, so a healthy week can never show 7 empty buckets. Lower this and missing-data-as-breaching weekdays make it alarm EVERY week.
   alarm_actions       = [aws_sns_topic.ops_alarms.arn]
   ok_actions          = [aws_sns_topic.ops_alarms.arn]
   tags                = module.label_whisper.tags

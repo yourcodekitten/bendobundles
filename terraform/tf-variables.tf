@@ -81,6 +81,6 @@ variable "whisper_enabled" {
 
 variable "whisper_schedule_expression" {
   type        = string
-  default     = "cron(0 10 ? * SAT *)"
-  description = "Whisper cadence in America/New_York (EventBridge Scheduler is timezone-aware; classic rules are UTC-only and drift an hour across DST, which is why this rides aws_scheduler_schedule). ⚠️ The whisper-log slot key is the ISO WEEK — grain coupled to a weekly cadence; a sub-weekly schedule must change the slot derivation in fulfillment in the same commit."
+  default     = "cron(0 10 ? * SAT,SUN *)"
+  description = "Whisper cadence in America/New_York. The SUNDAY tick is a HEARTBEAT, not a second whisper: Saturday always wins the ISO-week slot, Sunday exits as the designed conditional-put loser — it keeps InvocationAttemptCount present at ≤6-day gaps (the never-ran alarm lives under AWS's hard 7-day evaluation cap, measured 2026-08-28 when the API refused 8 daily buckets), and doubles as the retry day if a Saturday tick outright fails. Cadence in America/New_York (EventBridge Scheduler is timezone-aware; classic rules are UTC-only and drift an hour across DST, which is why this rides aws_scheduler_schedule). ⚠️ The whisper-log slot key is the ISO WEEK — grain coupled to a weekly cadence; a sub-weekly schedule must change the slot derivation in fulfillment in the same commit."
 }
