@@ -37,6 +37,10 @@ module "lambda_fulfillment" {
     local.discord_webhook_param_name == null ? {} : {
       DISCORD_WEBHOOK_PARAM = local.discord_webhook_param_name
     },
+    local.whisper_webhook_param_name == null ? {} : {
+      WHISPER_WEBHOOK_PARAM = local.whisper_webhook_param_name
+      WHISPER_SITE_URL      = "https://bendobundles.com"
+    },
     local.humble_step_up_env
   )
 
@@ -63,6 +67,11 @@ module "lambda_fulfillment" {
           Effect   = "Allow"
           Action   = ["ssm:GetParameter"]
           Resource = [local.discord_webhook_param_arn]
+        }],
+        local.whisper_webhook_param_arn == null ? [] : [{
+          Effect   = "Allow"
+          Action   = ["ssm:GetParameter"]
+          Resource = [local.whisper_webhook_param_arn]
         }]
       )
     })

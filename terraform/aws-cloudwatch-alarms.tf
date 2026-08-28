@@ -63,3 +63,55 @@ resource "aws_cloudwatch_metric_alarm" "fulfillment_silent" {
   alarm_actions       = [aws_sns_topic.ops_alarms.arn]
   tags                = module.label_alarms.tags
 }
+
+# ── the attic whispers: cause ⑤, the run that never happened ────────────────────────────────
+# The whisper's own no-send announcements ride the lambda; a schedule that stops firing (or a
+# lapsed invoke role) produces silence with NO announcer — "a monitor whose alert path runs
+# through the monitored channel reports healthy and silent identically" (family review
+# 2026-08-28). These alarms trigger on the Scheduler's OWN metrics — a different instrument, so
+# they cannot inherit the failure they watch for.
+resource "aws_cloudwatch_metric_alarm" "whisper_never_ran" {
+  count             = var.whisper_enabled ? 1 : 0
+  alarm_name        = "${module.label_whisper.id}-never-ran"
+  alarm_description = "The whisper schedule has not fired in over a week — the run that never happened cannot announce itself."
+  namespace         = "AWS/Scheduler"
+  metric_name       = "InvocationAttemptCount"
+  # ScheduleGroup is the ONLY dimension AWS/Scheduler emits (measured against the docs
+  # 2026-08-28 — there is NO ScheduleName dimension; a per-schedule alarm would sit on missing
+  # data forever). The whisper has its own dedicated group, so this IS the whisper's metric.
+  dimensions = {
+    ScheduleGroup = aws_scheduler_schedule_group.whisper[0].name
+  }
+  statistic           = "Sum"
+  period              = 86400 # 8 daily buckets ⇒ a whole weekly tick plus a day of grace
+  evaluation_periods  = 8
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "breaching" # silence from the metric IS the alarm condition
+  datapoints_to_alarm = 8           # ALL eight must breach, pinned against "tuning": 7 days would also always contain a Saturday — with ZERO slack; 8 buys one day of margin against a tick crossing a bucket edge. Lower this and 6 missing-data-as-breaching weekdays make it alarm EVERY week.
+  alarm_actions       = [aws_sns_topic.ops_alarms.arn]
+  ok_actions          = [aws_sns_topic.ops_alarms.arn]
+  tags                = module.label_whisper.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "whisper_target_errors" {
+  count             = var.whisper_enabled ? 1 : 0
+  alarm_name        = "${module.label_whisper.id}-target-errors"
+  alarm_description = "The whisper schedule fired but its lambda target errored — the invoke path is broken."
+  namespace         = "AWS/Scheduler"
+  metric_name       = "TargetErrorCount"
+  # ScheduleGroup is the ONLY dimension AWS/Scheduler emits (measured against the docs
+  # 2026-08-28 — there is NO ScheduleName dimension; a per-schedule alarm would sit on missing
+  # data forever). The whisper has its own dedicated group, so this IS the whisper's metric.
+  dimensions = {
+    ScheduleGroup = aws_scheduler_schedule_group.whisper[0].name
+  }
+  statistic           = "Sum"
+  period              = 86400
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.ops_alarms.arn]
+  tags                = module.label_whisper.tags
+}

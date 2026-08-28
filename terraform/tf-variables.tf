@@ -72,3 +72,15 @@ variable "ops_alarm_email" {
   type        = string
   description = "Email endpoint for the ops-alarm SNS topic."
 }
+
+variable "whisper_enabled" {
+  type        = bool
+  default     = false # flipped in production.tfvars; default-off so plan-only environments stay silent
+  description = "The attic whispers: weekly forgotten-treasure nudge (spec: docs/spec-attic-whispers.md). Creates the schedule, the whisper webhook SSM container, and the never-ran alarm."
+}
+
+variable "whisper_schedule_expression" {
+  type        = string
+  default     = "cron(0 10 ? * SAT *)"
+  description = "Whisper cadence in America/New_York (EventBridge Scheduler is timezone-aware; classic rules are UTC-only and drift an hour across DST, which is why this rides aws_scheduler_schedule). ⚠️ The whisper-log slot key is the ISO WEEK — grain coupled to a weekly cadence; a sub-weekly schedule must change the slot derivation in fulfillment in the same commit."
+}
