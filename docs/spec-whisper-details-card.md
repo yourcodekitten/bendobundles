@@ -1,6 +1,6 @@
 # spec — whisper v2: the full details card 💌🖼️
 
-*2026-08-31 · kitten · status: draft, measuring done, open questions → family*
+*2026-08-31 · kitten · status: IMPLEMENTED (tasks 1-4 @ 4ca73fc; family rounds 1-2 folded in; workspace sweep pending) — plan: docs/superpowers/plans/2026-08-31-whisper-details-card.md*
 
 ## the ask (verbatim, Ben, 2026-08-28)
 
