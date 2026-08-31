@@ -4782,7 +4782,10 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
             return FulfillResponse::Whispered;
         }
     }
-    let text = whisper::whisper_message(pick, &deps.whisper_site_url);
+    // TEMPORARY shim (Task 1 of docs/superpowers/plans/2026-08-31-whisper-details-card.md):
+    // content-only, v1 wire behavior — the full card body ships in Task 3's send swap.
+    let card = whisper::whisper_card(pick, None, &deps.whisper_site_url, cycle, &slot, None);
+    let text = card["content"].as_str().unwrap_or_default().to_string();
     if whisper_send(&deps.http, &whisper_url, &text).await {
         if let Err(e) = deps.store.mark_whisper_delivered(&slot).await {
             tracing::error!(error = ?e, slot, "whisper sent but mark failed — item stays a receipt; the game re-eligible next tick");

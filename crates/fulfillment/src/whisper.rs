@@ -87,22 +87,122 @@ pub fn select<'a>(pool: &[&'a Game], julian_day: i64) -> Option<&'a Game> {
     Some(effective[idx])
 }
 
-/// The whisper itself — the friend-surface voice (lowercase, ♡), never the operator register.
-/// Discord unfurls the bare art URL into the image; the deep-link lands on the admin catalog
-/// pre-filtered to the treasure (`Catalog.tsx` already reads `?q=` — zero web changes).
-pub fn whisper_message(game: &Game, site_url: &str) -> String {
+// ── the details card (spec: docs/spec-whisper-details-card.md) ───────────────────────────────
+// Discord API limits. The gallery grouping below (≤4 embeds sharing one identical `url` merge
+// their images) is CLIENT RENDERING, not API contract — if it ever stops, the card degrades to a
+// tall column of single-image embeds, nothing lost; nothing may ASSUME three groups.
+
+pub const EMBED_TITLE_MAX: usize = 256;
+pub const EMBED_DESC_MAX: usize = 4096;
+pub const EMBED_FIELD_VALUE_MAX: usize = 1024;
+pub const EMBED_TOTAL_TEXT_MAX: usize = 6000;
+pub const MAX_EMBEDS: usize = 10;
+pub const GALLERY_GROUP: usize = 4;
+
+/// Char-boundary-safe truncation with a `…` marker. `max` counts CHARS (Discord counts
+/// characters, not bytes).
+pub(crate) fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Which shape a 🔍 preview is showing — the footer names it, because the two render identically
+/// otherwise (family round 1, Lilith ③).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewKind {
+    NewestDelivered,
+    DryRunPick,
+}
+
+impl PreviewKind {
+    fn label(self) -> &'static str {
+        match self {
+            PreviewKind::NewestDelivered => "newest delivered",
+            PreviewKind::DryRunPick => "today's dry pick",
+        }
+    }
+}
+
+/// The footer, one constructor: preview marking is a PREFIX (travels with the embeds), the
+/// trimmed/trailer-cut markers SUFFIXES. `trailer_cut` names the highest-priority loser when even
+/// the link cannot fit — a budget that can't seat its highest-priority element needs a stated
+/// loser, not an accident.
+fn footer_text(
+    cycle: u32,
+    slot: &str,
+    preview: Option<PreviewKind>,
+    trimmed: bool,
+    trailer_cut: bool,
+) -> String {
+    let mut f = String::new();
+    if let Some(k) = preview {
+        f.push_str(&format!("🔍 preview — {} · ", k.label()));
+    }
+    f.push_str(&format!("the attic whispers · cycle {cycle} · {slot}"));
+    if trimmed {
+        f.push_str(" · trimmed to fit");
+    }
+    if trailer_cut {
+        f.push_str(" · trailer link cut");
+    }
+    f
+}
+
+/// The full webhook body: the v1 voice in `content` (minus the bare art URL — the embed carries
+/// art now) + the details-card embeds. Pure on purpose: every Discord-limit rule is pinned by a
+/// test below and the handler just POSTs the value.
+///
+/// `allowed_mentions: {"parse": []}` is documented as covering message CONTENT; the steam-wire
+/// text in the embeds is protected by a DIFFERENT, observed-but-uncited behavior (embeds do not
+/// render mentions). Two layers, two halves — do not claim the field covers the embeds.
+pub fn whisper_card(
+    game: &Game,
+    steam: Option<&dynamo::SteamAppCache>,
+    site_url: &str,
+    cycle: u32,
+    slot: &str,
+    preview: Option<PreviewKind>,
+) -> serde_json::Value {
     let q = urlencoding::encode(&game.title);
-    let mut m = format!(
+    let mut content = format!(
         "🕯️ *from the attic…*\n**{title}** has been sleeping in *{bundle}*.\ncut a link for someone ♡ → {site}/admin/catalog?q={q}",
         title = game.title,
         bundle = game.bundle,
         site = site_url,
     );
-    if let Some(art) = &game.artwork_url {
-        m.push('\n');
-        m.push_str(art);
+    if let Some(k) = preview {
+        content = format!("🔍 *preview — {}, not a new whisper*\n{content}", k.label());
     }
-    m
+    let embeds = build_embeds(game, steam, cycle, slot, preview);
+    serde_json::json!({
+        "content": content,
+        "embeds": embeds,
+        "allowed_mentions": { "parse": [] },
+    })
+}
+
+/// Fallback embed only for now (the full card lands with the steam half).
+fn build_embeds(
+    game: &Game,
+    _steam: Option<&dynamo::SteamAppCache>,
+    cycle: u32,
+    slot: &str,
+    preview: Option<PreviewKind>,
+) -> Vec<serde_json::Value> {
+    let title = trunc(&game.title, EMBED_TITLE_MAX);
+    let trimmed = title != game.title;
+    let mut e = serde_json::json!({
+        "title": title,
+        "footer": { "text": footer_text(cycle, slot, preview, trimmed, false) },
+    });
+    if let Some(art) = &game.artwork_url {
+        e["image"] = serde_json::json!({ "url": art });
+    }
+    vec![e]
 }
 
 #[cfg(test)]
@@ -243,25 +343,86 @@ mod tests {
     }
 
     #[test]
-    fn message_carries_title_bundle_deeplink_and_art() {
+    fn card_without_steam_carries_v1_information() {
         let g = game_with_bundle(
             "g1",
             "Overgrowth",
             "Humble Indie Bundle 9",
             Some("https://art/x.png"),
         );
-        let m = whisper_message(&g, "https://bendobundles.com");
-        assert!(m.contains("**Overgrowth**"));
-        assert!(m.contains("Humble Indie Bundle 9"));
-        assert!(m.contains("https://bendobundles.com/admin/catalog?q=Overgrowth"));
-        assert!(m.contains("https://art/x.png"));
-        assert!(m.starts_with("🕯️")); // the register is the friend voice, not the ops voice
+        let v = whisper_card(&g, None, "https://bendobundles.com", 0, "2026-W36", None);
+        let content = v["content"].as_str().unwrap();
+        assert!(content.starts_with("🕯️")); // the register is the friend voice, not the ops voice
+        assert!(content.contains("**Overgrowth**"));
+        assert!(content.contains("Humble Indie Bundle 9"));
+        assert!(content.contains("https://bendobundles.com/admin/catalog?q=Overgrowth"));
+        assert!(!content.contains("https://art/x.png")); // art rides the embed now, never the content
+        let embeds = v["embeds"].as_array().unwrap();
+        assert_eq!(embeds.len(), 1);
+        assert_eq!(embeds[0]["title"], "Overgrowth");
+        assert_eq!(embeds[0]["image"]["url"], "https://art/x.png");
+        assert_eq!(v["allowed_mentions"]["parse"].as_array().unwrap().len(), 0);
     }
 
     #[test]
-    fn deeplink_urlencodes_the_title() {
+    fn card_deeplink_urlencodes_the_title() {
         let g = game_with_bundle("g1", "Papers, Please", "HB 12", None);
-        let m = whisper_message(&g, "https://bendobundles.com");
-        assert!(m.contains("catalog?q=Papers%2C%20Please"));
+        let v = whisper_card(&g, None, "https://bendobundles.com", 0, "2026-W36", None);
+        assert!(v["content"].as_str().unwrap().contains("catalog?q=Papers%2C%20Please"));
+    }
+
+    #[test]
+    fn card_preview_marks_content_and_footer_and_names_its_kind() {
+        let g = game("g1", "aaa", None);
+        let real = whisper_card(&g, None, "https://s", 0, "2026-W36", None);
+        let prev = whisper_card(
+            &g,
+            None,
+            "https://s",
+            0,
+            "2026-W36",
+            Some(PreviewKind::NewestDelivered),
+        );
+        let dry = whisper_card(
+            &g,
+            None,
+            "https://s",
+            0,
+            "2026-W36",
+            Some(PreviewKind::DryRunPick),
+        );
+        assert!(prev["content"].as_str().unwrap().starts_with("🔍 *preview"));
+        // the FOOTER is the mechanism — it travels with the embeds, the part anyone looks at
+        assert!(prev["embeds"][0]["footer"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("🔍 preview — newest delivered"));
+        assert!(dry["embeds"][0]["footer"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("🔍 preview — today's dry pick"));
+        let strip = |v: &serde_json::Value| {
+            v["embeds"][0]["footer"]["text"]
+                .as_str()
+                .unwrap()
+                .rsplit("the attic whispers")
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(strip(&real), strip(&prev)); // same card body under the marking
+        assert!(!real["content"].as_str().unwrap().contains("preview"));
+        assert!(!real["embeds"][0]["footer"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("preview"));
+    }
+
+    #[test]
+    fn trunc_is_char_boundary_safe() {
+        assert_eq!(trunc("abc", 5), "abc");
+        assert_eq!(trunc("abcdef", 5), "abcd…");
+        let s = "♡♡♡♡"; // 3-byte chars — a byte-index cut would panic
+        assert_eq!(trunc(s, 3), "♡♡…");
     }
 }
