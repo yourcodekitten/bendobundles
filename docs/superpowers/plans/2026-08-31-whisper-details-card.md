@@ -157,8 +157,10 @@ pub fn whisper_card(
 }
 
 /// The footer, one constructor: preview marking is a PREFIX (travels with the embeds), the
-/// trimmed marker a SUFFIX. Every embed-set builder ends by installing this on embeds[0].
-fn footer_text(cycle: u32, slot: &str, preview: Option<PreviewKind>, trimmed: bool) -> String {
+/// trimmed/trailer-cut markers SUFFIXES. Every embed-set builder ends by installing this on
+/// embeds[0]. `trailer_cut` names the highest-priority loser when even the link cannot fit —
+/// a budget that can't seat its highest-priority element needs a stated loser, not an accident.
+fn footer_text(cycle: u32, slot: &str, preview: Option<PreviewKind>, trimmed: bool, trailer_cut: bool) -> String {
     let mut f = String::new();
     if let Some(k) = preview {
         f.push_str(&format!("🔍 preview — {} · ", k.label()));
@@ -166,6 +168,9 @@ fn footer_text(cycle: u32, slot: &str, preview: Option<PreviewKind>, trimmed: bo
     f.push_str(&format!("the attic whispers · cycle {cycle} · {slot}"));
     if trimmed {
         f.push_str(" · trimmed to fit");
+    }
+    if trailer_cut {
+        f.push_str(" · trailer link cut");
     }
     f
 }
@@ -182,7 +187,7 @@ fn build_embeds(
     let trimmed = title != game.title;
     let mut e = serde_json::json!({
         "title": title,
-        "footer": { "text": footer_text(cycle, slot, preview, trimmed) },
+        "footer": { "text": footer_text(cycle, slot, preview, trimmed, false) },
     });
     if let Some(art) = &game.artwork_url {
         e["image"] = serde_json::json!({ "url": art });
@@ -203,7 +208,15 @@ let text = body["content"].as_str().unwrap_or_default().to_string();
 
 - [ ] **Step 4: Run to verify green**
 
-Run: `cargo test -p fulfillment -- --nocapture` — all whisper unit tests + handler tests pass (handler asserts on content substrings, which are preserved verbatim minus the art URL; if `whisper` integration arms assert the art URL in content, update those assertions in this task and say so in the commit).
+Run: `cargo test -p fulfillment -- --nocapture` — all whisper unit tests + handler tests pass.
+MEASURED at plan time (gate-5 MAJOR: an "if" is a judgement call a cold executor cannot resolve —
+so it was resolved here): the seven whisper integration arms at `handler_test.rs:9118-9237`
+(`whisper_envelope_parses` · `dark_param` · `unresolved_param` · `happy_path` · `send_failure` ·
+`second_run_same_slot` · `empty_pool`) all build games via `available_game`, whose `artwork_url`
+is `None` — **no arm asserts the art URL; NONE change in this task.** `happy_path` asserts
+`contains("Overgrowth")` and `contains("from the attic")`, both preserved verbatim in the v2
+content line. If any handler arm goes red here anyway, STOP and re-read it — do not silently
+adjust an assertion this plan says should hold.
 
 - [ ] **Step 5: Commit**
 
@@ -346,6 +359,10 @@ fn card_text_budget_holds_under_hostile_description() {
     let v = whisper_card(&g, Some(&cache), "https://s", 0, "2026-W36", None);
     let embeds = v["embeds"].as_array().unwrap();
     assert_eq!(embeds[0]["title"].as_str().unwrap().chars().count(), EMBED_TITLE_MAX);
+    // gate-5 blocker 2: the trailer link must SURVIVE the hostile description — it is reserved
+    // before truncation, never the tail that gets cut
+    assert!(embeds[0]["description"].as_str().unwrap().contains("[🎬 watch the trailer]"));
+    assert!(embeds[0]["footer"]["text"].as_str().unwrap().contains("trimmed to fit"));
     let total: usize = embeds.iter().map(|e| {
         e["title"].as_str().unwrap_or("").chars().count()
             + e["description"].as_str().unwrap_or("").chars().count()
@@ -415,7 +432,7 @@ fn build_embeds(
     // footer + fields text participate in the 6000 budget; compute the fixed parts first and
     // give the description whatever remains. Worst-case footer (preview + trimmed) is budgeted so
     // flipping `trimmed` late can never overflow what was already measured.
-    let footer_max = footer_text(cycle, slot, preview, true);
+    let footer_max = footer_text(cycle, slot, preview, true, true);
 
     let mut fields: Vec<(String, String)> = Vec::new();
     if let Some(d) = detail {
@@ -450,20 +467,36 @@ fn build_embeds(
         .sum();
     let fixed = title_len_after_trunc(&game.title) + footer_max.chars().count() + fields_chars;
 
+    // TRAILER LINK SURVIVES TRUNCATION BY CONSTRUCTION (gate-5 blocker 2 + Lilith's edge): trunc
+    // cuts the TAIL and the link was the tail — any near-budget description silently ate the
+    // trailer. The loser order is STATED, not accidental: ① description tail loses to the link
+    // (reserve the link's chars first, truncate only the body); ② if the link ITSELF cannot fit,
+    // it is cut and the footer NAMES it — no unsigned subtraction anywhere near the boundary
+    // (debug panic / release wrap-to-usize::MAX → 6000 blown → Discord 400 → whisper not sent).
+    // NOTE: arm ② is unreachable through whisper_card's real inputs today (worst-case fixed text
+    // ≈5.6k of 6000, link ≈60) — guarded anyway because the spec promises the build is TOTAL, and
+    // commented as defensive rather than tested with a fixture no input can produce.
     let mut description = String::new();
+    let mut trailer_cut = false;
     if let Some(d) = detail {
-        description = d.short_description.clone();
-        if d.video_hls_url.is_some() {
-            if let Some(u) = &store_url {
-                // copy promises nothing: age-gated titles show a gate, never write "autoplays"
-                description.push_str(&format!("\n\n[🎬 watch the trailer]({u})"));
-            }
+        let link = match (&d.video_hls_url, &store_url) {
+            (Some(_), Some(u)) => format!("\n\n[🎬 watch the trailer]({u})"),
+            _ => String::new(),
+        };
+        let total_budget = EMBED_DESC_MAX.min(EMBED_TOTAL_TEXT_MAX.saturating_sub(fixed));
+        let link_len = link.chars().count();
+        if link_len <= total_budget {
+            let body = trunc(&d.short_description, total_budget - link_len); // guarded: link_len <= total_budget
+            trimmed |= body != d.short_description;
+            description = format!("{body}{link}");
+        } else {
+            trailer_cut = !link.is_empty();
+            trimmed |= trailer_cut;
+            description = trunc(&d.short_description, total_budget);
+            trimmed |= description != d.short_description;
         }
     }
-    let desc_budget = EMBED_DESC_MAX.min(EMBED_TOTAL_TEXT_MAX.saturating_sub(fixed));
-    let desc_out = trunc(&description, desc_budget);
-    trimmed |= desc_out != description;
-    if !desc_out.is_empty() { main["description"] = serde_json::json!(desc_out); }
+    if !description.is_empty() { main["description"] = serde_json::json!(description); }
 
     main["fields"] = serde_json::json!(fields.iter().map(|(n, v)| serde_json::json!({
         "name": trunc(n, EMBED_TITLE_MAX), "value": trunc(v, EMBED_FIELD_VALUE_MAX), "inline": true,
@@ -487,7 +520,7 @@ fn build_embeds(
         main["thumbnail"] = serde_json::json!({ "url": t });
     }
 
-    main["footer"] = serde_json::json!({ "text": footer_text(cycle, slot, preview, trimmed) });
+    main["footer"] = serde_json::json!({ "text": footer_text(cycle, slot, preview, trimmed, trailer_cut) });
 
     let mut embeds = vec![main];
     // galleries carry screenshots[1..] (screenshots[0] is embed[0]'s image). Grouping is keyed on
@@ -542,34 +575,89 @@ git commit -S -m "feat(whisper): full details card — fields, review math, 3-gr
 
 **Interfaces:**
 - Consumes: `whisper::whisper_card` (Task 1/2 signature).
-- Produces: `async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> u32` (1 = failure, 0 = success — `deliver`'s exact polarity, incl. the load-bearing `Ok(non-2xx) → 1` arm); `async fn whisper_send_body(http, url, body) -> bool` (`deliver_json(..) == 0`).
+- Produces: `async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> u32` (1 = failure, 0 = success — `deliver`'s exact polarity, incl. the load-bearing `Ok(non-2xx) → 1` arm); `async fn whisper_send_body(http, url, body) -> bool` (`deliver_json(..) == 0`); `#[doc(hidden)] pub async fn whisper_send_body_for_test(url: &str, body: &serde_json::Value) -> bool` (the test seam, consumed by this task's own 429 arm and nothing else).
 
 - [ ] **Step 1: Write the failing integration tests** (handler_test.rs, next to the existing whisper arms; reuse `deps_whisper` + the discord MockServer)
 
 ```rust
-#[tokio::test]
-async fn whisper_posts_embed_card_with_mention_denial() {
-    // existing deps_whisper harness: listable game WITH steam_app_id + a seeded SteamAppCache row,
-    // discord MockServer capturing the POST
-    // (seed the cache via store.put_steam_app / the same seam sync tests use)
-    // assert on the captured request body:
-    //   body["embeds"] is a non-empty array
-    //   body["embeds"][0]["title"] == the picked game title
-    //   body["allowed_mentions"]["parse"] == []
-    //   body["content"] starts with "🕯️"
+/// Integration-side steam cache fixture (minimal: detail half only — the unit tests own the full
+/// per-field rendering; these arms prove the WIRE). Seeded via put_steam_app Absent guard.
+fn seeded_cache(app_id: u32) -> dynamo::SteamAppCache {
+    dynamo::SteamAppCache {
+        app_id,
+        detail: Some(steam_client::SteamAppDetail {
+            app_id,
+            name: "Overgrowth".into(),
+            developers: vec!["Wolfire".into()],
+            publishers: vec![],
+            genres: vec!["Action".into()],
+            release_date: Some("Oct 16, 2017".into()),
+            short_description: "a rabbit does kung fu.".into(),
+            header_image: Some("https://cdn/header.jpg".into()),
+            video_hls_url: None,
+            video_thumbnail: None,
+            screenshots: vec![],
+            tags: vec![],
+            content_descriptor_ids: vec![],
+            content_notes: None,
+        }),
+        overall: None,
+        recent: None,
+        fetched_at: 0,
+        reviews_fetched_at: 0,
+    }
 }
 
 #[tokio::test]
-async fn whisper_steam_cache_read_failure_degrades_to_fallback_card() {
-    // game has steam_app_id but NO cache row → embeds.len() == 1, still delivered=true
+async fn whisper_posts_embed_card_with_mention_denial() {
+    let Some(store) = store_or_skip("whisper-card").await else { return; };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&wh).await;
+    let mut g = available_game("g1", "Overgrowth");
+    g.steam_app_id = Some(570);
+    store.put_game(&g).await.unwrap();
+    store.put_steam_app(&seeded_cache(570), dynamo::SteamAppPutGuard::Absent).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    let reqs = wh.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(!body["embeds"].as_array().unwrap().is_empty()); // the card is ON THE WIRE
+    assert_eq!(body["embeds"][0]["title"], "Overgrowth");
+    assert!(body["embeds"][0]["description"].as_str().unwrap().contains("a rabbit does kung fu."));
+    assert_eq!(body["allowed_mentions"]["parse"].as_array().unwrap().len(), 0); // #174, on the new shape
+    assert!(body["content"].as_str().unwrap().starts_with("🕯️"));
+}
+
+#[tokio::test]
+async fn whisper_steam_cache_miss_degrades_to_fallback_card_still_delivered() {
+    let Some(store) = store_or_skip("whisper-card-nocache").await else { return; };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&wh).await;
+    let mut g = available_game("g1", "Aaa");
+    g.steam_app_id = Some(999_999); // no cache row exists for this app id
+    store.put_game(&g).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    let ws = store.list_whispers().await.unwrap();
+    assert_eq!(ws.len(), 1);
+    assert!(ws[0].delivered); // cache is best-effort: the whisper still went
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(body["embeds"].as_array().unwrap().len(), 1); // fallback card, no phantom galleries
 }
 
 #[tokio::test]
 async fn whisper_send_body_treats_non_2xx_as_failure() {
-    // discord mock answers 429 → whisper_send_body == false; mirrors ping_treats_non_2xx_as_failure
-    // via the existing #[doc(hidden)] seam pattern: add `pub async fn whisper_send_body_for_test`
+    // mirrors ping_treats_non_2xx_as_failure for the JSON twin: a 429 must not read as sent
+    let wh = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(429)).expect(1).mount(&wh).await;
+    let ok = fulfillment::whisper_send_body_for_test(&wh.uri(), &serde_json::json!({"content": "x"})).await;
+    assert!(!ok, "a 429 landed in the success branch — the Ok(non-2xx) arm is missing");
 }
 ```
+
+(Imports this task adds to handler_test.rs: `dynamo::SteamAppPutGuard` — everything else is already
+in scope. `store_or_skip`, `deps_whisper`, `available_game`, `handle` are the file's own fixtures.)
 
 (Write them as real tests against the existing harness — the exact seeding calls are visible in the
 neighboring whisper arms in this same file; follow their shape. The assertions above are the
@@ -581,7 +669,7 @@ captured payload with `discord.received_requests().await.unwrap()` and
 `serde_json::from_slice::<serde_json::Value>(&reqs[0].body)`. For the 429 arm, respond with
 `ResponseTemplate::new(429)` and call the `whisper_send_body_for_test` seam directly.)
 
-- [ ] **Step 2: Run to verify they fail** — `cargo test -p fulfillment --test handler_test whisper` → new arms FAIL (no embeds on the wire yet / helper missing).
+- [ ] **Step 2: Run to verify they fail** — `cargo test -p fulfillment --test handler_test whisper`: `whisper_send_body_treats_non_2xx_as_failure` fails to COMPILE (`whisper_send_body_for_test` not found — the right red for a missing seam); comment it out for one run and the two wire arms fail on ASSERTION (`body["embeds"]` empty/absent — v1 still sends content-only after Task 1's shim). Both failure modes stated so neither surprises.
 
 - [ ] **Step 3: Implement**
 
@@ -650,37 +738,80 @@ git commit -S -m "feat(whisper): send the card — deliver_json twin (non-2xx = 
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
+/// Order-independent whisper-log fingerprint — list order is not contractual, field equality is.
+fn whisper_log_key(ws: &[domain::WhisperRecord]) -> Vec<(String, String, u32, bool)> {
+    let mut k: Vec<_> = ws
+        .iter()
+        .map(|w| (w.slot.clone(), w.game_id.clone(), w.cycle, w.delivered))
+        .collect();
+    k.sort();
+    k
+}
+
 #[tokio::test]
 async fn whisper_preview_resends_newest_delivered_and_writes_nothing() {
-    // seed: whisper log rows (slot "2026-W35" delivered, "2026-W34" delivered) + their game +
-    // steam cache; invoke {"op":"whisper_preview"}
-    // assert: discord mock received ONE POST; body["content"] starts with "🔍 *preview";
-    //         embeds[0]["footer"]["text"] starts with "🔍 preview — newest delivered" (the footer
-    //         is the mechanism — it travels with the embeds);
-    //         embeds[0]["title"] == the W35 game's title (newest delivered, lexicographic max slot
-    //         — slots are zero-padded so lex max IS chronological max);
-    //         whisper log via list_whispers is BYTE-IDENTICAL before/after (zero writes);
-    //         response == {"result":"preview_sent"}
+    let Some(store) = store_or_skip("whisper-preview").await else { return; };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&wh).await;
+    store.put_game(&available_game("g-old", "Older")).await.unwrap();
+    store.put_game(&available_game("g-new", "Newer")).await.unwrap();
+    assert!(store.record_whisper("2026-W34", "g-old", 0).await.unwrap());
+    store.mark_whisper_delivered("2026-W34").await.unwrap();
+    assert!(store.record_whisper("2026-W35", "g-new", 0).await.unwrap());
+    store.mark_whisper_delivered("2026-W35").await.unwrap();
+    let before = whisper_log_key(&store.list_whispers().await.unwrap());
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSent));
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert!(body["content"].as_str().unwrap().starts_with("🔍 *preview"));
+    // the footer is the mechanism — it travels with the embeds, and it names WHICH shape
+    assert!(body["embeds"][0]["footer"]["text"].as_str().unwrap().starts_with("🔍 preview — newest delivered"));
+    // newest delivered = lexicographic max slot (slots are zero-padded ⇒ lex max IS chronological)
+    assert_eq!(body["embeds"][0]["title"], "Newer");
+    let after = whisper_log_key(&store.list_whispers().await.unwrap());
+    assert_eq!(before, after); // ZERO WRITES — field-identical log
 }
 
 #[tokio::test]
 async fn whisper_preview_with_empty_log_previews_todays_pick_without_recording() {
-    // no whisper rows; listable pool non-empty → posts a preview card for select()'s pick,
-    // footer starts with "🔍 preview — today's dry pick" (one word says WHICH shape),
-    // list_whispers is STILL empty afterwards (the dry-run must not record),
-    // response == {"result":"preview_sent"}
+    let Some(store) = store_or_skip("whisper-preview-dry").await else { return; };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&wh).await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSent));
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert!(body["embeds"][0]["footer"]["text"].as_str().unwrap().starts_with("🔍 preview — today's dry pick"));
+    assert!(store.list_whispers().await.unwrap().is_empty()); // the dry-run recorded NOTHING
 }
 
 #[tokio::test]
 async fn whisper_preview_dark_says_blocked_not_whispered() {
-    // Notify::Disabled → zero discord posts, zero writes, ops ping fired (same dark face as
-    // whisper) — AND response == {"result":"preview_blocked"}: silence must not be byte-identical
-    // to sent-fine (Lilith's ③)
+    let Some(store) = store_or_skip("whisper-preview-dark").await else { return; };
+    let ops = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).expect(1).mount(&ops).await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &ops.uri(), Some(ops.uri()), None); // whisper DARK, ops on
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    // Lilith's ③: silence must not be byte-identical to sent-fine — the response says BLOCKED
+    assert!(matches!(r, FulfillResponse::PreviewBlocked));
+    assert!(store.list_whispers().await.unwrap().is_empty()); // zero writes on the dark path
 }
 
 #[tokio::test]
 async fn whisper_preview_dead_webhook_says_send_failed() {
-    // webhook mock answers 500 → response == {"result":"preview_send_failed"}, zero writes
+    let Some(store) = store_or_skip("whisper-preview-500").await else { return; };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(500)).expect(1).mount(&wh).await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSendFailed));
+    assert!(store.list_whispers().await.unwrap().is_empty()); // failure still writes nothing
 }
 
 #[test]
@@ -690,7 +821,7 @@ fn whisper_preview_op_deserializes() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — deserialize test fails first (unknown variant), integration arms fail on dispatch.
+- [ ] **Step 2: Run to verify they fail** — the four integration arms fail to COMPILE (`FulfillRequest::WhisperPreview`, `FulfillResponse::PreviewSent/Blocked/SendFailed` are unresolved paths — the right red for missing variants); `whisper_preview_op_deserializes` additionally fails at runtime on the unknown variant once the enum exists but before dispatch does.
 
 - [ ] **Step 3: Implement**
 

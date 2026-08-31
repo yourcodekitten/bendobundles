@@ -86,6 +86,19 @@ embeds[8..10] (group C, url + "#more2"):  image = screenshots[8..10] → third g
 satisfied, zero silent drops. Groups only exist when they have images; a game with 2 screenshots
 gets one small gallery; a game with none gets the single embed with header art.
 
+**🔴 THE CLASS, named so the fourth instance is caught by design (family round 2 — three
+instances in one morning, one defect):** *a media element dropped silently, with a nearby test
+looking elsewhere.* ① the header/screenshot layout promised 11 images in 10 slots and a test
+PINNED the drop of the 10th (Lilith found the arithmetic; my own catch: a defect with a passing
+test is a specification). ② the trailer link was the truncation's tail — the hostile-description
+test cut it while asserting only the 6000 total (OMBB). ③ the naïve fix's unsigned subtraction
+would have silently no-opped truncation in release and 400'd the whole send (Lilith).
+⇒ **Design rule for every media element on this card, present and future: it has an explicit
+place in a STATED loser order, and either a test asserting it survives or a footer marker naming
+its loss.** Silence is never an outcome. Current order: screenshots+trailer-link outrank header
+art (header → thumbnail chain) · trailer link outranks description tail · if even the link cannot
+fit, it is cut AND the footer says "trailer link cut", never bare "trimmed".
+
 **Provenance, named honestly (OMBB, round 1):**
 - `allowed_mentions: {"parse": []}` is DOCUMENTED as covering message *content*. Embeds are never
   named by the docs; what protects the steam-wire text in embeds is that **embeds do not render
