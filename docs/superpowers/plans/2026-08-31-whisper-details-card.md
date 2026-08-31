@@ -388,7 +388,7 @@ fn card_thumbnail_dropped_when_it_would_duplicate_image() {
 }
 ```
 
-- [ ] **Step 2: Run to verify the new tests fail** — `cargo test -p fulfillment whisper` → the 7 new tests FAIL (missing url/fields/galleries), Task 1's stay green.
+- [ ] **Step 2: Run to verify the new tests fail** — `cargo test -p fulfillment whisper` → every test added in Step 1 FAILS (missing url/fields/galleries — count them in the output rather than trusting a number here), Task 1's stay green.
 
 - [ ] **Step 3: Implement — replace `build_embeds`**
 
@@ -571,7 +571,15 @@ async fn whisper_send_body_treats_non_2xx_as_failure() {
 }
 ```
 
-(Write them as real tests against the existing harness — the exact seeding calls are visible in the neighboring whisper arms; follow their shape. The assertions above are the contract.)
+(Write them as real tests against the existing harness — the exact seeding calls are visible in the
+neighboring whisper arms in this same file; follow their shape. The assertions above are the
+contract. Harness idiom, concretely: `let discord = MockServer::start().await;` +
+`Mock::given(method("POST")).respond_with(ResponseTemplate::new(204)).mount(&discord).await;`,
+build deps via the file's `deps_whisper(...)` fixture pointing `whisper_notify` at
+`discord.uri()`, invoke through the same handler entry the neighboring arms use, then read the
+captured payload with `discord.received_requests().await.unwrap()` and
+`serde_json::from_slice::<serde_json::Value>(&reqs[0].body)`. For the 429 arm, respond with
+`ResponseTemplate::new(429)` and call the `whisper_send_body_for_test` seam directly.)
 
 - [ ] **Step 2: Run to verify they fail** — `cargo test -p fulfillment --test handler_test whisper` → new arms FAIL (no embeds on the wire yet / helper missing).
 
