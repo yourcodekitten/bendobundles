@@ -49,34 +49,55 @@ Discord constraints that shape the design (limits are Discord API constants):
   gallery under the first embed of the group. Distinct `url` values start distinct groups.
 - A webhook embed cannot carry a playable video. The trailer must travel as a link.
 
-### the card, as embeds
+### the card, as embeds — REVISED after family round 1 (Lilith's ① was blocking: the original
+### layout promised header + 10 screenshots = 11 images in 10 slots, and its own test pinned the
+### silent drop of the 10th. The header is the most droppable image — it moves to the thumbnail.
 
 ```
-content: "🕯️ *from the attic…* — cut a link for someone ♡ → {site}/admin/catalog?q={title}"
+content: v1's whisper voice verbatim, minus the bare art URL (the embed carries art now)
 
-embed[0]  (group A url = steam store page, or site deep-link when no steam app):
+embed[0]  (group A url = steam store page; url omitted when no steam app):
   title:        {game.title}                                  (≤256, truncated defensively)
   url:          https://store.steampowered.com/app/{app_id}
   description:  {short_description}
-                + "\n\n🎬 [watch the trailer](store page)"    (only when video_hls_url present)
+                + "\n\n🎬 [watch the trailer](store page)"    (only when video_hls_url present;
+                  copy promises nothing — age-gated titles show a gate, never write "autoplays")
   fields (inline):
     "by"       → developers · publishers (pubs suppressed when == devs)
     "released" → release_date
     "tags"     → tags ?? genres, joined " · "
     "reviews"  → "{overall.desc} — {pct}% of {total} ({recent}% of {n} recent)"
     "bundle"   → {game.bundle} ({key_type})
-  image:        header_image ?? artwork_url
-  thumbnail:    video_thumbnail ?? artwork_url  (small corner art; skipped if == image)
+  image:        screenshots[0].full  — when screenshots exist
+                header_image ?? artwork_url — when none (nothing displaced)
+  thumbnail:    video_thumbnail ?? header_image ?? artwork_url  (dropped when == image)
   footer:       "the attic whispers · cycle {cycle} · {slot}"
+                (+ "🔍 preview — newest delivered|today's dry pick · " PREFIX in preview mode —
+                 the marking travels with the salient part, not only in content)
+                (+ " · trimmed to fit" SUFFIX when ANY truncation fired — a drop must announce
+                 itself in production, not only in tests)
 
-embeds[1..3]  (group A, same url): image = screenshots[0..3]   → 4-image gallery incl. header
-embeds[4..7]  (group B, url + "#more"):  image = screenshots[3..7]   → second gallery
-embeds[8..9]  (group C, url + "#more2"): image = screenshots[7..10]  → third gallery (partial)
+embeds[1..4]  (group A, same url):        image = screenshots[1..4]  → 4-image gallery w/ embed[0]
+embeds[4..8]  (group B, url + "#more"):   image = screenshots[4..8]  → second gallery
+embeds[8..10] (group C, url + "#more2"):  image = screenshots[8..10] → third gallery (partial)
 ```
 
-10 embeds total ⇒ header + up to **10 screenshots** — the card's own cap is 10 screenshots, so
-"all of the media" is literally satisfied. Groups only exist when they have images; a game with 2
-screenshots gets one small gallery; a game with none gets the single embed with header art.
+10 embeds ⇒ **all 10 screenshots** (the card's own cap) — "all of the media" is literally
+satisfied, zero silent drops. Groups only exist when they have images; a game with 2 screenshots
+gets one small gallery; a game with none gets the single embed with header art.
+
+**Provenance, named honestly (OMBB, round 1):**
+- `allowed_mentions: {"parse": []}` is DOCUMENTED as covering message *content*. Embeds are never
+  named by the docs; what protects the steam-wire text in embeds is that **embeds do not render
+  mentions at all** — **observed behaviour, UNCITED** (neither account in the family round had a
+  citation; agreement between reviewers is not a source). Two layers, each covering its own half;
+  moving text across the content/embed line changes which guarantee applies. Both halves stay
+  pinned by tests on the payload we send (Discord's behavior is not ours to test; the field is).
+- The 4-per-gallery `url`-grouping is **client rendering, not API contract** (the 10-embed cap IS
+  documented). **The failure mode, written down instead of the trick:** if grouping ever stops,
+  Discord renders 10 stacked single-image embeds — a long scroll, no error, nothing lost.
+  Survivable exactly as long as nothing downstream ASSUMES three groups — do not build anything
+  that counts galleries.
 
 ### fallbacks — delight never gates (PRODUCT principle 5, same as v1 select())
 
@@ -95,7 +116,9 @@ screenshots gets one small gallery; a game with none gets the single embed with 
   The embed body carries wire-derived text (title, description from Steam); the mention-power
   denial must cover it exactly as it covers content.
 - The whisper voice: lowercase, ♡, friend register. The embed is the card; the content line is
-  still the whisper.
+  still the whisper. **Audience vs voice, disambiguated on purpose (OMBB, round 1): the whisper
+  goes to BEN'S channel; "friend-surface" names the VOICE, never the audience.** No friend reads
+  this room — don't get cautious about the wrong thing later.
 
 ## the preview envelope — `{"op":"whisper_preview"}` (Ben's parked idea, riding along)
 
@@ -103,10 +126,18 @@ A no-write sibling: re-render and re-send the card for **the most recent deliver
 (fall back: the pick select() would make today, clearly marked), so Ben can see card changes
 without spending a weekly slot.
 
-- ZERO writes: no record, no mark, no cycle movement. Reuses the dark-gate (both faces) verbatim.
+- ZERO writes: no record, no mark, no cycle movement. Reuses the dark-gate (both faces) verbatim
+  via an extracted `resolve_whisper_url` — the family-reviewed wording moves, unedited.
 - Sends to the whisper webhook (it previews the whisper channel's rendering — an ops-channel
-  preview would render under different channel settings and prove nothing), prefixed
-  `🔍 *preview — not this week's whisper*` in content so it can never be mistaken for a real one.
+  preview would render under different channel settings and prove nothing). Marked 🔍 in BOTH the
+  content prefix AND the footer (the footer is the mechanism — it travels with the embeds, the
+  part anyone actually looks at), and the marking names WHICH shape is being previewed:
+  `newest delivered` vs `today's dry pick` (they render identically otherwise; one word fixes it).
+- **Three-valued response, not `Whispered`** (Lilith's ③: a binary response has nowhere to put
+  "the gate refused" — dark-preview silence would be byte-identical to sent-fine and to 500'd):
+  `preview_sent` · `preview_blocked` (dark ①a/①b, unreadable log/game, empty pool — each face
+  still emits its own distinct ping/log naming why) · `preview_send_failed`. Ben invokes by hand,
+  so the lambda response JSON is exactly where the verdict lands.
 - Invocable only like every other envelope: by whoever holds lambda:InvokeFunction on fulfillment
   (Ben's CLI / the two API lambdas' IAM). No schedule, no new infra.
 
@@ -126,14 +157,17 @@ without spending a weekly slot.
    `FulfillResponse` reuse of `Whispered`.
 3. No terraform, no IAM, no schedule change. Deploy = the #210 runbook (CI-built zips).
 
-## open questions (→ OMBB + Lilith, shared channel)
+## open questions — ALL RESOLVED, family round 1 (2026-08-31 morning, shared channel)
 
-1. **Media coverage:** 3 gallery groups / 10 embeds = every screenshot, but a TALL message. The
-   tasteful alternative: one 4-image gallery + a "＋N more on steam" note. Ben's words say ALL;
-   taste says the second. Which wins? (My lean: all 10 — his sentence is explicit, and Discord
-   collapses galleries compactly.)
-2. **Trailer:** `video_hls_url` is an .m3u8 — not browser-playable as a bare link. Card users get
-   the in-modal player; Discord can't. Proposal: `🎬 watch the trailer` markdown link → the steam
-   store page (trailer autoplays at top). Anyone see a better throat?
-3. **Preview recipient:** whisper webhook (marked) per above — anyone want it on the ops webhook
-   instead?
+1. **Media coverage: ALL 10 — and the original layout couldn't deliver it.** Lilith (blocking):
+   header + 10 screenshots = 11 images in 10 slots; my own plan test had pinned the silent drop of
+   the 10th. Fix adopted whole: embed[0] carries screenshots[0], header moves to the thumbnail
+   chain. 10/10, zero silent drops.
+2. **Trailer: store-page link, settled by measurement** — OMBB grepped the captured payload
+   (`docs/superpowers/specs/captures/2026-07-06-steam/appdetails-413150-trimmed.json` movies[0]:
+   dash_av1/dash_h264/hls_h264 only) + my own July note: Steam is HLS/DASH-only now, no mp4 to
+   post. Copy promises nothing ("watch the trailer", never "autoplays" — age gates exist). Never
+   pattern-derive an mp4 from the .m3u8: a guessed URL that resolves is the worst kind of working.
+3. **Preview: same channel, marked in the footer, three-valued response** — see the preview
+   section. Plus Lilith's unasked fourth: any truncation announces itself in the footer
+   (" · trimmed to fit"), so the 6000-budget can never silently eat the review meter.
