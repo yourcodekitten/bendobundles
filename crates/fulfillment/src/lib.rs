@@ -4662,7 +4662,11 @@ async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Valu
     match http.post(url).json(body).send().await {
         Ok(r) if r.status().is_success() => 0,
         Ok(r) => {
-            tracing::error!(status = %r.status(), "whisper card POST non-success");
+            tracing::error!(
+                outcome = "whisper_http_error",
+                status = %r.status(),
+                "whisper card POST non-success"
+            );
             1
         }
         Err(e) => {

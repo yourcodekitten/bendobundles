@@ -98,6 +98,15 @@ pub const EMBED_FIELD_VALUE_MAX: usize = 1024;
 pub const EMBED_TOTAL_TEXT_MAX: usize = 6000;
 pub const MAX_EMBEDS: usize = 10;
 pub const GALLERY_GROUP: usize = 4;
+/// Discord's cap on message CONTENT — separate from every embed budget, audited separately
+/// (pass-1 review: the embed budgets were airtight while content had no guard at all).
+pub const CONTENT_MAX: usize = 2000;
+/// Display caps inside the content voice line. Losers to the deep-link, the stated winner.
+pub const CONTENT_TITLE_MAX: usize = 180;
+pub const CONTENT_BUNDLE_MAX: usize = 180;
+/// Raw-prefix cap for the catalog query token — a FILTER, not a display: cut without the `…`
+/// marker (an encoded ellipsis would break `Catalog.tsx`'s substring match).
+pub const CONTENT_QUERY_MAX: usize = 120;
 
 /// Char-boundary-safe truncation with a `…` marker. `max` counts CHARS (Discord counts
 /// characters, not bytes).
@@ -167,11 +176,16 @@ pub fn whisper_card(
     slot: &str,
     preview: Option<PreviewKind>,
 ) -> serde_json::Value {
-    let q = urlencoding::encode(&game.title);
+    // Content-side loser order (pass-1 review): the deep-link WINS — it is the feature's one-tap
+    // core; display title and bundle are the losers; the query token is a raw prefix. With these
+    // caps the line is structurally bounded far under CONTENT_MAX; the assert is a belt for the
+    // TOTAL promise, not a live truncation site.
+    let q_prefix: String = game.title.chars().take(CONTENT_QUERY_MAX).collect();
+    let q = urlencoding::encode(&q_prefix);
     let mut content = format!(
         "🕯️ *from the attic…*\n**{title}** has been sleeping in *{bundle}*.\ncut a link for someone ♡ → {site}/admin/catalog?q={q}",
-        title = game.title,
-        bundle = game.bundle,
+        title = trunc(&game.title, CONTENT_TITLE_MAX),
+        bundle = trunc(&game.bundle, CONTENT_BUNDLE_MAX),
         site = site_url,
     );
     if let Some(k) = preview {
@@ -895,6 +909,32 @@ mod tests {
                 .iter()
                 .any(|f| f["name"] == "reviews")
         );
+    }
+
+    #[test]
+    fn content_holds_under_hostile_title_and_bundle() {
+        // pass-1 review finding: content has its OWN Discord cap (2000) and carried the title
+        // twice (display + urlencoded query) plus unbounded wire bundle. The deep-link WINS
+        // (feature core); display title/bundle lose; the query is a RAW PREFIX (no … marker —
+        // it is a filter token, and an encoded ellipsis would break the catalog match).
+        let g = game_with_bundle("g1", &"t♡".repeat(300), &"b".repeat(900), None);
+        let v = whisper_card(
+            &g,
+            None,
+            "https://bendobundles.example",
+            0,
+            "2026-W36",
+            Some(PreviewKind::DryRunPick),
+        );
+        let content = v["content"].as_str().unwrap();
+        assert!(
+            content.chars().count() <= CONTENT_MAX,
+            "content {} > {}",
+            content.chars().count(),
+            CONTENT_MAX
+        );
+        assert!(content.contains("/admin/catalog?q=")); // the winner survived
+        assert!(!content.contains("%E2%80%A6")); // no encoded … in the filter token
     }
 
     #[test]
