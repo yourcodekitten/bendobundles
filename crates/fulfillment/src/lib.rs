@@ -4666,7 +4666,15 @@ async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Valu
             1
         }
         Err(e) => {
-            tracing::error!(error = %e, "whisper card POST transport failure");
+            // SEALED like deliver()'s arm and for the same reason (#171): reqwest's Display
+            // APPENDS the request URL unredacted, and the whisper webhook URL carries its token
+            // in the path — a credential this codebase already keeps out of read-side logs.
+            // without_url() keeps the kind (the diagnostic half). Do not swap back to %e.
+            tracing::error!(
+                outcome = "whisper_transport",
+                error = %e.without_url(),
+                "whisper card POST transport failure"
+            );
             1
         }
     }
