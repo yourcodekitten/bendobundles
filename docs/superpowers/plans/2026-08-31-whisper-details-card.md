@@ -33,7 +33,7 @@
 - Produces: `pub fn whisper_card(game: &Game, steam: Option<&dynamo::SteamAppCache>, site_url: &str, cycle: u32, slot: &str, preview: Option<PreviewKind>) -> serde_json::Value` — the FULL webhook body `{content, embeds, allowed_mentions}`. Preview marking lives in BOTH the content prefix and the footer (footer names the kind: `newest delivered` / `today's dry pick`).
 - Produces: `pub(crate) fn trunc(s: &str, max: usize) -> String` — char-boundary-safe, `…`-suffixed.
 
-- [ ] **Step 1: Write the failing tests** (append to whisper.rs `mod tests`; delete `message_carries_title_bundle_deeplink_and_art` and `deeplink_urlencodes_the_title` in the same edit — their assertions move here)
+- [x] **Step 1: Write the failing tests** (append to whisper.rs `mod tests`; delete `message_carries_title_bundle_deeplink_and_art` and `deeplink_urlencodes_the_title` in the same edit — their assertions move here)
 
 ```rust
 #[test]
@@ -85,12 +85,12 @@ fn trunc_is_char_boundary_safe() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p fulfillment whisper -- --nocapture` (from repo root)
 Expected: FAIL — `whisper_card` / `trunc` not found (and the two deleted tests gone).
 
-- [ ] **Step 3: Minimal implementation**
+- [x] **Step 3: Minimal implementation**
 
 ```rust
 pub const EMBED_TITLE_MAX: usize = 256;
@@ -206,7 +206,7 @@ let text = body["content"].as_str().unwrap_or_default().to_string();
 
 (The shim keeps v1 wire behavior — content-only — so this task is independently shippable; Task 3 swaps the send itself.)
 
-- [ ] **Step 4: Run to verify green**
+- [x] **Step 4: Run to verify green**
 
 Run: `cargo test -p fulfillment -- --nocapture` — all whisper unit tests + handler tests pass.
 MEASURED at plan time (gate-5 MAJOR: an "if" is a judgement call a cold executor cannot resolve —
@@ -218,7 +218,7 @@ is `None` — **no arm asserts the art URL; NONE change in this task.** `happy_p
 content line. If any handler arm goes red here anyway, STOP and re-read it — do not silently
 adjust an assertion this plan says should hold.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/fulfillment/src/whisper.rs crates/fulfillment/src/lib.rs crates/fulfillment/tests/handler_test.rs
@@ -234,7 +234,7 @@ git commit -S -m "feat(whisper): pure card builder — fallback shape, preview p
 - Consumes: `dynamo::SteamAppCache { detail: Option<steam_client::SteamAppDetail>, overall: Option<ReviewSummary>, recent: Option<RecentReviews>, .. }`
 - Produces: unchanged `whisper_card` signature; `build_embeds` now renders the full card.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 // test helper: a full cache blob with n screenshots
@@ -405,9 +405,9 @@ fn card_thumbnail_dropped_when_it_would_duplicate_image() {
 }
 ```
 
-- [ ] **Step 2: Run to verify the new tests fail** — `cargo test -p fulfillment whisper` → every test added in Step 1 FAILS (missing url/fields/galleries — count them in the output rather than trusting a number here), Task 1's stay green.
+- [x] **Step 2: Run to verify the new tests fail** — `cargo test -p fulfillment whisper` → every test added in Step 1 FAILS (missing url/fields/galleries — count them in the output rather than trusting a number here), Task 1's stay green.
 
-- [ ] **Step 3: Implement — replace `build_embeds`**
+- [x] **Step 3: Implement — replace `build_embeds`**
 
 ```rust
 fn build_embeds(
@@ -558,9 +558,9 @@ fn fmt_thousands(n: u64) -> String {
 }
 ```
 
-- [ ] **Step 4: Run to verify green** — `cargo test -p fulfillment whisper` → all pass. Also `cargo clippy -p fulfillment --all-targets`.
+- [x] **Step 4: Run to verify green** — `cargo test -p fulfillment whisper` → all pass. Also `cargo clippy -p fulfillment --all-targets`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/fulfillment/src/whisper.rs
@@ -577,7 +577,7 @@ git commit -S -m "feat(whisper): full details card — fields, review math, 3-gr
 - Consumes: `whisper::whisper_card` (Task 1/2 signature).
 - Produces: `async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> u32` (1 = failure, 0 = success — `deliver`'s exact polarity, incl. the load-bearing `Ok(non-2xx) → 1` arm); `async fn whisper_send_body(http, url, body) -> bool` (`deliver_json(..) == 0`); `#[doc(hidden)] pub async fn whisper_send_body_for_test(url: &str, body: &serde_json::Value) -> bool` (the test seam, consumed by this task's own 429 arm and nothing else).
 
-- [ ] **Step 1: Write the failing integration tests** (handler_test.rs, next to the existing whisper arms; reuse `deps_whisper` + the discord MockServer)
+- [x] **Step 1: Write the failing integration tests** (handler_test.rs, next to the existing whisper arms; reuse `deps_whisper` + the discord MockServer)
 
 ```rust
 /// Integration-side steam cache fixture (minimal: detail half only — the unit tests own the full
@@ -669,9 +669,9 @@ captured payload with `discord.received_requests().await.unwrap()` and
 `serde_json::from_slice::<serde_json::Value>(&reqs[0].body)`. For the 429 arm, respond with
 `ResponseTemplate::new(429)` and call the `whisper_send_body_for_test` seam directly.)
 
-- [ ] **Step 2: Run to verify they fail** — `cargo test -p fulfillment --test handler_test whisper`: `whisper_send_body_treats_non_2xx_as_failure` fails to COMPILE (`whisper_send_body_for_test` not found — the right red for a missing seam); comment it out for one run and the two wire arms fail on ASSERTION (`body["embeds"]` empty/absent — v1 still sends content-only after Task 1's shim). Both failure modes stated so neither surprises.
+- [x] **Step 2: Run to verify they fail** — `cargo test -p fulfillment --test handler_test whisper`: `whisper_send_body_treats_non_2xx_as_failure` fails to COMPILE (`whisper_send_body_for_test` not found — the right red for a missing seam); comment it out for one run and the two wire arms fail on ASSERTION (`body["embeds"]` empty/absent — v1 still sends content-only after Task 1's shim). Both failure modes stated so neither surprises.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 /// POST one prebuilt JSON body. Same polarity and the same load-bearing Ok(non-2xx)→failure arm
@@ -716,9 +716,9 @@ In `handle_whisper`, replace the shim + send:
 
 (the `mark_whisper_delivered` / cause-④ tail is unchanged; `whisper_send` becomes dead — delete it and its doc block.)
 
-- [ ] **Step 4: Run the full crate** — `cargo test -p fulfillment` (moto on :8000). All green, including every pre-existing whisper arm (they assert content substrings, preserved).
+- [x] **Step 4: Run the full crate** — `cargo test -p fulfillment` (moto on :8000). All green, including every pre-existing whisper arm (they assert content substrings, preserved).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/fulfillment/src/lib.rs crates/fulfillment/tests/handler_test.rs
@@ -735,7 +735,7 @@ git commit -S -m "feat(whisper): send the card — deliver_json twin (non-2xx = 
 - Consumes: `whisper_card(.., preview: Some(PreviewKind::...))`, `whisper_send_body`, `Store::{list_whispers, get_game, get_steam_app}`.
 - Produces: `FulfillRequest::WhisperPreview` (wire: `{"op":"whisper_preview"}`) and THREE new `FulfillResponse` variants (family round 1, Lilith's ③ — a binary response has nowhere to put "the gate refused"): `PreviewSent` / `PreviewBlocked` / `PreviewSendFailed`, wire `{"result":"preview_sent"|"preview_blocked"|"preview_send_failed"}`. Ben invokes by hand; the lambda response JSON is where the verdict lands. `PreviewBlocked` covers dark ①a/①b, unreadable log/game/pool, and empty pool — each cause still emits its own distinct ping/log naming why; the response says only that no preview was sent.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 /// Order-independent whisper-log fingerprint — list order is not contractual, field equality is.
@@ -821,9 +821,9 @@ fn whisper_preview_op_deserializes() {
 }
 ```
 
-- [ ] **Step 2: Run to verify they fail** — the four integration arms fail to COMPILE (`FulfillRequest::WhisperPreview`, `FulfillResponse::PreviewSent/Blocked/SendFailed` are unresolved paths — the right red for missing variants); `whisper_preview_op_deserializes` additionally fails at runtime on the unknown variant once the enum exists but before dispatch does.
+- [x] **Step 2: Run to verify they fail** — the four integration arms fail to COMPILE (`FulfillRequest::WhisperPreview`, `FulfillResponse::PreviewSent/Blocked/SendFailed` are unresolved paths — the right red for missing variants); `whisper_preview_op_deserializes` additionally fails at runtime on the unknown variant once the enum exists but before dispatch does.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Enum + dispatch:
 
@@ -921,9 +921,9 @@ async fn handle_whisper_preview(deps: &Deps) -> FulfillResponse {
 }
 ```
 
-- [ ] **Step 4: Run** — `cargo test -p fulfillment` all green.
+- [x] **Step 4: Run** — `cargo test -p fulfillment` all green.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/fulfillment/src/lib.rs crates/fulfillment/tests/handler_test.rs
@@ -935,10 +935,10 @@ git commit -S -m "feat(whisper): whisper_preview envelope — zero writes, newes
 **Files:**
 - Modify: `docs/spec-whisper-details-card.md` (status → implemented; resolve open questions with family answers), `docs/spec-attic-whispers.md` (one line: payload superseded by v2 spec, selection unchanged)
 
-- [ ] **Step 1:** Update both spec headers/notes as above.
-- [ ] **Step 2:** `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] **Step 3:** Full suite: `cargo test --workspace` (moto on :8000; 29 suites was the 08-28 baseline).
-- [ ] **Step 4:** Commit:
+- [x] **Step 1:** Update both spec headers/notes as above.
+- [x] **Step 2:** `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
+- [x] **Step 3:** Full suite: `cargo test --workspace` (moto on :8000; 29 suites was the 08-28 baseline).
+- [x] **Step 4:** Commit:
 
 ```bash
 git add docs/

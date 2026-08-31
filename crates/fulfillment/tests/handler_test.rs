@@ -9259,8 +9259,13 @@ async fn whisper_preview_resends_newest_delivered_and_writes_nothing() {
         .put_game(&available_game("g-old", "Older"))
         .await
         .unwrap();
+    // g-new carries steam data: the preview exists to preview the CARD, so this arm proves
+    // preview + FULL card on the wire, not only the fallback shape (pass-2 completeness walk)
+    let mut g_new = available_game("g-new", "Newer");
+    g_new.steam_app_id = Some(570);
+    store.put_game(&g_new).await.unwrap();
     store
-        .put_game(&available_game("g-new", "Newer"))
+        .put_steam_app(&seeded_cache(570), dynamo::SteamAppPutGuard::Absent)
         .await
         .unwrap();
     assert!(store.record_whisper("2026-W34", "g-old", 0).await.unwrap());
@@ -9283,6 +9288,13 @@ async fn whisper_preview_resends_newest_delivered_and_writes_nothing() {
     );
     // newest delivered = lexicographic max slot (slots are zero-padded ⇒ lex max IS chronological)
     assert_eq!(body["embeds"][0]["title"], "Newer");
+    // …and it is the FULL card, previewed: steam fields render under the preview marking
+    assert!(
+        body["embeds"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("a rabbit does kung fu.")
+    );
     let after = whisper_log_key(&store.list_whispers().await.unwrap());
     assert_eq!(before, after); // ZERO WRITES — field-identical log
 }
