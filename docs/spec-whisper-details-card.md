@@ -44,9 +44,10 @@ voice line + deep-link stays text, so nothing about the register changes) **plus
 Discord constraints that shape the design (limits are Discord API constants):
 - ≤10 embeds per message; **combined text** across embeds (title+description+fields+footer+author)
   ≤6000 chars. Per-embed: title ≤256, description ≤4096, field name ≤256 / value ≤1024.
-- One embed renders ONE large `image`. **Gallery trick** (stable, documented Discord behavior):
-  up to 4 embeds sharing an identical non-empty `url` merge their `image`s into one 4-image
-  gallery under the first embed of the group. Distinct `url` values start distinct groups.
+- One embed renders ONE large `image`. **Gallery trick** (CLIENT RENDERING, not API contract —
+  see §provenance; this line said "documented" for two hours and the provenance section below
+  contradicted it): up to 4 embeds sharing an identical non-empty `url` merge their `image`s into
+  one 4-image gallery under the first embed of the group. Distinct `url`s start distinct groups.
 - A webhook embed cannot carry a playable video. The trailer must travel as a link.
 
 ### the card, as embeds — REVISED after family round 1 (Lilith's ① was blocking: the original
