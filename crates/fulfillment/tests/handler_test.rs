@@ -9120,6 +9120,113 @@ fn whisper_envelope_parses() {
     assert!(matches!(r, FulfillRequest::Whisper));
 }
 
+/// Integration-side steam cache fixture (minimal: detail half only — the unit tests own the full
+/// per-field rendering; these arms prove the WIRE). Seeded via put_steam_app Absent guard.
+fn seeded_cache(app_id: u32) -> dynamo::SteamAppCache {
+    dynamo::SteamAppCache {
+        app_id,
+        detail: Some(steam_client::SteamAppDetail {
+            app_id,
+            name: "Overgrowth".into(),
+            developers: vec!["Wolfire".into()],
+            publishers: vec![],
+            genres: vec!["Action".into()],
+            release_date: Some("Oct 16, 2017".into()),
+            short_description: "a rabbit does kung fu.".into(),
+            header_image: Some("https://cdn/header.jpg".into()),
+            video_hls_url: None,
+            video_thumbnail: None,
+            screenshots: vec![],
+            tags: vec![],
+            content_descriptor_ids: vec![],
+            content_notes: None,
+        }),
+        overall: None,
+        recent: None,
+        fetched_at: 0,
+        reviews_fetched_at: 0,
+    }
+}
+
+#[tokio::test]
+async fn whisper_posts_embed_card_with_mention_denial() {
+    let Some(store) = store_or_skip("whisper-card").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    let mut g = available_game("g1", "Overgrowth");
+    g.steam_app_id = Some(570);
+    store.put_game(&g).await.unwrap();
+    store
+        .put_steam_app(&seeded_cache(570), dynamo::SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    let reqs = wh.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(!body["embeds"].as_array().unwrap().is_empty()); // the card is ON THE WIRE
+    assert_eq!(body["embeds"][0]["title"], "Overgrowth");
+    assert!(
+        body["embeds"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("a rabbit does kung fu.")
+    );
+    assert_eq!(
+        body["allowed_mentions"]["parse"].as_array().unwrap().len(),
+        0
+    ); // #174, new shape
+    assert!(body["content"].as_str().unwrap().starts_with("🕯️"));
+}
+
+#[tokio::test]
+async fn whisper_steam_cache_miss_degrades_to_fallback_card_still_delivered() {
+    let Some(store) = store_or_skip("whisper-card-nocache").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    let mut g = available_game("g1", "Aaa");
+    g.steam_app_id = Some(999_999); // no cache row exists for this app id
+    store.put_game(&g).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    let ws = store.list_whispers().await.unwrap();
+    assert_eq!(ws.len(), 1);
+    assert!(ws[0].delivered); // cache is best-effort: the whisper still went
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(body["embeds"].as_array().unwrap().len(), 1); // fallback card, no phantom galleries
+}
+
+#[tokio::test]
+async fn whisper_send_body_treats_non_2xx_as_failure() {
+    // mirrors ping_treats_non_2xx_as_failure for the JSON twin: a 429 must not read as sent
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    let ok =
+        fulfillment::whisper_send_body_for_test(&wh.uri(), &serde_json::json!({"content": "x"}))
+            .await;
+    assert!(
+        !ok,
+        "a 429 landed in the success branch — the Ok(non-2xx) arm is missing"
+    );
+}
+
 #[tokio::test]
 async fn whisper_dark_param_writes_nothing_and_pings_ops() {
     let Some(store) = store_or_skip("whisper-dark").await else {

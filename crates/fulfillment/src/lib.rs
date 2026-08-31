@@ -4637,14 +4637,37 @@ async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
     }
 }
 
-/// Send one whisper. `true` ⇔ the POST landed. Calls [`deliver`] directly — NOT `ping_msg` —
-/// because the whisper is not an operator message: different webhook, different register, no
-/// PING_PREFIX, and its body is runtime text that must not (and cannot) pass through
-/// `OperatorMessage`. `deliver` returns a FAILURE count (its `== 1` is `ping_msg`'s error
-/// branch), so landed is `== 0` — the polarity is pinned here because a guess ships
-/// success-on-failure and every "it sent" assertion still passes.
-async fn whisper_send(http: &reqwest::Client, url: &str, text: &str) -> bool {
-    deliver(http, url, text).await == 0
+/// POST one prebuilt JSON body (the whisper card). Same polarity and the same load-bearing
+/// `Ok(non-2xx) → failure` arm as [`deliver`] — a 429 must not read as sent. The body is expected
+/// to carry its own `allowed_mentions` (whisper_card always does; pinned in its unit tests —
+/// note that field is documented for CONTENT; embed text rides a different, observed-but-uncited
+/// behavior, see whisper_card's doc). Not `ping_msg` on purpose: the whisper is not an operator
+/// message — different webhook, different register.
+async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> u32 {
+    match http.post(url).json(body).send().await {
+        Ok(r) if r.status().is_success() => 0,
+        Ok(r) => {
+            tracing::error!(status = %r.status(), "whisper card POST non-success");
+            1
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "whisper card POST transport failure");
+            1
+        }
+    }
+}
+
+/// `true` ⇔ the card landed — `deliver_json(..) == 0`; the polarity is pinned by
+/// `whisper_send_body_treats_non_2xx_as_failure` because a guess ships success-on-failure and
+/// every "it sent" assertion still passes.
+async fn whisper_send_body(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> bool {
+    deliver_json(http, url, body).await == 0
+}
+
+/// Test seam for the polarity pin — kept out of the public surface like its `ping` siblings.
+#[doc(hidden)]
+pub async fn whisper_send_body_for_test(url: &str, body: &serde_json::Value) -> bool {
+    whisper_send_body(&reqwest::Client::new(), url, body).await
 }
 
 /// The attic whispers — one forgotten treasure, warmly, then quiet (spec:
@@ -4782,11 +4805,22 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
             return FulfillResponse::Whispered;
         }
     }
-    // TEMPORARY shim (Task 1 of docs/superpowers/plans/2026-08-31-whisper-details-card.md):
-    // content-only, v1 wire behavior — the full card body ships in Task 3's send swap.
-    let card = whisper::whisper_card(pick, None, &deps.whisper_site_url, cycle, &slot, None);
-    let text = card["content"].as_str().unwrap_or_default().to_string();
-    if whisper_send(&deps.http, &whisper_url, &text).await {
+    // The details card (spec: docs/spec-whisper-details-card.md). Cache is best-effort exactly
+    // as public-api treats it: a read failure degrades to the fallback card, never blocks the
+    // whisper — delight never gates, and neither does enrichment.
+    let steam = match pick.steam_app_id {
+        None => None,
+        Some(app_id) => deps.store.get_steam_app(app_id).await.ok().flatten(),
+    };
+    let body = whisper::whisper_card(
+        pick,
+        steam.as_ref(),
+        &deps.whisper_site_url,
+        cycle,
+        &slot,
+        None,
+    );
+    if whisper_send_body(&deps.http, &whisper_url, &body).await {
         if let Err(e) = deps.store.mark_whisper_delivered(&slot).await {
             tracing::error!(error = ?e, slot, "whisper sent but mark failed — item stays a receipt; the game re-eligible next tick");
         }
