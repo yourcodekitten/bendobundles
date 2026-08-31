@@ -9227,6 +9227,129 @@ async fn whisper_send_body_treats_non_2xx_as_failure() {
     );
 }
 
+#[test]
+fn whisper_preview_op_deserializes() {
+    let r: FulfillRequest =
+        serde_json::from_value(serde_json::json!({"op":"whisper_preview"})).unwrap();
+    assert!(matches!(r, FulfillRequest::WhisperPreview));
+}
+
+/// Order-independent whisper-log fingerprint — list order is not contractual, field equality is.
+fn whisper_log_key(ws: &[domain::WhisperRecord]) -> Vec<(String, String, u32, bool)> {
+    let mut k: Vec<_> = ws
+        .iter()
+        .map(|w| (w.slot.clone(), w.game_id.clone(), w.cycle, w.delivered))
+        .collect();
+    k.sort();
+    k
+}
+
+#[tokio::test]
+async fn whisper_preview_resends_newest_delivered_and_writes_nothing() {
+    let Some(store) = store_or_skip("whisper-preview").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    store
+        .put_game(&available_game("g-old", "Older"))
+        .await
+        .unwrap();
+    store
+        .put_game(&available_game("g-new", "Newer"))
+        .await
+        .unwrap();
+    assert!(store.record_whisper("2026-W34", "g-old", 0).await.unwrap());
+    store.mark_whisper_delivered("2026-W34").await.unwrap();
+    assert!(store.record_whisper("2026-W35", "g-new", 0).await.unwrap());
+    store.mark_whisper_delivered("2026-W35").await.unwrap();
+    let before = whisper_log_key(&store.list_whispers().await.unwrap());
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSent));
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert!(body["content"].as_str().unwrap().starts_with("🔍 *preview"));
+    // the footer is the mechanism — it travels with the embeds, and it names WHICH shape
+    assert!(
+        body["embeds"][0]["footer"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("🔍 preview — newest delivered")
+    );
+    // newest delivered = lexicographic max slot (slots are zero-padded ⇒ lex max IS chronological)
+    assert_eq!(body["embeds"][0]["title"], "Newer");
+    let after = whisper_log_key(&store.list_whispers().await.unwrap());
+    assert_eq!(before, after); // ZERO WRITES — field-identical log
+}
+
+#[tokio::test]
+async fn whisper_preview_with_empty_log_previews_todays_pick_without_recording() {
+    let Some(store) = store_or_skip("whisper-preview-dry").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSent));
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert!(
+        body["embeds"][0]["footer"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("🔍 preview — today's dry pick")
+    );
+    assert!(store.list_whispers().await.unwrap().is_empty()); // the dry-run recorded NOTHING
+}
+
+#[tokio::test]
+async fn whisper_preview_dark_says_blocked_not_whispered() {
+    let Some(store) = store_or_skip("whisper-preview-dark").await else {
+        return;
+    };
+    let ops = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&ops)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &ops.uri(), Some(ops.uri()), None); // whisper DARK, ops on
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    // Lilith's ③: silence must not be byte-identical to sent-fine — the response says BLOCKED
+    assert!(matches!(r, FulfillResponse::PreviewBlocked));
+    assert!(store.list_whispers().await.unwrap().is_empty()); // zero writes on the dark path
+}
+
+#[tokio::test]
+async fn whisper_preview_dead_webhook_says_send_failed() {
+    let Some(store) = store_or_skip("whisper-preview-500").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSendFailed));
+    assert!(store.list_whispers().await.unwrap().is_empty()); // failure still writes nothing
+}
+
 #[tokio::test]
 async fn whisper_dark_param_writes_nothing_and_pings_ops() {
     let Some(store) = store_or_skip("whisper-dark").await else {

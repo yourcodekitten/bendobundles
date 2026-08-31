@@ -158,6 +158,11 @@ pub enum FulfillRequest {
     /// input — caught by this typed parse BEFORE main.rs's `aws.events`→Sync fallback, so a
     /// whisper payload cannot contaminate sync.
     Whisper,
+    /// Zero-write preview (spec: docs/spec-whisper-details-card.md): re-render + re-send the
+    /// newest DELIVERED whisper's card (fallback: today's would-be pick, still without
+    /// recording), marked 🔍 in footer + content, so card changes are visible without spending a
+    /// weekly slot. Manual-invoke-only, like ValidateCookie.
+    WhisperPreview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +195,15 @@ pub enum FulfillResponse {
     /// same reason: Scheduler invokes async and the payload is discarded; the run's truth lives
     /// in the whisper log and the ops/whisper channels.
     Whispered,
+    /// whisper_preview: the card went out. Which shape it showed is in the card's own footer.
+    PreviewSent,
+    /// whisper_preview: no preview was possible — dark webhook (either face), unreadable
+    /// log/game/pool, or empty pool. Each cause announces itself in its own ping/log; this
+    /// variant exists so silence is never byte-identical to sent-fine (a hand-invoked op's
+    /// response JSON is its verdict surface).
+    PreviewBlocked,
+    /// whisper_preview: the card was built and the POST failed.
+    PreviewSendFailed,
     CookieStatus {
         ok: bool,
     },
@@ -704,6 +718,7 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
         FulfillRequest::Sync => handle_sync(deps).await,
         FulfillRequest::ValidateCookie => handle_validate_cookie(deps).await,
         FulfillRequest::Whisper => handle_whisper(deps).await,
+        FulfillRequest::WhisperPreview => handle_whisper_preview(deps).await,
     }
 }
 
@@ -4670,6 +4685,125 @@ pub async fn whisper_send_body_for_test(url: &str, body: &serde_json::Value) -> 
     whisper_send_body(&reqwest::Client::new(), url, body).await
 }
 
+/// The whisper dark-gate, shared by whisper + preview: `Some(url)` ⟺ sendable; both dark faces
+/// announce themselves distinctly and return None (①a advises the put-parameter; ①b never
+/// advises overwrite — the stored value may be right and the fault the read path). Extracted
+/// UNCHANGED from handle_whisper — the two faces' wording is family-reviewed, do not edit in
+/// passing. Match all three states; never flatten with a let-else.
+async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
+    match &deps.whisper_notify {
+        Notify::Webhook(u) => Some(u.clone()),
+        Notify::Disabled => {
+            tracing::warn!(
+                outcome = "whisper_dark",
+                "whisper webhook unconfigured — no-op, zero writes"
+            );
+            ping_msg(deps, &OperatorMessage::fmt(
+                "whisper is DARK — the attic has a voice and no throat. Light it: aws ssm put-parameter --name {} --type SecureString --overwrite --value <discord webhook url>",
+                &[Part::Id(&deps.whisper_param_name)],
+            ))
+            .await;
+            None
+        }
+        Notify::Unresolved => {
+            tracing::error!(
+                outcome = "whisper_unresolved",
+                "whisper webhook configured but UNREADABLE — no-op, zero writes"
+            );
+            ping_msg(deps, &OperatorMessage::fmt(
+                "whisper webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value; the stored secret may be fine and the fault is the read path.",
+                &[Part::Id(&deps.whisper_param_name)],
+            ))
+            .await;
+            None
+        }
+    }
+}
+
+/// `{"op":"whisper_preview"}` — ZERO WRITES BY CONSTRUCTION: no record, no mark, no cycle
+/// movement; the only side effects are one webhook POST and the dark-gate's own ops ping. The
+/// card is rendered by the same `whisper_card` the real path uses — a preview that renders
+/// through different code previews nothing. Three-valued response: silence must never be
+/// byte-identical to sent-fine.
+async fn handle_whisper_preview(deps: &Deps) -> FulfillResponse {
+    let Some(url) = resolve_whisper_url(deps).await else {
+        return FulfillResponse::PreviewBlocked; // dark faces already pinged their own reason
+    };
+    let whispers = match deps.store.list_whispers().await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::error!(error = ?e, "whisper_preview: cannot list whisper log — blocked");
+            return FulfillResponse::PreviewBlocked;
+        }
+    };
+    let newest = whispers
+        .iter()
+        .filter(|w| w.delivered)
+        .max_by(|a, b| a.slot.cmp(&b.slot));
+    let (game, cycle, slot, kind) = match newest {
+        Some(w) => match deps.store.get_game(&w.game_id).await {
+            Ok(Some(g)) => (
+                g,
+                w.cycle,
+                w.slot.clone(),
+                whisper::PreviewKind::NewestDelivered,
+            ),
+            _ => {
+                tracing::error!(game = %w.game_id, "whisper_preview: delivered game unreadable — blocked");
+                return FulfillResponse::PreviewBlocked;
+            }
+        },
+        None => {
+            // empty log: dry-run today's pick — same reads as the real path, NO record
+            let (games, links) = match (
+                deps.store.list_listable_games().await,
+                deps.store.list_links().await,
+            ) {
+                (Ok(g), Ok(l)) => (g, l),
+                _ => {
+                    tracing::error!("whisper_preview: cannot read pool — blocked");
+                    return FulfillResponse::PreviewBlocked;
+                }
+            };
+            let now = OffsetDateTime::now_utc();
+            let promises = whisper::active_promises(&links, now);
+            let pool = whisper::eligible(&games, &promises, &std::collections::HashSet::new());
+            let Some(pick) = whisper::select(&pool, i64::from(now.date().to_julian_day())) else {
+                tracing::warn!("whisper_preview: empty pool — blocked, nothing to preview");
+                return FulfillResponse::PreviewBlocked;
+            };
+            let (y, w, _) = now.date().to_iso_week_date();
+            (
+                pick.clone(),
+                0,
+                format!("{y}-W{w:02}"),
+                whisper::PreviewKind::DryRunPick,
+            )
+        }
+    };
+    let steam = match game.steam_app_id {
+        None => None,
+        Some(app_id) => deps.store.get_steam_app(app_id).await.ok().flatten(),
+    };
+    let body = whisper::whisper_card(
+        &game,
+        steam.as_ref(),
+        &deps.whisper_site_url,
+        cycle,
+        &slot,
+        Some(kind),
+    );
+    if whisper_send_body(&deps.http, &url, &body).await {
+        FulfillResponse::PreviewSent
+    } else {
+        tracing::error!(
+            outcome = "whisper_preview_send_failed",
+            "preview POST failed"
+        );
+        FulfillResponse::PreviewSendFailed
+    }
+}
+
 /// The attic whispers — one forgotten treasure, warmly, then quiet (spec:
 /// `docs/spec-attic-whispers.md`). Order is RECORD → SEND → MARK (the choosecontent two-write
 /// shape): a crash between record and send loses at most one whisper and can never double-send.
@@ -4692,32 +4826,8 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
     // the stored value may be right and the fault is the read path. Match all three; never
     // flatten with a let-else. ZERO writes on either dark face — record-then-skip-send would
     // burn treasures into the exclusion log on a dark deploy's happy path.
-    let whisper_url = match &deps.whisper_notify {
-        Notify::Webhook(u) => u.clone(),
-        Notify::Disabled => {
-            tracing::warn!(
-                outcome = "whisper_dark",
-                "whisper webhook unconfigured — no-op, zero writes"
-            );
-            ping_msg(deps, &OperatorMessage::fmt(
-                "whisper is DARK — the attic has a voice and no throat. Light it: aws ssm put-parameter --name {} --type SecureString --overwrite --value <discord webhook url>",
-                &[Part::Id(&deps.whisper_param_name)],
-            ))
-            .await;
-            return FulfillResponse::Whispered;
-        }
-        Notify::Unresolved => {
-            tracing::error!(
-                outcome = "whisper_unresolved",
-                "whisper webhook configured but UNREADABLE — no-op, zero writes"
-            );
-            ping_msg(deps, &OperatorMessage::fmt(
-                "whisper webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value; the stored secret may be fine and the fault is the read path.",
-                &[Part::Id(&deps.whisper_param_name)],
-            ))
-            .await;
-            return FulfillResponse::Whispered;
-        }
+    let Some(whisper_url) = resolve_whisper_url(deps).await else {
+        return FulfillResponse::Whispered;
     };
     let games = match deps.store.list_listable_games().await {
         Ok(g) => g,
