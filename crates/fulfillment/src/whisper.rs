@@ -186,9 +186,9 @@ pub fn whisper_card(
     preview: Option<PreviewKind>,
 ) -> serde_json::Value {
     // Content-side loser order (pass-1 review): the deep-link WINS — it is the feature's one-tap
-    // core; display title and bundle are the losers; the query token is a raw prefix. With these
-    // caps the line is structurally bounded far under CONTENT_MAX; the assert is a belt for the
-    // TOTAL promise, not a live truncation site.
+    // core; display title and bundle are the losers; the query token is a raw prefix. These caps
+    // keep the NORMAL line short; the LIVE truncation at the seam below (gate-9 ②) is what makes
+    // the CONTENT_MAX bound bind — config-fed site_url included, no prose claims, no trust.
     let q_prefix: String = game.title.chars().take(CONTENT_QUERY_MAX).collect();
     let q = urlencoding::encode(&q_prefix);
     let mut content = format!(
