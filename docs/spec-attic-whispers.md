@@ -1,5 +1,10 @@
 # spec — the attic whispers 💌
 
+> **PAYLOAD SUPERSEDED (2026-08-31):** the whisper's Discord payload is now the full details card
+> — embeds, media galleries, preview envelope — specced in `docs/spec-whisper-details-card.md`.
+> Everything below about SELECTION, the RECORD→SEND→MARK orchestration, the slot key and the five
+> no-send causes remains authoritative and unchanged.
+
 *2026-08-28 · kitten · status: family-reviewed (round 1: OMBB + Lilith, 2026-08-28 morning), ready for plan*
 
 ## the gap this closes

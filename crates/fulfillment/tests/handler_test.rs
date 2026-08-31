@@ -9120,6 +9120,248 @@ fn whisper_envelope_parses() {
     assert!(matches!(r, FulfillRequest::Whisper));
 }
 
+/// Integration-side steam cache fixture (minimal: detail half only — the unit tests own the full
+/// per-field rendering; these arms prove the WIRE). Seeded via put_steam_app Absent guard.
+fn seeded_cache(app_id: u32) -> dynamo::SteamAppCache {
+    dynamo::SteamAppCache {
+        app_id,
+        detail: Some(steam_client::SteamAppDetail {
+            app_id,
+            name: "Overgrowth".into(),
+            developers: vec!["Wolfire".into()],
+            publishers: vec![],
+            genres: vec!["Action".into()],
+            release_date: Some("Oct 16, 2017".into()),
+            short_description: "a rabbit does kung fu.".into(),
+            header_image: Some("https://cdn/header.jpg".into()),
+            video_hls_url: None,
+            video_thumbnail: None,
+            screenshots: vec![],
+            tags: vec![],
+            content_descriptor_ids: vec![],
+            content_notes: None,
+        }),
+        overall: None,
+        recent: None,
+        fetched_at: 0,
+        reviews_fetched_at: 0,
+    }
+}
+
+#[tokio::test]
+async fn whisper_posts_embed_card_with_mention_denial() {
+    let Some(store) = store_or_skip("whisper-card").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    let mut g = available_game("g1", "Overgrowth");
+    g.steam_app_id = Some(570);
+    store.put_game(&g).await.unwrap();
+    store
+        .put_steam_app(&seeded_cache(570), dynamo::SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    let reqs = wh.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    assert!(!body["embeds"].as_array().unwrap().is_empty()); // the card is ON THE WIRE
+    assert_eq!(body["embeds"][0]["title"], "Overgrowth");
+    assert!(
+        body["embeds"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("a rabbit does kung fu.")
+    );
+    assert_eq!(
+        body["allowed_mentions"]["parse"].as_array().unwrap().len(),
+        0
+    ); // #174, new shape
+    assert!(body["content"].as_str().unwrap().starts_with("🕯️"));
+}
+
+#[tokio::test]
+async fn whisper_steam_cache_miss_degrades_to_fallback_card_still_delivered() {
+    let Some(store) = store_or_skip("whisper-card-nocache").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    let mut g = available_game("g1", "Aaa");
+    g.steam_app_id = Some(999_999); // no cache row exists for this app id
+    store.put_game(&g).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    handle(&d, FulfillRequest::Whisper).await;
+    let ws = store.list_whispers().await.unwrap();
+    assert_eq!(ws.len(), 1);
+    assert!(ws[0].delivered); // cache is best-effort: the whisper still went
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert_eq!(body["embeds"].as_array().unwrap().len(), 1); // fallback card, no phantom galleries
+}
+
+#[tokio::test]
+async fn whisper_send_body_treats_non_2xx_as_failure() {
+    // mirrors ping_treats_non_2xx_as_failure for the JSON twin: a 429 must not read as sent
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    let ok =
+        fulfillment::whisper_send_body_for_test(&wh.uri(), &serde_json::json!({"content": "x"}))
+            .await;
+    assert!(
+        !ok,
+        "a 429 landed in the success branch — the Ok(non-2xx) arm is missing"
+    );
+}
+
+#[test]
+fn whisper_preview_op_deserializes() {
+    let r: FulfillRequest =
+        serde_json::from_value(serde_json::json!({"op":"whisper_preview"})).unwrap();
+    assert!(matches!(r, FulfillRequest::WhisperPreview));
+}
+
+/// Order-independent whisper-log fingerprint — list order is not contractual, field equality is.
+fn whisper_log_key(ws: &[domain::WhisperRecord]) -> Vec<(String, String, u32, bool)> {
+    let mut k: Vec<_> = ws
+        .iter()
+        .map(|w| (w.slot.clone(), w.game_id.clone(), w.cycle, w.delivered))
+        .collect();
+    k.sort();
+    k
+}
+
+#[tokio::test]
+async fn whisper_preview_resends_newest_delivered_and_writes_nothing() {
+    let Some(store) = store_or_skip("whisper-preview").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    store
+        .put_game(&available_game("g-old", "Older"))
+        .await
+        .unwrap();
+    // g-new carries steam data: the preview exists to preview the CARD, so this arm proves
+    // preview + FULL card on the wire, not only the fallback shape (pass-2 completeness walk)
+    let mut g_new = available_game("g-new", "Newer");
+    g_new.steam_app_id = Some(570);
+    store.put_game(&g_new).await.unwrap();
+    store
+        .put_steam_app(&seeded_cache(570), dynamo::SteamAppPutGuard::Absent)
+        .await
+        .unwrap();
+    assert!(store.record_whisper("2026-W34", "g-old", 0).await.unwrap());
+    store.mark_whisper_delivered("2026-W34").await.unwrap();
+    assert!(store.record_whisper("2026-W35", "g-new", 0).await.unwrap());
+    store.mark_whisper_delivered("2026-W35").await.unwrap();
+    let before = whisper_log_key(&store.list_whispers().await.unwrap());
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSent));
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert!(body["content"].as_str().unwrap().starts_with("🔍 *preview"));
+    // the footer is the mechanism — it travels with the embeds, and it names WHICH shape
+    assert!(
+        body["embeds"][0]["footer"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("🔍 preview — newest delivered")
+    );
+    // newest delivered = lexicographic max slot (slots are zero-padded ⇒ lex max IS chronological)
+    assert_eq!(body["embeds"][0]["title"], "Newer");
+    // …and it is the FULL card, previewed: steam fields render under the preview marking
+    assert!(
+        body["embeds"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("a rabbit does kung fu.")
+    );
+    let after = whisper_log_key(&store.list_whispers().await.unwrap());
+    assert_eq!(before, after); // ZERO WRITES — field-identical log
+}
+
+#[tokio::test]
+async fn whisper_preview_with_empty_log_previews_todays_pick_without_recording() {
+    let Some(store) = store_or_skip("whisper-preview-dry").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSent));
+    let body: serde_json::Value =
+        serde_json::from_slice(&wh.received_requests().await.unwrap()[0].body).unwrap();
+    assert!(
+        body["embeds"][0]["footer"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("🔍 preview — today's dry pick")
+    );
+    assert!(store.list_whispers().await.unwrap().is_empty()); // the dry-run recorded NOTHING
+}
+
+#[tokio::test]
+async fn whisper_preview_dark_says_blocked_not_whispered() {
+    let Some(store) = store_or_skip("whisper-preview-dark").await else {
+        return;
+    };
+    let ops = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&ops)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &ops.uri(), Some(ops.uri()), None); // whisper DARK, ops on
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    // Lilith's ③: silence must not be byte-identical to sent-fine — the response says BLOCKED
+    assert!(matches!(r, FulfillResponse::PreviewBlocked));
+    assert!(store.list_whispers().await.unwrap().is_empty()); // zero writes on the dark path
+}
+
+#[tokio::test]
+async fn whisper_preview_dead_webhook_says_send_failed() {
+    let Some(store) = store_or_skip("whisper-preview-500").await else {
+        return;
+    };
+    let wh = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&wh)
+        .await;
+    store.put_game(&available_game("g1", "Aaa")).await.unwrap();
+    let d = deps_whisper(store.clone(), &wh.uri(), None, Some(wh.uri()));
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewSendFailed));
+    assert!(store.list_whispers().await.unwrap().is_empty()); // failure still writes nothing
+}
+
 #[tokio::test]
 async fn whisper_dark_param_writes_nothing_and_pings_ops() {
     let Some(store) = store_or_skip("whisper-dark").await else {

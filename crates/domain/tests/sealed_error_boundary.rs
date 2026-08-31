@@ -696,14 +696,15 @@ const REVIEWED_VERB_COUNTS: &[(&str, &str, usize, &str)] = &[
     (
         "crates/fulfillment/src/lib.rs",
         ".send()",
-        2,
-        "deliver() — the crate's only reqwest error boundary, sealed at #171 — plus a test helper",
+        3,
+        "deliver() + deliver_json() — BOTH sealed with without_url() (#171; the whisper webhook \
+         URL is a credential too) — plus a test helper",
     ),
     (
         "crates/fulfillment/src/lib.rs",
         ".json(",
-        1,
-        "deliver()'s request body; not an error-rendering path",
+        2,
+        "deliver()'s and deliver_json()'s request bodies; not error-rendering paths",
     ),
     (
         "crates/fulfillment/src/main.rs",
