@@ -97,6 +97,15 @@ pub const EMBED_DESC_MAX: usize = 4096;
 pub const EMBED_FIELD_VALUE_MAX: usize = 1024;
 pub const EMBED_TOTAL_TEXT_MAX: usize = 6000;
 pub const MAX_EMBEDS: usize = 10;
+// gate-9 ③ (the survivor of a killed finding): MAX_EMBEDS and steam-client's SCREENSHOT_CAP were
+// equal BY COINCIDENCE, in two crates, with nothing asserting the relation — and the footer is
+// sealed before the gallery loop, so a cap above the budget would drop screenshots silently AND
+// unannounceably. Top rung of the enforcement ladder: this REFUSES at compile time (a runtime
+// test for it could never go red under this assert, so there deliberately isn't one).
+const _: () = assert!(
+    steam_client::SCREENSHOT_CAP <= MAX_EMBEDS,
+    "steam-client SCREENSHOT_CAP exceeds the whisper card's embed budget — screenshots would drop silently"
+);
 pub const GALLERY_GROUP: usize = 4;
 /// Discord's cap on message CONTENT — separate from every embed budget, audited separately
 /// (pass-1 review: the embed budgets were airtight while content had no guard at all).
@@ -191,7 +200,13 @@ pub fn whisper_card(
     if let Some(k) = preview {
         content = format!("🔍 *preview — {}, not a new whisper*\n{content}", k.label());
     }
-    let embeds = build_embeds(game, steam, cycle, slot, preview);
+    // gate-9 ②: the cap is ENFORCED here, not asserted in prose — site_url is config and a
+    // pathological value must produce a short message, never a Discord 400. The cut announces
+    // itself through the embed footer (content has no footer; the embeds travel with it).
+    let content_full = content;
+    let content = trunc(&content_full, CONTENT_MAX);
+    let content_trimmed = content != content_full;
+    let embeds = build_embeds(game, steam, cycle, slot, preview, content_trimmed);
     serde_json::json!({
         "content": content,
         "embeds": embeds,
@@ -209,12 +224,15 @@ fn build_embeds(
     cycle: u32,
     slot: &str,
     preview: Option<PreviewKind>,
+    content_trimmed: bool,
 ) -> Vec<serde_json::Value> {
     let detail = steam.and_then(|c| c.detail.as_ref());
     let store_url = game
         .steam_app_id
         .map(|id| format!("https://store.steampowered.com/app/{id}"));
-    let mut trimmed = false; // any truncation flips this; the footer announces it
+    // any truncation flips this; the footer announces it. Seeded with the CONTENT cut — the one
+    // truncation that happens outside this fn (content has no footer of its own).
+    let mut trimmed = content_trimmed;
 
     let title = trunc(&game.title, EMBED_TITLE_MAX);
     trimmed |= title != game.title;
@@ -935,6 +953,24 @@ mod tests {
         );
         assert!(content.contains("/admin/catalog?q=")); // the winner survived
         assert!(!content.contains("%E2%80%A6")); // no encoded … in the filter token
+    }
+
+    #[test]
+    fn content_cap_is_enforced_not_asserted() {
+        // gate-9 ②: CONTENT_MAX was declared and never enforced — site_url is config, and a
+        // pathological value walked straight past every "structurally bounded" comment. The cap
+        // is a live guard now, and the cut announces itself in the embed footer (content has no
+        // footer of its own — the embeds travel with it).
+        let g = game("g1", "aaa", None);
+        let huge_site = format!("https://x/{}", "p".repeat(3000));
+        let v = whisper_card(&g, None, &huge_site, 0, "2026-W36", None);
+        assert!(v["content"].as_str().unwrap().chars().count() <= CONTENT_MAX);
+        assert!(
+            v["embeds"][0]["footer"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("trimmed to fit")
+        );
     }
 
     #[test]

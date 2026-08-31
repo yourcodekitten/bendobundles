@@ -304,7 +304,11 @@ const ALLOWED_CATEGORY_IDS: [u32; 5] = [2, 1, 9, 49, 20];
 
 /// Screenshots kept per app ("a handful", issue #61): bounds the cache blob; a cap change
 /// reaches existing blobs only via a backfill rerun or the 30-day refresh.
-const SCREENSHOT_CAP: usize = 10;
+/// Screenshot cap for cached app detail. PUBLIC because fulfillment's whisper card pins
+/// `SCREENSHOT_CAP <= MAX_EMBEDS` at COMPILE TIME (whisper.rs const assert) — the card renders
+/// one embed per screenshot and a cap above the embed budget would drop shots silently. If you
+/// raise this, that assert is the thing that refuses.
+pub const SCREENSHOT_CAP: usize = 10;
 
 #[derive(Deserialize)]
 struct ReleaseDateWire {
