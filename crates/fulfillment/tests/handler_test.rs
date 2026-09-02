@@ -145,6 +145,7 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         whisper_notify: fulfillment::Notify::Disabled,
         whisper_site_url: String::new(),
         whisper_param_name: String::new(),
+        bell_disabled: false,
         http: reqwest::Client::new(),
         // No self-login in these handler tests — a dead session keeps the flag-and-ping path.
         session_store: None,
@@ -537,6 +538,7 @@ async fn deps_with_selfheal(
         whisper_notify: fulfillment::Notify::Disabled,
         whisper_site_url: String::new(),
         whisper_param_name: String::new(),
+        bell_disabled: false,
         http: reqwest::Client::new(),
         session_store: Some(SessionStore {
             ssm: ssm_at(ssm_uri).await,
@@ -9112,6 +9114,30 @@ fn available_game(id: &str, title: &str) -> domain::Game {
         owned_by_ben: false,
         hidden_source: None,
     }
+}
+
+// ── the attic bell (spec: docs/spec-attic-bell.md) ───────────────────────────────────────────
+
+#[tokio::test]
+async fn bell_op_always_answers_belled_even_on_a_dark_deploy() {
+    // whisper register DARK (deps() default) + an unknown link: every failure inside the bell
+    // must still come home as Belled — a function error would trigger the Event-invoke retry
+    // and a double ring is worse than a missed one. Zero writes on the dark path.
+    let Some(store) = store_or_skip("bell-dark").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(
+        &deps,
+        FulfillRequest::Bell {
+            event: fulfillment::bell::BellEvent::Thanks {
+                link_token: "nope".into(),
+            },
+        },
+    )
+    .await;
+    assert!(matches!(resp, FulfillResponse::Belled));
 }
 
 #[test]

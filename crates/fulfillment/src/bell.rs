@@ -67,6 +67,96 @@ pub fn unwrap_card(
     })
 }
 
+use crate::operator_message::{OperatorMessage, Part};
+use crate::Deps;
+
+/// The bell ledger's week key — ONE implementation (the whisper's slot derivation is a different
+/// meaning: tick identity, schedule-coupled; this is just "which week does this count in").
+pub fn current_week() -> String {
+    let (y, w, _) = time::OffsetDateTime::now_utc().date().to_iso_week_date();
+    format!("{y}-W{w:02}")
+}
+
+/// Ring the bell for one event. Best-effort BY CONTRACT: every failure is a log line and a clean
+/// return — an Event-invoked lambda retries on function error, and a double ring is worse than a
+/// missed one. The gift may never miss; the bell may.
+pub async fn ring(deps: &Deps, event: &BellEvent) {
+    if deps.bell_disabled {
+        // the bell's OWN off-switch (shared secret, split disable flag): muting bells must not
+        // dark the weekly whisper, and vice versa. Loud, so a muted bell never reads as broken.
+        tracing::info!(outcome = "bell_disabled", "bell: BELL_DISABLED set — not ringing, by choice");
+        return;
+    }
+    let Some(url) = crate::resolve_whisper_url(deps).await else {
+        // dark deploy: same loud no-op face as the whisper — the resolve fn already logged it.
+        return;
+    };
+    let body = match event {
+        BellEvent::Unwrap { link_token, game_id, choice, .. } => {
+            let label = match deps.store.get_link(link_token).await {
+                Ok(Some(l)) => l.label,
+                Ok(None) => {
+                    tracing::warn!(link_token, "bell: unwrap for unknown link — not ringing");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "bell: link read failed — not ringing");
+                    return;
+                }
+            };
+            let (title, art) = match deps.store.get_game(game_id).await {
+                Ok(Some(g)) => (g.title, g.artwork_url),
+                Ok(None) => {
+                    tracing::warn!(game_id, "bell: unwrap for unknown game — not ringing");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "bell: game read failed — not ringing");
+                    return;
+                }
+            };
+            unwrap_card(&label, &title, art.as_deref(), &deps.whisper_site_url, *choice)
+        }
+        BellEvent::Thanks { link_token } => {
+            let link = match deps.store.get_link(link_token).await {
+                Ok(Some(l)) => l,
+                Ok(None) => {
+                    tracing::warn!(link_token, "bell: thanks for unknown link — not ringing");
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "bell: link read failed — not ringing");
+                    return;
+                }
+            };
+            // the STORED note, never a payload-carried copy (spec: content & security).
+            let Some(note) = link.thank_note.as_deref() else {
+                tracing::warn!(link_token, "bell: thanks event but no stored note — not ringing");
+                return;
+            };
+            thanks_card(&link.label, note, &deps.whisper_site_url)
+        }
+    };
+    if !crate::whisper_send_body(&deps.http, &url, &body).await {
+        // A WARN nobody reads is at-never-once: the miss goes to the MONITORED ops channel via
+        // the same pattern as whisper cause-④ — and the ops webhook is a DIFFERENT credential,
+        // so this report survives a dead whisper webhook. Frequency is bounded by construction
+        // (claims ≤ claims_allowed; thanks write-once), so this cannot storm.
+        tracing::error!(outcome = "bell_send_failed", "bell POST failed — accepted loss, no retry");
+        crate::ping_msg(
+            deps,
+            &OperatorMessage::fmt(
+                "the attic bell failed to ring ({}): webhook POST failed — the moment passed unheard; no retry by design",
+                &[Part::Id(match event {
+                    BellEvent::Unwrap { .. } => "unwrap",
+                    BellEvent::Thanks { .. } => "thanks",
+                })],
+            ),
+        )
+        .await;
+    }
+}
+
 pub fn thanks_card(label: &str, note: &str, site_url: &str) -> serde_json::Value {
     // `note` is the STORED value: control/bidi-sanitized at write, ≤500 chars by
     // THANK_NOTE_MAX_CHARS. Mentions are denied structurally, never by scrubbing — all

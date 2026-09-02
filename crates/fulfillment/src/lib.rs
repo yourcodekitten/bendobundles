@@ -519,6 +519,10 @@ pub struct Deps {
     /// operator an actionable one-liner. When the env isn't even wired, main.rs passes a literal
     /// that says so — the message must always name something actionable.
     pub whisper_param_name: String,
+    /// The bell's OWN off-switch (spec-attic-bell Q①: shared secret, SPLIT disable flag) —
+    /// muting per-event bells must not dark the weekly whisper, and vice versa. Resolved in
+    /// main.rs from `BELL_DISABLED`, mirroring `WHISPER_DISABLED`'s register-decoupling rule.
+    pub bell_disabled: bool,
     pub http: reqwest::Client,
     /// SSM client + the humble-cookie parameter name, so the app can self-heal its own session:
     /// on a dead session it logs in (via `humble.login()`) and persists the fresh cookie here,
@@ -703,9 +707,7 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
             }
         }
         FulfillRequest::Bell { event } => {
-            // minimal dispatch (Task 2): the ring arrives with bell::ring in the next commit;
-            // every outcome is Belled BY DESIGN — see the variant's doc.
-            let _ = event;
+            bell::ring(deps, &event).await;
             FulfillResponse::Belled
         }
         FulfillRequest::SelfClaim {
@@ -4644,7 +4646,7 @@ fn logged<E: std::error::Error>(e: &E, what: &'static str) -> ErrorSummary {
 /// never runs, which an in-band record cannot. **No dead-letter row** — there is no drainer, so a
 /// durable queue would be storage with no consumer. **No retry** — a chunked send is not atomic
 /// (`1 of 2 chunk(s) sent` is a real observed outcome), so a naive retry double-posts.
-async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
+pub(crate) async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
     let Notify::Webhook(url) = &deps.notify else {
         return;
     };
@@ -4703,7 +4705,7 @@ async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Valu
 /// `true` ⇔ the card landed — `deliver_json(..) == 0`; the polarity is pinned by
 /// `whisper_send_body_treats_non_2xx_as_failure` because a guess ships success-on-failure and
 /// every "it sent" assertion still passes.
-async fn whisper_send_body(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> bool {
+pub(crate) async fn whisper_send_body(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> bool {
     deliver_json(http, url, body).await == 0
 }
 
@@ -4718,7 +4720,7 @@ pub async fn whisper_send_body_for_test(url: &str, body: &serde_json::Value) -> 
 /// advises overwrite — the stored value may be right and the fault the read path). Extracted
 /// UNCHANGED from handle_whisper — the two faces' wording is family-reviewed, do not edit in
 /// passing. Match all three states; never flatten with a let-else.
-async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
+pub(crate) async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
     match &deps.whisper_notify {
         Notify::Webhook(u) => Some(u.clone()),
         Notify::Disabled => {
