@@ -249,11 +249,11 @@ git commit -S -m "🔔 bell cards: pure builders for the unwrap and thanks momen
 fn bell_request_wire_shape_round_trips() {
     let req: FulfillRequest = serde_json::from_value(serde_json::json!({
         "op": "bell",
-        "event": { "kind": "unwrap", "link_token": "t", "game_id": "g", "choice": true }
+        "event": { "kind": "unwrap", "link_token": "t", "game_id": "g", "week": "2026-W36", "choice": true }
     })).unwrap();
     match req {
-        FulfillRequest::Bell { event: bell::BellEvent::Unwrap { link_token, game_id, choice } } => {
-            assert_eq!((link_token.as_str(), game_id.as_str(), choice), ("t", "g", true));
+        FulfillRequest::Bell { event: bell::BellEvent::Unwrap { link_token, game_id, week, choice } } => {
+            assert_eq!((link_token.as_str(), game_id.as_str(), week.as_str(), choice), ("t", "g", "2026-W36", true));
         }
         other => panic!("wrong parse: {other:?}"),
     }
@@ -289,7 +289,11 @@ In `bell.rs`:
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BellEvent {
-    Unwrap { link_token: String, game_id: String, #[serde(default)] choice: bool },
+    /// `week`: the ledger week this unwrap's RING must be counted in — computed by the SENDER
+    /// beside the gift response (bell::current_week()), so the unwrap/ring pair cannot straddle
+    /// a week boundary across the async invoke (Lilith: at a handful of claims a week, a ±1
+    /// straddle gap is indistinguishable from a real miss).
+    Unwrap { link_token: String, game_id: String, week: String, #[serde(default)] choice: bool },
     Thanks { link_token: String },
 }
 ```
@@ -345,7 +349,8 @@ git commit -S -m "🔔 bell wire: BellEvent + FulfillRequest::Bell + Belled resp
   `deps.whisper_site_url`.
 - Produces: `pub async fn ring(deps: &Deps, event: &BellEvent)` — returns `()`, NEVER errors.
 - Produces: `pub fn current_week() -> String` (in bell.rs) — the ISO-week string (`2026-W36`
-  shape), ONE implementation for every bell-ledger write; the whisper's own slot derivation stays
+  shape), ONE implementation for every bell-ledger write AND for public-api's event stamping
+  (Task 5 calls `fulfillment::bell::current_week()`); the whisper's own slot derivation stays
   its own (it is the tick IDENTITY, coupled to the schedule by name — different meaning).
 - Produces: `Deps.bell_disabled: bool` — the bell's OWN off-switch (Q①: shared secret, split
   disable flag; muting bells must not dark the weekly whisper).
@@ -406,7 +411,7 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
         return;
     };
     let body = match event {
-        BellEvent::Unwrap { link_token, game_id, choice } => {
+        BellEvent::Unwrap { link_token, game_id, choice, .. } => {
             let label = match deps.store.get_link(link_token).await {
                 Ok(Some(l)) => l.label,
                 Ok(None) => { tracing::warn!(link_token, "bell: unwrap for unknown link — not ringing"); return; }
@@ -595,10 +600,16 @@ count rings on failures, which un-falsifies the whole ledger):
 ```rust
     if crate::whisper_send_body(&deps.http, &url, &body).await {
         // ledger of rings, best-effort like everything here: the count exists so the weekly
-        // whisper can contradict a silent bell; a failed increment is a WARN, never a failed ring.
-        let week = current_week();
-        if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Rings).await {
-            tracing::warn!(error = ?e, week, "bell rang but the ring ledger write failed");
+        // whisper can contradict a silent bell; a failed increment is a WARN, never a failed
+        // ring. UNWRAP RINGS ONLY — `rings` must be a true pair with `unwraps` (same population,
+        // same week: the event CARRIES its ledger week, computed beside the gift response, so
+        // the pair cannot straddle a weekly boundary across the async hop). Thanks bells are
+        // deliberately uncounted: adding them makes rings ≥ unwraps normal and the suspect
+        // direction unreadable.
+        if let BellEvent::Unwrap { week, .. } = event {
+            if let Err(e) = deps.store.increment_bell_counter(week, dynamo::BellCounter::Rings).await {
+                tracing::warn!(error = ?e, week, "bell rang but the ring ledger write failed");
+            }
         }
     } else {
         // A WARN nobody reads is at-never-once (OMBB, ④): the miss goes to the MONITORED ops
@@ -633,7 +644,8 @@ At BOTH durable gift-success points (the `Ok(())` arms of `fulfill_claim` at `li
 ```
 
 (Admin self-claim `Reveal` paths get NO increment — the ledger counts friend unwraps, mirroring
-what bells ring for.)
+what bells ring for. `rings` counts UNWRAP bells only — Task 3's ring — so the two columns are
+one population and `rings < unwraps` stays readable as the suspect direction.)
 
 In `handle_whisper`, right before the `whisper_card` call (the `slot` string is already the ISO
 week): `let bell_counts = deps.store.get_bell_counts(&slot).await.ok();` and pass it as the new
@@ -762,34 +774,46 @@ read the match first; do NOT ring on AlreadyRedeemed/KeyDead/Parked/Error):
     // exactly the claim that matters. Affordable to bound at all BECAUSE misses are counted
     // (the ring ledger) and pinged (ops) — OMBB's coupling. Warm typical ~20ms.
     let t0 = std::time::Instant::now();
+    let mut timed_out = false;
     match tokio::time::timeout(std::time::Duration::from_secs(2),
         s.invoker.bell(FulfillRequest::Bell {
             event: fulfillment::bell::BellEvent::Unwrap {
                 link_token: token.clone(),
                 game_id: body.game_id.clone(),
+                week: fulfillment::bell::current_week(),   // stamped HERE so the unwrap/ring pair shares a week across the async hop
                 choice: requires_choice,
             },
         })).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(error = %e, "unwrap bell invoke failed — gift unaffected"),
-        Err(_) => tracing::warn!("unwrap bell invoke timed out (2s) — gift unaffected"),
+        Err(_) => {
+            timed_out = true;
+            tracing::warn!("unwrap bell invoke timed out (2s) — gift unaffected");
+        }
     }
-    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, "bell invoke duration"); // the 2s prior becomes a distribution (OMBB)
+    // the 2s prior becomes a distribution (OMBB) — and timeouts are logged as CENSORED (Lilith):
+    // a timed-out wait proves >=2000ms, never its true value; without the flag the tail being
+    // tuned against is invisible by construction.
+    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, censored = timed_out, "bell invoke duration");
 ```
 
 Thanks call site (inside the `Ok(dynamo::SetThanksOutcome::Set)` arm, after the info line):
 
 ```rust
     let t0 = std::time::Instant::now();
+    let mut timed_out = false;
     match tokio::time::timeout(std::time::Duration::from_secs(2),
         s.invoker.bell(FulfillRequest::Bell {
             event: fulfillment::bell::BellEvent::Thanks { link_token: token.clone() },
         })).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(error = %e, "thanks bell invoke failed — thanks unaffected"),
-        Err(_) => tracing::warn!("thanks bell invoke timed out (2s) — thanks unaffected"),
+        Err(_) => {
+            timed_out = true;
+            tracing::warn!("thanks bell invoke timed out (2s) — thanks unaffected");
+        }
     }
-    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, "bell invoke duration");
+    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, censored = timed_out, "bell invoke duration");
 ```
 
 (Exact variable names — `token`, `body.game_id`, `requires_choice` — must be read off the real
@@ -850,7 +874,10 @@ at-most-once + ops ping on miss + the whisper-carried ring count), plus these tw
 - "**Reading the count line, direction stated (OMBB):** delivery is at-least-once, so `rings`
   may legally EXCEED `unwraps` — `rings > unwraps` is a benign duplicate; **`rings < unwraps` is
   the suspect direction.** A counter that cries wolf on its first legal duplicate gets ignored
-  forever."
+  forever." `rings` counts unwrap bells ONLY (one population with `unwraps`), and each ring is
+  counted in the week its EVENT carries — stamped beside the gift response — so a week-boundary
+  straddle is bounded to a milliseconds window (Lilith). Residual ±1 remains possible; **only a
+  sustained or multi-unit gap is signal.**
 - "**The ops register's reader is PROVISIONAL:** every detection path here is a sender; nobody
   has demonstrated a human reads the ops room from this seat. Deploy verification includes ben
   confirming one ops-register message reached eyes; until then 'detection in hours' is a
