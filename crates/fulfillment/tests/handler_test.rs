@@ -250,7 +250,10 @@ async fn gift_happy_path_records_url_and_gifts_game() {
         .await
         .unwrap();
     assert_eq!(unwraps, 1, "the durable gift must count as an unwrap");
-    assert_eq!(rings, 0, "dark register ⇒ no ring; the pair reads 1·0 (suspect direction)");
+    assert_eq!(
+        rings, 0,
+        "dark register ⇒ no ring; the pair reads 1·0 (suspect direction)"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

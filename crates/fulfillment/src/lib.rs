@@ -167,7 +167,9 @@ pub enum FulfillRequest {
     /// The attic bell (spec: docs/spec-attic-bell.md): one warm webhook message for a durable
     /// friend-side moment. Fired by public-api as InvocationType::Event — NEVER RequestResponse,
     /// NEVER from a schedule. Shares the whisper transport, never WHISPER# slot state.
-    Bell { event: bell::BellEvent },
+    Bell {
+        event: bell::BellEvent,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4757,7 +4759,11 @@ async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Valu
 /// `true` ⇔ the card landed — `deliver_json(..) == 0`; the polarity is pinned by
 /// `whisper_send_body_treats_non_2xx_as_failure` because a guess ships success-on-failure and
 /// every "it sent" assertion still passes.
-pub(crate) async fn whisper_send_body(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> bool {
+pub(crate) async fn whisper_send_body(
+    http: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> bool {
     deliver_json(http, url, body).await == 0
 }
 
@@ -4874,7 +4880,7 @@ async fn handle_whisper_preview(deps: &Deps) -> FulfillResponse {
         cycle,
         &slot,
         Some(kind),
-            None,   // preview: zero writes, and no live counter read implied
+        None, // preview: zero writes, and no live counter read implied
     );
     if whisper_send_body(&deps.http, &url, &body).await {
         FulfillResponse::PreviewSent
@@ -5015,7 +5021,7 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
         cycle,
         &slot,
         None,
-            bell_counts,
+        bell_counts,
     );
     if whisper_send_body(&deps.http, &whisper_url, &body).await {
         if let Err(e) = deps.store.mark_whisper_delivered(&slot).await {
@@ -5096,7 +5102,13 @@ mod tests {
         .unwrap();
         match req {
             FulfillRequest::Bell {
-                event: bell::BellEvent::Unwrap { link_token, game_id, week, choice },
+                event:
+                    bell::BellEvent::Unwrap {
+                        link_token,
+                        game_id,
+                        week,
+                        choice,
+                    },
             } => {
                 assert_eq!(
                     (link_token.as_str(), game_id.as_str(), week.as_str(), choice),
@@ -5111,7 +5123,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             thanks,
-            FulfillRequest::Bell { event: bell::BellEvent::Thanks { .. } }
+            FulfillRequest::Bell {
+                event: bell::BellEvent::Thanks { .. }
+            }
         ));
     }
 

@@ -575,7 +575,15 @@ mod tests {
             "Humble Indie Bundle 9",
             Some("https://art/x.png"),
         );
-        let v = whisper_card(&g, None, "https://bendobundles.com", 0, "2026-W36", None, None);
+        let v = whisper_card(
+            &g,
+            None,
+            "https://bendobundles.com",
+            0,
+            "2026-W36",
+            None,
+            None,
+        );
         let content = v["content"].as_str().unwrap();
         assert!(content.starts_with("🕯️")); // the register is the friend voice, not the ops voice
         assert!(content.contains("**Overgrowth**"));
@@ -592,7 +600,15 @@ mod tests {
     #[test]
     fn card_deeplink_urlencodes_the_title() {
         let g = game_with_bundle("g1", "Papers, Please", "HB 12", None);
-        let v = whisper_card(&g, None, "https://bendobundles.com", 0, "2026-W36", None, None);
+        let v = whisper_card(
+            &g,
+            None,
+            "https://bendobundles.com",
+            0,
+            "2026-W36",
+            None,
+            None,
+        );
         assert!(
             v["content"]
                 .as_str()
@@ -611,10 +627,12 @@ mod tests {
         assert!(!c.contains("attic was quiet"));
         // (0,0) ⇒ a genuinely quiet week
         let quiet = whisper_card(&g, None, "https://s", 0, "2026-W36", None, Some((0, 0)));
-        assert!(quiet["content"]
-            .as_str()
-            .unwrap()
-            .contains("the attic was quiet this week"));
+        assert!(
+            quiet["content"]
+                .as_str()
+                .unwrap()
+                .contains("the attic was quiet this week")
+        );
         // (4,0) ⇒ THE CONTRADICTION the reader must be able to see: four friends unwrapped and
         // the bell never rang. The card prints both numbers and computes no verdict.
         let suspect = whisper_card(&g, None, "https://s", 0, "2026-W36", None, Some((4, 0)));
@@ -954,7 +972,15 @@ mod tests {
         g.steam_app_id = Some(570);
         let mut only_reviews = steam_cache(0, false);
         only_reviews.detail = None; // negative-cache stub
-        let v = whisper_card(&g, Some(&only_reviews), "https://s", 0, "2026-W36", None, None);
+        let v = whisper_card(
+            &g,
+            Some(&only_reviews),
+            "https://s",
+            0,
+            "2026-W36",
+            None,
+            None,
+        );
         let fields = v["embeds"][0]["fields"].as_array().unwrap();
         assert!(fields.iter().any(|f| f["name"] == "reviews"));
         assert!(!fields.iter().any(|f| f["name"] == "by"));
@@ -962,7 +988,15 @@ mod tests {
         let mut only_detail = steam_cache(0, false);
         only_detail.overall = None;
         only_detail.recent = None;
-        let v2 = whisper_card(&g, Some(&only_detail), "https://s", 0, "2026-W36", None, None);
+        let v2 = whisper_card(
+            &g,
+            Some(&only_detail),
+            "https://s",
+            0,
+            "2026-W36",
+            None,
+            None,
+        );
         assert!(
             !v2["embeds"][0]["fields"]
                 .as_array()

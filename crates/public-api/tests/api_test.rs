@@ -912,12 +912,13 @@ async fn claim_success_rings_the_unwrap_bell_and_response_is_unchanged() {
     assert_eq!(bells.len(), 1, "exactly one unwrap bell per claim");
     match &bells[0] {
         FulfillRequest::Bell {
-            event: fulfillment::bell::BellEvent::Unwrap {
-                link_token,
-                game_id,
-                choice,
-                week,
-            },
+            event:
+                fulfillment::bell::BellEvent::Unwrap {
+                    link_token,
+                    game_id,
+                    choice,
+                    week,
+                },
         } => {
             assert_eq!(link_token, "bell-tok");
             assert_eq!(game_id, &gid);
@@ -973,7 +974,11 @@ async fn thanks_success_rings_the_thanks_bell() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let bells = mock.bells_rung().await;
-    assert_eq!(bells.len(), 2, "one unwrap bell from the claim, one thanks bell");
+    assert_eq!(
+        bells.len(),
+        2,
+        "one unwrap bell from the claim, one thanks bell"
+    );
     assert!(
         matches!(
             &bells[1],

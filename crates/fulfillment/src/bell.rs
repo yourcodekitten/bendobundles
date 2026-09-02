@@ -16,7 +16,9 @@ pub enum BellEvent {
         #[serde(default)]
         choice: bool,
     },
-    Thanks { link_token: String },
+    Thanks {
+        link_token: String,
+    },
 }
 
 /// Discord hard cap on `content`; same bound whisper's CONTENT_MAX respects.
@@ -67,8 +69,8 @@ pub fn unwrap_card(
     })
 }
 
-use crate::operator_message::{OperatorMessage, Part};
 use crate::Deps;
+use crate::operator_message::{OperatorMessage, Part};
 
 /// The bell ledger's week key — ONE implementation (the whisper's slot derivation is a different
 /// meaning: tick identity, schedule-coupled; this is just "which week does this count in").
@@ -84,7 +86,10 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
     if deps.bell_disabled {
         // the bell's OWN off-switch (shared secret, split disable flag): muting bells must not
         // dark the weekly whisper, and vice versa. Loud, so a muted bell never reads as broken.
-        tracing::info!(outcome = "bell_disabled", "bell: BELL_DISABLED set — not ringing, by choice");
+        tracing::info!(
+            outcome = "bell_disabled",
+            "bell: BELL_DISABLED set — not ringing, by choice"
+        );
         return;
     }
     let Some(url) = crate::resolve_whisper_url(deps).await else {
@@ -92,7 +97,12 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
         return;
     };
     let body = match event {
-        BellEvent::Unwrap { link_token, game_id, choice, .. } => {
+        BellEvent::Unwrap {
+            link_token,
+            game_id,
+            choice,
+            ..
+        } => {
             let label = match deps.store.get_link(link_token).await {
                 Ok(Some(l)) => l.label,
                 Ok(None) => {
@@ -115,7 +125,13 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
                     return;
                 }
             };
-            unwrap_card(&label, &title, art.as_deref(), &deps.whisper_site_url, *choice)
+            unwrap_card(
+                &label,
+                &title,
+                art.as_deref(),
+                &deps.whisper_site_url,
+                *choice,
+            )
         }
         BellEvent::Thanks { link_token } => {
             let link = match deps.store.get_link(link_token).await {
@@ -131,7 +147,10 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
             };
             // the STORED note, never a payload-carried copy (spec: content & security).
             let Some(note) = link.thank_note.as_deref() else {
-                tracing::warn!(link_token, "bell: thanks event but no stored note — not ringing");
+                tracing::warn!(
+                    link_token,
+                    "bell: thanks event but no stored note — not ringing"
+                );
                 return;
             };
             thanks_card(&link.label, note, &deps.whisper_site_url)
@@ -158,7 +177,10 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
         // the same pattern as whisper cause-④ — and the ops webhook is a DIFFERENT credential,
         // so this report survives a dead whisper webhook. Frequency is bounded by construction
         // (claims ≤ claims_allowed; thanks write-once), so this cannot storm.
-        tracing::error!(outcome = "bell_send_failed", "bell POST failed — accepted loss, no retry");
+        tracing::error!(
+            outcome = "bell_send_failed",
+            "bell POST failed — accepted loss, no retry"
+        );
         crate::ping_msg(
             deps,
             &OperatorMessage::fmt(
@@ -219,10 +241,12 @@ mod tests {
     #[test]
     fn unwrap_card_choice_says_so_and_artless_sends_zero_embeds() {
         let v = unwrap_card("sam", "Celeste", None, "https://s", true);
-        assert!(v["content"]
-            .as_str()
-            .unwrap()
-            .contains("a monthly pick, spent with love"));
+        assert!(
+            v["content"]
+                .as_str()
+                .unwrap()
+                .contains("a monthly pick, spent with love")
+        );
         // no art ⇒ NO embed: an empty embed object is a Discord 400, not a blank space
         assert!(v["embeds"].as_array().unwrap().is_empty());
     }
