@@ -685,8 +685,9 @@ git commit -S -m "🔔 the ring ledger: BELL# week counter, and the whisper carr
 **Files:**
 - Modify: `crates/public-api/src/lib.rs` (trait at :28, `LambdaInvoker` at :34–:58,
   `handle_post_claim` success arms near :899, `handle_post_thanks` `Set` arm near :1136)
-- Test: the existing public-api test module's mock invoker (find it:
-  `grep -n 'impl Invoker for' crates/public-api/src -r`)
+- Test: `crates/public-api/tests/api_test.rs` — the real harness: `MockInvoker` at `:129`,
+  57 `#[tokio::test]`s (scouted 2026-09-02; the in-src test module is only a wire-contract test —
+  do NOT hunt fixtures in src/lib.rs)
 
 **Interfaces:**
 - Consumes: `FulfillRequest::Bell` / `bell::BellEvent` from Task 2.
@@ -720,11 +721,14 @@ async fn bell_invoke_failure_never_touches_the_response() {
 }
 ```
 
-(The bodies must be REAL: FIRST run `grep -n '#\[tokio::test\]' crates/public-api/src/lib.rs | head`
+(The bodies must be REAL: FIRST run `grep -n 'claim\|thanks' crates/public-api/tests/api_test.rs | head -30`
 and read the nearest claim-success and thanks-success tests whole; copy their fixture setup and
-extend the mock invoker with a `Vec<FulfillRequest>` behind a Mutex. Write all four with full
-setup — the pattern exists in-file. **If no claim-success fixture exists to copy, STOP and
-report rather than inventing a harness.**)
+extend `MockInvoker` (`api_test.rs:129`) with a `Vec<FulfillRequest>` behind a Mutex — its `bell`
+impl records and returns `Ok(())` by default, `Err` when the test says so. Write all four with
+full setup — the pattern exists in that file. **If no claim-success fixture exists to copy, STOP
+and report rather than inventing a harness.** NB: `adapter_test.rs:235` has a second impl
+(`NoInvoker`) — every `impl Invoker` in tests/ must gain the new `bell` method or the crate stops
+compiling; that compile error is the roster, follow it.)
 
 - [ ] **Step 2: Run to verify failure**
 
