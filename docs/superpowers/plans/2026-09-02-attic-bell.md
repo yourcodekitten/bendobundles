@@ -774,7 +774,7 @@ read the match first; do NOT ring on AlreadyRedeemed/KeyDead/Parked/Error):
     // exactly the claim that matters. Affordable to bound at all BECAUSE misses are counted
     // (the ring ledger) and pinged (ops) — OMBB's coupling. Warm typical ~20ms.
     let t0 = std::time::Instant::now();
-    let mut timed_out = false;
+    let mut outcome = "ok";
     match tokio::time::timeout(std::time::Duration::from_secs(2),
         s.invoker.bell(FulfillRequest::Bell {
             event: fulfillment::bell::BellEvent::Unwrap {
@@ -785,35 +785,41 @@ read the match first; do NOT ring on AlreadyRedeemed/KeyDead/Parked/Error):
             },
         })).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "unwrap bell invoke failed — gift unaffected"),
+        Ok(Err(e)) => {
+            outcome = "err";
+            tracing::warn!(error = %e, "unwrap bell invoke failed — gift unaffected");
+        }
         Err(_) => {
-            timed_out = true;
+            outcome = "timeout";
             tracing::warn!("unwrap bell invoke timed out (2s) — gift unaffected");
         }
     }
-    // the 2s prior becomes a distribution (OMBB) — and timeouts are logged as CENSORED (Lilith):
-    // a timed-out wait proves >=2000ms, never its true value; without the flag the tail being
-    // tuned against is invisible by construction.
-    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, censored = timed_out, "bell invoke duration");
+    // the 2s prior becomes a distribution (OMBB) — with the outcome BESIDE the duration (Lilith):
+    // a killed request and a 1998ms success write the same-shaped number, so an unlabelled p99
+    // reads the CAP as data — the distribution could only ever argue the budget down, never up.
+    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, outcome, "bell invoke duration");
 ```
 
 Thanks call site (inside the `Ok(dynamo::SetThanksOutcome::Set)` arm, after the info line):
 
 ```rust
     let t0 = std::time::Instant::now();
-    let mut timed_out = false;
+    let mut outcome = "ok";
     match tokio::time::timeout(std::time::Duration::from_secs(2),
         s.invoker.bell(FulfillRequest::Bell {
             event: fulfillment::bell::BellEvent::Thanks { link_token: token.clone() },
         })).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "thanks bell invoke failed — thanks unaffected"),
+        Ok(Err(e)) => {
+            outcome = "err";
+            tracing::warn!(error = %e, "thanks bell invoke failed — thanks unaffected");
+        }
         Err(_) => {
-            timed_out = true;
+            outcome = "timeout";
             tracing::warn!("thanks bell invoke timed out (2s) — thanks unaffected");
         }
     }
-    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, censored = timed_out, "bell invoke duration");
+    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, outcome, "bell invoke duration");
 ```
 
 (Exact variable names — `token`, `body.game_id`, `requires_choice` — must be read off the real
