@@ -1,6 +1,9 @@
 # the attic bell 🔔 — spec
 
-*2026-09-02, kitten. Status: DRAFT → family review (OMBB + Lilith) → plan.*
+*2026-09-02, kitten. Status: BUILT — family review (OMBB + Lilith, 8 rounds) → plan
+`docs/superpowers/plans/2026-09-02-attic-bell.md` → OMBB sign-off at `21e5e9f` → implemented.
+Where this document's narrative sections disagree with **decisions** below, the decisions win —
+they are the reviewed outcome and the narrative is the proposal it started as.*
 
 ## why this exists
 
@@ -47,22 +50,26 @@ Two bell events, delivered to ben's Discord in the attic voice, via the whisper-
   builder — and **NEVER touches `WHISPER#` slot state**. (The weekly slot invariant stands;
   Saturday 2026-W36's first full-card tick must arrive virgin.) One send function, two callers:
   a second implementation of the webhook POST is the drift this repo already refuses.
-- **Unwrap bell fires from INSIDE fulfillment's Gift success path** — it is already the
-  post-durable-write point, in the process that owns the transport; no extra invoke exists to
-  fail. Link label comes from a store read it can already do.
-- **Thanks bell**: public-api owns `set_link_thanks`, so after the durable write it invokes
-  fulfillment with the `Bell` op **fire-and-forget** (`InvocationType::Event` — a new invoker
-  method beside the existing RequestResponse `gift()`; the trait grows, the Gift path does not
-  change).
+- **BOTH bells fire from public-api as fire-and-forget `InvocationType::Event` invokes** (a new
+  `Invoker::bell` beside the RequestResponse `gift()`; the trait grows, the Gift path's behaviour
+  does not). *This paragraph's first draft put the unwrap ring INSIDE fulfillment's Gift success
+  path — see Q② below for why that lost: a webhook connect-hang would have sat in the friend's
+  claim latency, and lambda-freeze leaves no "after the response" to hide it in.*
+- **One exception, decided at sign-off: the RECONCILE HEAL rings INLINE**, from
+  `claimed_tpk_terminal`'s guarded `GiftUrl` arm. A healed claim is a friend whose HTTP path never
+  completed — a real unwrap ben was never told about — and reconcile is a background invocation,
+  so nobody waits on that webhook. The arm is guarded on `link_token != SELF_LINK_TOKEN`: ben's
+  own reconciled self-claim must not ring.
 - **Failure disposition: best-effort, loud in logs, invisible to friends.** A bell failure must
   never fail, slow, or color the claim/thanks response — *delight never gates*, and the bell is
-  delight. Send failure = WARN with correlator, nothing else. Stated plainly: **the bell may
-  miss; the gift may never.**
+  delight. **The bell may miss; the gift may never.** A send failure is an ERROR log **and** an
+  ops `ping_msg` on the other credential (Q④) — a WARN nobody reads is at-never-once.
 - **Dark-deploy doctrine inherited verbatim** from spec-attic-whispers: webhook param resolving
-  `UNSET` ⇒ loud no-op log line, zero writes, zero friend-visible effect.
-- **At-most-once, by disposition.** Async lambda invokes retry on *function error* — so the Bell
-  handler swallows its own failures (logs, returns success) rather than signaling error. A missed
-  bell is accepted; a double ring is cheap but sloppy; a retry storm is neither.
+  `UNSET` ⇒ loud no-op log line, zero writes, zero friend-visible effect. `BELL_DISABLED=1` is the
+  bell's own separate mute (Q①).
+- **Delivery honesty: at-most-once against HANDLER failure, at-least-once by DELIVERY.** See Q④ —
+  the handler swallows its own errors so a retry cannot double-send after a partial success, but
+  Lambda's async delivery contract still permits a rare duplicate, which is accepted.
 
 ## content & security
 
@@ -70,8 +77,9 @@ Two bell events, delivered to ben's Discord in the attic voice, via the whisper-
   thank-you is write-once per link (conditional update). No unbounded webhook-spam path exists.
 - The thanks bell sends the **STORED** note — already control/bidi-sanitized at write
   (`sanitize_note`), already budgeted (`THANK_NOTE_MAX_CHARS = 500`) — never the raw request body.
-- `allowed_mentions: {"parse": []}` on every bell (the #176 adjudication: denies notify; embeds
-  unaffected).
+- `allowed_mentions: {"parse": []}` on every bell. **Scope corrected in review:** it is documented
+  for `content` and says nothing contractual about embeds, so all friend-influenced text rides
+  `content` and the question does not arise (see the fences).
 - No friend PII beyond the link label, which ben himself wrote.
 
 ## decisions (2026-09-02, family review ×8 rounds + OMBB sign-off at plan `21e5e9f`)
