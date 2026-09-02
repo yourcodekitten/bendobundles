@@ -90,6 +90,48 @@ needs — no part of this waits on Ben.**
    - `ops_alarm_email` — **MANDATORY, no default.** Ben's alert email address (the ops-alarm SNS
      topic subscription target — he confirms it once by mail). Value supplied at deploy time only,
      never committed. Omitting it hard-fails the apply.
+   - 🔴 **EVERY `*_enabled` FEATURE FLAG — `discord_webhook_enabled = true`, `whisper_enabled = true`.**
+     These default to **`false`** so plan-only environments stay silent, which means **omitting one
+     does not fail the plan — it silently proposes DESTROYING that feature's whole stack.** Measured
+     2026-09-02 (the attic-bell deploy): a tfvars built from this list *before this line existed*
+     produced `0 to add, 4 to change, **7 to destroy**` — the whisper schedule, its scheduler role and
+     policy, both alarms, **and `aws_ssm_parameter.whisper_webhook` itself**, whose value is
+     `PutParameter`'d out of band and would have been unrecoverable from state. It also stripped the
+     fulfillment role's `ssm:GetParameter` on that param, which would have darkened the whisper *and*
+     the bell.
+     ⚠️ **THE KEY LIST ABOVE IS THE HAZARD, NOT THE CURE: it is a hand-written roster that a new
+     feature flag does not update.** Do not trust it — **derive** the set before every deploy, and add
+     any flag the code declares:
+     ```bash
+     # every declared variable, minus what your tfvars already sets (admin_password_hash rides TF_VAR)
+     # ⚠️ [a-z0-9_] — NOT [a-z_]. The first draft of this very command dropped the digits, and the
+     # consequence is worse than a miscount: MEASURED on this tree, both classes yield 15 names, so
+     # THE COUNT NEVER MOVES. `route53_profile` is silently replaced by the phantom `route` — and in
+     # `comm -23` that one swap fires BOTH WAYS AT ONCE: `route` is not in supplied ⇒ FALSE ALARM,
+     # and `route53_profile` is never in declared ⇒ NEVER CHECKED, a FALSE CLEAN. The false clean is
+     # the dangerous half: a genuinely missing `route53_profile` slips past the very check written
+     # to catch it. (OMBB's correction, 2026-09-02 — my first note here claimed the narrow class
+     # "under-counted by one", which would have taught you to look for a short count that never
+     # comes.)
+     # 🔑 AND THE FAILURE MODE DEPENDS ON ANCHORING, same root cause, opposite symptom — both
+     # reproduced on this tree:
+     #   ANCHORED   `variable "([a-z_]+)"`        — must reach the closing quote ⇒ no match at all
+     #                                              ⇒ DROPS the name ⇒ 14 vs 15 (a short census)
+     #   UNANCHORED `grep -oP 'variable "\K[a-z_]+'` — keeps the prefix it can spell
+     #                                              ⇒ SWAPS in a phantom ⇒ 15 vs 15 (a lying census)
+     # ⇒ A CENSUS CANNOT BE VALIDATED BY ITS COUNT. Check that every name it emits is a name that
+     #   exists — the count is identical in the case that lies to you.
+     # process substitution, NOT /tmp/<fixed-name> files (OMBB, PR review): two people running this
+     # at once collide on the same paths, and the loser silently compares one run's DECLARED against
+     # the other's SUPPLIED — a wrong answer with no error. The files also outlive the check, so a
+     # stale pair reads as a fresh result. A command in a note about censuses that lie must not be
+     # one. This form holds no state and needs no cleanup.
+     comm -23 <(grep -hoP 'variable "\K[a-z0-9_]+' terraform/*.tf | sort) \
+              <(grep -hoP '^\K[a-z0-9_]+' terraform/production.tfvars | sort)
+     # read EVERY line; any *_enabled here is a destroy waiting
+     ```
+     **And the backstop that actually caught it: `Plan: N to add, N to change, N to destroy` — ANY
+     non-zero destroy on a code-only deploy means STOP.**
 3. **`admin_password_hash` — pull the LIVE value and pass it back verbatim (a no-op). NEVER re-hash the
    password.** The `admin_hash` SSM param (`aws-ssm.tf`) is `value = var.admin_password_hash` with **no
    `ignore_changes`**, so terraform sets it to whatever you pass on every apply. Argon2 with a fresh salt
