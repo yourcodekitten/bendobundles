@@ -784,6 +784,20 @@ async fn drive_fulfillment(rig: &Rig) -> MethodOps {
         s.list_pending_claims().await.unwrap();
     })
     .await;
+    // the attic bell's week ledger (spec: docs/spec-attic-bell.md). BOTH legs captured: the
+    // generated policy must describe what the lambda ACTUALLY calls, and this driver is a
+    // hand-written roster — a new store call that nobody adds here silently stops being
+    // described, which is the one way this generator can lie.
+    capture(cap, &mut m, "increment_bell_counter", async {
+        s.increment_bell_counter("2026-W36", dynamo::BellCounter::Unwraps)
+            .await
+            .unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "get_bell_counts", async {
+        s.get_bell_counts("2026-W36").await.unwrap();
+    })
+    .await;
     capture(cap, &mut m, "record_choice_intent", async {
         s.record_choice_intent("ftok", "fc1", vec!["tpk1".into()])
             .await
