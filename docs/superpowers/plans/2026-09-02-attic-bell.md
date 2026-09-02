@@ -498,8 +498,9 @@ failure domain.)*
 - Modify: `crates/dynamo/tests/store_test.rs` (counter round-trip test, existing
   dynamodb-local harness — tests SKIP locally without `DYNAMODB_LOCAL_URL`; CI runs them)
 - Modify: `crates/fulfillment/src/bell.rs` (`ring` increments after a successful send)
-- Modify: `crates/fulfillment/src/lib.rs` (the `FulfillRequest::Gift` dispatch arm at :654 —
-  see Step 5 — and `handle_whisper` reads the count near the `whisper_card` call at ~:4940)
+- Modify: `crates/fulfillment/src/lib.rs` (both `fulfill_claim` Ok-arms `:894`/`:1451`, the
+  reconcile heal-success arm in `claimed_tpk_terminal` ~`:2086`, and `handle_whisper` reads the
+  count near the `whisper_card` call at ~:4940)
 - Modify: `crates/fulfillment/tests/handler_test.rs` (population-enumeration asserts, Step 5)
 - Modify: `crates/fulfillment/src/whisper.rs` (`whisper_card` gains a `bell_count: Option<u32>`
   parameter and one content line)
@@ -515,10 +516,11 @@ failure domain.)*
   — `None` = counters unreadable (say nothing rather than lie a zero). TWO numbers from
   INDEPENDENT sources (OMBB's sharpening: one number stays ambiguous — "rang 0" reads exactly
   like a quiet week; "4 unwrapped, 0 rings" contradicts itself):
-  - `unwraps` is incremented in `handle()`'s `FulfillRequest::Gift` dispatch arm on a `GiftUrl`
-    response (NEVER at the `fulfill_claim` Ok-arms — reconcile's bell-less heal reaches those;
-    OMBB's blocker) — bell-independent by construction: not gated by `BELL_DISABLED`, not
-    touched by webhook health, written by the process that writes the gift.
+  - `unwraps` is incremented at BOTH `fulfill_claim` Ok-arms (`:894`/`:1451`) — every friend
+    gift made durable, whatever route minted it; the reconcile heal RINGS INLINE at its success
+    site so the pair balances by construction (sign-off ruling: a healed claim is a real unwrap
+    and ben gets told; excluding it would delete the disagreeing population). Bell-independent:
+    not gated by `BELL_DISABLED`, not touched by webhook health.
   - `rings` is incremented by `ring` after a successful send.
   Render: `(0, 0)` → `*(the attic was quiet this week)*` · otherwise →
   `🔔 *({u} unwrapped · the bell rang {r})*` — the reader sees the contradiction, the card never
@@ -630,54 +632,71 @@ count rings on failures, which un-falsifies the whole ledger):
     }
 ```
 
-- [ ] **Step 5: Wire the unwrap counter (DISPATCH layer), `handle_whisper` and `whisper_card`**
+- [ ] **Step 5: Wire the unwrap counter + the RECONCILE ring, `handle_whisper` and `whisper_card`**
 
-🔴 NOT at the `fulfill_claim` `Ok` arms — OMBB's sign-off blocker, verified in the code: `:1451`
-sits in `redeem_claimed_tpk`, which the background RECONCILE heal also reaches
-(`reconcile :4158 → reconcile_choice_claim :1971 → claimed_tpk_terminal :2074 →
-redeem_claimed_tpk :1396`) with no request in flight and no bell to follow — counting there
-drifts `rings < unwraps` permanently, the exact direction the spec calls suspect. The increment
-lives in `handle()`'s `FulfillRequest::Gift` DISPATCH arm (`lib.rs:654`), which only
-public-api's claim path constructs (`public-api/src/lib.rs:887`; verified: no other constructor
-outside tests) — so the population is EXACTLY the bell's: `op == Gift ∧ resp == GiftUrl`, the
-same predicate public-api rings on. Restructure the arm to capture the response:
+🔴 DESIGN, settled at sign-off (OMBB's blocker + Lilith's product ruling): `unwraps` counts the
+honest noun — EVERY friend gift made durable — at BOTH `fulfill_claim` `Ok(())` arms
+(`lib.rs:894` and `:1451`; friend-only by construction — SelfClaim flows through
+`reveal_claimed_tpk`, never `fulfill_claim`). The reconcile-healed claim is a friend who got a
+gift while ben was never told: excluding it from the denominator would balance the pair by
+deleting the population that disagreed (retuning a test to its own output). Instead THE HEAL
+RINGS TOO — the pair balances by construction because every counted event has a ring route:
+- HTTP route: public-api's Event invoke (Task 5).
+- Reconcile route: an INLINE `bell::ring` at the heal's success site — a background invocation,
+  so webhook latency is harmless there.
+Any FUTURE gift-minting route that forgets to ring shows up as sustained `rings < unwraps` —
+the counter detecting a missed-notification class, which is its job.
+
+At both `fulfill_claim` `Ok(())` arms, immediately after the fulfill succeeds:
 
 ```rust
-        FulfillRequest::Gift {
-            claim_id, link_token, game_id, gamekey, machine_name, keyindex, requires_choice,
-        } => {
-            tracing::info!(claim_id, game_id, machine_name, keyindex, requires_choice,
-                "fulfillment: gift request");
-            let resp = if requires_choice {
-                handle_gift_choice(deps, &claim_id, &link_token, &game_id, &gamekey, &machine_name).await
-            } else {
-                handle_gift(deps, &claim_id, &link_token, &game_id, &gamekey, &machine_name, keyindex).await
-            };
-            if matches!(resp, FulfillResponse::GiftUrl { .. }) {
-                // unwrap ledger — DISPATCH layer, deliberately NOT the fulfill_claim Ok-arms:
-                // reconcile's heal reaches those with no bell to follow (OMBB's blocker). Here
-                // the increment set ≡ the ring set: friend-initiated Gift op ∧ GiftUrl. Still
-                // bell-BLIND: no BELL_DISABLED gate, no webhook read. Best-effort: a ledger
-                // miss is a WARN, never a failed gift.
-                let week = bell::current_week();
-                if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Unwraps).await {
-                    tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
-                }
-            }
-            resp
-        }
+                        // durable unwrap ledger — the honest noun: every friend gift made
+                        // durable, whatever route minted it (HTTP or reconcile heal). Bell-BLIND:
+                        // not gated by BELL_DISABLED, blind to webhook health. Best-effort: a
+                        // ledger miss is a WARN, never a failed gift.
+                        let week = bell::current_week();
+                        if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Unwraps).await {
+                            tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
+                        }
+```
+
+At the reconcile heal's success site — `claimed_tpk_terminal`'s arm matching
+`FulfillResponse::GiftUrl { .. }` (`lib.rs:~2086`; `claim.link_token` and `claim.game_id` are in
+scope; the `RevealedKey` sibling and the `claim.link_token == domain::SELF_LINK_TOKEN` branch
+must NOT ring — read the arm structure and place the call on the GiftUrl-and-not-self path only):
+
+```rust
+                        // the heal rings too (product ruling, sign-off 2026-09-02): a healed
+                        // claim is a friend who got their gift on the bumpy path — the one case
+                        // ben most wants to hear about. Inline is fine HERE: reconcile is a
+                        // background invocation, nobody waits on the webhook. choice: true —
+                        // reconcile B2 heals choice claims.
+                        bell::ring(deps, &bell::BellEvent::Unwrap {
+                            link_token: claim.link_token.clone(),
+                            game_id: claim.game_id.clone(),
+                            week: bell::current_week(),
+                            choice: true,
+                        }).await;
 ```
 
 **POPULATION ENUMERATION, asserted not eyeballed (the sign-off flip condition):** in
 `crates/fulfillment/tests/handler_test.rs`, extend one existing Gift-success test with
 `assert_eq!(store.get_bell_counts(&bell::current_week()).await.unwrap().0, 1)` and one existing
-reconcile-heal test with the COUNTER-ARM: unwraps unchanged by the heal
-(`get_bell_counts(...).0 == 0`). The rings side is pinned by Task 5's api_test asserts (bell
-called iff GiftUrl). Two layers, one predicate, both directions tested.
+reconcile-heal test with BOTH asserts: `unwraps` incremented by the heal AND the ring attempted —
+with the test webhook dark, the attempt's observable is the dark no-op face (assert the captured
+log line if the harness captures logs; otherwise assert unwraps and note the ring call is pinned
+by this plan's code block + review). The rings side of the HTTP route is pinned by Task 5's
+api_test asserts (bell called iff GiftUrl). One event set, every route ringing, both directions
+tested.
 
-(Admin self-claim `Reveal`/`SelfClaim` ops get NO increment — different op arm, untouched.
-`rings` counts UNWRAP bells only — Task 3's ring — so the two columns are one population and
-`rings < unwraps` stays readable as the suspect direction.)
+⚠️ NAMING (Lilith): the card says "N unwrapped" to BEN — with this design the column means
+exactly that, every friend unwrap, so the noun is honest. Do not re-scope the column without
+renaming it.
+
+(Admin self-claims get NO count and NO ring — `reveal_claimed_tpk`'s path never touches
+`fulfill_claim`, and the reconcile ring site explicitly skips `SELF_LINK_TOKEN`. `rings` counts
+UNWRAP bells only — thanks bells would break the pairing — so `rings < unwraps` stays readable
+as the suspect direction.)
 
 In `handle_whisper`, right before the `whisper_card` call (the `slot` string is already the ISO
 week): `let bell_counts = deps.store.get_bell_counts(&slot).await.ok();` and pass it as the new
