@@ -660,32 +660,45 @@ At both `fulfill_claim` `Ok(())` arms, immediately after the fulfill succeeds:
                         }
 ```
 
-At the reconcile heal's success site — `claimed_tpk_terminal`'s arm matching
-`FulfillResponse::GiftUrl { .. }` (`lib.rs:~2086`; `claim.link_token` and `claim.game_id` are in
-scope; the `RevealedKey` sibling and the `claim.link_token == domain::SELF_LINK_TOKEN` branch
-must NOT ring — read the arm structure and place the call on the GiftUrl-and-not-self path only):
+At the reconcile heal's success site, REPLACE `claimed_tpk_terminal`'s combined success arm
+(`lib.rs:2086`, today `FulfillResponse::GiftUrl { .. } | FulfillResponse::RevealedKey { .. } =>`)
+with this split — GUARDED ARM FIRST, the split in the CODE not the prose (OMBB's blocker: pasted
+unguarded, a reconciled SELF-claim would ring ben's own action AND drift `rings > unwraps` with
+no unwrap, since reveal never touches `fulfill_claim`):
 
 ```rust
-                        // the heal rings too (product ruling, sign-off 2026-09-02): a healed
-                        // claim is a friend who got their gift on the bumpy path — the one case
-                        // ben most wants to hear about. Inline is fine HERE: reconcile is a
-                        // background invocation, nobody waits on the webhook. choice: true —
-                        // reconcile B2 heals choice claims.
+                match resp {
+                    // the heal rings too (product ruling, sign-off 2026-09-02): a healed claim
+                    // is a friend who got their gift on the bumpy path — the one case ben most
+                    // wants to hear about. Guarded arm FIRST: a reconciled SELF-claim must not
+                    // ring (decided non-goal). Inline is fine HERE — reconcile is a background
+                    // invocation, nobody waits on the webhook. choice: true — B2 heals choice.
+                    FulfillResponse::GiftUrl { .. }
+                        if claim.link_token != domain::SELF_LINK_TOKEN =>
+                    {
+                        tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
                         bell::ring(deps, &bell::BellEvent::Unwrap {
                             link_token: claim.link_token.clone(),
                             game_id: claim.game_id.clone(),
                             week: bell::current_week(),
                             choice: true,
                         }).await;
+                    }
+                    FulfillResponse::GiftUrl { .. } | FulfillResponse::RevealedKey { .. } => {
+                        tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
+                    }
+                    // ... keep the existing KeyDead and catch-all arms below unchanged
 ```
 
 **POPULATION ENUMERATION, asserted not eyeballed (the sign-off flip condition):** in
 `crates/fulfillment/tests/handler_test.rs`, extend one existing Gift-success test with
 `assert_eq!(store.get_bell_counts(&bell::current_week()).await.unwrap().0, 1)` and one existing
-reconcile-heal test with BOTH asserts: `unwraps` incremented by the heal AND the ring attempted —
-with the test webhook dark, the attempt's observable is the dark no-op face (assert the captured
-log line if the harness captures logs; otherwise assert unwraps and note the ring call is pinned
-by this plan's code block + review). The rings side of the HTTP route is pinned by Task 5's
+reconcile-heal test with BOTH asserts REQUIRED, no fallback: `unwraps` incremented by the heal
+AND the ring attempted — the harness DOES capture logs: `capture_logs()` at
+`handler_test.rs:3275`, which carries its own vacuity guard (verified at sign-off; the earlier
+"if the harness captures" hatch is closed — a subagent that cannot find the helper STOPS and
+reports rather than shipping the ring unasserted). With the test webhook dark, assert the ring's
+dark no-op face in the captured logs. The rings side of the HTTP route is pinned by Task 5's
 api_test asserts (bell called iff GiftUrl). One event set, every route ringing, both directions
 tested.
 
