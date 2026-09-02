@@ -236,9 +236,10 @@ git commit -S -m "🔔 bell cards: pure builders for the unwrap and thanks momen
 
 **Interfaces:**
 - Produces: `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub enum BellEvent` with variants
-  `Unwrap { link_token: String, game_id: String, choice: bool }` and
+  `Unwrap { link_token: String, game_id: String, week: String, choice: bool }` and
   `Thanks { link_token: String }` (snake_case tags to match the existing wire style — copy the
-  serde attributes `FulfillRequest` itself uses; do not invent a different casing).
+  serde attributes `FulfillRequest` itself uses; do not invent a different casing). `week` is the
+  ring's ledger week, stamped by the sender (Task 5) so the unwrap/ring pair shares one bucket.
 - Produces: `FulfillRequest::Bell { event: BellEvent }` and fieldless `FulfillResponse::Belled`.
 
 - [ ] **Step 1: Write the failing wire tests** (beside the existing FulfillRequest serde tests —
@@ -497,8 +498,9 @@ failure domain.)*
 - Modify: `crates/dynamo/tests/store_test.rs` (counter round-trip test, existing
   dynamodb-local harness — tests SKIP locally without `DYNAMODB_LOCAL_URL`; CI runs them)
 - Modify: `crates/fulfillment/src/bell.rs` (`ring` increments after a successful send)
-- Modify: `crates/fulfillment/src/lib.rs` (`handle_whisper` reads the count; near the
-  `whisper_card` call at ~:4940)
+- Modify: `crates/fulfillment/src/lib.rs` (the `FulfillRequest::Gift` dispatch arm at :654 —
+  see Step 5 — and `handle_whisper` reads the count near the `whisper_card` call at ~:4940)
+- Modify: `crates/fulfillment/tests/handler_test.rs` (population-enumeration asserts, Step 5)
 - Modify: `crates/fulfillment/src/whisper.rs` (`whisper_card` gains a `bell_count: Option<u32>`
   parameter and one content line)
 
@@ -513,9 +515,10 @@ failure domain.)*
   — `None` = counters unreadable (say nothing rather than lie a zero). TWO numbers from
   INDEPENDENT sources (OMBB's sharpening: one number stays ambiguous — "rang 0" reads exactly
   like a quiet week; "4 unwrapped, 0 rings" contradicts itself):
-  - `unwraps` is incremented by the GIFT handlers at the durable `fulfill_claim` success points
-    (`lib.rs:894` and `:1451` neighborhoods) — bell-independent by construction: not gated by
-    `BELL_DISABLED`, not touched by webhook health, written by the process that writes the gift.
+  - `unwraps` is incremented in `handle()`'s `FulfillRequest::Gift` dispatch arm on a `GiftUrl`
+    response (NEVER at the `fulfill_claim` Ok-arms — reconcile's bell-less heal reaches those;
+    OMBB's blocker) — bell-independent by construction: not gated by `BELL_DISABLED`, not
+    touched by webhook health, written by the process that writes the gift.
   - `rings` is incremented by `ring` after a successful send.
   Render: `(0, 0)` → `*(the attic was quiet this week)*` · otherwise →
   `🔔 *({u} unwrapped · the bell rang {r})*` — the reader sees the contradiction, the card never
@@ -627,25 +630,54 @@ count rings on failures, which un-falsifies the whole ledger):
     }
 ```
 
-- [ ] **Step 5: Wire the unwrap counter, `handle_whisper` and `whisper_card`**
+- [ ] **Step 5: Wire the unwrap counter (DISPATCH layer), `handle_whisper` and `whisper_card`**
 
-At BOTH durable gift-success points (the `Ok(())` arms of `fulfill_claim` at `lib.rs:894` and
-`:1451` neighborhoods), immediately after the fulfill succeeds:
+🔴 NOT at the `fulfill_claim` `Ok` arms — OMBB's sign-off blocker, verified in the code: `:1451`
+sits in `redeem_claimed_tpk`, which the background RECONCILE heal also reaches
+(`reconcile :4158 → reconcile_choice_claim :1971 → claimed_tpk_terminal :2074 →
+redeem_claimed_tpk :1396`) with no request in flight and no bell to follow — counting there
+drifts `rings < unwraps` permanently, the exact direction the spec calls suspect. The increment
+lives in `handle()`'s `FulfillRequest::Gift` DISPATCH arm (`lib.rs:654`), which only
+public-api's claim path constructs (`public-api/src/lib.rs:887`; verified: no other constructor
+outside tests) — so the population is EXACTLY the bell's: `op == Gift ∧ resp == GiftUrl`, the
+same predicate public-api rings on. Restructure the arm to capture the response:
 
 ```rust
-                        // durable unwrap ledger — bell-INDEPENDENT by construction (not gated
-                        // by BELL_DISABLED, blind to webhook health): the whisper prints this
-                        // beside `rings` so a dead bell contradicts it. Best-effort: a ledger
-                        // miss is a WARN, never a failed gift.
-                        let week = bell::current_week();
-                        if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Unwraps).await {
-                            tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
-                        }
+        FulfillRequest::Gift {
+            claim_id, link_token, game_id, gamekey, machine_name, keyindex, requires_choice,
+        } => {
+            tracing::info!(claim_id, game_id, machine_name, keyindex, requires_choice,
+                "fulfillment: gift request");
+            let resp = if requires_choice {
+                handle_gift_choice(deps, &claim_id, &link_token, &game_id, &gamekey, &machine_name).await
+            } else {
+                handle_gift(deps, &claim_id, &link_token, &game_id, &gamekey, &machine_name, keyindex).await
+            };
+            if matches!(resp, FulfillResponse::GiftUrl { .. }) {
+                // unwrap ledger — DISPATCH layer, deliberately NOT the fulfill_claim Ok-arms:
+                // reconcile's heal reaches those with no bell to follow (OMBB's blocker). Here
+                // the increment set ≡ the ring set: friend-initiated Gift op ∧ GiftUrl. Still
+                // bell-BLIND: no BELL_DISABLED gate, no webhook read. Best-effort: a ledger
+                // miss is a WARN, never a failed gift.
+                let week = bell::current_week();
+                if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Unwraps).await {
+                    tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
+                }
+            }
+            resp
+        }
 ```
 
-(Admin self-claim `Reveal` paths get NO increment — the ledger counts friend unwraps, mirroring
-what bells ring for. `rings` counts UNWRAP bells only — Task 3's ring — so the two columns are
-one population and `rings < unwraps` stays readable as the suspect direction.)
+**POPULATION ENUMERATION, asserted not eyeballed (the sign-off flip condition):** in
+`crates/fulfillment/tests/handler_test.rs`, extend one existing Gift-success test with
+`assert_eq!(store.get_bell_counts(&bell::current_week()).await.unwrap().0, 1)` and one existing
+reconcile-heal test with the COUNTER-ARM: unwraps unchanged by the heal
+(`get_bell_counts(...).0 == 0`). The rings side is pinned by Task 5's api_test asserts (bell
+called iff GiftUrl). Two layers, one predicate, both directions tested.
+
+(Admin self-claim `Reveal`/`SelfClaim` ops get NO increment — different op arm, untouched.
+`rings` counts UNWRAP bells only — Task 3's ring — so the two columns are one population and
+`rings < unwraps` stays readable as the suspect direction.)
 
 In `handle_whisper`, right before the `whisper_card` call (the `slot` string is already the ISO
 week): `let bell_counts = deps.store.get_bell_counts(&slot).await.ok();` and pass it as the new
@@ -888,6 +920,13 @@ at-most-once + ops ping on miss + the whisper-carried ring count), plus these tw
   counted in the week its EVENT carries — stamped beside the gift response — so a week-boundary
   straddle is bounded to a milliseconds window (Lilith). Residual ±1 remains possible; **only a
   sustained or multi-unit gap is signal.**
+- "**The counter covers unwrap bells only:** a thanks-bell outage is invisible to the
+  `unwraps · rings` line by design (thanks would break the pairing) and is visible only via the
+  per-miss ops ping." (OMBB's minor, placed where the fences live.)
+- "**The count line clips ~a day a week, both columns equally:** the Saturday whisper reads
+  `BELL#<current week>`, so unwraps/rings landing after that read (Sat eve, Sunday) are printed
+  by no card — next week's card reads its own key. The direction rule survives (both columns
+  drop together); totals under-report and that is said here rather than discovered." (OMBB.)
 - "**The ops register's reader is PROVISIONAL:** every detection path here is a sender; nobody
   has demonstrated a human reads the ops room from this seat. Deploy verification includes ben
   confirming one ops-register message reached eyes; until then 'detection in hours' is a
