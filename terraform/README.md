@@ -90,6 +90,29 @@ needs — no part of this waits on Ben.**
    - `ops_alarm_email` — **MANDATORY, no default.** Ben's alert email address (the ops-alarm SNS
      topic subscription target — he confirms it once by mail). Value supplied at deploy time only,
      never committed. Omitting it hard-fails the apply.
+   - 🔴 **EVERY `*_enabled` FEATURE FLAG — `discord_webhook_enabled = true`, `whisper_enabled = true`.**
+     These default to **`false`** so plan-only environments stay silent, which means **omitting one
+     does not fail the plan — it silently proposes DESTROYING that feature's whole stack.** Measured
+     2026-09-02 (the attic-bell deploy): a tfvars built from this list *before this line existed*
+     produced `0 to add, 4 to change, **7 to destroy**` — the whisper schedule, its scheduler role and
+     policy, both alarms, **and `aws_ssm_parameter.whisper_webhook` itself**, whose value is
+     `PutParameter`'d out of band and would have been unrecoverable from state. It also stripped the
+     fulfillment role's `ssm:GetParameter` on that param, which would have darkened the whisper *and*
+     the bell.
+     ⚠️ **THE KEY LIST ABOVE IS THE HAZARD, NOT THE CURE: it is a hand-written roster that a new
+     feature flag does not update.** Do not trust it — **derive** the set before every deploy, and add
+     any flag the code declares:
+     ```bash
+     # every declared variable, minus what your tfvars already sets (admin_password_hash rides TF_VAR)
+     # ⚠️ [a-z0-9_] — NOT [a-z_]. The first draft of this very command dropped the digits and
+     # reported `route53_profile` as `route`, under-counting the declared set by one. A census
+     # whose pattern cannot spell every member is a census that silently omits them.
+     grep -hoP 'variable "\K[a-z0-9_]+' terraform/*.tf | sort > /tmp/declared
+     grep -hoP '^\K[a-z0-9_]+' terraform/production.tfvars | sort > /tmp/supplied
+     comm -23 /tmp/declared /tmp/supplied   # read every line; any *_enabled here is a destroy waiting
+     ```
+     **And the backstop that actually caught it: `Plan: N to add, N to change, N to destroy` — ANY
+     non-zero destroy on a code-only deploy means STOP.**
 3. **`admin_password_hash` — pull the LIVE value and pass it back verbatim (a no-op). NEVER re-hash the
    password.** The `admin_hash` SSM param (`aws-ssm.tf`) is `value = var.admin_password_hash` with **no
    `ignore_changes`**, so terraform sets it to whatever you pass on every apply. Argon2 with a fresh salt
