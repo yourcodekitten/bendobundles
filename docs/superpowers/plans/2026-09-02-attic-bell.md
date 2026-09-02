@@ -75,8 +75,10 @@ resolved below in Global Constraints — carried to OMBB sign-off with reasons).
 **Files:**
 - Create: `crates/fulfillment/src/bell.rs`
 - Modify: `crates/fulfillment/src/lib.rs` (add `pub mod bell;` next to `pub mod whisper;` at :16)
-- Modify: `crates/fulfillment/src/whisper.rs` (make `trunc`, `CONTENT_MAX`, `EMBED_TITLE_MAX`
-  `pub(crate)` if not already — reuse, never re-implement caps)
+
+(The bell carries its OWN `cap` + caps rather than borrowing whisper's `trunc`: whisper's caps are
+card-layout numbers tuned to ITS card and drift independently; the shared invariant is only
+"content ≤ 2000", pinned by the pathological-inputs test.)
 
 **Interfaces:**
 - Produces: `pub fn unwrap_card(label: &str, game_title: &str, artwork_url: Option<&str>, site_url: &str, choice: bool) -> serde_json::Value`
@@ -101,13 +103,15 @@ mod tests {
         assert!(!content.contains("monthly pick"));
         assert_eq!(v["allowed_mentions"]["parse"].as_array().unwrap().len(), 0);
         assert_eq!(v["embeds"][0]["thumbnail"]["url"], "https://art/1.png");
+        assert_eq!(v["embeds"][0]["title"], "Celeste"); // never thumbnail-only
     }
 
     #[test]
-    fn unwrap_card_choice_says_so_and_artless_has_no_thumbnail() {
+    fn unwrap_card_choice_says_so_and_artless_sends_zero_embeds() {
         let v = unwrap_card("sam", "Celeste", None, "https://s", true);
         assert!(v["content"].as_str().unwrap().contains("a monthly pick, spent with love"));
-        assert!(v["embeds"][0].get("thumbnail").is_none());
+        // no art ⇒ NO embed: an empty embed object is a Discord 400, not a blank space
+        assert!(v["embeds"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -169,13 +173,19 @@ pub fn unwrap_card(
         title = cap(game_title, BELL_TITLE_MAX),
         site = site_url,
     );
-    let mut embed = serde_json::json!({});
-    if let Some(url) = artwork_url {
-        embed["thumbnail"] = serde_json::json!({ "url": url });
-    }
+    // artless ⇒ NO embed at all: an embed object with no renderable field is a Discord 400,
+    // and the bell must not die precisely for games without artwork. With art, the embed
+    // carries the (catalog-owned) title so it is never thumbnail-only.
+    let embeds = match artwork_url {
+        Some(url) => serde_json::json!([{
+            "title": cap(game_title, BELL_TITLE_MAX),
+            "thumbnail": { "url": url },
+        }]),
+        None => serde_json::json!([]),
+    };
     serde_json::json!({
         "content": cap(&content, BELL_CONTENT_MAX),
-        "embeds": [embed],
+        "embeds": embeds,
         "allowed_mentions": { "parse": [] },
     })
 }
@@ -207,7 +217,7 @@ Expected: 4 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/fulfillment/src/bell.rs crates/fulfillment/src/lib.rs crates/fulfillment/src/whisper.rs
+git add crates/fulfillment/src/bell.rs crates/fulfillment/src/lib.rs
 git commit -S -m "🔔 bell cards: pure builders for the unwrap and thanks moments"
 ```
 
@@ -221,7 +231,7 @@ git commit -S -m "🔔 bell cards: pure builders for the unwrap and thanks momen
 - Modify: `crates/fulfillment/src/bell.rs` (the `BellEvent` type lives with its cards)
 
 **Interfaces:**
-- Produces: `#[derive(Debug, Clone, Serialize, Deserialize)] pub enum BellEvent` with variants
+- Produces: `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub enum BellEvent` with variants
   `Unwrap { link_token: String, game_id: String, choice: bool }` and
   `Thanks { link_token: String }` (snake_case tags to match the existing wire style — copy the
   serde attributes `FulfillRequest` itself uses; do not invent a different casing).
@@ -329,6 +339,9 @@ git commit -S -m "🔔 bell wire: BellEvent + FulfillRequest::Bell + Belled resp
   ops line, whisper cause-④'s pattern), `deps.store.get_link(token)`, `deps.store.get_game(id)`,
   `deps.whisper_site_url`.
 - Produces: `pub async fn ring(deps: &Deps, event: &BellEvent)` — returns `()`, NEVER errors.
+- Produces: `pub fn current_week() -> String` (in bell.rs) — the ISO-week string (`2026-W36`
+  shape), ONE implementation for every bell-ledger write; the whisper's own slot derivation stays
+  its own (it is the tick IDENTITY, coupled to the schedule by name — different meaning).
 - Produces: `Deps.bell_disabled: bool` — the bell's OWN off-switch (Q①: shared secret, split
   disable flag; muting bells must not dark the weekly whisper).
 
@@ -365,6 +378,13 @@ In `bell.rs`:
 
 ```rust
 use crate::Deps;
+
+/// The bell ledger's week key — ONE implementation (the whisper's slot derivation is a different
+/// meaning: tick identity, schedule-coupled; this is just "which week does this count in").
+pub fn current_week() -> String {
+    let (y, w, _) = time::OffsetDateTime::now_utc().date().to_iso_week_date();
+    format!("{y}-W{w:02}")
+}
 
 /// Ring the bell for one event. Best-effort BY CONTRACT: every failure is a log line and a clean
 /// return — an Event-invoked lambda retries on function error, and a double ring is worse than a
@@ -425,7 +445,6 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
 ```
 
 (`OperatorMessage`/`Part` paths must match the real module layout — `grep -n 'use.*OperatorMessage\|ping_msg(' crates/fulfillment/src/lib.rs | head` and copy an existing call site's imports.)
-```
 
 In `lib.rs`'s op dispatch (beside the `Whisper` arm):
 
@@ -530,7 +549,7 @@ the compile failure still proves the red.)
             .table_name(&self.table)
             .key("pk", AttributeValue::S(format!("BELL#{week}")))
             .key("sk", AttributeValue::S("COUNT".into()))
-            .update_expression(&format!("ADD {attr} :one"))
+            .update_expression(format!("ADD {attr} :one"))   // owned: the builder takes Into<String>
             .expression_attribute_values(":one", AttributeValue::N("1".into()))
             .send()
             .await
@@ -564,17 +583,31 @@ method first; if the table uses different key attribute names, copy THOSE.)
 
 - [ ] **Step 4: Wire `ring` to increment after a successful send**
 
-At the end of `ring`'s success path (send returned `true`):
+REPLACE ring's final `if !crate::whisper_send_body(...) { ... }` block WHOLE with this if/else —
+the increment lives in the SUCCESS branch only (an increment pasted after the if-block would
+count rings on failures, which un-falsifies the whole ledger):
 
 ```rust
-    // ledger of rings, best-effort like everything here: the count exists so the weekly
-    // whisper can contradict a silent bell; a failed increment is a WARN, never a failed ring.
-    let week = {
-        let (y, w, _) = time::OffsetDateTime::now_utc().date().to_iso_week_date();
-        format!("{y}-W{w:02}")
-    };
-    if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Rings).await {
-        tracing::warn!(error = ?e, week, "bell rang but the ring ledger write failed");
+    if crate::whisper_send_body(&deps.http, &url, &body).await {
+        // ledger of rings, best-effort like everything here: the count exists so the weekly
+        // whisper can contradict a silent bell; a failed increment is a WARN, never a failed ring.
+        let week = current_week();
+        if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Rings).await {
+            tracing::warn!(error = ?e, week, "bell rang but the ring ledger write failed");
+        }
+    } else {
+        // A WARN nobody reads is at-never-once (OMBB, ④): the miss goes to the MONITORED ops
+        // channel via the same pattern as whisper cause-④ — and the ops webhook is a DIFFERENT
+        // credential, so this report survives a dead whisper webhook. Frequency is bounded by
+        // construction (claims ≤ claims_allowed; thanks write-once), so this cannot storm.
+        tracing::error!(outcome = "bell_send_failed", "bell POST failed — accepted loss, no retry");
+        crate::ping_msg(deps, &crate::OperatorMessage::fmt(
+            "the attic bell failed to ring ({}): webhook POST failed — the moment passed unheard; no retry by design",
+            &[crate::operator_message::Part::Id(match event {
+                BellEvent::Unwrap { .. } => "unwrap",
+                BellEvent::Thanks { .. } => "thanks",
+            })],
+        )).await;
     }
 ```
 
@@ -588,10 +621,7 @@ At BOTH durable gift-success points (the `Ok(())` arms of `fulfill_claim` at `li
                         // by BELL_DISABLED, blind to webhook health): the whisper prints this
                         // beside `rings` so a dead bell contradicts it. Best-effort: a ledger
                         // miss is a WARN, never a failed gift.
-                        let week = {
-                            let (y, w, _) = time::OffsetDateTime::now_utc().date().to_iso_week_date();
-                            format!("{y}-W{w:02}")
-                        };
+                        let week = bell::current_week();
                         if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Unwraps).await {
                             tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
                         }
@@ -673,10 +703,11 @@ async fn bell_invoke_failure_never_touches_the_response() {
 }
 ```
 
-(The bodies must be REAL: copy the fixture setup from the nearest existing `handle_post_claim`
-test — `grep -n 'async fn.*claim' crates/public-api/src/lib.rs | grep test` — and extend the mock
-invoker with a `Vec<FulfillRequest>` behind a Mutex. Write all four with full setup; the pattern
-exists in-file.)
+(The bodies must be REAL: FIRST run `grep -n '#\[tokio::test\]' crates/public-api/src/lib.rs | head`
+and read the nearest claim-success and thanks-success tests whole; copy their fixture setup and
+extend the mock invoker with a `Vec<FulfillRequest>` behind a Mutex. Write all four with full
+setup — the pattern exists in-file. **If no claim-success fixture exists to copy, STOP and
+report rather than inventing a harness.**)
 
 - [ ] **Step 2: Run to verify failure**
 
