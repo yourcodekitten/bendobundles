@@ -3,7 +3,7 @@ use domain::{
     AppidSource, Claim, ClaimState, Game, GameStatus, HiddenSource, Link, SELF_LINK_TOKEN, game_id,
 };
 use dynamo::{
-    AppidWrite, AutoHideWrite, ClaimTxError, GuardedWrite, HiddenWrite, OwnedWrite,
+    AppidWrite, AutoHideWrite, BellCounter, ClaimTxError, GuardedWrite, HiddenWrite, OwnedWrite,
     SYNC_RUN_STALE_SECS, SteamAppCache, SteamAppPutError, SteamAppPutGuard, Store, SyncBegin,
     SyncState, SyncWrite, sync_run_is_live,
 };
@@ -92,6 +92,28 @@ fn link(token: &str) -> Link {
         curated_game_ids: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
+}
+
+#[tokio::test]
+async fn bell_counters_increment_independently_and_read_zero_when_absent() {
+    let Some(store) = store_or_skip("bell-counters").await else {
+        return;
+    };
+    assert_eq!(store.get_bell_counts("2026-W36").await.unwrap(), (0, 0));
+    store
+        .increment_bell_counter("2026-W36", BellCounter::Unwraps)
+        .await
+        .unwrap();
+    store
+        .increment_bell_counter("2026-W36", BellCounter::Unwraps)
+        .await
+        .unwrap();
+    store
+        .increment_bell_counter("2026-W36", BellCounter::Rings)
+        .await
+        .unwrap();
+    assert_eq!(store.get_bell_counts("2026-W36").await.unwrap(), (2, 1));
+    assert_eq!(store.get_bell_counts("2026-W37").await.unwrap(), (0, 0)); // week-scoped
 }
 
 #[tokio::test]

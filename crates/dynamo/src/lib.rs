@@ -102,6 +102,16 @@ pub enum OwnedWrite {
     Contested,
 }
 
+/// Which column of the bell's week ledger to bump (spec: bendobundles docs/spec-attic-bell.md).
+/// An enum, never a caller-supplied string — attribute names must not be injectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BellCounter {
+    /// Friend gifts made durable (written at fulfill_claim's Ok arms; bell-BLIND by design).
+    Unwraps,
+    /// Unwrap bells actually delivered (written by bell::ring on send success).
+    Rings,
+}
+
 /// Outcome of the friend's write-once thank-you write (`set_link_thanks`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetThanksOutcome {
@@ -582,6 +592,61 @@ impl Store {
 
     pub async fn get_game(&self, id: &str) -> Result<Option<Game>, StoreError> {
         self.get_meta(&game_pk(id)).await
+    }
+
+    /// The bell's week ledger: two counters, INDEPENDENT sources, one item —
+    /// `pk = BELL#<week>, sk = COUNT`. Its OWN namespace; `WHISPER#` is untouchable (the weekly
+    /// slot invariant). Purpose is falsifiability, not accounting: the weekly whisper prints
+    /// both so a dead bell contradicts the durable unwrap count instead of reading as a quiet
+    /// week (spec-attic-bell).
+    pub async fn increment_bell_counter(
+        &self,
+        week: &str,
+        field: BellCounter,
+    ) -> Result<(), StoreError> {
+        let attr = match field {
+            BellCounter::Unwraps => "unwraps",
+            BellCounter::Rings => "rings",
+        };
+        let (pk, sk) = schema::key_pair(format!("BELL#{week}"), "COUNT");
+        self.client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .update_expression(format!("ADD {attr} :one"))
+            .expression_attribute_values(
+                ":one",
+                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
+            )
+            .send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("update_item", &e)))?;
+        Ok(())
+    }
+
+    /// `(unwraps, rings)` for a week; `(0, 0)` when the item is absent — absent means "nothing
+    /// counted", which for a ledger whose whole job is contradiction is a real zero, not an
+    /// unknown (the whisper's caller still distinguishes UNREADABLE via the Err arm).
+    pub async fn get_bell_counts(&self, week: &str) -> Result<(u32, u32), StoreError> {
+        let (pk, sk) = schema::key_pair(format!("BELL#{week}"), "COUNT");
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+        let read = |name: &str| -> u32 {
+            out.item()
+                .and_then(|i| i.get(name))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        Ok((read("unwraps"), read("rings")))
     }
 
     /// [`Store::get_game`] plus the item's version-counter token (#134). Every internal

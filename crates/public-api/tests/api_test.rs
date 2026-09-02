@@ -106,6 +106,11 @@ struct MockInvoker {
     response_json: String,
     /// Last FulfillRequest received, stored as Value so we can read it later.
     captured: Mutex<Option<serde_json::Value>>,
+    /// Every fire-and-forget bell this invoker was handed (spec: docs/spec-attic-bell.md).
+    /// A Vec, not an Option: "exactly one" and "at least one" are different assertions.
+    bells: Mutex<Vec<serde_json::Value>>,
+    /// When true, `bell` returns Err — the arm proving a bell failure never colours a response.
+    bell_fails: bool,
 }
 
 impl MockInvoker {
@@ -113,7 +118,28 @@ impl MockInvoker {
         Arc::new(Self {
             response_json: serde_json::to_string(&resp).unwrap(),
             captured: Mutex::new(None),
+            bells: Mutex::new(Vec::new()),
+            bell_fails: false,
         })
+    }
+
+    /// Same, but every bell invoke fails — a bell failure must never reach the friend.
+    fn new_with_failing_bell(resp: FulfillResponse) -> Arc<Self> {
+        Arc::new(Self {
+            response_json: serde_json::to_string(&resp).unwrap(),
+            captured: Mutex::new(None),
+            bells: Mutex::new(Vec::new()),
+            bell_fails: true,
+        })
+    }
+
+    async fn bells_rung(&self) -> Vec<FulfillRequest> {
+        self.bells
+            .lock()
+            .await
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()).expect("bell request must deserialise"))
+            .collect()
     }
 
     async fn captured_request(&self) -> Option<FulfillRequest> {
@@ -130,6 +156,17 @@ impl Invoker for MockInvoker {
     async fn gift(&self, req: FulfillRequest) -> Result<FulfillResponse, String> {
         *self.captured.lock().await = Some(serde_json::to_value(&req).unwrap());
         Ok(serde_json::from_str(&self.response_json).unwrap())
+    }
+
+    async fn bell(&self, req: FulfillRequest) -> Result<(), String> {
+        self.bells
+            .lock()
+            .await
+            .push(serde_json::to_value(&req).unwrap());
+        if self.bell_fails {
+            return Err("bell invoke exploded".into());
+        }
+        Ok(())
     }
 }
 
@@ -830,6 +867,228 @@ async fn expired_link_state_expired_games_empty() {
     let j = body_json(resp).await;
     assert_eq!(j["state"], "expired");
     assert_eq!(j["games"], serde_json::json!([]));
+}
+
+// ── the attic bell (spec: docs/spec-attic-bell.md) ────────────────────────────
+
+/// A successful claim rings the unwrap bell — and the friend's response is untouched.
+#[tokio::test]
+async fn claim_success_rings_the_unwrap_bell_and_response_is_unchanged() {
+    let Some(store) = store_or_skip("bell-claim").await else {
+        return;
+    };
+    let g = test_game(1);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store.create_link(&test_link("bell-tok")).await.unwrap();
+
+    let mock: Arc<MockInvoker> = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://humblebundle.com/gift?key=abc".into(),
+    });
+    let invoker: Arc<dyn Invoker> = mock.clone();
+
+    let claim_body = serde_json::json!({"game_id": gid});
+    let post_req = Request::post("/api/l/bell-tok/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+        .unwrap();
+    let post_resp = plain_router(Arc::clone(&store), Arc::clone(&invoker))
+        .oneshot(post_req)
+        .await
+        .unwrap();
+
+    // ① the friend's moment is byte-for-byte what it was before the bell existed
+    assert_eq!(post_resp.status(), StatusCode::OK);
+    let post_j = body_json(post_resp).await;
+    assert_eq!(post_j["gift_url"], "https://humblebundle.com/gift?key=abc");
+    assert_eq!(
+        post_j.as_object().unwrap().len(),
+        1,
+        "the claim response gained a field — the bell must be invisible to the friend"
+    );
+
+    // ② exactly one bell, naming the same link and game the gift did
+    let bells = mock.bells_rung().await;
+    assert_eq!(bells.len(), 1, "exactly one unwrap bell per claim");
+    match &bells[0] {
+        FulfillRequest::Bell {
+            event:
+                fulfillment::bell::BellEvent::Unwrap {
+                    link_token,
+                    game_id,
+                    choice,
+                    week,
+                },
+        } => {
+            assert_eq!(link_token, "bell-tok");
+            assert_eq!(game_id, &gid);
+            assert!(!choice, "test_game(1) is a plain bundle game");
+            assert_eq!(
+                week,
+                &fulfillment::bell::current_week(),
+                "the ring's ledger week is stamped by the sender, beside the gift response"
+            );
+        }
+        other => panic!("wrong bell event: {other:?}"),
+    }
+}
+
+/// A landed thank-you rings the thanks bell.
+#[tokio::test]
+async fn thanks_success_rings_the_thanks_bell() {
+    let Some(store) = store_or_skip("bell-thanks").await else {
+        return;
+    };
+    let g = test_game(1);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store.create_link(&test_link("thx-tok")).await.unwrap();
+
+    let mock: Arc<MockInvoker> = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://humblebundle.com/gift?key=abc".into(),
+    });
+    let invoker: Arc<dyn Invoker> = mock.clone();
+
+    // thanks is the echo of an unwrap: claim first, or the handler refuses.
+    let claim_req = Request::post("/api/l/thx-tok/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"game_id": gid})).unwrap(),
+        ))
+        .unwrap();
+    plain_router(Arc::clone(&store), Arc::clone(&invoker))
+        .oneshot(claim_req)
+        .await
+        .unwrap();
+
+    let thanks_req = Request::post("/api/l/thx-tok/thanks")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"note": "thank you ♡"})).unwrap(),
+        ))
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), Arc::clone(&invoker))
+        .oneshot(thanks_req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bells = mock.bells_rung().await;
+    assert_eq!(
+        bells.len(),
+        2,
+        "one unwrap bell from the claim, one thanks bell"
+    );
+    assert!(
+        matches!(
+            &bells[1],
+            FulfillRequest::Bell {
+                event: fulfillment::bell::BellEvent::Thanks { link_token }
+            } if link_token == "thx-tok"
+        ),
+        "the second bell is the thanks, naming its link: {:?}",
+        bells[1]
+    );
+}
+
+/// Refusals ring NOTHING: a revoked link's claim and a duplicate thank-you.
+#[tokio::test]
+async fn refused_claim_and_refused_thanks_ring_nothing() {
+    let Some(store) = store_or_skip("bell-refused").await else {
+        return;
+    };
+    let g = test_game(1);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    let mut lnk = test_link("rev-bell-tok");
+    lnk.revoked = true;
+    store.create_link(&lnk).await.unwrap();
+
+    let mock: Arc<MockInvoker> = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://humblebundle.com/gift?key=abc".into(),
+    });
+    let invoker: Arc<dyn Invoker> = mock.clone();
+
+    let claim_req = Request::post("/api/l/rev-bell-tok/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"game_id": gid})).unwrap(),
+        ))
+        .unwrap();
+    let claim_resp = plain_router(Arc::clone(&store), Arc::clone(&invoker))
+        .oneshot(claim_req)
+        .await
+        .unwrap();
+    assert_ne!(claim_resp.status(), StatusCode::OK);
+
+    let thanks_req = Request::post("/api/l/rev-bell-tok/thanks")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"note": "hi"})).unwrap(),
+        ))
+        .unwrap();
+    let thanks_resp = plain_router(Arc::clone(&store), Arc::clone(&invoker))
+        .oneshot(thanks_req)
+        .await
+        .unwrap();
+    assert_ne!(thanks_resp.status(), StatusCode::OK);
+
+    assert!(
+        mock.bells_rung().await.is_empty(),
+        "a refused moment is not a moment: no bell may ring"
+    );
+}
+
+/// A bell invoke that FAILS must never colour the friend's response.
+#[tokio::test]
+async fn bell_invoke_failure_never_touches_the_response() {
+    let Some(store) = store_or_skip("bell-fails").await else {
+        return;
+    };
+    let g = test_game(1);
+    let gid = g.id.clone();
+    store.put_game(&g).await.unwrap();
+    store.create_link(&test_link("boom-tok")).await.unwrap();
+
+    let mock: Arc<MockInvoker> = MockInvoker::new_with_failing_bell(FulfillResponse::GiftUrl {
+        url: "https://humblebundle.com/gift?key=abc".into(),
+    });
+    let invoker: Arc<dyn Invoker> = mock.clone();
+
+    let claim_req = Request::post("/api/l/boom-tok/claim")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"game_id": gid})).unwrap(),
+        ))
+        .unwrap();
+    let claim_resp = plain_router(Arc::clone(&store), Arc::clone(&invoker))
+        .oneshot(claim_req)
+        .await
+        .unwrap();
+    assert_eq!(claim_resp.status(), StatusCode::OK);
+    let j = body_json(claim_resp).await;
+    assert_eq!(j["gift_url"], "https://humblebundle.com/gift?key=abc");
+
+    let thanks_req = Request::post("/api/l/boom-tok/thanks")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"note": "still landed"})).unwrap(),
+        ))
+        .unwrap();
+    let thanks_resp = plain_router(Arc::clone(&store), Arc::clone(&invoker))
+        .oneshot(thanks_req)
+        .await
+        .unwrap();
+    assert_eq!(
+        thanks_resp.status(),
+        StatusCode::OK,
+        "the gift and the thank-you may never miss; only the bell may"
+    );
+    assert_eq!(
+        mock.bells_rung().await.len(),
+        2,
+        "both bells were ATTEMPTED — the failure is in the invoke, not the call site"
+    );
 }
 
 /// Happy path: seed game + link, claim with MockInvoker returning GiftUrl →

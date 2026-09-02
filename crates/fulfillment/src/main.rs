@@ -62,6 +62,13 @@ fn whisper_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
     env("WHISPER_DISABLED").as_deref() == Some("1")
 }
 
+/// Is the BELL suppressed? Reads `BELL_DISABLED` and ONLY `BELL_DISABLED` — the bell shares the
+/// whisper's CREDENTIAL (one room, one rotation event) but not its off-switch: muting per-event
+/// bells must not dark the weekly whisper, and vice versa (spec-attic-bell Q①).
+fn bell_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
+    env("BELL_DISABLED").as_deref() == Some("1")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
     tracing_subscriber::fmt()
@@ -286,6 +293,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     whisper_notify,
                     whisper_site_url,
                     whisper_param_name,
+                    bell_disabled: bell_suppressed(|k| std::env::var(k).ok()),
                     http: http_client,
                     session_store,
                     steam: steam.clone(),
@@ -319,5 +327,16 @@ mod tests {
         // THE register-decoupling pin: quieting ops must not silently kill the gift feature.
         let env = |k: &str| (k == "NOTIFY_DISABLED").then(|| "1".to_string());
         assert!(!whisper_suppressed(env));
+    }
+
+    #[test]
+    fn bell_flag_is_its_own_switch_in_both_directions() {
+        // shared credential, split off-switch: BELL_DISABLED mutes only the bell, and neither
+        // the whisper flag nor the global one reaches it.
+        let bell = |k: &str| (k == "BELL_DISABLED").then(|| "1".to_string());
+        assert!(super::bell_suppressed(bell));
+        assert!(!whisper_suppressed(bell));
+        let whisper = |k: &str| (k == "WHISPER_DISABLED").then(|| "1".to_string());
+        assert!(!super::bell_suppressed(whisper));
     }
 }

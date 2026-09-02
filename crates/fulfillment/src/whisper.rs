@@ -184,6 +184,7 @@ pub fn whisper_card(
     cycle: u32,
     slot: &str,
     preview: Option<PreviewKind>,
+    bell_counts: Option<(u32, u32)>,
 ) -> serde_json::Value {
     // Content-side loser order (pass-1 review): the deep-link WINS — it is the feature's one-tap
     // core; display title and bundle are the losers; the query token is a raw prefix. These caps
@@ -199,6 +200,19 @@ pub fn whisper_card(
     );
     if let Some(k) = preview {
         content = format!("🔍 *preview — {}, not a new whisper*\n{content}", k.label());
+    }
+    // The bell's week ledger, TWO numbers from INDEPENDENT sources (spec-attic-bell): `unwraps`
+    // is written by the gift path (bell-blind), `rings` by a delivered bell. A single number
+    // could not contradict itself — "rang 0" reads exactly like a quiet week — so both are
+    // printed and the card computes NO verdict. Direction: rings > unwraps is a legal duplicate
+    // (async delivery is at-least-once); rings < unwraps is the suspect direction. None = the
+    // counters were unreadable: say nothing rather than lie a zero.
+    if let Some((u, r)) = bell_counts {
+        content.push_str(&if (u, r) == (0, 0) {
+            "\n*(the attic was quiet this week)*".to_string()
+        } else {
+            format!("\n🔔 *({u} unwrapped · the bell rang {r})*")
+        });
     }
     // gate-9 ②: the cap is ENFORCED here, not asserted in prose — site_url is config and a
     // pathological value must produce a short message, never a Discord 400. The cut announces
@@ -561,7 +575,15 @@ mod tests {
             "Humble Indie Bundle 9",
             Some("https://art/x.png"),
         );
-        let v = whisper_card(&g, None, "https://bendobundles.com", 0, "2026-W36", None);
+        let v = whisper_card(
+            &g,
+            None,
+            "https://bendobundles.com",
+            0,
+            "2026-W36",
+            None,
+            None,
+        );
         let content = v["content"].as_str().unwrap();
         assert!(content.starts_with("🕯️")); // the register is the friend voice, not the ops voice
         assert!(content.contains("**Overgrowth**"));
@@ -578,7 +600,15 @@ mod tests {
     #[test]
     fn card_deeplink_urlencodes_the_title() {
         let g = game_with_bundle("g1", "Papers, Please", "HB 12", None);
-        let v = whisper_card(&g, None, "https://bendobundles.com", 0, "2026-W36", None);
+        let v = whisper_card(
+            &g,
+            None,
+            "https://bendobundles.com",
+            0,
+            "2026-W36",
+            None,
+            None,
+        );
         assert!(
             v["content"]
                 .as_str()
@@ -588,9 +618,33 @@ mod tests {
     }
 
     #[test]
+    fn bell_count_line_renders_three_ways_including_the_contradiction() {
+        let g = game("g1", "aaa", None);
+        // None ⇒ counters unreadable: say nothing rather than lie a zero
+        let none = whisper_card(&g, None, "https://s", 0, "2026-W36", None, None);
+        let c = none["content"].as_str().unwrap();
+        assert!(!c.contains("the bell rang"));
+        assert!(!c.contains("attic was quiet"));
+        // (0,0) ⇒ a genuinely quiet week
+        let quiet = whisper_card(&g, None, "https://s", 0, "2026-W36", None, Some((0, 0)));
+        assert!(
+            quiet["content"]
+                .as_str()
+                .unwrap()
+                .contains("the attic was quiet this week")
+        );
+        // (4,0) ⇒ THE CONTRADICTION the reader must be able to see: four friends unwrapped and
+        // the bell never rang. The card prints both numbers and computes no verdict.
+        let suspect = whisper_card(&g, None, "https://s", 0, "2026-W36", None, Some((4, 0)));
+        let sc = suspect["content"].as_str().unwrap();
+        assert!(sc.contains("4 unwrapped"));
+        assert!(sc.contains("the bell rang 0"));
+    }
+
+    #[test]
     fn card_preview_marks_content_and_footer_and_names_its_kind() {
         let g = game("g1", "aaa", None);
-        let real = whisper_card(&g, None, "https://s", 0, "2026-W36", None);
+        let real = whisper_card(&g, None, "https://s", 0, "2026-W36", None, None);
         let prev = whisper_card(
             &g,
             None,
@@ -598,6 +652,7 @@ mod tests {
             0,
             "2026-W36",
             Some(PreviewKind::NewestDelivered),
+            None,
         );
         let dry = whisper_card(
             &g,
@@ -606,6 +661,7 @@ mod tests {
             0,
             "2026-W36",
             Some(PreviewKind::DryRunPick),
+            None,
         );
         assert!(prev["content"].as_str().unwrap().starts_with("🔍 *preview"));
         // the FOOTER is the mechanism — it travels with the embeds, the part anyone looks at
@@ -701,6 +757,7 @@ mod tests {
             3,
             "2026-W36",
             None,
+            None,
         );
         let e0 = &v["embeds"][0];
         assert_eq!(e0["url"], "https://store.steampowered.com/app/570");
@@ -751,6 +808,7 @@ mod tests {
             0,
             "2026-W36",
             None,
+            None,
         );
         assert_eq!(v["embeds"][0]["image"]["url"], "https://cdn/header.jpg"); // nothing displaced it
     }
@@ -765,6 +823,7 @@ mod tests {
             "https://s",
             0,
             "2026-W36",
+            None,
             None,
         );
         let s = serde_json::to_string(&v).unwrap();
@@ -783,6 +842,7 @@ mod tests {
             "https://s",
             0,
             "2026-W36",
+            None,
             None,
         );
         let embeds = v["embeds"].as_array().unwrap();
@@ -825,6 +885,7 @@ mod tests {
             0,
             "2026-W36",
             None,
+            None,
         );
         let embeds = v["embeds"].as_array().unwrap();
         assert_eq!(embeds.len(), 2); // main carries s0; one gallery member carries s1; no #more groups
@@ -843,7 +904,7 @@ mod tests {
         }
         let mut g = game("g1", "aaa", None);
         g.steam_app_id = Some(570);
-        let v = whisper_card(&g, Some(&cache), "https://s", 0, "2026-W36", None);
+        let v = whisper_card(&g, Some(&cache), "https://s", 0, "2026-W36", None, None);
         assert!(
             v["embeds"][0]["footer"]["text"]
                 .as_str()
@@ -860,7 +921,7 @@ mod tests {
         }
         let mut g = game("g1", &"t".repeat(300), None);
         g.steam_app_id = Some(570);
-        let v = whisper_card(&g, Some(&cache), "https://s", 0, "2026-W36", None);
+        let v = whisper_card(&g, Some(&cache), "https://s", 0, "2026-W36", None, None);
         let embeds = v["embeds"].as_array().unwrap();
         assert_eq!(
             embeds[0]["title"].as_str().unwrap().chars().count(),
@@ -911,7 +972,15 @@ mod tests {
         g.steam_app_id = Some(570);
         let mut only_reviews = steam_cache(0, false);
         only_reviews.detail = None; // negative-cache stub
-        let v = whisper_card(&g, Some(&only_reviews), "https://s", 0, "2026-W36", None);
+        let v = whisper_card(
+            &g,
+            Some(&only_reviews),
+            "https://s",
+            0,
+            "2026-W36",
+            None,
+            None,
+        );
         let fields = v["embeds"][0]["fields"].as_array().unwrap();
         assert!(fields.iter().any(|f| f["name"] == "reviews"));
         assert!(!fields.iter().any(|f| f["name"] == "by"));
@@ -919,7 +988,15 @@ mod tests {
         let mut only_detail = steam_cache(0, false);
         only_detail.overall = None;
         only_detail.recent = None;
-        let v2 = whisper_card(&g, Some(&only_detail), "https://s", 0, "2026-W36", None);
+        let v2 = whisper_card(
+            &g,
+            Some(&only_detail),
+            "https://s",
+            0,
+            "2026-W36",
+            None,
+            None,
+        );
         assert!(
             !v2["embeds"][0]["fields"]
                 .as_array()
@@ -943,6 +1020,7 @@ mod tests {
             0,
             "2026-W36",
             Some(PreviewKind::DryRunPick),
+            None,
         );
         let content = v["content"].as_str().unwrap();
         assert!(
@@ -963,7 +1041,7 @@ mod tests {
         // footer of its own — the embeds travel with it).
         let g = game("g1", "aaa", None);
         let huge_site = format!("https://x/{}", "p".repeat(3000));
-        let v = whisper_card(&g, None, &huge_site, 0, "2026-W36", None);
+        let v = whisper_card(&g, None, &huge_site, 0, "2026-W36", None, None);
         assert!(v["content"].as_str().unwrap().chars().count() <= CONTENT_MAX);
         assert!(
             v["embeds"][0]["footer"]["text"]
@@ -985,7 +1063,7 @@ mod tests {
         // image falls back to artwork; thumbnail would fall back to the same artwork → dropped
         let mut g2 = g.clone();
         g2.artwork_url = Some("https://art/same.png".into());
-        let v = whisper_card(&g2, Some(&cache), "https://s", 0, "2026-W36", None);
+        let v = whisper_card(&g2, Some(&cache), "https://s", 0, "2026-W36", None, None);
         assert_eq!(v["embeds"][0]["image"]["url"], "https://art/same.png");
         assert!(v["embeds"][0].get("thumbnail").is_none());
     }

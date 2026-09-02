@@ -11,6 +11,7 @@
 
 /// Pure gate logic for the `heal_choice_pairs` operator sweep (spec Q5). Non-gated so the normal
 /// test suite runs it; only the `delete_game` call in the bin is `heal`-feature-gated.
+pub mod bell;
 pub mod heal_pairs;
 pub mod operator_message;
 pub mod whisper;
@@ -163,6 +164,12 @@ pub enum FulfillRequest {
     /// recording), marked 🔍 in footer + content, so card changes are visible without spending a
     /// weekly slot. Manual-invoke-only, like ValidateCookie.
     WhisperPreview,
+    /// The attic bell (spec: docs/spec-attic-bell.md): one warm webhook message for a durable
+    /// friend-side moment. Fired by public-api as InvocationType::Event — NEVER RequestResponse,
+    /// NEVER from a schedule. Shares the whisper transport, never WHISPER# slot state.
+    Bell {
+        event: bell::BellEvent,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,6 +204,11 @@ pub enum FulfillResponse {
     Whispered,
     /// whisper_preview: the card went out. Which shape it showed is in the card's own footer.
     PreviewSent,
+    /// The bell ran (sent, dark no-op, or swallowed failure): every outcome is this variant BY
+    /// DESIGN — a function error would trigger the async-invoke retry and double-send after a
+    /// partial success. This buys at-most-once AGAINST HANDLER FAILURE only; Lambda async
+    /// delivery is itself at-least-once, so a rare double ring remains possible and accepted.
+    Belled,
     /// whisper_preview: no preview was possible — dark webhook (either face), unreadable
     /// log/game/pool, or empty pool. Each cause announces itself in its own ping/log; this
     /// variant exists so silence is never byte-identical to sent-fine (a hand-invoked op's
@@ -509,6 +521,10 @@ pub struct Deps {
     /// operator an actionable one-liner. When the env isn't even wired, main.rs passes a literal
     /// that says so — the message must always name something actionable.
     pub whisper_param_name: String,
+    /// The bell's OWN off-switch (spec-attic-bell Q①: shared secret, SPLIT disable flag) —
+    /// muting per-event bells must not dark the weekly whisper, and vice versa. Resolved in
+    /// main.rs from `BELL_DISABLED`, mirroring `WHISPER_DISABLED`'s register-decoupling rule.
+    pub bell_disabled: bool,
     pub http: reqwest::Client,
     /// SSM client + the humble-cookie parameter name, so the app can self-heal its own session:
     /// on a dead session it logs in (via `humble.login()`) and persists the fresh cookie here,
@@ -691,6 +707,10 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
                 )
                 .await
             }
+        }
+        FulfillRequest::Bell { event } => {
+            bell::ring(deps, &event).await;
+            FulfillResponse::Belled
         }
         FulfillRequest::SelfClaim {
             claim_id,
@@ -894,7 +914,22 @@ async fn handle_gift(
                     .fulfill_claim(link_token, claim_id, game_id, &url)
                     .await
                 {
-                    Ok(()) => FulfillResponse::GiftUrl { url },
+                    Ok(()) => {
+                        // durable unwrap ledger — the honest noun: every friend gift made
+                        // durable, whatever route minted it (HTTP or reconcile heal). Friend-only
+                        // by construction: SelfClaim flows through reveal_claimed_tpk and never
+                        // reaches fulfill_claim. Bell-BLIND: no BELL_DISABLED gate, no webhook
+                        // read. Best-effort: a ledger miss is a WARN, never a failed gift.
+                        let week = bell::current_week();
+                        if let Err(e) = deps
+                            .store
+                            .increment_bell_counter(&week, dynamo::BellCounter::Unwraps)
+                            .await
+                        {
+                            tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
+                        }
+                        FulfillResponse::GiftUrl { url }
+                    }
                     // fulfill lost to compensate = loud Corrupt; the URL exists but the game moved
                     // on. Surface as Error + ping — human decides. NEVER retry the redeem.
                     Err(e) => {
@@ -1451,7 +1486,22 @@ async fn redeem_claimed_tpk(
                     .fulfill_claim(link_token, claim_id, game_id, &url)
                     .await
                 {
-                    Ok(()) => FulfillResponse::GiftUrl { url },
+                    Ok(()) => {
+                        // durable unwrap ledger — the honest noun: every friend gift made
+                        // durable, whatever route minted it (HTTP or reconcile heal). Friend-only
+                        // by construction: SelfClaim flows through reveal_claimed_tpk and never
+                        // reaches fulfill_claim. Bell-BLIND: no BELL_DISABLED gate, no webhook
+                        // read. Best-effort: a ledger miss is a WARN, never a failed gift.
+                        let week = bell::current_week();
+                        if let Err(e) = deps
+                            .store
+                            .increment_bell_counter(&week, dynamo::BellCounter::Unwraps)
+                            .await
+                        {
+                            tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
+                        }
+                        FulfillResponse::GiftUrl { url }
+                    }
                     Err(e) => {
                         ping_msg(deps, &OperatorMessage::fmt(
     "fulfill after choice redeem failed for claim {}: {} — gift URL was generated but not recorded — recover it from humble\'s gift history page (purchases → the order → gift link)",
@@ -2083,6 +2133,28 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                 )
                 .await;
                 match resp {
+                    // the heal rings too (product ruling, sign-off 2026-09-02): a healed claim
+                    // is a friend who got their gift on the bumpy path — the one case ben most
+                    // wants to hear about, and the HTTP path never completed so no bell rang.
+                    // Guarded arm FIRST: a reconciled SELF-claim must not ring (decided
+                    // non-goal), and ringing it would drift rings > unwraps with no unwrap,
+                    // since reveal never touches fulfill_claim. Inline is fine HERE — reconcile
+                    // is a background invocation, nobody waits on the webhook.
+                    FulfillResponse::GiftUrl { .. }
+                        if claim.link_token != domain::SELF_LINK_TOKEN =>
+                    {
+                        tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
+                        bell::ring(
+                            deps,
+                            &bell::BellEvent::Unwrap {
+                                link_token: claim.link_token.clone(),
+                                game_id: claim.game_id.clone(),
+                                week: bell::current_week(),
+                                choice: true,
+                            },
+                        )
+                        .await;
+                    }
                     FulfillResponse::GiftUrl { .. } | FulfillResponse::RevealedKey { .. } => {
                         tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
                     }
@@ -4628,7 +4700,7 @@ fn logged<E: std::error::Error>(e: &E, what: &'static str) -> ErrorSummary {
 /// never runs, which an in-band record cannot. **No dead-letter row** — there is no drainer, so a
 /// durable queue would be storage with no consumer. **No retry** — a chunked send is not atomic
 /// (`1 of 2 chunk(s) sent` is a real observed outcome), so a naive retry double-posts.
-async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
+pub(crate) async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
     let Notify::Webhook(url) = &deps.notify else {
         return;
     };
@@ -4687,7 +4759,11 @@ async fn deliver_json(http: &reqwest::Client, url: &str, body: &serde_json::Valu
 /// `true` ⇔ the card landed — `deliver_json(..) == 0`; the polarity is pinned by
 /// `whisper_send_body_treats_non_2xx_as_failure` because a guess ships success-on-failure and
 /// every "it sent" assertion still passes.
-async fn whisper_send_body(http: &reqwest::Client, url: &str, body: &serde_json::Value) -> bool {
+pub(crate) async fn whisper_send_body(
+    http: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> bool {
     deliver_json(http, url, body).await == 0
 }
 
@@ -4702,7 +4778,7 @@ pub async fn whisper_send_body_for_test(url: &str, body: &serde_json::Value) -> 
 /// advises overwrite — the stored value may be right and the fault the read path). Extracted
 /// UNCHANGED from handle_whisper — the two faces' wording is family-reviewed, do not edit in
 /// passing. Match all three states; never flatten with a let-else.
-async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
+pub(crate) async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
     match &deps.whisper_notify {
         Notify::Webhook(u) => Some(u.clone()),
         Notify::Disabled => {
@@ -4804,6 +4880,7 @@ async fn handle_whisper_preview(deps: &Deps) -> FulfillResponse {
         cycle,
         &slot,
         Some(kind),
+        None, // preview: zero writes, and no live counter read implied
     );
     if whisper_send_body(&deps.http, &url, &body).await {
         FulfillResponse::PreviewSent
@@ -4934,6 +5011,9 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
         None => None,
         Some(app_id) => deps.store.get_steam_app(app_id).await.ok().flatten(),
     };
+    // the bell's week ledger — best-effort like the steam cache: unreadable degrades to a card
+    // with no count line (None), never to a fabricated zero.
+    let bell_counts = deps.store.get_bell_counts(&slot).await.ok();
     let body = whisper::whisper_card(
         pick,
         steam.as_ref(),
@@ -4941,6 +5021,7 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
         cycle,
         &slot,
         None,
+        bell_counts,
     );
     if whisper_send_body(&deps.http, &whisper_url, &body).await {
         if let Err(e) = deps.store.mark_whisper_delivered(&slot).await {
@@ -5007,6 +5088,54 @@ pub async fn ping_chunks_for_test(url: &str, msg: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------------------------
+    // The attic bell — wire shapes (spec: docs/spec-attic-bell.md).
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn bell_request_wire_shape_round_trips() {
+        let req: FulfillRequest = serde_json::from_value(serde_json::json!({
+            "op": "bell",
+            "event": { "kind": "unwrap", "link_token": "t", "game_id": "g", "week": "2026-W36", "choice": true }
+        }))
+        .unwrap();
+        match req {
+            FulfillRequest::Bell {
+                event:
+                    bell::BellEvent::Unwrap {
+                        link_token,
+                        game_id,
+                        week,
+                        choice,
+                    },
+            } => {
+                assert_eq!(
+                    (link_token.as_str(), game_id.as_str(), week.as_str(), choice),
+                    ("t", "g", "2026-W36", true)
+                );
+            }
+            other => panic!("wrong parse: {other:?}"),
+        }
+        let thanks: FulfillRequest = serde_json::from_value(serde_json::json!({
+            "op": "bell", "event": { "kind": "thanks", "link_token": "t" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            thanks,
+            FulfillRequest::Bell {
+                event: bell::BellEvent::Thanks { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn bell_wire_cannot_contaminate_existing_ops() {
+        // the whisper spec's own rule: a new op must not widen or shadow existing parses.
+        let sync: FulfillRequest =
+            serde_json::from_value(serde_json::json!({"op": "whisper"})).unwrap();
+        assert!(matches!(sync, FulfillRequest::Whisper));
+    }
 
     // -----------------------------------------------------------------------------------------
     // Notify / SecretRead — operator-truth (A). An unconfigured webhook used to return success

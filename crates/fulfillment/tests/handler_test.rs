@@ -145,6 +145,7 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         whisper_notify: fulfillment::Notify::Disabled,
         whisper_site_url: String::new(),
         whisper_param_name: String::new(),
+        bell_disabled: false,
         http: reqwest::Client::new(),
         // No self-login in these handler tests — a dead session keeps the flag-and-ping path.
         session_store: None,
@@ -239,6 +240,20 @@ async fn gift_happy_path_records_url_and_gifts_game() {
 
     let game = deps.store.get_game(&gid).await.unwrap().unwrap();
     assert_eq!(game.status, GameStatus::Gifted);
+
+    // POPULATION ENUMERATION (spec-attic-bell): the durable unwrap ledger counts THIS event.
+    // `unwraps` is bell-BLIND — this deps has the whisper register dark, so no bell rang, and
+    // the counter moved anyway. That blindness is the whole reason the pair can contradict.
+    let (unwraps, rings) = deps
+        .store
+        .get_bell_counts(&fulfillment::bell::current_week())
+        .await
+        .unwrap();
+    assert_eq!(unwraps, 1, "the durable gift must count as an unwrap");
+    assert_eq!(
+        rings, 0,
+        "dark register ⇒ no ring; the pair reads 1·0 (suspect direction)"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -537,6 +552,7 @@ async fn deps_with_selfheal(
         whisper_notify: fulfillment::Notify::Disabled,
         whisper_site_url: String::new(),
         whisper_param_name: String::new(),
+        bell_disabled: false,
         http: reqwest::Client::new(),
         session_store: Some(SessionStore {
             ssm: ssm_at(ssm_uri).await,
@@ -4953,6 +4969,20 @@ async fn reconcile_self_choice_b2_reveals_never_chooses() {
         0,
         "reconcile must never call choosecontent"
     );
+
+    // THE GUARD'S COUNTER-ARM (spec-attic-bell, sign-off blocker): a reconciled SELF-claim must
+    // ring NOTHING and count NOTHING. Reveal never touches fulfill_claim ⇒ no unwrap; the
+    // reconcile ring's arm is guarded on link_token != SELF_LINK_TOKEN ⇒ no ring. A ring here
+    // would drift rings > unwraps forever on the counter this design exists to keep readable.
+    assert_eq!(
+        deps_val
+            .store
+            .get_bell_counts(&fulfillment::bell::current_week())
+            .await
+            .unwrap(),
+        (0, 0),
+        "a reconciled SELF-claim is ben's own action: no unwrap counted, no bell rung"
+    );
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -9112,6 +9142,30 @@ fn available_game(id: &str, title: &str) -> domain::Game {
         owned_by_ben: false,
         hidden_source: None,
     }
+}
+
+// ── the attic bell (spec: docs/spec-attic-bell.md) ───────────────────────────────────────────
+
+#[tokio::test]
+async fn bell_op_always_answers_belled_even_on_a_dark_deploy() {
+    // whisper register DARK (deps() default) + an unknown link: every failure inside the bell
+    // must still come home as Belled — a function error would trigger the Event-invoke retry
+    // and a double ring is worse than a missed one. Zero writes on the dark path.
+    let Some(store) = store_or_skip("bell-dark").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let deps = deps(store, &humble.uri(), None);
+    let resp = handle(
+        &deps,
+        FulfillRequest::Bell {
+            event: fulfillment::bell::BellEvent::Thanks {
+                link_token: "nope".into(),
+            },
+        },
+    )
+    .await;
+    assert!(matches!(resp, FulfillResponse::Belled));
 }
 
 #[test]

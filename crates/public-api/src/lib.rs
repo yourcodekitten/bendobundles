@@ -27,6 +27,10 @@ use time::OffsetDateTime;
 #[async_trait]
 pub trait Invoker: Send + Sync {
     async fn gift(&self, req: FulfillRequest) -> Result<FulfillResponse, String>;
+    /// Fire-and-forget bell (spec: docs/spec-attic-bell.md): InvocationType::Event, 202-and-done,
+    /// no response to parse. Callers log-and-continue on Err — a bell failure may never fail,
+    /// slow, or colour a friend's response.
+    async fn bell(&self, req: FulfillRequest) -> Result<(), String>;
 }
 
 // ── LambdaInvoker ─────────────────────────────────────────────────────────────
@@ -54,6 +58,19 @@ impl Invoker for LambdaInvoker {
             .payload()
             .ok_or_else(|| "no payload in lambda response".to_string())?;
         serde_json::from_slice(blob.as_ref()).map_err(|e| e.to_string())
+    }
+
+    async fn bell(&self, req: FulfillRequest) -> Result<(), String> {
+        let payload = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
+        self.client
+            .invoke()
+            .function_name(&self.fn_name)
+            .invocation_type(aws_sdk_lambda::types::InvocationType::Event)
+            .payload(aws_sdk_lambda::primitives::Blob::new(payload))
+            .send()
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(())
     }
 }
 
@@ -884,6 +901,11 @@ async fn handle_post_claim(
     };
 
     // 5. Invoke fulfillment lambda (RequestResponse = synchronous).
+    // cloned BEFORE the request moves them: the bell rings only on GiftUrl below, and it must
+    // name the same link+game the gift did.
+    let bell_token = token.clone();
+    let bell_game_id = body.game_id.clone();
+    let bell_choice = game.requires_choice;
     let fulfill_req = FulfillRequest::Gift {
         claim_id,
         link_token: token,
@@ -908,6 +930,49 @@ async fn handle_post_claim(
     }
     match gift_result {
         Ok(FulfillResponse::GiftUrl { url }) => {
+            // 🔔 the attic bell (spec: docs/spec-attic-bell.md), after durable success and
+            // BEFORE the response: an Event invoke is a control-plane 202 (~20ms warm) and a
+            // failure is a WARN — it never touches the friend's moment. Fired pre-response
+            // because a frozen lambda never finishes a post-response task. The budget is
+            // CHOSEN AGAINST THE COLD PATH: this app is low-traffic, so the first claim after
+            // a quiet spell pays DNS+TCP+TLS with no pooled connection, and a warm-measured
+            // 1s would concentrate misses on exactly the claim that matters. Affordable to
+            // bound at all BECAUSE misses are counted (the ring ledger) and pinged (ops).
+            let t0 = std::time::Instant::now();
+            let mut outcome = "ok";
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                s.invoker.bell(FulfillRequest::Bell {
+                    event: fulfillment::bell::BellEvent::Unwrap {
+                        link_token: bell_token,
+                        game_id: bell_game_id,
+                        // stamped HERE so the unwrap/ring pair shares one ledger week across
+                        // the async hop
+                        week: fulfillment::bell::current_week(),
+                        choice: bell_choice,
+                    },
+                }),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    outcome = "err";
+                    tracing::warn!(error = %e, "unwrap bell invoke failed — gift unaffected");
+                }
+                Err(_) => {
+                    outcome = "timeout";
+                    tracing::warn!("unwrap bell invoke timed out (2s) — gift unaffected");
+                }
+            }
+            // the budget becomes a distribution — with the OUTCOME beside the duration: a
+            // killed request and a 1998ms success write the same-shaped number, so an
+            // unlabelled p99 reads the CAP as data and could only ever argue the budget down.
+            tracing::info!(
+                bell_invoke_ms = t0.elapsed().as_millis() as u64,
+                outcome,
+                "bell invoke duration"
+            );
             (StatusCode::OK, Json(serde_json::json!({"gift_url": url}))).into_response()
         }
         Ok(FulfillResponse::AlreadyRedeemed) => (
@@ -1135,6 +1200,37 @@ async fn handle_post_thanks(
     match s.store.set_link_thanks(&token, note, at).await {
         Ok(dynamo::SetThanksOutcome::Set) => {
             tracing::info!("thanks: landed"); // never the note text
+            // 🔔 the thanks bell — same shape and same budget as the unwrap bell above. The
+            // ring reads the STORED note (never this request body), and thanks rings are
+            // deliberately NOT counted in the ledger: they would break the unwraps/rings
+            // pairing that makes `rings < unwraps` readable as the suspect direction.
+            let t0 = std::time::Instant::now();
+            let mut outcome = "ok";
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                s.invoker.bell(FulfillRequest::Bell {
+                    event: fulfillment::bell::BellEvent::Thanks {
+                        link_token: token.clone(),
+                    },
+                }),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    outcome = "err";
+                    tracing::warn!(error = %e, "thanks bell invoke failed — thanks unaffected");
+                }
+                Err(_) => {
+                    outcome = "timeout";
+                    tracing::warn!("thanks bell invoke timed out (2s) — thanks unaffected");
+                }
+            }
+            tracing::info!(
+                bell_invoke_ms = t0.elapsed().as_millis() as u64,
+                outcome,
+                "bell invoke duration"
+            );
             let ts = at
                 .format(&time::format_description::well_known::Rfc3339)
                 .expect("rfc3339");

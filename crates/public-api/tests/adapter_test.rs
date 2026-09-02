@@ -228,12 +228,15 @@ async fn fake_store() -> Arc<dynamo::Store> {
     ))
 }
 
-// The real trait (verified at public-api/src/lib.rs:27-30): exactly ONE method,
-// `gift`, with fulfillment:: types. Error arm mirrors api_test.rs's MockInvoker.
+// The real trait (verified at public-api/src/lib.rs): TWO methods — `gift` (sync) and `bell`
+// (fire-and-forget, spec-attic-bell). Error arms mirror api_test.rs's MockInvoker.
 struct NoInvoker;
 #[async_trait]
 impl Invoker for NoInvoker {
     async fn gift(&self, _req: FulfillRequest) -> Result<FulfillResponse, String> {
+        Err("adapter tests never invoke".into())
+    }
+    async fn bell(&self, _req: FulfillRequest) -> Result<(), String> {
         Err("adapter tests never invoke".into())
     }
 }

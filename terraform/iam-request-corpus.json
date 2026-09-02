@@ -870,6 +870,18 @@
         ]
       }
     ],
+    "get_bell_counts": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "BELL#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
     "get_game": [
       {
         "action": "dynamodb:GetItem",
@@ -939,6 +951,22 @@
         "attributes": [
           "pk",
           "sk"
+        ]
+      }
+    ],
+    "increment_bell_counter": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "BELL#"
+        ],
+        "attributes": [
+          "pk",
+          "sk",
+          "unwraps"
+        ],
+        "update_attributes": [
+          "unwraps"
         ]
       }
     ],
