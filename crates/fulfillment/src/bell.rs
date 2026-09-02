@@ -137,7 +137,23 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
             thanks_card(&link.label, note, &deps.whisper_site_url)
         }
     };
-    if !crate::whisper_send_body(&deps.http, &url, &body).await {
+    if crate::whisper_send_body(&deps.http, &url, &body).await {
+        // ledger of rings, best-effort like everything here: the count exists so the weekly
+        // whisper can contradict a silent bell; a failed increment is a WARN, never a failed
+        // ring. UNWRAP RINGS ONLY — `rings` must be a true pair with `unwraps` (same population,
+        // same week: the event CARRIES its ledger week, computed beside the gift response, so
+        // the pair cannot straddle a weekly boundary across the async hop). Thanks bells are
+        // deliberately uncounted: adding them makes rings ≥ unwraps normal and the suspect
+        // direction unreadable.
+        if let BellEvent::Unwrap { week, .. } = event
+            && let Err(e) = deps
+                .store
+                .increment_bell_counter(week, dynamo::BellCounter::Rings)
+                .await
+        {
+            tracing::warn!(error = ?e, week, "bell rang but the ring ledger write failed");
+        }
+    } else {
         // A WARN nobody reads is at-never-once: the miss goes to the MONITORED ops channel via
         // the same pattern as whisper cause-④ — and the ops webhook is a DIFFERENT credential,
         // so this report survives a dead whisper webhook. Frequency is bounded by construction

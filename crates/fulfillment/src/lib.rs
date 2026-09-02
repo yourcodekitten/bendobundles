@@ -912,7 +912,22 @@ async fn handle_gift(
                     .fulfill_claim(link_token, claim_id, game_id, &url)
                     .await
                 {
-                    Ok(()) => FulfillResponse::GiftUrl { url },
+                    Ok(()) => {
+                        // durable unwrap ledger — the honest noun: every friend gift made
+                        // durable, whatever route minted it (HTTP or reconcile heal). Friend-only
+                        // by construction: SelfClaim flows through reveal_claimed_tpk and never
+                        // reaches fulfill_claim. Bell-BLIND: no BELL_DISABLED gate, no webhook
+                        // read. Best-effort: a ledger miss is a WARN, never a failed gift.
+                        let week = bell::current_week();
+                        if let Err(e) = deps
+                            .store
+                            .increment_bell_counter(&week, dynamo::BellCounter::Unwraps)
+                            .await
+                        {
+                            tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
+                        }
+                        FulfillResponse::GiftUrl { url }
+                    }
                     // fulfill lost to compensate = loud Corrupt; the URL exists but the game moved
                     // on. Surface as Error + ping — human decides. NEVER retry the redeem.
                     Err(e) => {
@@ -1469,7 +1484,22 @@ async fn redeem_claimed_tpk(
                     .fulfill_claim(link_token, claim_id, game_id, &url)
                     .await
                 {
-                    Ok(()) => FulfillResponse::GiftUrl { url },
+                    Ok(()) => {
+                        // durable unwrap ledger — the honest noun: every friend gift made
+                        // durable, whatever route minted it (HTTP or reconcile heal). Friend-only
+                        // by construction: SelfClaim flows through reveal_claimed_tpk and never
+                        // reaches fulfill_claim. Bell-BLIND: no BELL_DISABLED gate, no webhook
+                        // read. Best-effort: a ledger miss is a WARN, never a failed gift.
+                        let week = bell::current_week();
+                        if let Err(e) = deps
+                            .store
+                            .increment_bell_counter(&week, dynamo::BellCounter::Unwraps)
+                            .await
+                        {
+                            tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
+                        }
+                        FulfillResponse::GiftUrl { url }
+                    }
                     Err(e) => {
                         ping_msg(deps, &OperatorMessage::fmt(
     "fulfill after choice redeem failed for claim {}: {} — gift URL was generated but not recorded — recover it from humble\'s gift history page (purchases → the order → gift link)",
@@ -2101,6 +2131,28 @@ async fn reconcile_choice_claim(deps: &Deps, claim: &Claim, game: &Game, order: 
                 )
                 .await;
                 match resp {
+                    // the heal rings too (product ruling, sign-off 2026-09-02): a healed claim
+                    // is a friend who got their gift on the bumpy path — the one case ben most
+                    // wants to hear about, and the HTTP path never completed so no bell rang.
+                    // Guarded arm FIRST: a reconciled SELF-claim must not ring (decided
+                    // non-goal), and ringing it would drift rings > unwraps with no unwrap,
+                    // since reveal never touches fulfill_claim. Inline is fine HERE — reconcile
+                    // is a background invocation, nobody waits on the webhook.
+                    FulfillResponse::GiftUrl { .. }
+                        if claim.link_token != domain::SELF_LINK_TOKEN =>
+                    {
+                        tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
+                        bell::ring(
+                            deps,
+                            &bell::BellEvent::Unwrap {
+                                link_token: claim.link_token.clone(),
+                                game_id: claim.game_id.clone(),
+                                week: bell::current_week(),
+                                choice: true,
+                            },
+                        )
+                        .await;
+                    }
                     FulfillResponse::GiftUrl { .. } | FulfillResponse::RevealedKey { .. } => {
                         tracing::info!(claim_id = %claim.id, "reconcile(choice): completed a crash-between-writes claim");
                     }
@@ -4822,6 +4874,7 @@ async fn handle_whisper_preview(deps: &Deps) -> FulfillResponse {
         cycle,
         &slot,
         Some(kind),
+            None,   // preview: zero writes, and no live counter read implied
     );
     if whisper_send_body(&deps.http, &url, &body).await {
         FulfillResponse::PreviewSent
@@ -4952,6 +5005,9 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
         None => None,
         Some(app_id) => deps.store.get_steam_app(app_id).await.ok().flatten(),
     };
+    // the bell's week ledger — best-effort like the steam cache: unreadable degrades to a card
+    // with no count line (None), never to a fabricated zero.
+    let bell_counts = deps.store.get_bell_counts(&slot).await.ok();
     let body = whisper::whisper_card(
         pick,
         steam.as_ref(),
@@ -4959,6 +5015,7 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
         cycle,
         &slot,
         None,
+            bell_counts,
     );
     if whisper_send_body(&deps.http, &whisper_url, &body).await {
         if let Err(e) = deps.store.mark_whisper_delivered(&slot).await {
