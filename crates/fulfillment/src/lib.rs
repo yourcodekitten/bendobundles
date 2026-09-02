@@ -164,6 +164,10 @@ pub enum FulfillRequest {
     /// recording), marked 🔍 in footer + content, so card changes are visible without spending a
     /// weekly slot. Manual-invoke-only, like ValidateCookie.
     WhisperPreview,
+    /// The attic bell (spec: docs/spec-attic-bell.md): one warm webhook message for a durable
+    /// friend-side moment. Fired by public-api as InvocationType::Event — NEVER RequestResponse,
+    /// NEVER from a schedule. Shares the whisper transport, never WHISPER# slot state.
+    Bell { event: bell::BellEvent },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -198,6 +202,11 @@ pub enum FulfillResponse {
     Whispered,
     /// whisper_preview: the card went out. Which shape it showed is in the card's own footer.
     PreviewSent,
+    /// The bell ran (sent, dark no-op, or swallowed failure): every outcome is this variant BY
+    /// DESIGN — a function error would trigger the async-invoke retry and double-send after a
+    /// partial success. This buys at-most-once AGAINST HANDLER FAILURE only; Lambda async
+    /// delivery is itself at-least-once, so a rare double ring remains possible and accepted.
+    Belled,
     /// whisper_preview: no preview was possible — dark webhook (either face), unreadable
     /// log/game/pool, or empty pool. Each cause announces itself in its own ping/log; this
     /// variant exists so silence is never byte-identical to sent-fine (a hand-invoked op's
@@ -692,6 +701,12 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
                 )
                 .await
             }
+        }
+        FulfillRequest::Bell { event } => {
+            // minimal dispatch (Task 2): the ring arrives with bell::ring in the next commit;
+            // every outcome is Belled BY DESIGN — see the variant's doc.
+            let _ = event;
+            FulfillResponse::Belled
         }
         FulfillRequest::SelfClaim {
             claim_id,
@@ -5008,6 +5023,46 @@ pub async fn ping_chunks_for_test(url: &str, msg: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------------------------
+    // The attic bell — wire shapes (spec: docs/spec-attic-bell.md).
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn bell_request_wire_shape_round_trips() {
+        let req: FulfillRequest = serde_json::from_value(serde_json::json!({
+            "op": "bell",
+            "event": { "kind": "unwrap", "link_token": "t", "game_id": "g", "week": "2026-W36", "choice": true }
+        }))
+        .unwrap();
+        match req {
+            FulfillRequest::Bell {
+                event: bell::BellEvent::Unwrap { link_token, game_id, week, choice },
+            } => {
+                assert_eq!(
+                    (link_token.as_str(), game_id.as_str(), week.as_str(), choice),
+                    ("t", "g", "2026-W36", true)
+                );
+            }
+            other => panic!("wrong parse: {other:?}"),
+        }
+        let thanks: FulfillRequest = serde_json::from_value(serde_json::json!({
+            "op": "bell", "event": { "kind": "thanks", "link_token": "t" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            thanks,
+            FulfillRequest::Bell { event: bell::BellEvent::Thanks { .. } }
+        ));
+    }
+
+    #[test]
+    fn bell_wire_cannot_contaminate_existing_ops() {
+        // the whisper spec's own rule: a new op must not widen or shadow existing parses.
+        let sync: FulfillRequest =
+            serde_json::from_value(serde_json::json!({"op": "whisper"})).unwrap();
+        assert!(matches!(sync, FulfillRequest::Whisper));
+    }
 
     // -----------------------------------------------------------------------------------------
     // Notify / SecretRead — operator-truth (A). An unconfigured webhook used to return success

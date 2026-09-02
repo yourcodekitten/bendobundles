@@ -2,6 +2,23 @@
 //! Pure card builders + best-effort ring. Shares the whisper TRANSPORT (webhook + POST helper),
 //! never its SLOT state: nothing in this module may name WHISPER#, record_whisper, or a slot.
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BellEvent {
+    /// `week`: the ledger week this unwrap's RING must be counted in — computed by the SENDER
+    /// beside the gift response (`current_week()`), so the unwrap/ring pair cannot straddle a
+    /// week boundary across the async invoke (at a handful of claims a week, a ±1 straddle gap
+    /// is indistinguishable from a real miss).
+    Unwrap {
+        link_token: String,
+        game_id: String,
+        week: String,
+        #[serde(default)]
+        choice: bool,
+    },
+    Thanks { link_token: String },
+}
+
 /// Discord hard cap on `content`; same bound whisper's CONTENT_MAX respects.
 const BELL_CONTENT_MAX: usize = 2000;
 const BELL_LABEL_MAX: usize = 120;
