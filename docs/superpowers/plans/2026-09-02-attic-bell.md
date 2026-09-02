@@ -526,7 +526,7 @@ failure domain.)*
 ```rust
 #[tokio::test]
 async fn bell_counters_increment_independently_and_read_zero_when_absent() {
-    let Some(store) = local_store().await else { return }; // the harness's existing skip shape
+    let Some(store) = store_or_skip("bell_counters").await else { return }; // store_test.rs:30, the real skip helper (scouted)
     assert_eq!(store.get_bell_counts("2026-W36").await.unwrap(), (0, 0));
     store.increment_bell_counter("2026-W36", BellCounter::Unwraps).await.unwrap();
     store.increment_bell_counter("2026-W36", BellCounter::Unwraps).await.unwrap();
@@ -536,8 +536,8 @@ async fn bell_counters_increment_independently_and_read_zero_when_absent() {
 }
 ```
 
-(`local_store()` stands for whatever constructor/skip helper the file's other tests use — copy it
-verbatim from a neighboring test; do NOT invent a second harness path.)
+(`store_or_skip(<test-name>)` is the file's real constructor/skip helper at `store_test.rs:30` —
+verified 2026-09-02; do NOT invent a second harness path.)
 
 - [ ] **Step 2: Run to verify failure**
 
