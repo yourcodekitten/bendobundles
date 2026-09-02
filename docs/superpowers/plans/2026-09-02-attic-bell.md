@@ -34,11 +34,15 @@ resolved below in Global Constraints — carried to OMBB sign-off with reasons).
 - **Q③ resolved: choice claims ring the same bell** with one extra clause: `(a monthly pick,
   spent with love)`. NO remaining-pick count — it is not in hand at ring time and the rule is
   "don't add a read for it" (OMBB).
-- **Q④ resolved: at-most-once, and misses reach the MONITORED channel.** The Bell handler NEVER
-  returns a function error (an Event retry re-runs the whole handler and can double-send after a
-  *partial success* — a webhook POST has no idempotency key). A send failure is `tracing::error!`
-  **plus an ops `ping_msg`** (whisper cause-④'s own pattern): a WARN nobody reads is
-  at-never-once (OMBB's 8-sent-0-received specimen, his box).
+- **Q④ resolved, worded honestly (Lilith): at-most-once AGAINST HANDLER FAILURE; delivery is
+  at-least-once by Lambda's async contract**, so a rare double ring stays possible with no
+  function error and no idempotency key to dedupe on — priced as cheap-but-sloppy, accepted.
+  The Bell handler NEVER returns a function error (a retry re-runs the whole handler and can
+  double-send after a *partial success*). A send failure is `tracing::error!` **plus an ops
+  `ping_msg`** (whisper cause-④'s pattern; `ping_msg` verified at `lib.rs:4632` to ride
+  `deps.notify` — the OPS credential, so the report survives a dead whisper webhook). ⚠️ The ops
+  register's READER is not demonstrated from this seat (OMBB's 8-sent-0-received specimen, his
+  box) — the spec credits it PROVISIONALLY and deploy verification carries a Ben-confirm.
 - **Mentions-deny provenance (OMBB's ⑤):** `allowed_mentions: {"parse": []}` is DOCUMENTED for
   `content`; embed behaviour is observed-not-contract. Both bell cards therefore put ALL
   friend-influenced text in `content` (the thanks card carries zero embeds), so the documented
@@ -302,9 +306,10 @@ In `lib.rs`, inside `FulfillRequest` (matching its existing tag style):
 and inside `FulfillResponse`:
 
 ```rust
-    /// The bell ran (sent, dark no-op, or swallowed failure — see handle_bell: every outcome is
-    /// this variant BY DESIGN, because an Event-invoke retries on function error and a double
-    /// ring is worse than a missed one).
+    /// The bell ran (sent, dark no-op, or swallowed failure): every outcome is this variant BY
+    /// DESIGN — a function error would trigger the async-invoke retry and double-send after a
+    /// partial success. This buys at-most-once AGAINST HANDLER FAILURE only; Lambda async
+    /// delivery is itself at-least-once, so a rare double ring remains possible and accepted.
     Belled,
 ```
 
@@ -756,6 +761,7 @@ read the match first; do NOT ring on AlreadyRedeemed/KeyDead/Parked/Error):
     // endpoint with no pooled connection — a warm-measured 1s would concentrate misses on
     // exactly the claim that matters. Affordable to bound at all BECAUSE misses are counted
     // (the ring ledger) and pinged (ops) — OMBB's coupling. Warm typical ~20ms.
+    let t0 = std::time::Instant::now();
     match tokio::time::timeout(std::time::Duration::from_secs(2),
         s.invoker.bell(FulfillRequest::Bell {
             event: fulfillment::bell::BellEvent::Unwrap {
@@ -768,11 +774,13 @@ read the match first; do NOT ring on AlreadyRedeemed/KeyDead/Parked/Error):
         Ok(Err(e)) => tracing::warn!(error = %e, "unwrap bell invoke failed — gift unaffected"),
         Err(_) => tracing::warn!("unwrap bell invoke timed out (2s) — gift unaffected"),
     }
+    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, "bell invoke duration"); // the 2s prior becomes a distribution (OMBB)
 ```
 
 Thanks call site (inside the `Ok(dynamo::SetThanksOutcome::Set)` arm, after the info line):
 
 ```rust
+    let t0 = std::time::Instant::now();
     match tokio::time::timeout(std::time::Duration::from_secs(2),
         s.invoker.bell(FulfillRequest::Bell {
             event: fulfillment::bell::BellEvent::Thanks { link_token: token.clone() },
@@ -781,6 +789,7 @@ Thanks call site (inside the `Ok(dynamo::SetThanksOutcome::Set)` arm, after the 
         Ok(Err(e)) => tracing::warn!(error = %e, "thanks bell invoke failed — thanks unaffected"),
         Err(_) => tracing::warn!("thanks bell invoke timed out (2s) — thanks unaffected"),
     }
+    tracing::info!(bell_invoke_ms = t0.elapsed().as_millis() as u64, "bell invoke duration");
 ```
 
 (Exact variable names — `token`, `body.game_id`, `requires_choice` — must be read off the real
@@ -838,6 +847,14 @@ at-most-once + ops ping on miss + the whisper-carried ring count), plus these tw
   (Lilith's ①-walkback + OMBB's report-path rule, closed by the two-credential split.)
 - "Mentions-deny provenance: `allowed_mentions` covers `content` by contract; embed behaviour is
   observed-not-contract, which is why all friend-influenced text rides `content`." (OMBB's ⑤)
+- "**Reading the count line, direction stated (OMBB):** delivery is at-least-once, so `rings`
+  may legally EXCEED `unwraps` — `rings > unwraps` is a benign duplicate; **`rings < unwraps` is
+  the suspect direction.** A counter that cries wolf on its first legal duplicate gets ignored
+  forever."
+- "**The ops register's reader is PROVISIONAL:** every detection path here is a sender; nobody
+  has demonstrated a human reads the ops room from this seat. Deploy verification includes ben
+  confirming one ops-register message reached eyes; until then 'detection in hours' is a
+  capability claim, not a property." (OMBB's third-time shape.)
 Plus: "Deploy note: no new infra. The bell rides the existing whisper webhook and
 the existing public-api→fulfillment invoke grant (`<file:line>`). Dark deploy behaviour inherited:
 webhook UNSET ⇒ loud no-op; `BELL_DISABLED` is the bell's own mute."
