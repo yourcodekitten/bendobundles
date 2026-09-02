@@ -121,9 +121,14 @@ needs — no part of this waits on Ben.**
      #                                              ⇒ SWAPS in a phantom ⇒ 15 vs 15 (a lying census)
      # ⇒ A CENSUS CANNOT BE VALIDATED BY ITS COUNT. Check that every name it emits is a name that
      #   exists — the count is identical in the case that lies to you.
-     grep -hoP 'variable "\K[a-z0-9_]+' terraform/*.tf | sort > /tmp/declared
-     grep -hoP '^\K[a-z0-9_]+' terraform/production.tfvars | sort > /tmp/supplied
-     comm -23 /tmp/declared /tmp/supplied   # read every line; any *_enabled here is a destroy waiting
+     # process substitution, NOT /tmp/<fixed-name> files (OMBB, PR review): two people running this
+     # at once collide on the same paths, and the loser silently compares one run's DECLARED against
+     # the other's SUPPLIED — a wrong answer with no error. The files also outlive the check, so a
+     # stale pair reads as a fresh result. A command in a note about censuses that lie must not be
+     # one. This form holds no state and needs no cleanup.
+     comm -23 <(grep -hoP 'variable "\K[a-z0-9_]+' terraform/*.tf | sort) \
+              <(grep -hoP '^\K[a-z0-9_]+' terraform/production.tfvars | sort)
+     # read EVERY line; any *_enabled here is a destroy waiting
      ```
      **And the backstop that actually caught it: `Plan: N to add, N to change, N to destroy` — ANY
      non-zero destroy on a code-only deploy means STOP.**
