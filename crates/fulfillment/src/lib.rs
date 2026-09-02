@@ -11,6 +11,7 @@
 
 /// Pure gate logic for the `heal_choice_pairs` operator sweep (spec Q5). Non-gated so the normal
 /// test suite runs it; only the `delete_game` call in the bin is `heal`-feature-gated.
+pub mod bell;
 pub mod heal_pairs;
 pub mod operator_message;
 pub mod whisper;
