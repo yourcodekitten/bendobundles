@@ -463,8 +463,8 @@ turns an unfalsifiable silence into a number that can contradict itself. No new 
 failure domain.)*
 
 **Files:**
-- Modify: `crates/dynamo/src/lib.rs` (two new Store methods; follow the `ADD` update-expression
-  style at :1143)
+- Modify: `crates/dynamo/src/lib.rs` (`pub enum BellCounter { Unwraps, Rings }` + two new Store
+  methods; follow the `ADD` update-expression style at :1143)
 - Modify: `crates/dynamo/tests/store_test.rs` (counter round-trip test, existing
   dynamodb-local harness — tests SKIP locally without `DYNAMODB_LOCAL_URL`; CI runs them)
 - Modify: `crates/fulfillment/src/bell.rs` (`ring` increments after a successful send)
@@ -474,25 +474,36 @@ failure domain.)*
   parameter and one content line)
 
 **Interfaces:**
-- Produces: `Store::increment_bell_count(&self, week: &str) -> Result<(), StoreError>` — atomic
-  `ADD rings :one` on item `pk = "BELL#<week>"` (its OWN namespace; `WHISPER#` is untouchable).
-- Produces: `Store::get_bell_count(&self, week: &str) -> Result<u32, StoreError>` — 0 when the
-  item is absent.
-- Changes: `whisper_card(game, steam, site_url, cycle, slot, preview, bell_count: Option<u32>)` —
-  `None` = counter unreadable (say nothing rather than lie a zero); `Some(n)` renders one line:
-  `n == 0` → `the bell was quiet this week` · `n > 0` → `the bell rang {n} time(s) this week ♡`.
+- Produces: `Store::increment_bell_counter(&self, week: &str, field: BellCounter) -> Result<(), StoreError>`
+  — atomic `ADD <field> :one` on item `pk = "BELL#<week>", sk = "COUNT"` (its OWN namespace;
+  `WHISPER#` is untouchable). `pub enum BellCounter { Unwraps, Rings }` maps to attribute names
+  `"unwraps"` / `"rings"` — an enum, never a caller-supplied string (no injectable attr names).
+- Produces: `Store::get_bell_counts(&self, week: &str) -> Result<(u32, u32), StoreError>` —
+  `(unwraps, rings)`, `(0, 0)` when the item is absent.
+- Changes: `whisper_card(game, steam, site_url, cycle, slot, preview, bell_counts: Option<(u32, u32)>)`
+  — `None` = counters unreadable (say nothing rather than lie a zero). TWO numbers from
+  INDEPENDENT sources (OMBB's sharpening: one number stays ambiguous — "rang 0" reads exactly
+  like a quiet week; "4 unwrapped, 0 rings" contradicts itself):
+  - `unwraps` is incremented by the GIFT handlers at the durable `fulfill_claim` success points
+    (`lib.rs:894` and `:1451` neighborhoods) — bell-independent by construction: not gated by
+    `BELL_DISABLED`, not touched by webhook health, written by the process that writes the gift.
+  - `rings` is incremented by `ring` after a successful send.
+  Render: `(0, 0)` → `*(the attic was quiet this week)*` · otherwise →
+  `🔔 *({u} unwrapped · the bell rang {r})*` — the reader sees the contradiction, the card never
+  computes a verdict.
 
 - [ ] **Step 1: Write the failing store test** (in `store_test.rs`, matching its harness style)
 
 ```rust
 #[tokio::test]
-async fn bell_count_increments_and_reads_zero_when_absent() {
+async fn bell_counters_increment_independently_and_read_zero_when_absent() {
     let Some(store) = local_store().await else { return }; // the harness's existing skip shape
-    assert_eq!(store.get_bell_count("2026-W36").await.unwrap(), 0);
-    store.increment_bell_count("2026-W36").await.unwrap();
-    store.increment_bell_count("2026-W36").await.unwrap();
-    assert_eq!(store.get_bell_count("2026-W36").await.unwrap(), 2);
-    assert_eq!(store.get_bell_count("2026-W37").await.unwrap(), 0); // week-scoped
+    assert_eq!(store.get_bell_counts("2026-W36").await.unwrap(), (0, 0));
+    store.increment_bell_counter("2026-W36", BellCounter::Unwraps).await.unwrap();
+    store.increment_bell_counter("2026-W36", BellCounter::Unwraps).await.unwrap();
+    store.increment_bell_counter("2026-W36", BellCounter::Rings).await.unwrap();
+    assert_eq!(store.get_bell_counts("2026-W36").await.unwrap(), (2, 1));
+    assert_eq!(store.get_bell_counts("2026-W37").await.unwrap(), (0, 0)); // week-scoped
 }
 ```
 
@@ -508,16 +519,18 @@ the compile failure still proves the red.)
 - [ ] **Step 3: Implement the two Store methods**
 
 ```rust
-    /// The bell's ring ledger: `ADD rings :one` on `pk = BELL#<week>`, own namespace, never
-    /// WHISPER#. Purpose is falsifiability, not accounting — the weekly whisper prints this so
-    /// a dead bell stops reading as a quiet week (spec-attic-bell, Lilith's ④).
-    pub async fn increment_bell_count(&self, week: &str) -> Result<(), StoreError> {
+    /// The bell's week ledger: two counters, INDEPENDENT sources, one item — `pk = BELL#<week>`,
+    /// own namespace, never WHISPER#. Purpose is falsifiability, not accounting: the weekly
+    /// whisper prints both so a dead bell contradicts the durable unwrap count instead of
+    /// reading as a quiet week (spec-attic-bell, Lilith's ④ + OMBB's two-numbers sharpening).
+    pub async fn increment_bell_counter(&self, week: &str, field: BellCounter) -> Result<(), StoreError> {
+        let attr = match field { BellCounter::Unwraps => "unwraps", BellCounter::Rings => "rings" };
         self.client
             .update_item()
             .table_name(&self.table)
             .key("pk", AttributeValue::S(format!("BELL#{week}")))
             .key("sk", AttributeValue::S("COUNT".into()))
-            .update_expression("ADD rings :one")
+            .update_expression(&format!("ADD {attr} :one"))
             .expression_attribute_values(":one", AttributeValue::N("1".into()))
             .send()
             .await
@@ -525,7 +538,7 @@ the compile failure still proves the red.)
         Ok(())
     }
 
-    pub async fn get_bell_count(&self, week: &str) -> Result<u32, StoreError> {
+    pub async fn get_bell_counts(&self, week: &str) -> Result<(u32, u32), StoreError> {
         let out = self
             .client
             .get_item()
@@ -535,12 +548,14 @@ the compile failure still proves the red.)
             .send()
             .await
             .map_err(box_sdk_err)?;
-        Ok(out
-            .item()
-            .and_then(|i| i.get("rings"))
-            .and_then(|v| v.as_n().ok())
-            .and_then(|n| n.parse::<u32>().ok())
-            .unwrap_or(0))
+        let read = |name: &str| -> u32 {
+            out.item()
+                .and_then(|i| i.get(name))
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        Ok((read("unwraps"), read("rings")))
     }
 ```
 
@@ -558,31 +573,51 @@ At the end of `ring`'s success path (send returned `true`):
         let (y, w, _) = time::OffsetDateTime::now_utc().date().to_iso_week_date();
         format!("{y}-W{w:02}")
     };
-    if let Err(e) = deps.store.increment_bell_count(&week).await {
+    if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Rings).await {
         tracing::warn!(error = ?e, week, "bell rang but the ring ledger write failed");
     }
 ```
 
-- [ ] **Step 5: Wire `handle_whisper` + `whisper_card`**
+- [ ] **Step 5: Wire the unwrap counter, `handle_whisper` and `whisper_card`**
+
+At BOTH durable gift-success points (the `Ok(())` arms of `fulfill_claim` at `lib.rs:894` and
+`:1451` neighborhoods), immediately after the fulfill succeeds:
+
+```rust
+                        // durable unwrap ledger — bell-INDEPENDENT by construction (not gated
+                        // by BELL_DISABLED, blind to webhook health): the whisper prints this
+                        // beside `rings` so a dead bell contradicts it. Best-effort: a ledger
+                        // miss is a WARN, never a failed gift.
+                        let week = {
+                            let (y, w, _) = time::OffsetDateTime::now_utc().date().to_iso_week_date();
+                            format!("{y}-W{w:02}")
+                        };
+                        if let Err(e) = deps.store.increment_bell_counter(&week, dynamo::BellCounter::Unwraps).await {
+                            tracing::warn!(error = ?e, week, "unwrap ledger write failed — gift unaffected");
+                        }
+```
+
+(Admin self-claim `Reveal` paths get NO increment — the ledger counts friend unwraps, mirroring
+what bells ring for.)
 
 In `handle_whisper`, right before the `whisper_card` call (the `slot` string is already the ISO
-week): `let bell_count = deps.store.get_bell_count(&slot).await.ok();` and pass it as the new
+week): `let bell_counts = deps.store.get_bell_counts(&slot).await.ok();` and pass it as the new
 final argument. In `whisper_card`, add the parameter and append to `content` before the cap:
 
 ```rust
-    if let Some(n) = bell_count {
-        content.push_str(&match n {
-            0 => "\n*(the bell was quiet this week)*".to_string(),
-            1 => "\n🔔 *(the bell rang once this week ♡)*".to_string(),
-            n => format!("\n🔔 *(the bell rang {n} times this week ♡)*"),
+    if let Some((u, r)) = bell_counts {
+        content.push_str(&if (u, r) == (0, 0) {
+            "\n*(the attic was quiet this week)*".to_string()
+        } else {
+            format!("\n🔔 *({u} unwrapped · the bell rang {r})*")
         });
     }
 ```
 
 Update every existing `whisper_card(` call site (including `handle_whisper_preview` and every
 test) — pass `None` in the preview path (a preview must not imply a live counter read) and in old
-tests; add ONE new card test asserting the three renderings (None → absent, 0 → quiet line,
-2 → "rang 2 times").
+tests; add ONE new card test asserting the three renderings (None → no line, (0,0) → quiet line,
+(4,0) → "4 unwrapped · the bell rang 0" — the contradiction the reader must be able to see).
 
 - [ ] **Step 6: Run the suites**
 
@@ -685,8 +720,11 @@ read the match first; do NOT ring on AlreadyRedeemed/KeyDead/Parked/Error):
     // 🔔 after durable success, before the response: Event invoke is milliseconds and a
     // failure is a WARN — never touches the friend's moment. (Fired pre-response because a
     // frozen lambda never finishes a post-response task.) The NUMBER is picked (Lilith's ②):
-    // 2s hard budget on the invoke call itself, so even a hung control plane costs the friend
-    // at most 2s — typical is ~20ms.
+    // 2s hard budget on the invoke call itself, CHOSEN AGAINST THE COLD PATH (Lilith): this app
+    // is low-traffic, so the first claim after a quiet spell pays DNS+TCP+TLS to the lambda
+    // endpoint with no pooled connection — a warm-measured 1s would concentrate misses on
+    // exactly the claim that matters. Affordable to bound at all BECAUSE misses are counted
+    // (the ring ledger) and pinged (ops) — OMBB's coupling. Warm typical ~20ms.
     match tokio::time::timeout(std::time::Duration::from_secs(2),
         s.invoker.bell(FulfillRequest::Bell {
             event: fulfillment::bell::BellEvent::Unwrap {
@@ -757,10 +795,16 @@ spec deploy note.
 
 Replace the "open questions" section with a "decisions (2026-09-02, family review + OMBB
 sign-off)" section recording Q①–Q④ answers as implemented (reuse webhook + split BELL_DISABLED
-toggle · uniform Event invoke with a 2s budget · choice clause without a pick count ·
+toggle · uniform Event invoke with a 2s budget (cold-path-chosen) · choice clause without a pick count ·
 at-most-once + ops ping on miss + the whisper-carried ring count), plus these two fences:
 - "**The bell is not the pick ledger.** The admin is truth for the monthly-pick budget; the bell
   may miss and must never be counted with." (Lilith's ③)
+- "**Coverage split, stated:** the whisper's `unwraps · rings` line covers *bell broken, channel
+  healthy* — it structurally CANNOT report a dead whisper webhook (the report dies with the
+  channel). Dead-channel detection is the per-miss ops `ping_msg`, which rides the OPS webhook —
+  a different credential — plus the weekly whisper's own cause-④ ping. Out-of-band at bell
+  frequency; a metric+alarm remains the deferred second step, with this line as its reason."
+  (Lilith's ①-walkback + OMBB's report-path rule, closed by the two-credential split.)
 - "Mentions-deny provenance: `allowed_mentions` covers `content` by contract; embed behaviour is
   observed-not-contract, which is why all friend-influenced text rides `content`." (OMBB's ⑤)
 Plus: "Deploy note: no new infra. The bell rides the existing whisper webhook and
