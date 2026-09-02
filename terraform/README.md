@@ -104,9 +104,23 @@ needs — no part of this waits on Ben.**
      any flag the code declares:
      ```bash
      # every declared variable, minus what your tfvars already sets (admin_password_hash rides TF_VAR)
-     # ⚠️ [a-z0-9_] — NOT [a-z_]. The first draft of this very command dropped the digits and
-     # reported `route53_profile` as `route`, under-counting the declared set by one. A census
-     # whose pattern cannot spell every member is a census that silently omits them.
+     # ⚠️ [a-z0-9_] — NOT [a-z_]. The first draft of this very command dropped the digits, and the
+     # consequence is worse than a miscount: MEASURED on this tree, both classes yield 15 names, so
+     # THE COUNT NEVER MOVES. `route53_profile` is silently replaced by the phantom `route` — and in
+     # `comm -23` that one swap fires BOTH WAYS AT ONCE: `route` is not in supplied ⇒ FALSE ALARM,
+     # and `route53_profile` is never in declared ⇒ NEVER CHECKED, a FALSE CLEAN. The false clean is
+     # the dangerous half: a genuinely missing `route53_profile` slips past the very check written
+     # to catch it. (OMBB's correction, 2026-09-02 — my first note here claimed the narrow class
+     # "under-counted by one", which would have taught you to look for a short count that never
+     # comes.)
+     # 🔑 AND THE FAILURE MODE DEPENDS ON ANCHORING, same root cause, opposite symptom — both
+     # reproduced on this tree:
+     #   ANCHORED   `variable "([a-z_]+)"`        — must reach the closing quote ⇒ no match at all
+     #                                              ⇒ DROPS the name ⇒ 14 vs 15 (a short census)
+     #   UNANCHORED `grep -oP 'variable "\K[a-z_]+'` — keeps the prefix it can spell
+     #                                              ⇒ SWAPS in a phantom ⇒ 15 vs 15 (a lying census)
+     # ⇒ A CENSUS CANNOT BE VALIDATED BY ITS COUNT. Check that every name it emits is a name that
+     #   exists — the count is identical in the case that lies to you.
      grep -hoP 'variable "\K[a-z0-9_]+' terraform/*.tf | sort > /tmp/declared
      grep -hoP '^\K[a-z0-9_]+' terraform/production.tfvars | sort > /tmp/supplied
      comm -23 /tmp/declared /tmp/supplied   # read every line; any *_enabled here is a destroy waiting
