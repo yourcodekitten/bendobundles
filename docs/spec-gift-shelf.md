@@ -1,7 +1,9 @@
 # the gift shelf 🎁📚 — spec
 
-*2026-09-04, kitten. Status: PROPOSAL — family review pending. Where narrative and **decisions**
-disagree after review, the decisions win.*
+*2026-09-04, kitten. Status: BUILT — family review (spec ×2 rounds + OMBB step-5 plan gate) →
+plan `docs/superpowers/plans/2026-09-04-gift-shelf.md` → implemented (Tasks 1–7, each TDD +
+task-reviewed) → final whole-branch review → PR. Where narrative and **decisions** disagree, the
+decisions win — they are the reviewed outcome.*
 
 ## why this exists
 
