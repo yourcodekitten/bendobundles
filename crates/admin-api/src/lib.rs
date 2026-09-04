@@ -11,6 +11,10 @@
 //! - GET   /admin/api/links              — list all links with used/allowed counts
 //! - POST  /admin/api/links/{token}/revoke
 //! - GET   /admin/api/links/{token}/claims
+//! - POST  /admin/api/links/{token}/friend — assign/clear the link's owning friend
+//! - POST  /admin/api/friends            — create a friend + mint their shelf token
+//! - GET   /admin/api/friends            — list all friends
+//! - POST  /admin/api/friends/{id}       — rename OR reissue OR revoke (exactly one)
 //! - GET   /admin/api/claims/self        — Ben's own self-claimed keys (SELF partition)
 //! - POST  /admin/api/sync               — trigger catalog sync now
 //! - GET   /admin/api/status             — sync state + game counts by status
@@ -110,6 +114,15 @@ pub fn router(
             post(handle_set_link_unlock).delete(handle_delete_link_unlock),
         )
         .route("/admin/api/links/{token}/claims", get(handle_link_claims))
+        .route(
+            "/admin/api/links/{token}/friend",
+            post(handle_set_link_friend),
+        )
+        .route(
+            "/admin/api/friends",
+            post(handle_create_friend).get(handle_list_friends),
+        )
+        .route("/admin/api/friends/{id}", post(handle_patch_friend))
         .route("/admin/api/claims/self", get(handle_self_claims))
         .route("/admin/api/sync", post(handle_sync))
         .route("/admin/api/status", get(handle_status))
@@ -237,12 +250,7 @@ async fn handle_login(State(s): State<AppState>, Json(body): Json<LoginBody>) ->
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    // Token = two uuid-v4 concatenated without hyphens: 32 + 32 = 64 hex chars (≥128 bits).
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
+    let token = mint_token();
     let expires = OffsetDateTime::now_utc() + time::Duration::days(7);
 
     if s.store
@@ -577,6 +585,18 @@ fn parse_gift_note(raw: Option<&str>) -> Result<Option<String>, String> {
     Ok(trimmed.map(String::from))
 }
 
+/// Mint a bearer token: two uuid-v4 simple-format (no hyphens) concatenated — 32 + 32 = 64
+/// lowercase hex chars (≥128 bits). Shared by login sessions, link tokens, and friend shelf
+/// tokens — three call sites now, one implementation, so the idiom can't silently drift between
+/// them.
+fn mint_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 /// The crate's one 422 shape — `{"error": msg}` — which the web client's
 /// `throwIfValidation422` parses; both validated endpoints build it here.
 fn unprocessable(msg: String) -> Response {
@@ -704,12 +724,7 @@ async fn handle_create_link(
         }
     }
 
-    // Token = two uuid-v4 simple-format (no hyphens) concatenated: 32 + 32 = 64 hex chars.
-    let token = format!(
-        "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    );
+    let token = mint_token();
 
     let now = OffsetDateTime::now_utc();
     let expires_at = body
@@ -928,6 +943,177 @@ async fn handle_link_claims(State(s): State<AppState>, Path(token): Path<String>
                 .collect();
             (StatusCode::OK, Json(views)).into_response()
         }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── POST /admin/api/links/{token}/friend ───────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AssignFriendBody {
+    /// `Some(id)` assigns; `None` clears. The friend must exist when non-null — an
+    /// assignment pointing at nobody is a worse failure mode than a 422.
+    friend_id: Option<String>,
+}
+
+/// Assign or clear a link's owning friend. Friend existence is checked BEFORE the store write
+/// (matching create/note's validate-before-touch shape): a non-null `friend_id` that doesn't
+/// resolve is a client error (422), not a 404 on the LINK. `set_link_friend`'s own
+/// `attribute_exists(pk)` condition is what tells an unknown link apart from an unknown friend —
+/// `Ok(false)` only happens once the friend side is already known-good.
+async fn handle_set_link_friend(
+    State(s): State<AppState>,
+    Path(token): Path<String>,
+    Json(body): Json<AssignFriendBody>,
+) -> Response {
+    if let Some(fid) = &body.friend_id {
+        match s.store.get_friend(fid).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return unprocessable("unknown friend".into()),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+
+    match s
+        .store
+        .set_link_friend(&token, body.friend_id.as_deref())
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── POST /admin/api/friends ─────────────────────────────────────────────────────
+
+const FRIEND_NAME_MAX_CHARS: usize = 64;
+
+#[derive(Deserialize)]
+struct CreateFriendBody {
+    name: String,
+}
+
+/// Create a friend + mint their first shelf token in one shot. `id` is a fresh uuid-v4
+/// (simple format, no hyphens); `shelf_token` is `mint_token()` — the same 64-hex idiom
+/// login sessions and link tokens use.
+async fn handle_create_friend(
+    State(s): State<AppState>,
+    Json(body): Json<CreateFriendBody>,
+) -> Response {
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > FRIEND_NAME_MAX_CHARS {
+        return unprocessable(format!("name must be 1-{FRIEND_NAME_MAX_CHARS} characters"));
+    }
+
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let token = mint_token();
+    let friend = domain::Friend {
+        id: id.clone(),
+        name: name.to_string(),
+        shelf_token: token.clone(),
+        created_at: OffsetDateTime::now_utc(),
+    };
+
+    match s.store.create_friend(&friend).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": id,
+                "name": friend.name,
+                "shelf_token": token,
+                "shelf_url_path": format!("/s/{token}"),
+            })),
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── GET /admin/api/friends ───────────────────────────────────────────────────────
+
+/// `domain::Friend` already serializes to exactly the wire shape this route promises
+/// (`{id, name, shelf_token, created_at}`, `shelf_token: ""` when revoked) — no view struct
+/// needed.
+async fn handle_list_friends(State(s): State<AppState>) -> Response {
+    match s.store.list_friends().await {
+        Ok(friends) => (StatusCode::OK, Json(friends)).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── POST /admin/api/friends/{id} ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PatchFriendBody {
+    name: Option<String>,
+    reissue: Option<bool>,
+    revoke: Option<bool>,
+}
+
+/// Rename OR reissue OR revoke — exactly one of the three per request. Counting the set ones
+/// (rather than an if/else-if chain) is what makes "two at once" a distinguishable 422 instead
+/// of one silently winning.
+async fn handle_patch_friend(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PatchFriendBody>,
+) -> Response {
+    let set_count = [
+        body.name.is_some(),
+        body.reissue == Some(true),
+        body.revoke == Some(true),
+    ]
+    .into_iter()
+    .filter(|set| *set)
+    .count();
+    if set_count != 1 {
+        return unprocessable("provide exactly one of: name, reissue, revoke".into());
+    }
+
+    if let Some(name) = body.name.as_deref() {
+        let name = name.trim();
+        if name.is_empty() || name.len() > FRIEND_NAME_MAX_CHARS {
+            return unprocessable(format!("name must be 1-{FRIEND_NAME_MAX_CHARS} characters"));
+        }
+        return match s.store.rename_friend(&id, name).await {
+            Ok(true) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
+
+    // reissue and revoke both need the friend's CURRENT token first — reissue to hand it to
+    // the transaction as the old-pointer key, revoke for the same reason. This read also
+    // supplies the 404 for an unknown id (neither store call below returns a bool).
+    let friend = match s.store.get_friend(&id).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    if body.reissue == Some(true) {
+        let new_token = mint_token();
+        return match s
+            .store
+            .reissue_shelf_token(&id, &friend.shelf_token, &new_token)
+            .await
+        {
+            Ok(()) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "shelf_token": new_token,
+                    "shelf_url_path": format!("/s/{new_token}"),
+                })),
+            )
+                .into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+    }
+
+    // revoke (the only remaining option, given set_count == 1)
+    match s.store.revoke_shelf_token(&id, &friend.shelf_token).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"shelf_token": ""}))).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

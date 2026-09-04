@@ -3209,3 +3209,157 @@ async fn delete_link_unlock_unseals_only_sealed() {
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
+
+// ── Friends CRUD + link↔friend assignment (Task 4) ────────────────────────────
+
+#[tokio::test]
+async fn friends_create_list_rename_reissue_revoke() {
+    let Some(store) = store_or_skip("admin-friends").await else {
+        return;
+    };
+    let password = "pw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let call = |req| {
+        router(
+            Arc::clone(&store),
+            Arc::clone(&invoker),
+            admin_hash.clone(),
+            None,
+        )
+        .oneshot(req)
+    };
+    let post = |path: &str, body: serde_json::Value| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let get = |path: &str| {
+        Request::get(path)
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // create
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "sarah"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(r).await;
+    let id = j["id"].as_str().unwrap().to_string();
+    let tok1 = j["shelf_token"].as_str().unwrap().to_string();
+    assert_eq!(tok1.len(), 64);
+    assert_eq!(j["shelf_url_path"], format!("/s/{tok1}"));
+    // list shows it
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j.as_array().unwrap().len(), 1);
+    // rename — assert the VALUE changed, not just the 200 (a 200 proves nothing about the name)
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"name": "sara"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(
+        j[0]["name"], "sara",
+        "rename must actually change the stored name"
+    );
+    // reissue → token changes
+    let j = body_json(
+        call(post(
+            &format!("/admin/api/friends/{id}"),
+            serde_json::json!({"reissue": true}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let tok2 = j["shelf_token"].as_str().unwrap().to_string();
+    assert_ne!(tok1, tok2, "reissue must mint a new token");
+    // revoke → empty token in list
+    call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"revoke": true}),
+    ))
+    .await
+    .unwrap();
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j[0]["shelf_token"], "");
+}
+
+#[tokio::test]
+async fn friends_validation_422s() {
+    let Some(store) = store_or_skip("admin-friends-422").await else {
+        return;
+    };
+    let password = "pw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let post = |path: &str, body: serde_json::Value| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let call = |req| {
+        router(
+            Arc::clone(&store),
+            Arc::clone(&invoker),
+            admin_hash.clone(),
+            None,
+        )
+        .oneshot(req)
+    };
+
+    // empty name
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "  "}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // create one to mutate
+    let j = body_json(
+        call(post(
+            "/admin/api/friends",
+            serde_json::json!({"name": "sarah"}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let id = j["id"].as_str().unwrap().to_string();
+    // two ops at once (rename AND revoke) → 422
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"name": "x", "revoke": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // assign a nonexistent friend to a link → 422
+    let l = test_link("t1");
+    store.create_link(&l).await.unwrap();
+    let r = call(post(
+        "/admin/api/links/t1/friend",
+        serde_json::json!({"friend_id": "ghost"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
