@@ -597,7 +597,10 @@ mod tests {
         // A pre-field stored record must deserialize (the zero-migration guarantee).
         let json = serde_json::to_string(&link()).unwrap(); // `fn link()` — the existing fixture above
         let stripped: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(stripped.get("friend_id").is_none(), "None must not serialize");
+        assert!(
+            stripped.get("friend_id").is_none(),
+            "None must not serialize"
+        );
         let back: Link = serde_json::from_str(&json).unwrap();
         assert_eq!(back.friend_id, None);
     }
