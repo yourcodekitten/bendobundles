@@ -8,10 +8,13 @@ import {
   adminSetLinkNote,
   adminSetLinkUnlock,
   adminDeleteLinkUnlock,
+  adminFriends,
+  adminSetLinkFriend,
   CreateLinkValidationError,
   GIFT_NOTE_MAX,
   type AdminLink,
   type AdminClaimView,
+  type AdminFriend,
 } from '../api';
 import { withAuth } from './withAuth';
 import { exposureLabel } from './pickExposure';
@@ -65,8 +68,26 @@ export function Links() {
   const location = useLocation();
   const [state, setState] = useState<PageState>({ phase: 'loading' });
 
+  // Friend roster (Task 6) — loaded independently of the links list: it only
+  // feeds a picker/name-lookup, so a friends-fetch failure must not blank the
+  // links page. `friends` stays [] until it resolves; every lookup already
+  // tolerates "not found".
+  const [friends, setFriends] = useState<AdminFriend[]>([]);
+  useEffect(() => {
+    withAuth(() => adminFriends(), navigate)
+      .then(setFriends)
+      .catch(() => {});
+  }, [navigate]);
+  const friendName = (id: string | undefined): string | undefined =>
+    id === undefined ? undefined : friends.find((f) => f.id === id)?.name;
+
   // Create form state
   const [formLabel, setFormLabel] = useState('');
+  // Friend picker on create — '' means open shelf (no assignment). The link
+  // API itself has no friend_id field (Task 4's CreateLinkBody), so a pick
+  // here fires a follow-up POST /admin/api/links/{token}/friend right after
+  // creation succeeds.
+  const [pickedFriendId, setPickedFriendId] = useState('');
   const [claimsAllowed, setClaimsAllowed] = useState(1);
   const [expiresDays, setExpiresDays] = useState('');
   const [unlockAt, setUnlockAt] = useState('');
@@ -118,6 +139,16 @@ export function Links() {
   // the friend's page now says (mirrors the revoke-error pattern)
   const [noteErrors, setNoteErrors] = useState<Record<string, string>>({});
 
+  // Friend reassignment: token → pending friend id ('' = clear). Key presence
+  // is the "armed" signal (noteDrafts' shape) — the in-voice warning and the
+  // request both wait for a SEPARATE confirm click, never fire on selection
+  // alone. Reassigning MOVES the link's already-claimed gifts to the other
+  // shelf (set_link_friend moves gsi3pk atomically), so a stray click must
+  // never be the trigger.
+  const [reassignDrafts, setReassignDrafts] = useState<Record<string, string>>({});
+  const [reassignErrors, setReassignErrors] = useState<Record<string, string>>({});
+  const [reassignBusy, setReassignBusy] = useState<Set<string>>(new Set());
+
   const load = useCallback(() => {
     setState({ phase: 'loading' });
     // withAuth re-throws non-Unauthorized errors → .catch sets error state
@@ -162,8 +193,24 @@ export function Links() {
         setUnlockAt('');
         setGiftNote('');
         setPicked([]);
-        // Reload to prepend the new link into the list
-        load();
+        const friendId = pickedFriendId;
+        setPickedFriendId('');
+        // The link API itself has no friend_id field — a pick fires the
+        // separate assignment endpoint right after creation. The link exists
+        // either way; a failed assignment must say so without erasing the
+        // just-created invite URL above (it's still copyable from the list).
+        if (friendId !== '') {
+          withAuth(() => adminSetLinkFriend(result.token, friendId), navigate)
+            .catch(() => {
+              setCreateError(
+                'link created, but assigning the friend failed — assign it from the list below.',
+              );
+            })
+            .finally(() => load());
+        } else {
+          // Reload to prepend the new link into the list
+          load();
+        }
       })
       .catch((err: unknown) => {
         // withAuth handles 401. A 422 means the server rejected the INPUT —
@@ -274,6 +321,39 @@ export function Links() {
       .finally(() => sealBusyOff(link.token));
   };
 
+  const handleReassignCancel = (token: string) => {
+    setReassignDrafts((prev) => omitKey(prev, token));
+    setReassignErrors((prev) => omitKey(prev, token));
+  };
+
+  const handleReassignConfirm = (link: AdminLink) => {
+    const draft = reassignDrafts[link.token];
+    if (draft === undefined) return;
+    setReassignBusy((prev) => new Set(prev).add(link.token));
+    setReassignErrors((prev) => omitKey(prev, link.token));
+    withAuth(() => adminSetLinkFriend(link.token, draft === '' ? null : draft), navigate)
+      .then(() => {
+        setReassignDrafts((prev) => omitKey(prev, link.token));
+        load();
+      })
+      .catch((err: unknown) => {
+        setReassignErrors((prev) => ({
+          ...prev,
+          [link.token]:
+            err instanceof CreateLinkValidationError
+              ? err.message
+              : "couldn't reassign — the link's friend is unchanged. try again.",
+        }));
+      })
+      .finally(() => {
+        setReassignBusy((prev) => {
+          const next = new Set(prev);
+          next.delete(link.token);
+          return next;
+        });
+      });
+  };
+
   const handleRevoke = (link: AdminLink) => {
     if (!revokeArmed.has(link.token)) {
       // First click: arm the button
@@ -346,6 +426,13 @@ export function Links() {
 
   // Capture as const so TypeScript narrows through closures below
   const info = createdInfo;
+
+  // Unassigned indicator (Lilith's finding): derived CLIENT-SIDE from the
+  // already-fetched links — friend_id rides the read-override, so an absent
+  // key means unassigned. Renders nothing at 0; the workbench carries the
+  // doubt the shelf structurally can't (a link with no friend has nowhere to
+  // show its gifts once claimed).
+  const unassignedCount = state.links.filter((l) => l.friend_id === undefined).length;
 
   return (
     <div className="flex flex-col gap-6">
@@ -423,6 +510,22 @@ export function Links() {
               onChange={(e) => setUnlockAt(e.target.value)}
               className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
             />
+          </label>
+          <label className="flex flex-col gap-1 text-xs text-dust">
+            friend (optional — puts this link on their shelf)
+            <select
+              aria-label="friend (optional — puts this link on their shelf)"
+              value={pickedFriendId}
+              onChange={(e) => setPickedFriendId(e.target.value)}
+              className="rounded border border-line bg-shelf px-2 py-1 text-sm text-ink"
+            >
+              <option value="">open shelf — no friend</option>
+              {friends.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
+            </select>
           </label>
         </div>
         <label className="flex flex-col gap-1 text-xs text-dust">
@@ -521,6 +624,13 @@ export function Links() {
       )}
 
       {/* ── Links list ─────────────────────────────────────────────────── */}
+      {unassignedCount > 0 && (
+        <p className="text-xs text-dust">
+          {unassignedCount === 1
+            ? "1 gift isn't on a shelf yet"
+            : `${unassignedCount} gifts aren't on a shelf yet`}
+        </p>
+      )}
       <div className="space-y-2">
         {state.links.map((link) => {
           const linkUrl = inviteUrl(link.token);
@@ -532,6 +642,11 @@ export function Links() {
           const savingNote = noteSaving.has(link.token);
           const sealDraft = sealDrafts[link.token];
           const sealErr = sealErrors[link.token];
+          const currentFriendId = link.friend_id ?? '';
+          const reassignDraft = reassignDrafts[link.token];
+          const reassignErr = reassignErrors[link.token];
+          const reassignIsBusy = reassignBusy.has(link.token);
+          const assignedFriendName = friendName(link.friend_id);
 
           return (
             <div key={link.token} className="rounded bg-floor p-4">
@@ -570,6 +685,14 @@ export function Links() {
                   </span>
                 )}
 
+                {/* Assigned friend — the row's own name display (Task 6);
+                    absent = unassigned, counted in the header above. */}
+                {assignedFriendName !== undefined && (
+                  <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
+                    🎀 {assignedFriendName}
+                  </span>
+                )}
+
                 {/* Actions — all accessible-named with the link's label */}
                 <div className="ml-auto flex items-center gap-2">
                   <button
@@ -580,6 +703,26 @@ export function Links() {
                   >
                     copy URL
                   </button>
+
+                  {/* Friend reassignment — selecting a NEW value only arms the
+                      confirm below; the request never fires on selection alone
+                      (reassign moves the link's already-claimed gifts). */}
+                  <select
+                    aria-label={`reassign friend for ${link.label}`}
+                    disabled={reassignIsBusy}
+                    value={reassignDraft ?? currentFriendId}
+                    onChange={(e) =>
+                      setReassignDrafts((prev) => ({ ...prev, [link.token]: e.target.value }))
+                    }
+                    className="rounded border border-line bg-shelf px-2 py-1 text-xs text-ink disabled:opacity-50"
+                  >
+                    <option value="">no friend</option>
+                    {friends.map((f) => (
+                      <option key={f.id} value={f.id}>
+                        {f.name}
+                      </option>
+                    ))}
+                  </select>
 
                   {/* Revoke: two-step, not window.confirm */}
                   {!link.revoked && (
@@ -690,6 +833,39 @@ export function Links() {
                       ? `, ${formatDate(link.thanked_at)}`
                       : ''}
                   </span>
+                </p>
+              )}
+
+              {/* Reassign confirm — the in-voice warning renders BEFORE the
+                  request fires; only a picked value DIFFERENT from the
+                  current assignment arms it (re-picking the same friend is a
+                  no-op, mirrors the note editor's unchanged-draft check). */}
+              {reassignDraft !== undefined && reassignDraft !== currentFriendId && (
+                <div className="mt-2 flex flex-wrap items-center gap-3 rounded bg-shelf p-2">
+                  <p className="text-xs text-dust">this moves its gifts to the other shelf</p>
+                  <button
+                    type="button"
+                    disabled={reassignIsBusy}
+                    onClick={() => handleReassignConfirm(link)}
+                    aria-label={`confirm reassign for ${link.label}`}
+                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
+                  >
+                    {reassignIsBusy ? 'saving…' : 'confirm reassign'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={reassignIsBusy}
+                    onClick={() => handleReassignCancel(link.token)}
+                    aria-label={`cancel reassign for ${link.label}`}
+                    className="rounded px-3 py-1.5 text-xs text-dust hover:text-ink disabled:opacity-50"
+                  >
+                    cancel
+                  </button>
+                </div>
+              )}
+              {reassignErr !== undefined && (
+                <p role="alert" className="mt-1 text-xs text-red-700">
+                  {reassignErr}
                 </p>
               )}
 
