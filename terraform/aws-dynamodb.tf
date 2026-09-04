@@ -39,6 +39,10 @@ resource "aws_dynamodb_table" "this" {
     name = "gsi2sk"
     type = "S"
   }
+  attribute {
+    name = "gsi3pk"
+    type = "S"
+  }
 
   global_secondary_index {
     name            = "listable"
@@ -65,6 +69,19 @@ resource "aws_dynamodb_table" "this" {
     key_schema {
       attribute_name = "gsi2sk"
       key_type       = "RANGE"
+    }
+  }
+
+  # Sparse index: only links that carry a friend_id write gsi3pk at all (see
+  # crates/dynamo/src/schema.rs GSI_FRIEND_LINKS / set_link_friend), hence hash-only
+  # (no sort key) — mirrors the test table's with_gsi3 branch in crates/dynamo/src/lib.rs.
+  global_secondary_index {
+    name            = "friend-links"
+    projection_type = "ALL"
+
+    key_schema {
+      attribute_name = "gsi3pk"
+      key_type       = "HASH"
     }
   }
 
