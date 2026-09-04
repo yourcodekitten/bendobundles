@@ -23,9 +23,11 @@ the shelf is where the unwraps go to live.
 
 - **A friend page at `/s/{shelf_token}`** — no account, same trust model as invite links: the URL
   is the key. Greeting in the brand voice ("ben's shelf for ⟨name⟩ ♡"), then the gifts: cover art,
-  title, the year it was given, ben's `gift_note` from that link, the friend's `thank_note` back.
+  title, the year they unwrapped it, ben's `gift_note` from that link, the friend's `thank_note`
+  back.
   Oldest first — a shelf accretes; the newest gift is the one you scroll to with everything you've
-  been given behind it.
+  been given behind it. (Accretion is the normal motion, not an enforced invariant — reassignment
+  is mutable admin state and can move a gift between shelves; see admin-api.)
 - **A lightweight `Friend`** in the data model: `{id, name, shelf_token, created_at}`. Links gain
   an optional `friend_id`. That's the whole identity system — no auth, no email, no profile.
 - **Admin plumbing sized to the workbench**: create a friend (mints the shelf token), pick a
@@ -37,7 +39,9 @@ the shelf is where the unwraps go to live.
 - **No bell on shelf visits.** A friend revisiting their own shelf must never page ben — same
   consent logic as the browse-doesn't-ring decision in spec-attic-bell.md.
 - **No unclaimed/chosen-but-unopened games on the shelf.** Only claimed gifts appear. A "you
-  haven't opened this yet" row is pressure, and pressure is shop grammar. (Family may overrule.)
+  haven't opened this yet" row is pressure, and pressure is shop grammar. (Family review agreed —
+  and located the warm version: "chosen and waiting" is BEN's feeling, which belongs to the
+  deferred ben-facing scrapbook, not the friend's page.)
 - **No wishes/requests, no whisper integration, no ben-facing scrapbook view** — each is a future
   spec if it earns one. v1 is the friend's shelf, read-only.
 - **No friend deletion in v1.** Revoke the shelf token and the page is gone; deleting the
@@ -53,14 +57,20 @@ the shelf is where the unwraps go to live.
 - `Link.friend_id: Option<String>` — following the `gift_note` pattern exactly: authoritative in a
   top-level dynamo attribute written only by a scoped update (`set_link_friend`), stripped from
   the stored `body` blob, overridden on read, `#[serde(default)]` so every pre-existing record
-  reads `None`. Same reasons: editable after creation (that's the backfill), and clearing leaves
-  no copy at rest.
+  reads `None`. **This pattern is MECHANICALLY REQUIRED, not aesthetic: a GSI key must be a
+  top-level scalar attribute, and `gsi3pk` derives from `friend_id` — a body-blob field cannot be
+  indexed, so "simplify to a plain body field" takes the shelf's only query path with it**
+  (Lilith, family review). Editability and no-copy-at-rest ride along as the same reasons
+  `gift_note` had.
 
 **Dynamo** (`crates/dynamo`, single table):
 - `FRIEND#<id> / META` — the friend record.
 - `SHELF#<token> / META` — pointer item `{friend_id}`; shelf resolution is a direct pk get, same
-  shape as link tokens. Revoke = delete pointer; reissue = write new pointer + update
-  `friend.shelf_token` (two-step admin op, not seamless rotation — v1 doesn't need seamless).
+  shape as link tokens. **Revoke = one transaction: delete pointer + REMOVE `friend.shelf_token`**
+  (the friend record must not keep a dead capability at rest — the same no-copy rule the
+  `gift_note` pattern exists for). **Reissue = one transaction: delete OLD pointer + put new
+  pointer + set `friend.shelf_token`** — the old URL dies atomically with the new one's birth,
+  which is exactly what the test list asserts ("reissue invalidates old token").
 - **Sparse GSI** (`gsi3pk = FRIEND#<friend_id>`) on LINK items, present only when `friend_id` is
   set → `list_links_for_friend`. Sparse means unassigned links simply don't exist to the shelf —
   backfill is optional per-link, zero migration.
@@ -74,8 +84,10 @@ the shelf is where the unwraps go to live.
   reconcile — rendering it would be a lie) → game + art. **`handle_game_detail` is link-scoped
   (resolves a link from its path token first — verified lib.rs:1316) and cannot be reused as a
   route; the detail-assembly under it (game record + steam cache join) gets extracted into a
-  helper both handlers call.** Each gift: `{title, artwork_url, given_at (claim.created_at),
-  gift_note, thank_note, detail…}`. Read-only; thank-yous continue to live on link pages.
+  helper both handlers call.** Each gift: `{title, artwork_url, unwrapped_at
+  (claim.created_at — named for what it IS: the friend's unwrap moment, which is the memory this
+  page serves; "when ben chose it" is link.created_at and belongs to the future ben-facing
+  scrapbook), gift_note, thank_note, detail…}`. Read-only; thank-yous continue to live on link pages.
 - **Partial failure is whole failure**: if any sub-fetch (links, claims, games, cache) errors,
   the response is a 500 in the brand's soft voice — a silently incomplete shelf reads as "ben
   gave me less than he did," which is worse than an error.
@@ -98,10 +110,16 @@ the shelf is where the unwraps go to live.
 
 ## content & security
 
-- **Bearer capability URL, same class as invite links** — the shelf shows strictly *less* than the
-  links that fed it (no keys, no claim actions, no gift URLs — titles, art, notes only). Token in
-  the pk raw, exactly as `link_pk` does; if that class choice is ever revisited (#88 hashed
-  sessions for dump-replay reasons), links and shelves revisit together.
+- **Bearer capability URL** — the shelf shows strictly *less* than the links that fed it (no
+  keys, no claim actions, no gift URLs — titles, art, notes only). **Token stored raw in the pk,
+  and the honest argument is about the TABLE, not class-consistency** (my first framing said
+  "hits links and shelves equally or neither" — Lilith refuted it: a link token is *spent*, a
+  shelf token is *permanent and appreciates*, so dump-exposure is asymmetric in duration).
+  Decided raw anyway because the marginal exposure is noise against the table's existing
+  contents: CLAIM items already store `gift_url` and `revealed_key` — a dump yields actual game
+  keys, which dominate any shelf token. **Reissue exists precisely because shelf tokens are
+  long-lived: the leak response is one admin op.** If the table's secret-at-rest posture is ever
+  hardened (#88's direction), shelf tokens join that migration.
 - **No cross-friend leakage by construction**: resolution starts at one pointer item and fans out
   only through `FRIEND#<id>`-keyed queries.
 - **Unknown and revoked are the same 404** — a probe learns nothing about which tokens ever lived.
@@ -129,11 +147,12 @@ the shelf is where the unwraps go to live.
 - admin-api: validation 422s, friends CRUD, reissue invalidates old token.
 - web: component tests per house pattern (ShelfPage states: loading/empty/populated/404).
 
-## open questions (for family review)
+## open questions — RESOLVED in family review (2026-09-04, Lilith)
 
-1. **claimed-only on the shelf** — my call above; is chosen-but-unclaimed ever wanted (e.g. as a
-   gentle "waiting for you")? I say no: pressure is shop grammar.
-2. **`friend_id` via the `gift_note` top-level-authoritative pattern** — consistency with the
-   editable-after-create class, or is a plain body field with a normal update simpler and enough?
-3. **raw shelf token in the pk (link pattern) vs hashed (session pattern, #88)** — I chose raw for
-   class-consistency with links; the dump-replay argument applies to both equally or neither.
+1. **claimed-only** — stands; the warm version of "waiting for you" is ben's, on the deferred
+   scrapbook surface.
+2. **`friend_id` pattern** — not a choice: GSI keys must be top-level attributes; the body-field
+   option never existed. Mechanical reason now stated at the definition.
+3. **raw vs hashed shelf token** — raw, re-argued on the table's actual contents (claims hold
+   `gift_url`/`revealed_key`) rather than my refuted symmetry premise; lifetime asymmetry
+   acknowledged, reissue is the leak response.
