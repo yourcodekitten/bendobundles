@@ -3363,3 +3363,84 @@ async fn friends_validation_422s() {
     .unwrap();
     assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+/// The friend name renders on the UNAUTHENTICATED `/s/{token}` shelf header ("ben's shelf
+/// for {name}") — same U+202E display-spoofing threat public-api's `sanitize_note` exists
+/// for on thank-you notes (review finding: the name previously got none of that
+/// treatment). Strip, not reject, matching the note path's own behavior — exercised at
+/// both write paths (create + rename).
+#[tokio::test]
+async fn friends_name_strips_spoofing_format_chars() {
+    let Some(store) = store_or_skip("admin-friends-spoof").await else {
+        return;
+    };
+    let password = "pw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let call = |req| {
+        router(
+            Arc::clone(&store),
+            Arc::clone(&invoker),
+            admin_hash.clone(),
+            None,
+        )
+        .oneshot(req)
+    };
+    let post = |path: &str, body: serde_json::Value| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let get = |path: &str| {
+        Request::get(path)
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // create with a bidi override + zero-width space smuggled in → stored name is clean
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "sarah\u{202E}\u{200B}"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(r).await;
+    assert_eq!(
+        j["name"], "sarah",
+        "spoofing format chars must be stripped from the CREATE response, not stored"
+    );
+    let id = j["id"].as_str().unwrap().to_string();
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j[0]["name"], "sarah", "and from the persisted record");
+
+    // rename with the same smuggle attempt → same treatment
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"name": "sar\u{202E}ah"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(
+        j[0]["name"], "sarah",
+        "rename must sanitize the same way create does"
+    );
+
+    // a name that sanitizes down to nothing is refused as empty, matching sanitize_note's
+    // own ordering (sanitize BEFORE the emptiness check)
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "\u{202E}\u{200B}"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}

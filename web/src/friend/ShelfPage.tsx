@@ -9,12 +9,22 @@ type ViewState =
   | { kind: "error" }
   | { kind: "loaded"; data: ShelfView };
 
-/** UTC, not local time — unwrapped_at is a server instant in rfc3339, and a
- * friend near a year boundary in ben's own timezone (America/New_York) must
- * never see a different year than the one the server actually recorded. */
+/** America/New_York, not UTC and not browser-local — unwrapped_at is a server
+ * instant in rfc3339, but the year is the keepsake's headline and the
+ * audience (ben + the friend) reads it in ben's own timezone. A gift
+ * unwrapped Dec 31 late-EST is still `getUTCFullYear()`-January in UTC, so
+ * a naive UTC read shows the friend the wrong year for their own memory.
+ * `Intl`/`toLocaleString` with an explicit `timeZone` is DST-aware, so this
+ * stays correct across the EST/EDT boundary without hand-rolled offsets —
+ * and admin and friend views must agree, so this is the one place it's
+ * computed. */
 function unwrappedYear(rfc3339: string): string {
   const d = new Date(rfc3339);
-  return Number.isNaN(d.getTime()) ? "" : String(d.getUTCFullYear());
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+  });
 }
 
 /**

@@ -196,6 +196,29 @@ describe("ShelfPage", () => {
     });
   });
 
+  it("derives the unwrapped year in America/New_York, not UTC — a late-Dec-EST unwrap stays in the old year", async () => {
+    vi.mocked(fetchShelf).mockResolvedValue({
+      name: "sarah",
+      gifts: [
+        {
+          game_id: "g1",
+          // 2026-01-01T04:30:00Z is 2025-12-31 23:30 EST — UTC rolls to
+          // 2026, but the friend (and ben) are in America/New_York and this
+          // gift was unwrapped in 2025.
+          title: "Celeste",
+          artwork_url: null,
+          unwrapped_at: "2026-01-01T04:30:00Z",
+          gift_note: null,
+          thank_note: null,
+        },
+      ],
+    });
+    renderShelfPage();
+    await waitFor(() => screen.getByText("Celeste"));
+    expect(screen.getByText(/unwrapped 2025/)).toBeInTheDocument();
+    expect(screen.queryByText(/unwrapped 2026/)).not.toBeInTheDocument();
+  });
+
   it("never renders a claim/action affordance — it's a read-only keepsake page", async () => {
     vi.mocked(fetchShelf).mockResolvedValue({
       name: "sarah",

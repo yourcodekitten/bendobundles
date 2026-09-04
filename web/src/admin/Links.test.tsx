@@ -988,8 +988,11 @@ describe('friend assignment', () => {
     await user.selectOptions(select, 'f2');
 
     // The warning renders BEFORE the request fires — reassigning MOVES gifts
-    // already claimed on this link to the other friend's shelf.
-    expect(screen.getByText(/this moves its gifts to the other shelf/i)).toBeInTheDocument();
+    // already claimed on this link (AND any thank-you note on them — a
+    // private reply-to-ben) to the other friend's shelf.
+    expect(
+      screen.getByText(/this moves its gifts.*thank-you note.*to the other shelf/i),
+    ).toBeInTheDocument();
     expect(adminSetLinkFriend).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole('button', { name: /confirm reassign for alice/i }));

@@ -706,7 +706,10 @@ export function Links() {
 
                   {/* Friend reassignment — selecting a NEW value only arms the
                       confirm below; the request never fires on selection alone
-                      (reassign moves the link's already-claimed gifts). */}
+                      (reassign moves the link's already-claimed gifts — AND
+                      any thank-you note on them: a private reply-to-ben
+                      becomes visible on the new friend's shelf, so the
+                      warning below says so). */}
                   <select
                     aria-label={`reassign friend for ${link.label}`}
                     disabled={reassignIsBusy}
@@ -842,7 +845,9 @@ export function Links() {
                   no-op, mirrors the note editor's unchanged-draft check). */}
               {reassignDraft !== undefined && reassignDraft !== currentFriendId && (
                 <div className="mt-2 flex flex-wrap items-center gap-3 rounded bg-shelf p-2">
-                  <p className="text-xs text-dust">this moves its gifts to the other shelf</p>
+                  <p className="text-xs text-dust">
+                    this moves its gifts — thank-you note included — to the other shelf
+                  </p>
                   <button
                     type="button"
                     disabled={reassignIsBusy}
