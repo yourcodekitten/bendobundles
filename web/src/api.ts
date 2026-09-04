@@ -44,6 +44,23 @@ export type LinkView = {
   curated?: boolean;
 };
 
+export type ShelfGiftView = {
+  game_id: string;
+  title: string;
+  artwork_url: string | null;
+  /** rfc3339 — the friend's unwrap moment (claim.created_at), not when ben chose it. */
+  unwrapped_at: string;
+  gift_note: string | null;
+  thank_note: string | null;
+};
+
+export type ShelfView = {
+  name: string;
+  /** Oldest-first, as the server sorts (public-api's assemble_shelf) — the
+   * page never re-sorts; scroll IS the timeline. */
+  gifts: ShelfGiftView[];
+};
+
 export type ThanksResult =
   | { kind: 'sent'; thank_note: string }
   | { kind: 'refused'; message: string }
@@ -200,6 +217,31 @@ export async function fetchLink(token: string): Promise<LinkView> {
 
   try {
     return (await response.json()) as LinkView;
+  } catch {
+    throw new FetchFailed();
+  }
+}
+
+// The gift shelf — a friend's persistent, read-only keepsake page (/s/{token}).
+// Same 404-is-oracle-proof / 500-is-transient contract as fetchLink above.
+export async function fetchShelf(token: string): Promise<ShelfView> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/s/${token}`);
+  } catch {
+    throw new FetchFailed();
+  }
+
+  if (response.status === 404) {
+    throw new NotFound();
+  }
+
+  if (response.status !== 200) {
+    throw new FetchFailed();
+  }
+
+  try {
+    return (await response.json()) as ShelfView;
   } catch {
     throw new FetchFailed();
   }
