@@ -117,7 +117,12 @@ the shelf is where the unwraps go to live.
   not necessarily components to import). Empty state in-voice: a shelf waiting for its first
   story. Errors soft, like LinkPage's.
 - Admin: friend picker on link create, friend column/selector on the links list, a small friends
-  panel (create/rename/copy-URL/reissue).
+  panel (create/rename/copy-URL/reissue). **And the sparse-GSI inverse, visible: the links list
+  shows an UNASSIGNED count** ("N gifts aren't on a shelf yet") — because the shelf's empty and
+  partial states are overloaded (no gifts / index not ACTIVE / links never assigned) and **the
+  shelf cannot know what it's missing; only the workbench can** (Lilith, family review). A
+  partially-backfilled shelf looks complete to the friend; the workbench carries the doubt so
+  the friend's page never has to.
 
 ## content & security
 

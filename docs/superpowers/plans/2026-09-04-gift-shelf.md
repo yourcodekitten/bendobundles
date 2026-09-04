@@ -378,7 +378,7 @@ git commit -S -m "🎁 web: the shelf itself — /s/:token, oldest-first keepsak
 
 **Interfaces:** consumes Task 4 routes verbatim.
 
-- [ ] **Step 1: Failing tests** — Friends panel: list renders, create flow posts and shows copyable `/s/<token>` URL, reissue confirms (`the old link stops working — hand them the new one`) and updates, revoke shows `no shelf link`; Links: picker present on create, row shows friend name, reassign fires `POST /admin/api/links/{token}/friend` and warns in-voice (`this moves its gifts to the other shelf`).
+- [ ] **Step 1: Failing tests** — Friends panel: list renders, create flow posts and shows copyable `/s/<token>` URL, reissue confirms (`the old link stops working — hand them the new one`) and updates, revoke shows `no shelf link`; Links: picker present on create, row shows friend name, reassign fires `POST /admin/api/links/{token}/friend` and warns in-voice (`this moves its gifts to the other shelf`); **unassigned indicator: with 3 links of which 1 has `friend_id`, the list header renders `2 gifts aren't on a shelf yet` (derived client-side from the already-fetched links payload — friend_id rides the read-override), and renders nothing when 0**.
 - [ ] **Step 2: Verify failure** — vitest, module/route missing.
 - [ ] **Step 3: Implement** — workbench register (it's a tool, warm but compact); ctx allowlist note: `/admin/friends` is `[a-z]+` ⇒ already allowed by `ctx_is_allowed` (verified — one lowercase segment).
 - [ ] **Step 4: Verify pass** — full `npx vitest run`.
