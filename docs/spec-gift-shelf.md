@@ -57,11 +57,15 @@ the shelf is where the unwraps go to live.
 - `Link.friend_id: Option<String>` — following the `gift_note` pattern exactly: authoritative in a
   top-level dynamo attribute written only by a scoped update (`set_link_friend`), stripped from
   the stored `body` blob, overridden on read, `#[serde(default)]` so every pre-existing record
-  reads `None`. **This pattern is MECHANICALLY REQUIRED, not aesthetic: a GSI key must be a
-  top-level scalar attribute, and `gsi3pk` derives from `friend_id` — a body-blob field cannot be
-  indexed, so "simplify to a plain body field" takes the shelf's only query path with it**
-  (Lilith, family review). Editability and no-copy-at-rest ride along as the same reasons
-  `gift_note` had.
+  reads `None`. **This pattern is MECHANICALLY REQUIRED, and the reason is the WRITE PATH, not
+  the index** (first stated wrong here — "a GSI key must be top-level" is true but the index key
+  could simply *derive* from a body field, as `gsi1pk` already does; OMBB's correction, family
+  review): **the claim transaction writes `SET body = :b` from a pre-transaction read
+  (`lib.rs:1208`), so a body-only `friend_id` is silently REVERTED by the friend opening their
+  gift — while a separate `gsi3pk` survives, desynchronising index from record.** `lib.rs:410`
+  already prescribes the gift_note recipe for every future editable field for exactly this.
+  ⇒ **testable, and tested: `friend_id` must survive a claim** (see testing). Editability and
+  no-copy-at-rest ride along.
 
 **Dynamo** (`crates/dynamo`, single table):
 - `FRIEND#<id> / META` — the friend record.
@@ -73,7 +77,10 @@ the shelf is where the unwraps go to live.
   which is exactly what the test list asserts ("reissue invalidates old token").
 - **Sparse GSI** (`gsi3pk = FRIEND#<friend_id>`) on LINK items, present only when `friend_id` is
   set → `list_links_for_friend`. Sparse means unassigned links simply don't exist to the shelf —
-  backfill is optional per-link, zero migration.
+  backfill is optional per-link, zero migration. **Projection: `ALL`** (the handler needs whole
+  links; matches gsi1/gsi2 precedent) — noting that ANY projection carries the table keys, so a
+  gsi3-shaped exposure yields link tokens regardless; that is already true of gsi1/gsi2 and is
+  part of the raw-token posture above, not a new surface this feature creates.
 - Token minting: same idiom links use — two uuid-v4 concatenated, 64 hex, ≥128 bits (currently
   inlined twice in admin-api at :240/:707; a third site extracts it into a helper all three call).
 
@@ -110,16 +117,20 @@ the shelf is where the unwraps go to live.
 
 ## content & security
 
-- **Bearer capability URL** — the shelf shows strictly *less* than the links that fed it (no
-  keys, no claim actions, no gift URLs — titles, art, notes only). **Token stored raw in the pk,
-  and the honest argument is about the TABLE, not class-consistency** (my first framing said
-  "hits links and shelves equally or neither" — Lilith refuted it: a link token is *spent*, a
-  shelf token is *permanent and appreciates*, so dump-exposure is asymmetric in duration).
-  Decided raw anyway because the marginal exposure is noise against the table's existing
-  contents: CLAIM items already store `gift_url` and `revealed_key` — a dump yields actual game
-  keys, which dominate any shelf token. **Reissue exists precisely because shelf tokens are
-  long-lived: the leak response is one admin op.** If the table's secret-at-rest posture is ever
-  hardened (#88's direction), shelf tokens join that migration.
+- **Bearer capability URL — token stored raw in the pk, and the warrant is scoped to what the
+  token UNLOCKS.** Two earlier warrants died in review: "links and shelves are symmetric" (no —
+  a link token is *spent*, a shelf token is *permanent and appreciates*: Lilith) and "game keys
+  in CLAIM items dominate the exposure" (no — keys are *decaying* assets; the dominance holds at
+  t=0 and inverts as they're redeemed, and key-only channels — streams, query logs, exports,
+  projections — leak pks *without* bodies at all: Lilith again). What stands: **the asset behind
+  a shelf token is a keepsake page** — a first name, game titles, warm notes. Privacy-sensitive
+  and worth protecting; not redeemable, not money. v1 accepts raw-in-pk for that asset class,
+  consistent with every other token this table keys.
+  **Reissue is the remedy and it is OPERATOR-INITIATED WITH NO DETECTION PATH** (OMBB): nothing
+  can announce a leaked shelf URL — no bell on visits (by design), no self-announcing failure
+  like a dead key. Do not read "reissue exists" as coverage; it fires when a human notices.
+  If the table's secret-at-rest posture is ever hardened (#88's direction), shelf tokens join
+  that migration first — they are the longest-lived capability the table holds in the clear.
 - **No cross-friend leakage by construction**: resolution starts at one pointer item and fans out
   only through `FRIEND#<id>`-keyed queries.
 - **Unknown and revoked are the same 404** — a probe learns nothing about which tokens ever lived.
@@ -141,7 +152,9 @@ the shelf is where the unwraps go to live.
 
 - domain: serde round-trips for `Friend`, `Link.friend_id` default-on-missing.
 - dynamo: store tests per house pattern (real-SDK path in CI) — pointer resolution, sparse-GSI
-  list, revoke/reissue, `set_link_friend` scoped update + body-strip + read-override.
+  list, revoke/reissue, `set_link_friend` scoped update + body-strip + read-override, and
+  **`friend_id` survives a claim** (assign → claim through the real transaction → assert the
+  assignment and the gsi3 row both intact; this is the write-path-revert reason made falsifiable).
 - public-api: handler tests — 404 unknown, 404 revoked, 200 shape, claimed-only filtering,
   cross-friend isolation (two friends, two links, no bleed).
 - admin-api: validation 422s, friends CRUD, reissue invalidates old token.
@@ -151,8 +164,10 @@ the shelf is where the unwraps go to live.
 
 1. **claimed-only** — stands; the warm version of "waiting for you" is ben's, on the deferred
    scrapbook surface.
-2. **`friend_id` pattern** — not a choice: GSI keys must be top-level attributes; the body-field
-   option never existed. Mechanical reason now stated at the definition.
+2. **`friend_id` pattern** — gift_note recipe required, but the first stated reason was a
+   non-sequitur (an index key can DERIVE from a body field — gsi1pk does). The real mechanism is
+   the claim path's `SET body` revert (OMBB, from lib.rs:1208 + my own :410 note); stated at the
+   definition, enforced by a test.
 3. **raw vs hashed shelf token** — raw, re-argued on the table's actual contents (claims hold
    `gift_url`/`revealed_key`) rather than my refuted symmetry premise; lifetime asymmetry
    acknowledged, reissue is the leak response.
