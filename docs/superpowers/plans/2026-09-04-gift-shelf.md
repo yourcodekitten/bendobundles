@@ -501,9 +501,11 @@ async fn friends_create_list_rename_reissue_revoke() {
     // list shows it
     let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
     assert_eq!(j.as_array().unwrap().len(), 1);
-    // rename
+    // rename — assert the VALUE changed, not just the 200 (a 200 proves nothing about the name)
     let r = call(post(&format!("/admin/api/friends/{id}"), serde_json::json!({"name": "sara"}))).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j[0]["name"], "sara", "rename must actually change the stored name");
     // reissue → token changes
     let j = body_json(call(post(&format!("/admin/api/friends/{id}"), serde_json::json!({"reissue": true}))).await.unwrap()).await;
     let tok2 = j["shelf_token"].as_str().unwrap().to_string();
@@ -641,7 +643,7 @@ git add docs/spec-gift-shelf.md && git commit -S -m "🎁 spec: status → BUILT
 
 - **Coverage:** spec§domain→T1, §dynamo→T2, §public-api→T3, §admin-api→T4, §web friend→T5, §web admin→T6, §deploy/gsi→T7. Detail-assembly helper: spec said "extracted"; plan REFUSES the extraction for v1 (shelf needs only Game fields — no duplication exists, so no helper is owed; T3 Interfaces).
 - **Types:** `unwrapped_at` everywhere; `set_link_friend(token, Option<&str>) -> bool`; token = 64 hex; friend item is top-level-attrs-only (ONE schema, T2, no body blob); `ShelfResponse`/`ShelfGift` defined in T3; body types defined in T4.
-- **Every test body is written in full.** There are NO comment-only test fns (B1). Each of the three review-added arms — `friend_id_survives_a_claim`, `shelf_500s_when_index_absent_never_renders_empty`, `shelf_happy_…` — carries its RED arm explicitly (Lilith: a written body can be vacuously green; watch it fail first).
+- **Every test body is written in full.** There are NO comment-only test fns (B1). Each formerly-hollow arm carries its RED arm explicitly (Lilith: a written body can be vacuously green; watch it fail first). Two of the three — `friend_id_survives_a_claim`, `shelf_500s_when_index_absent_never_renders_empty` — were review-added; `shelf_happy_…` predates review (spec test list, spec §testing). The pattern still holds: the review-added arms are the ones that arrived as stubs.
 - **Store construction:** the index-less fixture is reachable via `store_without_gsi3` helpers in both test crates (M1); the standard `store_or_skip` was the only path before.
 - **Cross-task attribution checked:** `claims_for_link`/`batch_get_games` marked pre-existing, not produced by T2 (M5); every `Consumes` traces to an earlier `Produces` or existing code.
 - **All Link literals** across domain + the three test crates are T1's responsibility (M2), enumerated by build error.
