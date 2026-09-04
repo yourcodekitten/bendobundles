@@ -26,6 +26,7 @@
 
 **Files:**
 - Modify: `crates/domain/src/lib.rs` (add `Friend` near `Link`; add `friend_id` field to `Link`)
+- Modify: `crates/dynamo/tests/store_test.rs` (the `fn link()` fixture at :536 gains `friend_id: None`) and `crates/public-api/tests/api_test.rs` + `crates/admin-api/tests/api_test.rs` (their `test_link()` fixtures gain `friend_id: None`) — **any `Link { .. }` literal anywhere in the workspace stops compiling until the field is added; this task owns all of them.** Grep first: `grep -rn 'Link {' crates/ web/ 2>/dev/null` and `cargo build --workspace 2>&1 | grep 'missing field'` to enumerate.
 
 **Interfaces:**
 - Produces: `domain::Friend { id: String, name: String, shelf_token: String, created_at: OffsetDateTime }` (all pub), serde round-trip stable, rfc3339 timestamps.
@@ -46,6 +47,10 @@ fn friend_serde_round_trips() {
     let back: Friend = serde_json::from_str(&s).unwrap();
     assert_eq!(back.id, f.id);
     assert_eq!(back.shelf_token, f.shelf_token);
+    assert_eq!(back.name, f.name);
+    // created_at is the ONLY field with custom serde (rfc3339) — the round-trip is meaningless
+    // without asserting it (M3).
+    assert_eq!(back.created_at, f.created_at);
 }
 
 #[test]
@@ -98,9 +103,9 @@ On `Link`, next to `gift_note` (same serde shape):
     pub friend_id: Option<String>,
 ```
 
-The `link_body` exhaustive destructure in `crates/dynamo/src/schema.rs` now fails to compile — that is Task 2's first step, by design (the type-level strip doing its job). For THIS task's tests to run, add `friend_id: _` is NOT done here; instead run only `-p domain`.
+The `link_body` exhaustive destructure in `crates/dynamo/src/schema.rs` now fails to compile — that is Task 2's first step, by design (the type-level strip doing its job). For THIS task's `-p domain` tests, that's fine; the workspace build is red until Task 2.
 
-Fix every `Link { .. }` literal in `crates/domain` tests by adding `friend_id: None`.
+Fix every `Link { .. }` literal by adding `friend_id: None` — in `crates/domain` tests AND in the three test fixtures named in Files (dynamo `link()` :536, public-api `test_link()` :76, admin-api `test_link()`), plus anything the enumerating grep/build surfaces. This task owns the field's introduction, so it owns every literal it breaks.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -135,12 +140,22 @@ git add crates/domain && git commit -S -m "🎁 domain: Friend record + Link.fri
   - `pub async fn revoke_shelf_token(&self, id: &str, old_token: &str) -> Result<(), StoreError>` — ONE transaction: delete `SHELF#<old>` + update friend `REMOVE shelf_token`. (Read-side: `friend_from_item` treats missing `shelf_token` as `""`; document that `""` means revoked and admin list renders "no shelf link".)
   - `pub async fn set_link_friend(&self, token: &str, friend_id: Option<&str>) -> Result<bool, StoreError>` — scoped update, `attribute_exists(pk)`: `Some` ⇒ `SET friend_id = :f, gsi3pk = :g` (`:g = "FRIEND#<id>"`); `None` ⇒ `REMOVE friend_id, gsi3pk`. **The two attrs move together, always.**
   - `pub async fn list_links_for_friend(&self, friend_id: &str) -> Result<Vec<Link>, StoreError>` — query `gsi3`, `gsi3pk = FRIEND#<id>`, map via `link_from_item`.
+- **FRIEND ITEM SCHEMA (single, final — no body blob):** a friend item is FOUR top-level scalar
+  attrs only: `pk = FRIEND#<id>`, `sk = "META"`, `name` (S), `shelf_token` (S), `created_at` (S,
+  rfc3339), plus membership `gsi1pk = "FRIEND"` and `gsi1sk = <name>`. **No `body` attribute.**
+  Four scalars can't drift, which is the whole point; `friend_from_item` reads the attrs directly
+  (`shelf_token` absent ⇒ `""` ⇒ revoked). (This supersedes any "parse body" phrasing — there is
+  no body.)
 - Produces: `link_from_item` override: `friend_id` from top-level attr (present ⇒ Some, absent ⇒ None — unconditional override like `expires_at`).
 - Produces: `link_item` writes top-level `friend_id` + `gsi3pk` when `l.friend_id` is Some (so create-with-friend indexes without a second write).
 - Produces: `create_table_for_tests` defines `gsi3` (pk-only, `gsi3pk` S attribute, projection ALL).
 - Produces: `pub async fn create_table_for_tests_without_gsi3(&self)` — identical minus gsi3.
-  **This is the deploy-window world as a fixture** (a backfilling/absent index ERRORS; the arm
-  below proves the shelf never renders that error as an empty).
+  **This is the deploy-window world as a fixture** (a query against an absent index ERRORS; the
+  arm in Task 3 proves the shelf never renders that error as an empty).
+- Produces (test-only helper for M1): `store_without_gsi3(test: &str)` in `store_test.rs` — a
+  copy of `store_or_skip`'s body that calls `create_table_for_tests_without_gsi3()` instead of
+  `create_table_for_tests()`. Public-api's fault test (Task 3) gets its index-less store the same
+  way, via a sibling helper in `api_test.rs`.
 
 - [ ] **Step 1: Fix the type-level strip (compile gate)** — in `schema.rs` `link_body`'s destructure add `friend_id: _` to the stripped set with a comment: `// authoritative top-level only; ALSO a gsi3 key — body copy would desync the index`.
 
@@ -184,7 +199,7 @@ async fn revoke_leaves_no_capability_at_rest() {
 #[tokio::test]
 async fn set_link_friend_moves_index_and_survives_round_trip() {
     let Some(store) = store_or_skip("link_friend").await else { return };
-    let l = link("t1"); // existing helper; add `friend_id: None` there in Task 1's literal fix
+    let l = link("t1"); // the store_test.rs `link()` fixture — Task 1 already added `friend_id: None`
     store.create_link(&l).await.unwrap();
     assert!(store.set_link_friend("t1", Some("f1")).await.unwrap());
     let got = store.get_link("t1").await.unwrap().unwrap();
@@ -205,24 +220,43 @@ fn friend(id: &str, name: &str, tok2: &str) -> Friend {
 }
 ```
 
-Add the write-path-revert regression test (the reason the gift_note pattern is mandatory here):
+Add the write-path-revert regression test — **fully written, not a comment** (the reason the
+gift_note pattern is mandatory here). Modeled on `gift_note_survives_claim_body_rewrite`
+(store_test.rs:236), which asserts the exact same property for `gift_note`:
 
 ```rust
+/// `friend_id` must survive `claim_game`'s `SET body` — the same war
+/// `gift_note_survives_claim_body_rewrite` (:236) fought for the note. A body-only
+/// `friend_id` is reverted by the friend claiming; a top-level attr + gsi3pk is not.
 #[tokio::test]
 async fn friend_id_survives_a_claim() {
-    let Some(store) = store_or_skip("friend_survives_claim").await else { return };
-    // THE EXEMPLAR EXISTS: store_test.rs:231 "the note must survive claim_game's SET body"
-    // — copy its claim_game("tok-noted", &game_id("gk1","mn"), "c1", now) construction (:247)
-    // and its seeding, swapping gift_note for a set_link_friend("t","f1") assignment. Then:
-    // - get_link(t).friend_id must still be Some("f1")
-    // - list_links_for_friend("f1") must still return the link
-    // A body-only implementation FAILS this test (SET body from a pre-tx read reverts it).
+    let Some(store) = store_or_skip("friend-survives-claim").await else { return };
+    store.put_game(&game(1, true)).await.unwrap();
+    store.create_friend(&friend("f1", "sarah", "aa")).await.unwrap();
+    store.create_link(&link("tok-fr")).await.unwrap();
+    assert!(store.set_link_friend("tok-fr", Some("f1")).await.unwrap());
+
+    let now = datetime!(2026-07-02 12:00 UTC);
+    store.claim_game("tok-fr", &game_id("gk1", "mn"), "c1", now).await.unwrap();
+
+    let after = store.get_link("tok-fr").await.unwrap().unwrap();
+    assert_eq!(after.claims_used, 1, "sanity: the claim landed");
+    assert_eq!(after.friend_id.as_deref(), Some("f1"),
+               "claim's SET body must not disturb the top-level friend_id");
+    assert_eq!(store.list_links_for_friend("f1").await.unwrap().len(), 1,
+               "and gsi3 still resolves the link to the friend");
 }
 ```
 
-- [ ] **Step 3: Run to verify failure** — `cargo test -p dynamo friend_ link_friend` (needs dynamodb-local; if absent locally, verify COMPILE failure is the missing methods, and lean on CI for the red→green cycle — note which mode you used in the commit body).
+**RED ARM (Lilith — a written body can be vacuously green; watch it fail first):** implement
+`set_link_friend` to write `friend_id` INTO the body blob only (no top-level attr, no gsi3pk).
+Both assertions fail — `claim_game`'s `SET body` from a pre-transaction read reverts it, and gsi3
+never had a key. Watch that red, THEN implement the real top-level version to green. Record the
+red in the commit body.
 
-- [ ] **Step 4: Implement** — `schema.rs`: `friend_pk(id) -> "FRIEND#<id>"`, `shelf_pk(token) -> "SHELF#<token>"`, `friend_item` (pk/sk/META, `body` = full serde json of Friend, `gsi1pk = "FRIEND"`, `gsi1sk = <name>` for ordered list), `shelf_pointer_item` (pk/sk/META, attr `friend_id`). `lib.rs`: the eight methods per the Interfaces block, transactions via the existing `transact_write_items` idiom (see `claim_game` ~:1240 for error mapping); `friend_from_item` = parse body then override `shelf_token` from top-level? — NO: friend body is small and rewritten whole by no concurrent writer except rename/reissue/revoke which are scoped updates ⇒ store `name` and `shelf_token` as top-level attrs too and make `body` carry only `{id, created_at}`… **decide simpler: friend item stores NO body blob; all four fields are top-level attrs** (`id`, `name`, `shelf_token`, `created_at` rfc3339 string). Friends are 4 scalar fields; a body blob would just create the copy-drift problem the link pattern exists to fight. `friend_from_item` reads the four attrs (`shelf_token` missing ⇒ `""`).
+- [ ] **Step 3: Run to verify failure** — `cargo test -p dynamo friend_ link_friend friend-survives` (needs dynamodb-local; without it locally, the tests SKIP not fail — so the RED must be produced in CI or against a local dynamodb-local, never assumed. If you cannot run dynamodb-local, say so in the commit and rely on CI's red→green, but do NOT mark the red-first box checked without a real red somewhere).
+
+- [ ] **Step 4: Implement** — `schema.rs`: `friend_pk(id) -> "FRIEND#<id>"`, `shelf_pk(token) -> "SHELF#<token>"`, `friend_item` per the FRIEND ITEM SCHEMA above (four top-level scalar attrs + gsi1 membership, **NO body blob**), `shelf_pointer_item` (pk/sk/META, attr `friend_id`). `friend_from_item` reads the four attrs directly (`shelf_token` absent ⇒ `""`). `lib.rs`: the eight methods per the Interfaces block, transactions via the existing `transact_write_items` idiom (see `claim_game` ~:1240 for error mapping).
   `create_table_for_tests`: the existing `gsi` closure (lib.rs:3253) REQUIRES a sort key —
   gsi3 has none, so add a sibling `gsi_pk_only(name, pk)` helper beside it rather than passing a
   dummy sk; define the `gsi3pk` attribute and build `gsi3` hash-key-only. (Do NOT copy gsi2's
@@ -245,19 +279,34 @@ git add crates/dynamo && git commit -S -m "🎁 dynamo: friend/shelf items, tran
 - Test: `crates/public-api/tests/api_test.rs`
 
 **Interfaces:**
-- Consumes: `Store::get_friend_by_shelf_token`, `list_links_for_friend`, `claims_for_link`, `batch_get_games` (Task 2).
-- Produces: route `GET /api/s/{token}`; response body:
+- Consumes (Task 2, new): `Store::get_friend_by_shelf_token`, `list_links_for_friend`.
+- Consumes (pre-existing store methods, verified present): `claims_for_link` (lib.rs:1093), `batch_get_games` (lib.rs:685). Not produced by any task — they already exist.
+- Produces: the response types (define them in `lib.rs`, `Serialize`):
 
-```json
-{ "name": "sarah",
-  "gifts": [ { "game_id": "...", "title": "...", "artwork_url": "...|null",
-               "unwrapped_at": "2026-01-05T00:00:00Z",
-               "gift_note": "...|null", "thank_note": "...|null" } ] }
+```rust
+#[derive(Serialize)]
+struct ShelfGift {
+    game_id: String,
+    title: String,
+    artwork_url: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    unwrapped_at: OffsetDateTime,
+    gift_note: Option<String>,
+    thank_note: Option<String>,
+}
+#[derive(Serialize)]
+struct ShelfResponse { name: String, gifts: Vec<ShelfGift> }
 ```
 
   Gifts sorted `unwrapped_at` ascending (oldest first — the shelf accretes).
-- Produces: `async fn assemble_shelf(store, friend) -> Result<ShelfResponse, StoreError>` internal; **detail-assembly extraction**: pull the game+steam-cache join out of `handle_game_detail` into `fn game_detail_payload(...)` ONLY IF the shelf ends up needing the same steam fields — v1 shelf payload above needs `title`/`artwork_url` from `Game` alone, so DO NOT extract yet (YAGNI; the spec's helper note is satisfied by not duplicating: the shelf never touches the steam cache in v1). If review wants richer cards later, that's when the helper is born.
-- 404 body/shape identical to `link_not_found_response()` for unknown AND revoked; any store error anywhere ⇒ 500 `{"error": "the shelf slipped — try again"}` (soft voice, no internals).
+- Produces: route `GET /api/s/{token}` → `handle_get_shelf`; and internal
+  `async fn assemble_shelf(store: &Store, friend: Friend) -> Result<ShelfResponse, StoreError>`
+  (the `ShelfResponse` above is its return type — B4).
+- **No detail-assembly extraction in v1** (YAGNI): the shelf payload needs only `title` +
+  `artwork_url`, both on `Game`; it never touches the steam cache, so there is no duplication of
+  `handle_game_detail`'s logic to factor out. The spec's "extract a helper" note is satisfied by
+  not copying link-scoped code, not by creating a premature helper.
+- 404 body/shape identical to `link_not_found_response()` for unknown AND revoked; any store error anywhere (INCLUDING a gsi3 query error during the deploy window) ⇒ 500 `{"error": "the shelf slipped — try again"}` (soft voice, no internals; never `Ok(vec![])`).
 
 - [ ] **Step 1: Write failing api tests** — the rig, verified in `api_test.rs`: routers are built
   `plain_router(store, mock)` with `MockInvoker::new(FulfillResponse::GiftUrl{..})`, requests are
@@ -290,38 +339,86 @@ async fn shelf_unknown_token_404s_byte_identical_to_revoked() {
     assert_eq!(body_json(r1).await, body_json(r2).await);
 }
 
+// A Fulfilled claim on a link belonging to a friend. `claim(state, game_n, token, year)`
+// helper — build the Claim literal from the fields verified in domain::Claim
+// (id, link_token, game_id, state, gift_url, revealed_key, created_at, choice_pre_tpks,
+// failure_reason). put_claim seeds it directly.
+fn claim(id: &str, token: &str, game_n: u32, state: ClaimState, year: i32) -> Claim {
+    Claim {
+        id: id.into(), link_token: token.into(),
+        game_id: game_id(&format!("gk{game_n}"), "mn"), state,
+        gift_url: Some("https://x.com/g".into()), revealed_key: None,
+        created_at: datetime!(2024-01-01 00:00 UTC).replace_year(year).unwrap(),
+        choice_pre_tpks: None, failure_reason: None,
+    }
+}
+
 #[tokio::test]
 async fn shelf_happy_fulfilled_only_no_cross_friend_bleed() {
     let Some(store) = store_or_skip("shelf-filter").await else { return };
-    // seed: g1,g2,g3 · f1←t1 (Fulfilled on g1 @2024, Pending on g2) · f2←t2 (Fulfilled on g3)
-    // claims: copy the Claim{} literal shape used by this file's ClaimsHistory tests and set
-    // state/created_at explicitly (states: Fulfilled / Pending).
-    // asserts: status OK (THE CANARY — this line cannot pass without the route existing);
-    //   j["name"] == "sarah"; gifts == exactly [g1]; unwrapped_at asc when a second Fulfilled
-    //   claim @2026 is added to t1; gift_note/thank_note ride from t1's link record.
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    for n in 1..=3 { store.put_game(&test_game(n)).await.unwrap(); }
+    // f1 ← t1 : Fulfilled g1 @2024, Fulfilled g3 @2026 (order test), Pending g2 (must be excluded)
+    let f1 = test_friend("f1", "sarah", "aa");
+    store.create_friend(&f1).await.unwrap();
+    let mut t1 = test_link("t1"); t1.gift_note = Some("for you ♡".into());
+    store.create_link(&t1).await.unwrap();
+    store.set_link_friend("t1", Some("f1")).await.unwrap();
+    store.put_claim(&claim("c1", "t1", 1, ClaimState::Fulfilled, 2024)).await.unwrap();
+    store.put_claim(&claim("c3", "t1", 3, ClaimState::Fulfilled, 2026)).await.unwrap();
+    store.put_claim(&claim("c2", "t1", 2, ClaimState::Pending, 2025)).await.unwrap();
+    // f2 ← t2 : Fulfilled g3 — must NOT appear on f1's shelf
+    let f2 = test_friend("f2", "dave", "bb");
+    store.create_friend(&f2).await.unwrap();
+    store.create_link(&test_link("t2")).await.unwrap();
+    store.set_link_friend("t2", Some("f2")).await.unwrap();
+    store.put_claim(&claim("c4", "t2", 3, ClaimState::Fulfilled, 2023)).await.unwrap();
+
+    let req = Request::get(&format!("/api/s/{}", f1.shelf_token)).body(Body::empty()).unwrap();
+    let resp = plain_router(store, mock).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK); // THE CANARY — cannot pass without the route
+    let j = body_json(resp).await;
+    assert_eq!(j["name"], "sarah");
+    let gifts = j["gifts"].as_array().unwrap();
+    assert_eq!(gifts.len(), 2, "Fulfilled only (Pending g2 excluded), and no g3-from-f2 bleed");
+    assert_eq!(gifts[0]["game_id"], game_id("gk1", "mn"), "oldest first: 2024 before 2026");
+    assert_eq!(gifts[1]["game_id"], game_id("gk3", "mn"));
+    assert_eq!(gifts[0]["gift_note"], "for you ♡", "note rides from the link record");
 }
-```
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p public-api shelf_` — Expected: FAIL, and
-  specifically the happy test's `StatusCode::OK` canary (a missing route trivially satisfies the
-  404 asserts; the OK is the assertion that cannot false-pass). Note: axum route-not-found may
-  render 404 before compile even fails — the compile failure on `create_friend` etc. imports
-  arrives first; both are valid reds.
-
-- [ ] **Step 3: Implement** — route in `router()`: `.route("/api/s/{token}", get(handle_get_shelf))`. Handler: resolve friend (None ⇒ `link_not_found_response()`), `list_links_for_friend`, for each `claims_for_link`, filter `ClaimState::Fulfilled`, collect `game_id`s, ONE `batch_get_games`, build gifts (skip a claim whose game record is missing? NO — that's a partial shelf; treat as 500 per spec), sort by `unwrapped_at`, respond. **Every store error INCLUDING a gsi3 query failure ⇒ 500** — during the deploy's index-backfill window the index errors, and a soft-empty here would render the empty state as a lie (see Task 7 deploy order). **And this IS testable — the index-less table is the fault injection** (OMBB): add
-
-```rust
 #[tokio::test]
 async fn shelf_500s_when_index_absent_never_renders_empty() {
-    // build a store over create_table_for_tests_without_gsi3 — the deploy-window world
-    // seed friend f1 + link t1 with set_link_friend("t1","f1")
-    // GET /api/s/<f1.token> → assert StatusCode::INTERNAL_SERVER_ERROR
-    // and assert the body is NOT a 200-shaped {name, gifts: []} — a query error must never
-    // collapse into Ok(vec![]) ("fail distinct, not fail soft")
+    // The deploy window as a fixture: a store whose table has NO gsi3. A query against the
+    // absent index ERRORS; the handler must surface 500, never Ok(vec![]) (fail distinct).
+    let Some(store) = store_without_gsi3("shelf-noindex").await else { return };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let f = test_friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    store.create_link(&test_link("t1")).await.unwrap();
+    // NOTE: set_link_friend writes gsi3pk too — on a table without gsi3 that write itself may
+    // error; if so, seed the friend_id via a create-path that doesn't require the index, or
+    // assert the 500 on the READ alone by pointing the friend at a link created before the
+    // assignment. The REQUIRED property: GET /api/s/<token> returns 500, body is NOT {name,gifts:[]}.
+    let req = Request::get(&format!("/api/s/{}", f.shelf_token)).body(Body::empty()).unwrap();
+    let resp = plain_router(store, mock).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let j = body_json(resp).await;
+    assert!(j.get("gifts").is_none(), "a query error must never collapse into an empty shelf");
 }
 ```
 
-- [ ] **Step 4: Run to verify pass** — `cargo test -p public-api shelf_` (or CI mode; note in commit).
+- [ ] **Step 2: Run to verify failure** — `cargo test -p public-api shelf_` (needs dynamodb-local;
+  without it the tests SKIP, so the RED for all three is produced in CI or against a local
+  instance, never assumed). **Watch each fail (Lilith, red-first):** the happy test's
+  `StatusCode::OK` canary reds on the missing route; the 404 test can't red on route-absence alone
+  (a missing route also 404s) so it is not load-bearing for red; the index-absent test reds only
+  once the route exists AND wrongly returns `Ok(vec![])` — so its red is produced during Step 3 by
+  first writing the handler to swallow the error, watching this test go green-when-it-should-500,
+  then fixing it. Record which reds you actually observed.
+
+- [ ] **Step 3: Implement** — route in `router()`: `.route("/api/s/{token}", get(handle_get_shelf))`. `handle_get_shelf` resolves the friend (None ⇒ `link_not_found_response()`), then `assemble_shelf`: `list_links_for_friend` → for each, `claims_for_link` → filter `ClaimState::Fulfilled` → collect `game_id`s → ONE `batch_get_games` → build `ShelfGift`s (a claim whose game record is missing ⇒ 500, NOT a skipped row — a partial shelf is a lie), sort by `unwrapped_at` ascending, wrap in `ShelfResponse`. **Every `?`/error arm maps to the 500** — a gsi3 query error during the deploy window MUST reach the 500, never `Ok(vec![])`. The index-absent test above is exactly this guarantee's red/green; produce its red by first writing the error arm as `.unwrap_or_default()`, watch the test fail (200 with empty gifts), then fix to `?`/500 and watch it pass.
+
+- [ ] **Step 4: Run to verify pass** — `cargo test -p public-api shelf_` (or CI mode; note in commit which reds you observed and where).
 
 - [ ] **Step 5: Commit**
 
@@ -342,15 +439,104 @@ git add crates/public-api && git commit -S -m "🎁 public-api: GET /api/s/{toke
 - Produces routes — **house convention verified: prefix is `/admin/api/...` and mutations are
   POST** (`/admin/api/links/{token}/note` → `post(handle_set_link_note)` at lib.rs:107; do NOT
   invent an `/api/admin` namespace or PATCH/PUT verbs):
-  - `POST /admin/api/friends` body `{"name": "sarah"}` → 201 `{id, name, shelf_token, shelf_url_path: "/s/<token>"}`. Validation: name trimmed non-empty, ≤ 64 chars ⇒ else 422 via `unprocessable(..)`. `id` = one uuid-v4 simple; token = `mint_token()`.
+  - `POST /admin/api/friends` body `{"name": "sarah"}` → 200 `{id, name, shelf_token, shelf_url_path: "/s/<token>"}` (200, not 201 — house convention; `create_link` returns 200). Validation: name trimmed non-empty, ≤ 64 chars ⇒ else 422 via `unprocessable(..)`. `id` = one uuid-v4 simple; token = `mint_token()`.
   - `GET /admin/api/friends` → 200 `[{id, name, shelf_token, created_at}]` (shelf_token `""` when revoked).
   - `POST /admin/api/friends/{id}` body `{"name": "..."}` (rename) OR `{"reissue": true}` OR `{"revoke": true}` — exactly one of the three ⇒ else 422. Reissue → 200 with new token; revoke → 200 `{shelf_token: ""}`; unknown id → 404.
   - `POST /admin/api/links/{token}/friend` body `{"friend_id": "f1" | null}` → 204; friend must exist when non-null ⇒ else 422 `unknown friend`; unknown link ⇒ 404.
-- Produces: `fn mint_token() -> String` — the double-uuid idiom extracted; the two existing inline sites (:240, :707 region) now call it. Behavior-identical (64 lowercase hex).
+- Produces: `fn mint_token() -> String` — the double-uuid idiom (`format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())`, admin-api:241/708) extracted to ONE fn; both existing sites replaced with `mint_token()`. Behavior-identical (64 lowercase hex).
+- Body types (define with `#[derive(Deserialize)]`):
 
-- [ ] **Step 1: Write failing tests** — follow `api_test.rs` house patterns (session fixture, json posts): create→list→rename→reissue (old token 404s on public side is Task 3's proof; here assert the returned token CHANGED and list reflects it)→revoke (list shows `""`)→422s (empty name, both-ops PATCH, unknown friend on link assign).
-- [ ] **Step 2: Run to verify failure** — `cargo test -p admin-api friends_` → compile fail (routes missing).
-- [ ] **Step 3: Implement** — handlers per interfaces; `mint_token()` extraction with a `// three call sites; extracted at the third (spec)` note.
+```rust
+#[derive(Deserialize)] struct CreateFriendBody { name: String }
+#[derive(Deserialize)] struct PatchFriendBody {
+    name: Option<String>, reissue: Option<bool>, revoke: Option<bool>,
+}
+#[derive(Deserialize)] struct AssignFriendBody { friend_id: Option<String> }
+```
+
+- [ ] **Step 1: Write failing tests** — the admin rig, verified in `api_test.rs`: build the router
+  `router(Arc::clone(&store), Arc::clone(&invoker), admin_hash.clone(), None)`, authenticate with
+  `let session = admin_login(&store, &invoker, &admin_hash, password).await`, and every request
+  carries `.header("cookie", format!("session={session}"))` + `.header("x-admin-request", "1")`.
+  Responses are 200 (not 201 — house convention: `create_link` returns 200). Add:
+
+```rust
+#[tokio::test]
+async fn friends_create_list_rename_reissue_revoke() {
+    let Some(store) = store_or_skip("admin-friends").await else { return };
+    let password = "pw"; let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let call = |req| router(Arc::clone(&store), Arc::clone(&invoker), admin_hash.clone(), None).oneshot(req);
+    let post = |path: &str, body: serde_json::Value| Request::post(path)
+        .header("content-type", "application/json")
+        .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
+        .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap();
+    let get = |path: &str| Request::get(path)
+        .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1").body(Body::empty()).unwrap();
+
+    // create
+    let r = call(post("/admin/api/friends", serde_json::json!({"name": "sarah"}))).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(r).await;
+    let id = j["id"].as_str().unwrap().to_string();
+    let tok1 = j["shelf_token"].as_str().unwrap().to_string();
+    assert_eq!(tok1.len(), 64);
+    assert_eq!(j["shelf_url_path"], format!("/s/{tok1}"));
+    // list shows it
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j.as_array().unwrap().len(), 1);
+    // rename
+    let r = call(post(&format!("/admin/api/friends/{id}"), serde_json::json!({"name": "sara"}))).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    // reissue → token changes
+    let j = body_json(call(post(&format!("/admin/api/friends/{id}"), serde_json::json!({"reissue": true}))).await.unwrap()).await;
+    let tok2 = j["shelf_token"].as_str().unwrap().to_string();
+    assert_ne!(tok1, tok2, "reissue must mint a new token");
+    // revoke → empty token in list
+    call(post(&format!("/admin/api/friends/{id}"), serde_json::json!({"revoke": true}))).await.unwrap();
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j[0]["shelf_token"], "");
+}
+
+#[tokio::test]
+async fn friends_validation_422s() {
+    let Some(store) = store_or_skip("admin-friends-422").await else { return };
+    let password = "pw"; let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let post = |path: &str, body: serde_json::Value| Request::post(path)
+        .header("content-type", "application/json")
+        .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
+        .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap();
+    let call = |req| router(Arc::clone(&store), Arc::clone(&invoker), admin_hash.clone(), None).oneshot(req);
+
+    // empty name
+    let r = call(post("/admin/api/friends", serde_json::json!({"name": "  "}))).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // create one to mutate
+    let j = body_json(call(post("/admin/api/friends", serde_json::json!({"name": "sarah"}))).await.unwrap()).await;
+    let id = j["id"].as_str().unwrap().to_string();
+    // two ops at once (rename AND revoke) → 422
+    let r = call(post(&format!("/admin/api/friends/{id}"), serde_json::json!({"name": "x", "revoke": true}))).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // assign a nonexistent friend to a link → 422
+    let l = test_link("t1"); store.create_link(&l).await.unwrap();
+    let r = call(post("/admin/api/links/t1/friend", serde_json::json!({"friend_id": "ghost"}))).await.unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+```
+
+- [ ] **Step 2: Run to verify failure** — `cargo test -p admin-api friends_` — Expected: compile FAIL (routes/handlers undefined).
+- [ ] **Step 3: Implement** — in `router()`, add the four routes (all `post`/`get`, `/admin/api/...` prefix, inside the session-guarded group). Handlers:
+  - `POST /admin/api/friends`: parse `CreateFriendBody`; `let name = body.name.trim(); if name.is_empty() || name.len() > 64 { return unprocessable("name must be 1–64 characters") }`; `id = Uuid::new_v4().simple().to_string()`; `token = mint_token()`; `store.create_friend(&Friend{ id, name, shelf_token: token, created_at: OffsetDateTime::now_utc() })`; 200 `{id, name, shelf_token, shelf_url_path}`.
+  - `GET /admin/api/friends`: `store.list_friends()` → 200 array of `{id, name, shelf_token, created_at}`.
+  - `POST /admin/api/friends/{id}`: parse `PatchFriendBody`; **exactly one of `name`/`reissue==Some(true)`/`revoke==Some(true)`** — count the set ones, `!= 1 ⇒ unprocessable("provide exactly one of: name, reissue, revoke")`. rename→`rename_friend`; reissue→read friend for old token, `mint_token()`, `reissue_shelf_token`, 200 with new token; revoke→read friend, `revoke_shelf_token`, 200 `{shelf_token: ""}`. `rename_friend` false / friend not found ⇒ 404.
+  - `POST /admin/api/links/{token}/friend`: parse `AssignFriendBody`; if `Some(fid)`, `store.get_friend(fid)` None ⇒ `unprocessable("unknown friend")`; `set_link_friend(token, body.friend_id.as_deref())` false ⇒ 404; else 204.
+  - `mint_token()`: extract, replace both inline sites, `// three call sites; extracted at the third (plan)`.
 - [ ] **Step 4: Run to verify pass** — `cargo test -p admin-api`.
 - [ ] **Step 5: Commit**
 
@@ -438,8 +624,12 @@ to a friend, on the one page built to prove they were remembered.**
 git add docs/spec-gift-shelf.md && git commit -S -m "🎁 spec: status → BUILT"
 ```
 
-## Self-review (done at write time)
+## Self-review (r2, after OMBB's step-5 gate — 4 blockers + 6 majors + 3 minors integrated)
 
-- **Coverage:** spec§domain→T1, §dynamo→T2, §public-api→T3, §admin-api→T4, §web friend→T5, §web admin→T6, §deploy/gsi→T7. Detail-assembly helper: spec said "extracted"; plan REFUSES the extraction for v1 (shelf needs only Game fields — no duplication exists, so no helper is owed; noted inline at T3, spec's intent — no copy-paste of link-scoped logic — is honored by not touching it).
-- **Types:** `unwrapped_at` everywhere; `set_link_friend(token, Option<&str>) -> bool`; token = 64 hex; friend item is top-level-attrs-only (decided in T2 with reason).
-- **No placeholders** except two test bodies explicitly deferred to implementation time with the exact fixtures named (api_test claim literals) — the shapes and assertions are specified.
+- **Coverage:** spec§domain→T1, §dynamo→T2, §public-api→T3, §admin-api→T4, §web friend→T5, §web admin→T6, §deploy/gsi→T7. Detail-assembly helper: spec said "extracted"; plan REFUSES the extraction for v1 (shelf needs only Game fields — no duplication exists, so no helper is owed; T3 Interfaces).
+- **Types:** `unwrapped_at` everywhere; `set_link_friend(token, Option<&str>) -> bool`; token = 64 hex; friend item is top-level-attrs-only (ONE schema, T2, no body blob); `ShelfResponse`/`ShelfGift` defined in T3; body types defined in T4.
+- **Every test body is written in full.** There are NO comment-only test fns (B1). Each of the three review-added arms — `friend_id_survives_a_claim`, `shelf_500s_when_index_absent_never_renders_empty`, `shelf_happy_…` — carries its RED arm explicitly (Lilith: a written body can be vacuously green; watch it fail first).
+- **Store construction:** the index-less fixture is reachable via `store_without_gsi3` helpers in both test crates (M1); the standard `store_or_skip` was the only path before.
+- **Cross-task attribution checked:** `claims_for_link`/`batch_get_games` marked pre-existing, not produced by T2 (M5); every `Consumes` traces to an earlier `Produces` or existing code.
+- **All Link literals** across domain + the three test crates are T1's responsibility (M2), enumerated by build error.
+- **No PATCH/PUT anywhere** — all mutations POST `/admin/api/...` (M4 fixed: the retracted PATCH copy is gone).
