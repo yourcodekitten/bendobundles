@@ -1283,12 +1283,56 @@ impl Store {
     /// on the friend record. No window exists where both tokens are live, or where
     /// neither is: a partial failure rolls back the whole transaction, never leaving a
     /// half-issued token at rest.
+    ///
+    /// A REVOKED friend (`old_token == ""` — `revoke_shelf_token` REMOVEs the attribute
+    /// and `friend_from_item` reads the absence back as `""`) has no pointer to delete,
+    /// so the two-item branch runs instead: put the new pointer and `SET shelf_token`
+    /// guarded by `attribute_not_exists(shelf_token)` — a concurrent reissue racing this
+    /// one loses on that condition, so two live pointers for one friend stay
+    /// unrepresentable. (Review pass 2: the delete branch keyed the pointer at the
+    /// literal pk `SHELF#` here and its `attribute_exists` cancelled the whole
+    /// transaction — revoke→reissue was a 500 dead-end.)
     pub async fn reissue_shelf_token(
         &self,
         id: &str,
         old_token: &str,
         new_token: &str,
     ) -> Result<(), StoreError> {
+        if old_token.is_empty() {
+            let put_new = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.table)
+                .set_item(Some(schema::shelf_pointer_item(new_token, id)))
+                .condition_expression("attribute_not_exists(pk)")
+                .build()
+                .expect("put_new");
+            let friend_update = aws_sdk_dynamodb::types::Update::builder()
+                .table_name(&self.table)
+                .key("pk", schema::s(schema::friend_pk(id)))
+                .key("sk", schema::s("META"))
+                .update_expression("SET shelf_token = :new")
+                .condition_expression("attribute_exists(pk) AND attribute_not_exists(shelf_token)")
+                .expression_attribute_values(":new", schema::s(new_token))
+                .build()
+                .expect("friend_update");
+            self.client
+                .transact_write_items()
+                .transact_items(
+                    aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                        .put(put_new)
+                        .build(),
+                )
+                .transact_items(
+                    aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                        .update(friend_update)
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    StoreError::Aws(AwsFault::from_sdk_error("transact_write_items", &e))
+                })?;
+            return Ok(());
+        }
         let delete_old = aws_sdk_dynamodb::types::Delete::builder()
             .table_name(&self.table)
             .key("pk", schema::s(schema::shelf_pk(old_token)))
@@ -1339,7 +1383,15 @@ impl Store {
     /// dead capability at rest — there is no representation of "revoked" that still
     /// carries a live pointer or a non-empty token; `friend_from_item` reads the
     /// resulting absence back as `""`.
+    ///
+    /// Revoking an ALREADY-revoked friend (`old_token == ""`) is an idempotent success:
+    /// there is no pointer to delete and no attribute to REMOVE, so the transaction is
+    /// skipped entirely rather than cancelling on its `attribute_exists` condition
+    /// (review pass 2: the double-revoke used to 500 forever).
     pub async fn revoke_shelf_token(&self, id: &str, old_token: &str) -> Result<(), StoreError> {
+        if old_token.is_empty() {
+            return Ok(());
+        }
         let delete_old = aws_sdk_dynamodb::types::Delete::builder()
             .table_name(&self.table)
             .key("pk", schema::s(schema::shelf_pk(old_token)))

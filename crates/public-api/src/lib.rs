@@ -1487,9 +1487,14 @@ async fn assemble_shelf(
     }
 
     // ONE batch_get_games call for every game on the shelf — never N serial gets.
+    // Deduped through a BTreeSet: DynamoDB BatchGetItem rejects duplicate keys, and the
+    // shelf must not depend on the distant one-Fulfilled-claim-per-game invariant to
+    // avoid them (results come back mapped by id, so input order carries no meaning).
     let game_ids: Vec<String> = fulfilled
         .iter()
         .map(|(c, _, _)| c.game_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect();
     let games = store.batch_get_games(&game_ids).await?;
 

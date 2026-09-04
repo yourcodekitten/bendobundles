@@ -15,9 +15,11 @@ type ViewState =
  * unwrapped Dec 31 late-EST is still `getUTCFullYear()`-January in UTC, so
  * a naive UTC read shows the friend the wrong year for their own memory.
  * `Intl`/`toLocaleString` with an explicit `timeZone` is DST-aware, so this
- * stays correct across the EST/EDT boundary without hand-rolled offsets —
- * and admin and friend views must agree, so this is the one place it's
- * computed. */
+ * stays correct across the EST/EDT boundary without hand-rolled offsets.
+ * This is the shelf's single computation point for the year (the admin list
+ * formats its dates browser-local and shows no unwrap year). Returns "" for
+ * an unparseable instant — the caller skips the label entirely rather than
+ * rendering a dangling "unwrapped ". */
 function unwrappedYear(rfc3339: string): string {
   const d = new Date(rfc3339);
   if (Number.isNaN(d.getTime())) return "";
@@ -126,58 +128,61 @@ export function ShelfPage() {
         </p>
       ) : (
         <ol className="mx-auto flex max-w-2xl flex-col gap-6 px-6 py-8">
-          {data.gifts.map((gift) => (
-            <li
-              key={gift.game_id}
-              className="flex gap-4 rounded-[6px_6px_20px_6px] bg-floor p-4"
-            >
-              {/* cover art, with the GameGrid fallback treatment: no
-                  artwork_url falls back to the shared title-hash color —
-                  there's no steam_app_id on a shelf gift to fall further
-                  back to a steam capsule image. */}
-              <div className="h-20 w-32 shrink-0 overflow-hidden rounded">
-                {gift.artwork_url !== null ? (
-                  <img
-                    src={gift.artwork_url}
-                    alt={gift.title}
-                    className="h-full w-full object-cover"
-                  />
-                ) : (
-                  <div
-                    className={`h-full w-full ${titleColorClass(gift.title)}`}
-                  />
-                )}
-              </div>
-              <div className="min-w-0 flex-1">
-                <h2 className="font-pixel text-lg leading-tight">
-                  {gift.title}
-                </h2>
-                <p className="mt-0.5 text-xs text-dust">
-                  unwrapped {unwrappedYear(gift.unwrapped_at)}
-                </p>
-                {/* ben's voice — same italic-quote-plus-attribution register
-                    as the gift note on LinkPage's dialog box. */}
-                {gift.gift_note !== null && (
-                  <p className="mt-2 max-w-[60ch] text-sm italic text-give-soft">
-                    &ldquo;{gift.gift_note}&rdquo;{" "}
-                    <span className="font-pixel not-italic text-xs text-dust">
-                      &mdash; ben
-                    </span>
-                  </p>
-                )}
-                {/* the friend's reply — same register as ThanksCard's
-                    SentNote, since this IS the friend's own page. */}
-                {gift.thank_note !== null && (
-                  <p className="mt-1.5 max-w-[60ch] text-sm italic text-give-soft">
-                    &ldquo;{gift.thank_note}&rdquo;{" "}
-                    <span className="font-pixel not-italic text-xs text-dust">
-                      &mdash; you, delivered to ben ♡
-                    </span>
-                  </p>
-                )}
-              </div>
-            </li>
-          ))}
+          {data.gifts.map((gift) => {
+            const year = unwrappedYear(gift.unwrapped_at);
+            return (
+              <li
+                key={gift.game_id}
+                className="flex gap-4 rounded-[6px_6px_20px_6px] bg-floor p-4"
+              >
+                {/* cover art, with the GameGrid fallback treatment: no
+                    artwork_url falls back to the shared title-hash color —
+                    there's no steam_app_id on a shelf gift to fall further
+                    back to a steam capsule image. */}
+                <div className="h-20 w-32 shrink-0 overflow-hidden rounded">
+                  {gift.artwork_url !== null ? (
+                    <img
+                      src={gift.artwork_url}
+                      alt={gift.title}
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <div
+                      className={`h-full w-full ${titleColorClass(gift.title)}`}
+                    />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h2 className="font-pixel text-lg leading-tight">
+                    {gift.title}
+                  </h2>
+                  {year !== "" && (
+                    <p className="mt-0.5 text-xs text-dust">unwrapped {year}</p>
+                  )}
+                  {/* ben's voice — same italic-quote-plus-attribution register
+                      as the gift note on LinkPage's dialog box. */}
+                  {gift.gift_note !== null && (
+                    <p className="mt-2 max-w-[60ch] text-sm italic text-give-soft">
+                      &ldquo;{gift.gift_note}&rdquo;{" "}
+                      <span className="font-pixel not-italic text-xs text-dust">
+                        &mdash; ben
+                      </span>
+                    </p>
+                  )}
+                  {/* the friend's reply — same register as ThanksCard's
+                      SentNote, since this IS the friend's own page. */}
+                  {gift.thank_note !== null && (
+                    <p className="mt-1.5 max-w-[60ch] text-sm italic text-give-soft">
+                      &ldquo;{gift.thank_note}&rdquo;{" "}
+                      <span className="font-pixel not-italic text-xs text-dust">
+                        &mdash; you, delivered to ben ♡
+                      </span>
+                    </p>
+                  )}
+                </div>
+              </li>
+            );
+          })}
         </ol>
       )}
     </div>

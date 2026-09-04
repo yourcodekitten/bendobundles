@@ -1055,7 +1055,9 @@ async fn handle_create_friend(
 ) -> Response {
     let name = sanitize_friend_name(&body.name);
     let name = name.trim();
-    if name.is_empty() || name.len() > FRIEND_NAME_MAX_CHARS {
+    // chars().count(), not len(): the constant and the 422 message both promise
+    // CHARACTERS, and a byte count refuses multibyte names far short of the cap
+    if name.is_empty() || name.chars().count() > FRIEND_NAME_MAX_CHARS {
         return unprocessable(format!("name must be 1-{FRIEND_NAME_MAX_CHARS} characters"));
     }
 
@@ -1127,7 +1129,8 @@ async fn handle_patch_friend(
     if let Some(name) = body.name.as_deref() {
         let name = sanitize_friend_name(name);
         let name = name.trim();
-        if name.is_empty() || name.len() > FRIEND_NAME_MAX_CHARS {
+        // chars().count(), not len() — same character-cap contract as create
+        if name.is_empty() || name.chars().count() > FRIEND_NAME_MAX_CHARS {
             return unprocessable(format!("name must be 1-{FRIEND_NAME_MAX_CHARS} characters"));
         }
         return match s.store.rename_friend(&id, name).await {
@@ -1139,7 +1142,9 @@ async fn handle_patch_friend(
 
     // reissue and revoke both need the friend's CURRENT token first — reissue to hand it to
     // the transaction as the old-pointer key, revoke for the same reason. This read also
-    // supplies the 404 for an unknown id (neither store call below returns a bool).
+    // supplies the 404 for an unknown id (neither store call below returns a bool). A
+    // REVOKED friend reads back shelf_token == "" — both store methods branch on that:
+    // reissue skips the pointer delete (there is none), revoke becomes an idempotent no-op.
     let friend = match s.store.get_friend(&id).await {
         Ok(Some(f)) => f,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),

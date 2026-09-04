@@ -55,23 +55,26 @@ describe("ShelfPage", () => {
     expect(screen.getByText(/♡/)).toBeInTheDocument();
   });
 
-  it("renders gifts in the order delivered by the server (oldest-first, no re-sort)", async () => {
+  it("renders gifts in exactly the server's array order — fed non-chronological on purpose, so a client-side sort would flip it", async () => {
+    // Deliberately NOT oldest-first: if the component sorted by unwrapped_at
+    // (either direction), the render order would differ from the array order
+    // and this assert would catch it. An already-sorted feed cannot.
     vi.mocked(fetchShelf).mockResolvedValue({
       name: "sarah",
       gifts: [
-        {
-          game_id: "g1",
-          title: "Celeste",
-          artwork_url: null,
-          unwrapped_at: "2022-03-01T12:00:00Z",
-          gift_note: null,
-          thank_note: null,
-        },
         {
           game_id: "g2",
           title: "Portal",
           artwork_url: "https://example.com/portal.jpg",
           unwrapped_at: "2024-06-01T12:00:00Z",
+          gift_note: null,
+          thank_note: null,
+        },
+        {
+          game_id: "g1",
+          title: "Celeste",
+          artwork_url: null,
+          unwrapped_at: "2022-03-01T12:00:00Z",
           gift_note: null,
           thank_note: null,
         },
@@ -84,7 +87,7 @@ describe("ShelfPage", () => {
     const titles = screen
       .getAllByRole("heading", { level: 2 })
       .map((h) => h.textContent);
-    expect(titles).toEqual(["Celeste", "Portal"]);
+    expect(titles).toEqual(["Portal", "Celeste"]);
 
     // year is derived from unwrapped_at
     expect(screen.getByText(/unwrapped 2022/)).toBeInTheDocument();
@@ -217,6 +220,25 @@ describe("ShelfPage", () => {
     await waitFor(() => screen.getByText("Celeste"));
     expect(screen.getByText(/unwrapped 2025/)).toBeInTheDocument();
     expect(screen.queryByText(/unwrapped 2026/)).not.toBeInTheDocument();
+  });
+
+  it('renders no "unwrapped" label at all for an unparseable unwrapped_at — never a dangling "unwrapped "', async () => {
+    vi.mocked(fetchShelf).mockResolvedValue({
+      name: "sarah",
+      gifts: [
+        {
+          game_id: "g1",
+          title: "Celeste",
+          artwork_url: null,
+          unwrapped_at: "not-a-date",
+          gift_note: null,
+          thank_note: null,
+        },
+      ],
+    });
+    renderShelfPage();
+    await waitFor(() => screen.getByText("Celeste"));
+    expect(screen.queryByText(/unwrapped/)).not.toBeInTheDocument();
   });
 
   it("never renders a claim/action affordance — it's a read-only keepsake page", async () => {

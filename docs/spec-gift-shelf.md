@@ -106,8 +106,8 @@ the shelf is where the unwraps go to live.
   gave me less than he did," which is worse than an error.
 
 **admin-api**:
-- `POST /api/admin/friends` (create, mints token) · `GET /api/admin/friends` (list) ·
-  `PATCH /api/admin/friends/{id}` (rename · reissue token) — input validation per the
+- `POST /admin/api/friends` (create, mints token) · `GET /admin/api/friends` (list) ·
+  `POST /admin/api/friends/{id}` (rename · reissue token) — input validation per the
   create-link 422 conventions.
 - `set_link_friend` wired to the existing link-edit surface (assign/reassign/clear).
   **Reassigning a link moves its whole gift history between shelves — deliberately** (it exists

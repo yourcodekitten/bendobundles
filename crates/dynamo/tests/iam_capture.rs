@@ -34,7 +34,7 @@ use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterce
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_types::config_bag::ConfigBag;
 
-use domain::{AppidSource, Game, GameStatus, Link, game_id};
+use domain::{AppidSource, Friend, Game, GameStatus, Link, game_id};
 use dynamo::{SteamAppCache, SteamAppPutGuard, Store, SyncState};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -483,6 +483,15 @@ fn link(token: &str) -> Link {
     }
 }
 
+fn friend(id: &str, name: &str, tok2: &str) -> Friend {
+    Friend {
+        id: id.into(),
+        name: name.into(),
+        shelf_token: tok2.repeat(32),
+        created_at: datetime!(2026-09-04 12:00 UTC),
+    }
+}
+
 fn steam_app_stub(app_id: u32) -> SteamAppCache {
     SteamAppCache {
         app_id,
@@ -507,6 +516,10 @@ async fn drive_public(rig: &Rig) -> MethodOps {
     let now = datetime!(2026-07-03 00:00 UTC);
     rig.seed.put_game(&game(1, true)).await.unwrap();
     rig.seed.create_link(&link("ptok")).await.unwrap();
+    rig.seed
+        .create_friend(&friend("pf1", "sarah", "ab"))
+        .await
+        .unwrap();
     rig.seed
         .put_steam_app(&steam_app_stub(570), SteamAppPutGuard::Absent)
         .await
@@ -568,6 +581,20 @@ async fn drive_public(rig: &Rig) -> MethodOps {
         s.put_steam_owned("76561198000000001", &[570], NOW_EPOCH)
             .await
             .unwrap();
+    })
+    .await;
+    // the gift shelf (public-api handle_shelf → assemble_shelf): token → friend, then the
+    // friend's links off gsi3. claims_for_link / batch_get_games legs of that path are
+    // already captured above via their claim-flow callers IN THIS SAME driver.
+    capture(cap, &mut m, "get_friend_by_shelf_token", async {
+        s.get_friend_by_shelf_token(&"ab".repeat(32))
+            .await
+            .unwrap()
+            .unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "list_links_for_friend", async {
+        s.list_links_for_friend("pf1").await.unwrap();
     })
     .await;
     m
@@ -718,6 +745,51 @@ async fn drive_admin(rig: &Rig) -> MethodOps {
         s.remove_link_unlock("atok-sealed", datetime!(2026-07-03 00:00 UTC))
             .await
             .unwrap();
+    })
+    .await;
+    // the gift shelf's admin surface (admin-api handle_create_friend / handle_list_friends /
+    // handle_patch_friend / handle_set_link_friend). reissue is captured on BOTH its
+    // branches — live-token (delete old pointer + put new + SET) and revoked-friend
+    // (put new + SET guarded by attribute_not_exists(shelf_token); no delete) — because
+    // each sends a different transaction shape. revoke's already-revoked arm sends NO
+    // requests at all (idempotent early return), so it has no IAM surface to capture.
+    capture(cap, &mut m, "create_friend", async {
+        s.create_friend(&friend("af1", "sarah", "cd"))
+            .await
+            .unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "list_friends", async {
+        s.list_friends().await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "rename_friend", async {
+        assert!(s.rename_friend("af1", "sara").await.unwrap());
+    })
+    .await;
+    capture(cap, &mut m, "reissue_shelf_token", async {
+        s.reissue_shelf_token("af1", &"cd".repeat(32), &"ce".repeat(32))
+            .await
+            .unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "revoke_shelf_token", async {
+        s.revoke_shelf_token("af1", &"ce".repeat(32)).await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "reissue_shelf_token", async {
+        s.reissue_shelf_token("af1", "", &"cf".repeat(32))
+            .await
+            .unwrap();
+    })
+    .await;
+    // both legs (assign SETs friend_id + gsi3pk, unassign REMOVEs them) captured separately
+    capture(cap, &mut m, "set_link_friend", async {
+        assert!(s.set_link_friend("atok2", Some("af1")).await.unwrap());
+    })
+    .await;
+    capture(cap, &mut m, "set_link_friend", async {
+        assert!(s.set_link_friend("atok2", None).await.unwrap());
     })
     .await;
     m

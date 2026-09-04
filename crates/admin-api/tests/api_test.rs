@@ -3298,6 +3298,113 @@ async fn friends_create_list_rename_reissue_revoke() {
     assert_eq!(j[0]["shelf_token"], "");
 }
 
+/// Revoke → reissue must hand the friend a fresh live shelf, and a second revoke must
+/// be an idempotent success — review pass 2 found both returned 500 forever, because the
+/// store's delete-the-old-pointer transaction keyed the pointer at the literal pk
+/// `SHELF#` (the revoked friend's `shelf_token` is `""`) and its `attribute_exists`
+/// condition cancelled the whole transaction.
+#[tokio::test]
+async fn friends_revoke_then_reissue_recovers() {
+    let Some(store) = store_or_skip("admin-friends-rerevoke").await else {
+        return;
+    };
+    let password = "pw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let call = |req| {
+        router(
+            Arc::clone(&store),
+            Arc::clone(&invoker),
+            admin_hash.clone(),
+            None,
+        )
+        .oneshot(req)
+    };
+    let post = |path: &str, body: serde_json::Value| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let get = |path: &str| {
+        Request::get(path)
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let j = body_json(
+        call(post(
+            "/admin/api/friends",
+            serde_json::json!({"name": "sarah"}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let id = j["id"].as_str().unwrap().to_string();
+    let tok1 = j["shelf_token"].as_str().unwrap().to_string();
+
+    // revoke
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"revoke": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // reissue on the revoked friend → 200 with a fresh live token, not a 500 dead-end
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"reissue": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "reissue after revoke must succeed"
+    );
+    let j = body_json(r).await;
+    let tok2 = j["shelf_token"].as_str().unwrap().to_string();
+    assert_eq!(tok2.len(), 64);
+    assert_ne!(tok1, tok2, "reissue must mint a new token");
+    assert_eq!(j["shelf_url_path"], format!("/s/{tok2}"));
+    // the reissued token is live in the store — the pointer + record moved together
+    let f = store.get_friend_by_shelf_token(&tok2).await.unwrap();
+    assert_eq!(f.unwrap().id, id, "fresh token resolves to the friend");
+
+    // second revoke (now on the live tok2), then revoke AGAIN on the already-revoked
+    // friend → idempotent 200, not a 500
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"revoke": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"revoke": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "double revoke must be an idempotent success"
+    );
+    let j = body_json(r).await;
+    assert_eq!(j["shelf_token"], "");
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j[0]["shelf_token"], "", "list agrees the friend is revoked");
+}
+
 #[tokio::test]
 async fn friends_validation_422s() {
     let Some(store) = store_or_skip("admin-friends-422").await else {
@@ -3329,6 +3436,28 @@ async fn friends_validation_422s() {
     let r = call(post(
         "/admin/api/friends",
         serde_json::json!({"name": "  "}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // the cap is measured in CHARACTERS, as the 422 message says — 33 CJK chars is
+    // 99 UTF-8 bytes but well under FRIEND_NAME_MAX_CHARS (review pass 2: `.len()`
+    // counted bytes and refused multibyte names the message promised to accept)
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "友".repeat(33)}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "33 chars must be accepted even at >64 bytes"
+    );
+    // 65 chars is over the cap regardless of byte width
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "a".repeat(65)}),
     ))
     .await
     .unwrap();

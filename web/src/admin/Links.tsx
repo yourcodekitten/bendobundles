@@ -342,7 +342,9 @@ export function Links() {
           [link.token]:
             err instanceof CreateLinkValidationError
               ? err.message
-              : "couldn't reassign — the link's friend is unchanged. try again.",
+              : // "may" — on a timeout after a server-side commit the client
+                // cannot know whether the move landed.
+                "couldn't reassign — the link's friend may be unchanged. try again.",
         }));
       })
       .finally(() => {

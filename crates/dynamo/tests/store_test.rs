@@ -56,39 +56,6 @@ async fn store_or_skip(test: &str) -> Option<Store> {
     Some(store)
 }
 
-/// `store_or_skip`'s body, but the table is built WITHOUT gsi3 —
-/// `create_table_for_tests_without_gsi3` fixtures the deploy window where the index
-/// hasn't gone ACTIVE yet (Task 3's fault-injection test: `list_links_for_friend`
-/// against a store built by this helper must surface the query error, not an empty
-/// Vec — a "no gifts yet" render would be a lie during that window).
-#[allow(dead_code)]
-async fn store_without_gsi3(test: &str) -> Option<Store> {
-    let (url, explicit) = match std::env::var("DYNAMODB_LOCAL_URL") {
-        Ok(v) => (v, true),
-        Err(_) => ("http://localhost:8000".into(), false),
-    };
-    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .endpoint_url(&url)
-        .region("us-east-1")
-        .test_credentials()
-        .load()
-        .await;
-    let client = aws_sdk_dynamodb::Client::new(&config);
-    if client.list_tables().send().await.is_err() {
-        if explicit {
-            panic!(
-                "DYNAMODB_LOCAL_URL is set but dynamodb-local is unreachable — \
-                 refusing to skip (this would forge a green run)"
-            );
-        }
-        eprintln!("SKIP {test}: no dynamodb-local at {url}");
-        return None;
-    }
-    let store = Store::new(client, format!("t-{test}"));
-    store.create_table_for_tests_without_gsi3().await.unwrap();
-    Some(store)
-}
-
 fn game(n: u32, listable: bool) -> Game {
     Game {
         id: game_id(&format!("gk{n}"), "mn"),
@@ -4097,6 +4064,52 @@ async fn revoke_leaves_no_capability_at_rest() {
     assert_eq!(
         raw.shelf_token, "",
         "revoked friend must not retain the token"
+    );
+}
+
+/// The revoke→reissue lifecycle must be a road, not a dead-end: a revoked friend
+/// (shelf_token REMOVE'd, read back as `""`) can be handed a fresh token, and
+/// revoking twice is an idempotent success — neither sequence may surface the
+/// old delete-the-pointer transaction's `attribute_exists` cancellation as an
+/// error (review pass 2: both paths 500'd forever, since `""` keys the pointer
+/// delete at the literal pk `SHELF#`).
+#[tokio::test]
+async fn revoke_then_reissue_recovers_and_double_revoke_is_a_no_op() {
+    let Some(store) = store_or_skip("friend_revoke_reissue").await else {
+        return;
+    };
+    let f = friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    store
+        .revoke_shelf_token("f1", &f.shelf_token)
+        .await
+        .unwrap();
+
+    // double revoke: the friend's token is now "" — must be an idempotent Ok, not
+    // a cancelled transaction
+    store.revoke_shelf_token("f1", "").await.unwrap();
+
+    // reissue on the revoked friend: a fresh pointer goes live
+    let new_tok = "bb".repeat(32);
+    store.reissue_shelf_token("f1", "", &new_tok).await.unwrap();
+    let got = store
+        .get_friend_by_shelf_token(&new_tok)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.id, "f1");
+    assert_eq!(
+        got.shelf_token, new_tok,
+        "friend record carries the reissued token"
+    );
+    // the pre-revoke token stays dead — no resurrected pointer
+    assert!(
+        store
+            .get_friend_by_shelf_token(&f.shelf_token)
+            .await
+            .unwrap()
+            .is_none(),
+        "old token must stay dead across revoke→reissue"
     );
 }
 

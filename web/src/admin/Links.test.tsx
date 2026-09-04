@@ -1002,6 +1002,46 @@ describe('friend assignment', () => {
     );
   });
 
+  it("hedges the failure copy — the client can't know whether the reassign committed", async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminLinks).mockResolvedValue([{ ...link1, friend_id: 'f1' }]);
+    vi.mocked(adminSetLinkFriend).mockRejectedValue(new Error('boom'));
+    renderLinks();
+
+    await waitFor(() => screen.getByText('Alice'));
+    await user.selectOptions(screen.getByLabelText(/reassign friend for alice/i), 'f2');
+    await user.click(screen.getByRole('button', { name: /confirm reassign for alice/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        "couldn't reassign — the link's friend may be unchanged. try again.",
+      ),
+    );
+  });
+
+  it('creating a link with a friend picked fires the follow-up assignment POST with the new token', async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminLinks).mockResolvedValue([]);
+    vi.mocked(adminCreateLink).mockResolvedValue({
+      token: 'tok-new',
+      url_path: '/l/tok-new',
+    });
+    vi.mocked(adminSetLinkFriend).mockResolvedValue(undefined);
+    renderLinks();
+
+    await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+    await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+    await user.selectOptions(
+      screen.getByLabelText(/puts this link on their shelf/i),
+      'f1',
+    );
+    await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+    await waitFor(() =>
+      expect(adminSetLinkFriend).toHaveBeenCalledWith('tok-new', 'f1'),
+    );
+  });
+
   it('clearing the assignment fires the request with friend_id: null', async () => {
     const user = userEvent.setup();
     vi.mocked(adminLinks)

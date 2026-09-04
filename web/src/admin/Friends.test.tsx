@@ -169,6 +169,90 @@ describe('Friends', () => {
       // old token no longer shown
       expect(screen.queryByText(new RegExp(TOKEN_A))).not.toBeInTheDocument();
     });
+
+    it('disables confirm and cancel while the request is in flight — a second click fires no second POST', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminFriends).mockResolvedValue([maya]);
+      let resolveReissue!: (v: { shelf_token: string; shelf_url_path: string }) => void;
+      vi.mocked(adminReissueFriendToken).mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveReissue = resolve;
+          }),
+      );
+      renderFriends();
+
+      await waitFor(() => screen.getByText('Maya'));
+      await user.click(screen.getByRole('button', { name: /reissue shelf link for maya/i }));
+      const confirm = screen.getByRole('button', { name: /confirm reissue for maya/i });
+      await user.click(confirm);
+
+      // request pending → both panel buttons disabled
+      expect(adminReissueFriendToken).toHaveBeenCalledTimes(1);
+      expect(confirm).toBeDisabled();
+      expect(
+        screen.getByRole('button', { name: /cancel reissue for maya/i }),
+      ).toBeDisabled();
+
+      // a second click must be a no-op — two POSTs is two token rotations
+      await user.click(confirm);
+      expect(adminReissueFriendToken).toHaveBeenCalledTimes(1);
+
+      resolveReissue({ shelf_token: TOKEN_B, shelf_url_path: `/s/${TOKEN_B}` });
+      await waitFor(() =>
+        expect(
+          screen.queryByRole('button', { name: /confirm reissue for maya/i }),
+        ).not.toBeInTheDocument(),
+      );
+    });
+
+    it("hedges the failure copy — the client can't know whether the old link survived", async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminFriends).mockResolvedValue([maya]);
+      vi.mocked(adminReissueFriendToken).mockRejectedValue(new Error('boom'));
+      renderFriends();
+
+      await waitFor(() => screen.getByText('Maya'));
+      await user.click(screen.getByRole('button', { name: /reissue shelf link for maya/i }));
+      await user.click(screen.getByRole('button', { name: /confirm reissue for maya/i }));
+
+      await waitFor(() =>
+        expect(screen.getByRole('alert')).toHaveTextContent(
+          "couldn't reissue — the old link may still be live. try again.",
+        ),
+      );
+    });
+  });
+
+  describe('reissue on a revoked friend', () => {
+    it('shows an "issue a new link" affordance, confirms, fires the same endpoint, and refreshes', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminFriends)
+        .mockResolvedValueOnce([rae])
+        .mockResolvedValueOnce([{ ...rae, shelf_token: TOKEN_B }]);
+      vi.mocked(adminReissueFriendToken).mockResolvedValue({
+        shelf_token: TOKEN_B,
+        shelf_url_path: `/s/${TOKEN_B}`,
+      });
+      renderFriends();
+
+      await waitFor(() => screen.getByText('Rae'));
+      await user.click(screen.getByRole('button', { name: /issue a new link for rae/i }));
+
+      // arming copy fits the revoked state — no old link dies here
+      expect(screen.getByText(/this hands them a brand-new link/i)).toBeInTheDocument();
+      expect(adminReissueFriendToken).not.toHaveBeenCalled();
+
+      await user.click(screen.getByRole('button', { name: /confirm reissue for rae/i }));
+
+      await waitFor(() => expect(adminReissueFriendToken).toHaveBeenCalledWith('f2'));
+      // list refreshed — the new shelf URL is on the row now
+      await waitFor(() =>
+        expect(
+          screen.getByText(`${window.location.origin}/s/${TOKEN_B}`),
+        ).toBeInTheDocument(),
+      );
+    });
   });
 
   describe('revoke', () => {
@@ -188,6 +272,48 @@ describe('Friends', () => {
 
       await waitFor(() => expect(adminRevokeFriendToken).toHaveBeenCalledWith('f1'));
       await waitFor(() => expect(screen.getByText(/no shelf link/i)).toBeInTheDocument());
+    });
+
+    it('disables the armed button while the request is in flight — a second click fires no second POST', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminFriends).mockResolvedValue([maya]);
+      let resolveRevoke!: () => void;
+      vi.mocked(adminRevokeFriendToken).mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveRevoke = () => resolve(undefined);
+          }),
+      );
+      renderFriends();
+
+      await waitFor(() => screen.getByText('Maya'));
+      await user.click(screen.getByRole('button', { name: /^revoke maya$/i }));
+      const confirm = screen.getByRole('button', { name: /confirm revoke maya/i });
+      await user.click(confirm);
+
+      expect(adminRevokeFriendToken).toHaveBeenCalledTimes(1);
+      expect(confirm).toBeDisabled();
+
+      await user.click(confirm);
+      expect(adminRevokeFriendToken).toHaveBeenCalledTimes(1);
+
+      resolveRevoke();
+      await waitFor(() => expect(confirm).not.toBeDisabled());
+    });
+  });
+
+  describe('copy', () => {
+    it('the row copy button writes the shelf URL to the clipboard', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminFriends).mockResolvedValue([maya]);
+      renderFriends();
+
+      await waitFor(() => screen.getByText('Maya'));
+      await user.click(screen.getByRole('button', { name: /copy shelf link for maya/i }));
+
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+        `${window.location.origin}/s/${TOKEN_A}`,
+      );
     });
   });
 });

@@ -48,6 +48,22 @@ export function Friends() {
   const [revokeArmed, setRevokeArmed] = useState<Set<string>>(new Set());
   const [revokeErrors, setRevokeErrors] = useState<Record<string, string>>({});
 
+  // In-flight guard for reissue AND revoke — one Set serves both (they're
+  // mutually exclusive per row and both rotate/kill the same token). Kindred
+  // to Links.tsx's reassignBusy: set before the request, cleared in finally,
+  // confirm and cancel disabled while set. Without it a double-click fires
+  // two POSTs — two token rotations, the first painted token already dead.
+  const [actionBusy, setActionBusy] = useState<Set<string>>(new Set());
+
+  const actionBusyOn = (id: string) =>
+    setActionBusy((prev) => new Set(prev).add(id));
+  const actionBusyOff = (id: string) =>
+    setActionBusy((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+
   const load = useCallback(() => {
     setState({ phase: 'loading' });
     withAuth(() => adminFriends(), navigate)
@@ -100,6 +116,13 @@ export function Friends() {
   };
 
   const handleReissueConfirm = (friend: AdminFriend) => {
+    // Re-entrancy guard on top of the disabled button — a queued second
+    // click must never fire a second rotation.
+    if (actionBusy.has(friend.id)) return;
+    // Reissue also serves a REVOKED friend (backend accepts it since the
+    // pass-2 pairing): no old link dies there, so the failure copy differs.
+    const live = friend.shelf_token !== '';
+    actionBusyOn(friend.id);
     setReissueErrors((prev) => omitKey(prev, friend.id));
     withAuth(() => adminReissueFriendToken(friend.id), navigate)
       .then(() => {
@@ -111,11 +134,17 @@ export function Friends() {
         load();
       })
       .catch(() => {
+        // "may" on purpose — on a timeout after a server-side commit the
+        // client cannot know whether the rotation landed (revoke copy below
+        // already hedges the same way).
         setReissueErrors((prev) => ({
           ...prev,
-          [friend.id]: "couldn't reissue — the old link is still live. try again.",
+          [friend.id]: live
+            ? "couldn't reissue — the old link may still be live. try again."
+            : "couldn't issue the new link — try again.",
         }));
-      });
+      })
+      .finally(() => actionBusyOff(friend.id));
   };
 
   const handleRevoke = (friend: AdminFriend) => {
@@ -123,6 +152,8 @@ export function Friends() {
       setRevokeArmed((prev) => new Set(prev).add(friend.id));
       return;
     }
+    if (actionBusy.has(friend.id)) return;
+    actionBusyOn(friend.id);
     withAuth(() => adminRevokeFriendToken(friend.id), navigate)
       .then(() => {
         setRevokeArmed((prev) => {
@@ -138,7 +169,8 @@ export function Friends() {
           ...prev,
           [friend.id]: 'revoke failed — the shelf link may still be live. try again.',
         }));
-      });
+      })
+      .finally(() => actionBusyOff(friend.id));
   };
 
   const copyToClipboard = (text: string) => {
@@ -230,6 +262,7 @@ export function Friends() {
           const reissueErr = reissueErrors[friend.id];
           const armedRevoke = revokeArmed.has(friend.id);
           const revokeErr = revokeErrors[friend.id];
+          const busy = actionBusy.has(friend.id);
 
           return (
             <div key={friend.id} className="rounded bg-floor p-4">
@@ -240,6 +273,24 @@ export function Friends() {
                   <span className="rounded bg-red-900 px-2 py-0.5 text-xs text-red-200">
                     revoked
                   </span>
+                )}
+
+                {/* A revoked friend is not a dead-end: the reissue endpoint
+                    now accepts a revoked friend (backend-paired change), so
+                    offer the way back — same confirm+busy flow, different
+                    arming copy since no old link dies here. */}
+                {!live && (
+                  <div className="ml-auto flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={armedReissue}
+                      onClick={() => handleReissueArm(friend.id)}
+                      aria-label={`issue a new link for ${friend.name}`}
+                      className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
+                    >
+                      issue a new link
+                    </button>
+                  </div>
                 )}
 
                 {live && (
@@ -263,9 +314,10 @@ export function Friends() {
                     </button>
                     <button
                       type="button"
+                      disabled={busy}
                       onClick={() => handleRevoke(friend)}
                       aria-label={armedRevoke ? `confirm revoke ${friend.name}` : `revoke ${friend.name}`}
-                      className={`rounded px-3 py-1.5 text-xs ${
+                      className={`rounded px-3 py-1.5 text-xs disabled:opacity-50 ${
                         armedRevoke
                           ? 'bg-red-700 text-red-100 hover:bg-red-600'
                           : 'bg-control hover:bg-control-bright'
@@ -290,21 +342,25 @@ export function Friends() {
               {armedReissue && (
                 <div className="mt-2 flex flex-wrap items-center gap-3 rounded bg-shelf p-2">
                   <p className="text-xs text-dust">
-                    the old link stops working — hand them the new one
+                    {live
+                      ? 'the old link stops working — hand them the new one'
+                      : 'this hands them a brand-new link — their shelf wakes back up'}
                   </p>
                   <button
                     type="button"
+                    disabled={busy}
                     onClick={() => handleReissueConfirm(friend)}
                     aria-label={`confirm reissue for ${friend.name}`}
-                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright"
+                    className="rounded bg-control px-3 py-1.5 text-xs hover:bg-control-bright disabled:opacity-50"
                   >
-                    confirm reissue
+                    {busy ? 'issuing…' : 'confirm reissue'}
                   </button>
                   <button
                     type="button"
+                    disabled={busy}
                     onClick={() => handleReissueCancel(friend.id)}
                     aria-label={`cancel reissue for ${friend.name}`}
-                    className="rounded px-3 py-1.5 text-xs text-dust hover:text-ink"
+                    className="rounded px-3 py-1.5 text-xs text-dust hover:text-ink disabled:opacity-50"
                   >
                     cancel
                   </button>
