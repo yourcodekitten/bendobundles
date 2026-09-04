@@ -409,12 +409,25 @@ async fn shelf_500s_when_index_absent_never_renders_empty() {
 
 - [ ] **Step 2: Run to verify failure** — `cargo test -p public-api shelf_` (needs dynamodb-local;
   without it the tests SKIP, so the RED for all three is produced in CI or against a local
-  instance, never assumed). **Watch each fail (Lilith, red-first):** the happy test's
-  `StatusCode::OK` canary reds on the missing route; the 404 test can't red on route-absence alone
-  (a missing route also 404s) so it is not load-bearing for red; the index-absent test reds only
-  once the route exists AND wrongly returns `Ok(vec![])` — so its red is produced during Step 3 by
-  first writing the handler to swallow the error, watching this test go green-when-it-should-500,
-  then fixing it. Record which reds you actually observed.
+  instance, never assumed). **A RED must fail FOR THE REASON THE TEST IS NAMED FOR — a red that
+  fires for an unrelated reason (route absent, compile error) passes the red-first ritual while
+  proving nothing** (Lilith: the mirror of the vacuous green). So watch each fail for its OWN
+  property, in TWO stages where the route's existence would otherwise mask the behaviour:
+  - **route stage:** before `handle_get_shelf` exists, all three shelf tests red on route-absence
+    (the happy test's `StatusCode::OK` canary is the cleanest). This proves the route is wired —
+    NOT that any filtering works.
+  - **behaviour stage (the load-bearing red):** with the route wired, write the handler's FIRST
+    version WRONG on purpose and watch the property-specific red:
+    - `shelf_happy_…` → implement WITHOUT the `Fulfilled` filter and WITHOUT friend-scoping (return
+      every claim on every link). The `gifts.len() == 2` / oldest-first / no-bleed asserts red —
+      *that* is the filter's red, not the OK canary. Then add the filter+scope, watch green.
+    - `shelf_500s_when_index_absent` → implement the gsi3-error arm as `.unwrap_or_default()`,
+      watch it wrongly return 200-empty (the test reds on `INTERNAL_SERVER_ERROR`), then fix to
+      `?`/500.
+    - the 404 test is NOT load-bearing for red (a missing route also 404s); it guards the
+      no-oracle byte-identity, which only matters once the route exists — assert it green, don't
+      manufacture a red for it.
+  Record which reds you actually observed, per stage.
 
 - [ ] **Step 3: Implement** — route in `router()`: `.route("/api/s/{token}", get(handle_get_shelf))`. `handle_get_shelf` resolves the friend (None ⇒ `link_not_found_response()`), then `assemble_shelf`: `list_links_for_friend` → for each, `claims_for_link` → filter `ClaimState::Fulfilled` → collect `game_id`s → ONE `batch_get_games` → build `ShelfGift`s (a claim whose game record is missing ⇒ 500, NOT a skipped row — a partial shelf is a lie), sort by `unwrapped_at` ascending, wrap in `ShelfResponse`. **Every `?`/error arm maps to the 500** — a gsi3 query error during the deploy window MUST reach the 500, never `Ok(vec![])`. The index-absent test above is exactly this guarantee's red/green; produce its red by first writing the error arm as `.unwrap_or_default()`, watch the test fail (200 with empty gifts), then fix to `?`/500 and watch it pass.
 
