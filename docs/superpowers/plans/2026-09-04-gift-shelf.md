@@ -51,7 +51,7 @@ fn friend_serde_round_trips() {
 #[test]
 fn link_friend_id_defaults_none_on_missing() {
     // A pre-field stored record must deserialize (the zero-migration guarantee).
-    let json = serde_json::to_string(&sample_link()).unwrap(); // existing test helper; if none, build a Link literally as other Link tests do
+    let json = serde_json::to_string(&link()).unwrap(); // `fn link()` — the existing fixture at domain lib.rs:535
     let stripped: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert!(stripped.get("friend_id").is_none(), "None must not serialize");
     let back: Link = serde_json::from_str(&json).unwrap();
@@ -127,7 +127,9 @@ git add crates/domain && git commit -S -m "🎁 domain: Friend record + Link.fri
   - `pub async fn create_friend(&self, f: &Friend) -> Result<(), StoreError>` — transaction: put `FRIEND#<id>/META` + put `SHELF#<token>/META {friend_id}`; both `attribute_not_exists(pk)`.
   - `pub async fn get_friend_by_shelf_token(&self, token: &str) -> Result<Option<Friend>, StoreError>` — pointer get → friend get; either missing ⇒ `None`.
   - `pub async fn get_friend(&self, id: &str) -> Result<Option<Friend>, StoreError>`
-  - `pub async fn list_friends(&self) -> Result<Vec<Friend>, StoreError>` — scan-free: gsi1? NO — friends are few; use a `gsi1pk = "FRIEND"` sparse membership attribute on friend items, query gsi1 (the LISTABLE pattern, different pk value).
+  - `pub async fn list_friends(&self) -> Result<Vec<Friend>, StoreError>` — friend items carry
+    `gsi1pk = "FRIEND"`, `gsi1sk = <name>` (the LISTABLE membership pattern, different pk value;
+    name as sort key gives an ordered list for free); query gsi1.
   - `pub async fn rename_friend(&self, id: &str, name: &str) -> Result<bool, StoreError>` — scoped `SET name`, `attribute_exists(pk)`; false on condition fail.
   - `pub async fn reissue_shelf_token(&self, id: &str, old_token: &str, new_token: &str) -> Result<(), StoreError>` — ONE transaction: delete `SHELF#<old>` (`attribute_exists(pk)`) + put `SHELF#<new>` (`attribute_not_exists(pk)`) + update friend `SET shelf_token = :new`.
   - `pub async fn revoke_shelf_token(&self, id: &str, old_token: &str) -> Result<(), StoreError>` — ONE transaction: delete `SHELF#<old>` + update friend `REMOVE shelf_token`. (Read-side: `friend_from_item` treats missing `shelf_token` as `""`; document that `""` means revoked and admin list renders "no shelf link".)
@@ -206,8 +208,9 @@ Add the write-path-revert regression test (the reason the gift_note pattern is m
 #[tokio::test]
 async fn friend_id_survives_a_claim() {
     let Some(store) = store_or_skip("friend_survives_claim").await else { return };
-    // assign, then run a REAL claim transaction on that link (copy the claim_game
-    // call shape from this file's existing claim tests), then re-read:
+    // THE EXEMPLAR EXISTS: store_test.rs:231 "the note must survive claim_game's SET body"
+    // — copy its claim_game("tok-noted", &game_id("gk1","mn"), "c1", now) construction (:247)
+    // and its seeding, swapping gift_note for a set_link_friend("t","f1") assignment. Then:
     // - get_link(t).friend_id must still be Some("f1")
     // - list_links_for_friend("f1") must still return the link
     // A body-only implementation FAILS this test (SET body from a pre-tx read reverts it).
@@ -217,7 +220,10 @@ async fn friend_id_survives_a_claim() {
 - [ ] **Step 3: Run to verify failure** — `cargo test -p dynamo friend_ link_friend` (needs dynamodb-local; if absent locally, verify COMPILE failure is the missing methods, and lean on CI for the red→green cycle — note which mode you used in the commit body).
 
 - [ ] **Step 4: Implement** — `schema.rs`: `friend_pk(id) -> "FRIEND#<id>"`, `shelf_pk(token) -> "SHELF#<token>"`, `friend_item` (pk/sk/META, `body` = full serde json of Friend, `gsi1pk = "FRIEND"`, `gsi1sk = <name>` for ordered list), `shelf_pointer_item` (pk/sk/META, attr `friend_id`). `lib.rs`: the eight methods per the Interfaces block, transactions via the existing `transact_write_items` idiom (see `claim_game` ~:1240 for error mapping); `friend_from_item` = parse body then override `shelf_token` from top-level? — NO: friend body is small and rewritten whole by no concurrent writer except rename/reissue/revoke which are scoped updates ⇒ store `name` and `shelf_token` as top-level attrs too and make `body` carry only `{id, created_at}`… **decide simpler: friend item stores NO body blob; all four fields are top-level attrs** (`id`, `name`, `shelf_token`, `created_at` rfc3339 string). Friends are 4 scalar fields; a body blob would just create the copy-drift problem the link pattern exists to fight. `friend_from_item` reads the four attrs (`shelf_token` missing ⇒ `""`).
-  `create_table_for_tests`: add `gsi3pk` attribute definition + `gsi3` (pk-only) mirroring gsi2's builder calls.
+  `create_table_for_tests`: the existing `gsi` closure (lib.rs:3253) REQUIRES a sort key —
+  gsi3 has none, so add a sibling `gsi_pk_only(name, pk)` helper beside it rather than passing a
+  dummy sk; define the `gsi3pk` attribute and build `gsi3` hash-key-only. (Do NOT copy gsi2's
+  call verbatim — gsi2 has a sort key, gsi3 deliberately doesn't.)
 
 - [ ] **Step 5: Run to verify pass** — `cargo test -p dynamo` (or CI as in Step 3). Also `cargo test -p domain -p dynamo` to prove the workspace compiles again.
 
@@ -250,41 +256,56 @@ git add crates/dynamo && git commit -S -m "🎁 dynamo: friend/shelf items, tran
 - Produces: `async fn assemble_shelf(store, friend) -> Result<ShelfResponse, StoreError>` internal; **detail-assembly extraction**: pull the game+steam-cache join out of `handle_game_detail` into `fn game_detail_payload(...)` ONLY IF the shelf ends up needing the same steam fields — v1 shelf payload above needs `title`/`artwork_url` from `Game` alone, so DO NOT extract yet (YAGNI; the spec's helper note is satisfied by not duplicating: the shelf never touches the steam cache in v1). If review wants richer cards later, that's when the helper is born.
 - 404 body/shape identical to `link_not_found_response()` for unknown AND revoked; any store error anywhere ⇒ 500 `{"error": "the shelf slipped — try again"}` (soft voice, no internals).
 
-- [ ] **Step 1: Write failing api tests** (house rig: build router with real store via `store_or_skip`, `oneshot` requests):
+- [ ] **Step 1: Write failing api tests** — the rig, verified in `api_test.rs`: routers are built
+  `plain_router(store, mock)` with `MockInvoker::new(FulfillResponse::GiftUrl{..})`, requests are
+  `Request::get("/api/s/x").body(Body::empty()).unwrap()` + `.oneshot(req)`, bodies read via
+  `body_json(resp)`. Fixtures `test_link(token)` / `test_game(n)` exist in the file; add beside
+  them:
 
 ```rust
-#[tokio::test]
-async fn shelf_unknown_token_404s_like_revoked() {
-    let Some(store) = store_or_skip("shelf_404").await else { return };
-    let app = test_router(store.clone()); // existing helper pattern in api_test.rs — reuse it
-    let r1 = app.clone().oneshot(get("/api/s/deadbeef")).await.unwrap();
-    assert_eq!(r1.status(), StatusCode::NOT_FOUND);
-    // revoked: create friend, revoke, then hit the old token — must be byte-identical
-    let f = friend_fixture("f1", "sarah", "aa");
-    store.create_friend(&f).await.unwrap();
-    store.revoke_shelf_token("f1", &f.shelf_token).await.unwrap();
-    let r2 = app.oneshot(get(&format!("/api/s/{}", f.shelf_token))).await.unwrap();
-    assert_eq!(r2.status(), StatusCode::NOT_FOUND);
-    assert_eq!(body_bytes(r1).await, body_bytes(r2).await, "no oracle");
-}
-
-#[tokio::test]
-async fn shelf_shows_fulfilled_only_and_no_cross_friend_bleed() {
-    let Some(store) = store_or_skip("shelf_filter").await else { return };
-    // friend f1: link t1 (fulfilled claim on g1, pending claim on g2)
-    // friend f2: link t2 (fulfilled claim on g3)
-    // expect f1's shelf = [g1] exactly: no pending, no failed, no g3.
-    /* build: put_game g1,g2,g3 · create_link t1,t2 · set_link_friend ·
-       put_claim with states Fulfilled/Pending via the claim fixtures used elsewhere in this file */
-    // assert names, order (unwrapped_at asc), and that gift_note/thank_note ride from the LINK
+fn test_friend(id: &str, name: &str, tok2: &str) -> Friend {
+    Friend { id: id.into(), name: name.into(), shelf_token: tok2.repeat(32),
+             created_at: datetime!(2026-09-04 12:00 UTC) }
 }
 ```
 
-(Write the fixture-building bodies fully at implementation time using this file's existing claim/link literals — copy a nearby `Claim {}` literal and set `state`/`created_at` explicitly.)
+```rust
+#[tokio::test]
+async fn shelf_unknown_token_404s_byte_identical_to_revoked() {
+    let Some(store) = store_or_skip("shelf-404").await else { return };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let req = Request::get("/api/s/no-such-shelf").body(Body::empty()).unwrap();
+    let r1 = plain_router(Arc::clone(&store), mock.clone()).oneshot(req).await.unwrap();
+    assert_eq!(r1.status(), StatusCode::NOT_FOUND);
+    let f = test_friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    store.revoke_shelf_token("f1", &f.shelf_token).await.unwrap();
+    let req2 = Request::get(&format!("/api/s/{}", f.shelf_token)).body(Body::empty()).unwrap();
+    let r2 = plain_router(store, mock).oneshot(req2).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::NOT_FOUND);
+    // byte-identical bodies: no oracle
+    assert_eq!(body_json(r1).await, body_json(r2).await);
+}
 
-- [ ] **Step 2: Run to verify failure** — `cargo test -p public-api shelf_` → route missing ⇒ 404 asserts pass trivially? NO: the unknown-token test would false-pass on a missing route. **Add a canary assertion first**: `assert_eq!(r_known.status(), StatusCode::OK)` for a live shelf — that one CANNOT pass without the route. Expected: FAIL.
+#[tokio::test]
+async fn shelf_happy_fulfilled_only_no_cross_friend_bleed() {
+    let Some(store) = store_or_skip("shelf-filter").await else { return };
+    // seed: g1,g2,g3 · f1←t1 (Fulfilled on g1 @2024, Pending on g2) · f2←t2 (Fulfilled on g3)
+    // claims: copy the Claim{} literal shape used by this file's ClaimsHistory tests and set
+    // state/created_at explicitly (states: Fulfilled / Pending).
+    // asserts: status OK (THE CANARY — this line cannot pass without the route existing);
+    //   j["name"] == "sarah"; gifts == exactly [g1]; unwrapped_at asc when a second Fulfilled
+    //   claim @2026 is added to t1; gift_note/thank_note ride from t1's link record.
+}
+```
 
-- [ ] **Step 3: Implement** — route in `router()`: `.route("/api/s/{token}", get(handle_get_shelf))`. Handler: resolve friend (None ⇒ `link_not_found_response()`), `list_links_for_friend`, for each `claims_for_link`, filter `ClaimState::Fulfilled`, collect `game_id`s, ONE `batch_get_games`, build gifts (skip a claim whose game record is missing? NO — that's a partial shelf; treat as 500 per spec), sort by `unwrapped_at`, respond.
+- [ ] **Step 2: Run to verify failure** — `cargo test -p public-api shelf_` — Expected: FAIL, and
+  specifically the happy test's `StatusCode::OK` canary (a missing route trivially satisfies the
+  404 asserts; the OK is the assertion that cannot false-pass). Note: axum route-not-found may
+  render 404 before compile even fails — the compile failure on `create_friend` etc. imports
+  arrives first; both are valid reds.
+
+- [ ] **Step 3: Implement** — route in `router()`: `.route("/api/s/{token}", get(handle_get_shelf))`. Handler: resolve friend (None ⇒ `link_not_found_response()`), `list_links_for_friend`, for each `claims_for_link`, filter `ClaimState::Fulfilled`, collect `game_id`s, ONE `batch_get_games`, build gifts (skip a claim whose game record is missing? NO — that's a partial shelf; treat as 500 per spec), sort by `unwrapped_at`, respond. **Every store error INCLUDING a gsi3 query failure ⇒ 500** — during the deploy's index-backfill window the index errors, and a soft-empty here would render the empty state as a lie (see Task 7 deploy order). Honesty note: the partial-failure 500 has no fault-injection rig to test it; it is enforced by construction (every `?`/match arm maps to the 500) and read in review, not asserted by a test — say so in the PR body rather than writing a fake test.
 
 - [ ] **Step 4: Run to verify pass** — `cargo test -p public-api shelf_` (or CI mode; note in commit).
 
@@ -304,11 +325,13 @@ git add crates/public-api && git commit -S -m "🎁 public-api: GET /api/s/{toke
 
 **Interfaces:**
 - Consumes: Task 2 store methods.
-- Produces routes (session-guarded like every admin route):
-  - `POST /api/admin/friends` body `{"name": "sarah"}` → 201 `{id, name, shelf_token, shelf_url_path: "/s/<token>"}`. Validation: name trimmed non-empty, ≤ 64 chars ⇒ else 422 via `unprocessable(..)`. `id` = one uuid-v4 simple; token = `mint_token()`.
-  - `GET /api/admin/friends` → 200 `[{id, name, shelf_token, created_at}]` (shelf_token `""` when revoked).
-  - `PATCH /api/admin/friends/{id}` body `{"name": "..."}` (rename) OR `{"reissue": true}` OR `{"revoke": true}` — exactly one of the three ⇒ else 422. Reissue → 200 with new token; revoke → 200 `{shelf_token: ""}`; unknown id → 404.
-  - `PUT /api/admin/links/{token}/friend` body `{"friend_id": "f1" | null}` → 204; friend must exist when non-null ⇒ else 422 `unknown friend`; unknown link ⇒ 404.
+- Produces routes — **house convention verified: prefix is `/admin/api/...` and mutations are
+  POST** (`/admin/api/links/{token}/note` → `post(handle_set_link_note)` at lib.rs:107; do NOT
+  invent an `/api/admin` namespace or PATCH/PUT verbs):
+  - `POST /admin/api/friends` body `{"name": "sarah"}` → 201 `{id, name, shelf_token, shelf_url_path: "/s/<token>"}`. Validation: name trimmed non-empty, ≤ 64 chars ⇒ else 422 via `unprocessable(..)`. `id` = one uuid-v4 simple; token = `mint_token()`.
+  - `GET /admin/api/friends` → 200 `[{id, name, shelf_token, created_at}]` (shelf_token `""` when revoked).
+  - `POST /admin/api/friends/{id}` body `{"name": "..."}` (rename) OR `{"reissue": true}` OR `{"revoke": true}` — exactly one of the three ⇒ else 422. Reissue → 200 with new token; revoke → 200 `{shelf_token: ""}`; unknown id → 404.
+  - `POST /admin/api/links/{token}/friend` body `{"friend_id": "f1" | null}` → 204; friend must exist when non-null ⇒ else 422 `unknown friend`; unknown link ⇒ 404.
 - Produces: `fn mint_token() -> String` — the double-uuid idiom extracted; the two existing inline sites (:240, :707 region) now call it. Behavior-identical (64 lowercase hex).
 
 - [ ] **Step 1: Write failing tests** — follow `api_test.rs` house patterns (session fixture, json posts): create→list→rename→reissue (old token 404s on public side is Task 3's proof; here assert the returned token CHANGED and list reflects it)→revoke (list shows `""`)→422s (empty name, both-ops PATCH, unknown friend on link assign).
@@ -355,7 +378,7 @@ git commit -S -m "🎁 web: the shelf itself — /s/:token, oldest-first keepsak
 
 **Interfaces:** consumes Task 4 routes verbatim.
 
-- [ ] **Step 1: Failing tests** — Friends panel: list renders, create flow posts and shows copyable `/s/<token>` URL, reissue confirms (`the old link stops working — hand them the new one`) and updates, revoke shows `no shelf link`; Links: picker present on create, row shows friend name, reassign fires `PUT .../friend` and warns in-voice (`this moves its gifts to the other shelf`).
+- [ ] **Step 1: Failing tests** — Friends panel: list renders, create flow posts and shows copyable `/s/<token>` URL, reissue confirms (`the old link stops working — hand them the new one`) and updates, revoke shows `no shelf link`; Links: picker present on create, row shows friend name, reassign fires `POST /admin/api/links/{token}/friend` and warns in-voice (`this moves its gifts to the other shelf`).
 - [ ] **Step 2: Verify failure** — vitest, module/route missing.
 - [ ] **Step 3: Implement** — workbench register (it's a tool, warm but compact); ctx allowlist note: `/admin/friends` is `[a-z]+` ⇒ already allowed by `ctx_is_allowed` (verified — one lowercase segment).
 - [ ] **Step 4: Verify pass** — full `npx vitest run`.
@@ -380,7 +403,16 @@ git add web/src/admin web/src/App.tsx && git commit -S -m "🎁 web/admin: frien
 git add terraform/aws-dynamodb.tf && git commit -S -m "🎁 terraform: sparse gsi3 (links by friend) — in-place GSI add"
 ```
 
-*(Apply happens at deploy, step 11 of the pounce arc, under the #217 runbook: derive the tfvars set, non-zero destroy = STOP.)*
+*(Apply happens at deploy, step 11 of the pounce arc, under the #217 runbook: derive the tfvars
+set, non-zero destroy = STOP.)*
+
+**DEPLOY ORDER IS LOAD-BEARING (OMBB, plan review): a new GSI backfills asynchronously —
+`CREATING` → `ACTIVE` is not instant on a table with real items, and `list_links_for_friend`
+CANNOT SERVE until `ACTIVE`.** Order: ① terraform apply (index only) → ② wait
+`aws dynamodb describe-table --table-name <t> --query 'Table.GlobalSecondaryIndexes[?IndexName==`gsi3`].IndexStatus'`
+= `ACTIVE` → ③ deploy lambda zips. The shelf handler fails LOUD on a gsi3 query error (500,
+Task 3) — the soft failure would be the empty state lying "a shelf waiting for its first story"
+to a friend, on the one page built to prove they were remembered.**
 
 ---
 

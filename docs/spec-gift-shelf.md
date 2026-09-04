@@ -150,6 +150,10 @@ the shelf is where the unwraps go to live.
 
 - New GSI on the existing table = in-place terraform update. **Run the runbook** (#217): derive
   the tfvars variable set, and any non-zero `destroy` on this code-only deploy is STOP.
+- **Index before code, and wait for `ACTIVE`** (OMBB): a new GSI backfills asynchronously; until
+  `ACTIVE`, `list_links_for_friend` cannot serve. Apply terraform → poll IndexStatus → only then
+  ship the lambda zips. The handler fails loud (500) on index errors, never soft-empty — the
+  soft failure would be the empty state lying to a friend.
 - Zero data migration: serde defaults + sparse GSI mean every existing record is already valid.
 
 ## testing
