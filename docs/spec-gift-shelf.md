@@ -79,8 +79,12 @@ the shelf is where the unwraps go to live.
   set → `list_links_for_friend`. Sparse means unassigned links simply don't exist to the shelf —
   backfill is optional per-link, zero migration. **Projection: `ALL`** (the handler needs whole
   links; matches gsi1/gsi2 precedent) — noting that ANY projection carries the table keys, so a
-  gsi3-shaped exposure yields link tokens regardless; that is already true of gsi1/gsi2 and is
-  part of the raw-token posture above, not a new surface this feature creates.
+  gsi3-shaped exposure yields link tokens at every projection level; the projection choice
+  decides whether the NOTES ride beside them, never whether the tokens do (Lilith). **And name
+  the true new shape: gsi3 is a second home for link tokens, organised BY FRIEND** — the base
+  table scatters them, this index answers "every token belonging to this person" in one query.
+  That organisation IS the feature; it is also a fact about exposure, recorded here rather than
+  discovered in an incident.
 - Token minting: same idiom links use — two uuid-v4 concatenated, 64 hex, ≥128 bits (currently
   inlined twice in admin-api at :240/:707; a third site extracts it into a helper all three call).
 

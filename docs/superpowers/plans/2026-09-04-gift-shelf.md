@@ -75,8 +75,9 @@ Add to `crates/domain/src/lib.rs` (doc comments in house voice — say what's au
 pub struct Friend {
     pub id: String,
     pub name: String,
-    /// Empty-string never occurs: revoke REMOVEs the attribute and the struct
-    /// only exists in memory with a live token or via a read that restored one.
+    /// `""` means REVOKED: revoke REMOVEs the top-level attribute and the
+    /// read side restores absence as empty (admin renders "no shelf link").
+    /// A live token is always 64 hex.
     pub shelf_token: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
@@ -89,8 +90,10 @@ On `Link`, next to `gift_note` (same serde shape):
     /// The friend this link was cut for. Authoritative ONLY in a top-level
     /// dynamo attribute (scoped update via `set_link_friend`), stripped from
     /// the stored `body` blob, overridden on read — the `gift_note` pattern,
-    /// and here it is MECHANICALLY REQUIRED: `gsi3pk` derives from this value
-    /// and a GSI key must be a top-level attribute (spec, family review).
+    /// MECHANICALLY REQUIRED here: the claim tx writes `SET body = :b` from a
+    /// pre-transaction read, so a body-only field is silently reverted by the
+    /// friend claiming — while gsi3pk survives, desyncing index from record
+    /// (spec, family review; enforced by friend_id_survives_a_claim).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub friend_id: Option<String>,
 ```
