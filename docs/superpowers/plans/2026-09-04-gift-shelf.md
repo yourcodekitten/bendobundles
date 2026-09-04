@@ -137,7 +137,10 @@ git add crates/domain && git commit -S -m "🎁 domain: Friend record + Link.fri
   - `pub async fn list_links_for_friend(&self, friend_id: &str) -> Result<Vec<Link>, StoreError>` — query `gsi3`, `gsi3pk = FRIEND#<id>`, map via `link_from_item`.
 - Produces: `link_from_item` override: `friend_id` from top-level attr (present ⇒ Some, absent ⇒ None — unconditional override like `expires_at`).
 - Produces: `link_item` writes top-level `friend_id` + `gsi3pk` when `l.friend_id` is Some (so create-with-friend indexes without a second write).
-- Produces: `create_table_for_tests` defines `gsi3` (pk-only, `gsi3pk` S attribute, projection ALL — match gsi2's shape).
+- Produces: `create_table_for_tests` defines `gsi3` (pk-only, `gsi3pk` S attribute, projection ALL).
+- Produces: `pub async fn create_table_for_tests_without_gsi3(&self)` — identical minus gsi3.
+  **This is the deploy-window world as a fixture** (a backfilling/absent index ERRORS; the arm
+  below proves the shelf never renders that error as an empty).
 
 - [ ] **Step 1: Fix the type-level strip (compile gate)** — in `schema.rs` `link_body`'s destructure add `friend_id: _` to the stripped set with a comment: `// authoritative top-level only; ALSO a gsi3 key — body copy would desync the index`.
 
@@ -305,7 +308,18 @@ async fn shelf_happy_fulfilled_only_no_cross_friend_bleed() {
   render 404 before compile even fails — the compile failure on `create_friend` etc. imports
   arrives first; both are valid reds.
 
-- [ ] **Step 3: Implement** — route in `router()`: `.route("/api/s/{token}", get(handle_get_shelf))`. Handler: resolve friend (None ⇒ `link_not_found_response()`), `list_links_for_friend`, for each `claims_for_link`, filter `ClaimState::Fulfilled`, collect `game_id`s, ONE `batch_get_games`, build gifts (skip a claim whose game record is missing? NO — that's a partial shelf; treat as 500 per spec), sort by `unwrapped_at`, respond. **Every store error INCLUDING a gsi3 query failure ⇒ 500** — during the deploy's index-backfill window the index errors, and a soft-empty here would render the empty state as a lie (see Task 7 deploy order). Honesty note: the partial-failure 500 has no fault-injection rig to test it; it is enforced by construction (every `?`/match arm maps to the 500) and read in review, not asserted by a test — say so in the PR body rather than writing a fake test.
+- [ ] **Step 3: Implement** — route in `router()`: `.route("/api/s/{token}", get(handle_get_shelf))`. Handler: resolve friend (None ⇒ `link_not_found_response()`), `list_links_for_friend`, for each `claims_for_link`, filter `ClaimState::Fulfilled`, collect `game_id`s, ONE `batch_get_games`, build gifts (skip a claim whose game record is missing? NO — that's a partial shelf; treat as 500 per spec), sort by `unwrapped_at`, respond. **Every store error INCLUDING a gsi3 query failure ⇒ 500** — during the deploy's index-backfill window the index errors, and a soft-empty here would render the empty state as a lie (see Task 7 deploy order). **And this IS testable — the index-less table is the fault injection** (OMBB): add
+
+```rust
+#[tokio::test]
+async fn shelf_500s_when_index_absent_never_renders_empty() {
+    // build a store over create_table_for_tests_without_gsi3 — the deploy-window world
+    // seed friend f1 + link t1 with set_link_friend("t1","f1")
+    // GET /api/s/<f1.token> → assert StatusCode::INTERNAL_SERVER_ERROR
+    // and assert the body is NOT a 200-shaped {name, gifts: []} — a query error must never
+    // collapse into Ok(vec![]) ("fail distinct, not fail soft")
+}
+```
 
 - [ ] **Step 4: Run to verify pass** — `cargo test -p public-api shelf_` (or CI mode; note in commit).
 
