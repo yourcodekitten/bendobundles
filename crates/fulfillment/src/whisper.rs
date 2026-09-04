@@ -476,6 +476,7 @@ mod tests {
             expires_at: None,
             unlock_at: None,
             curated_game_ids: None,
+            friend_id: None,
             created_at: OffsetDateTime::now_utc(),
         }
     }

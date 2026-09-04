@@ -214,6 +214,7 @@ fn test_link(token: &str) -> Link {
         expires_at: None,
         unlock_at: None,
         curated_game_ids: None,
+        friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }

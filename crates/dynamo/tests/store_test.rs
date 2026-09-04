@@ -90,6 +90,7 @@ fn link(token: &str) -> Link {
         expires_at: None,
         unlock_at: None,
         curated_game_ids: None,
+        friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }
@@ -1521,6 +1522,7 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
         expires_at: Some(datetime!(2020-01-01 00:00 UTC)),
         unlock_at: None,
         curated_game_ids: None,
+        friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     };
     // Top-level attrs are the AUTHORITATIVE truth: allowed=5, used=2, revoked=false, no expiry.

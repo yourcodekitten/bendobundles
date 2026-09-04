@@ -746,6 +746,7 @@ async fn handle_create_link(
         expires_at,
         unlock_at,
         curated_game_ids: body.game_ids.clone(),
+        friend_id: None,
         created_at: now,
     };
 
