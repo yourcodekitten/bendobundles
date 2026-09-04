@@ -1,5 +1,5 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
-import { LINK_ROUTE_PATTERN } from './inviteUrl';
+import { LINK_ROUTE_PATTERN, SHELF_ROUTE_PATTERN } from './inviteUrl';
 import { Landing } from './friend/Landing';
 import { LinkPage } from './friend/LinkPage';
 import { ShelfPage } from './friend/ShelfPage';
@@ -16,7 +16,7 @@ function App() {
         {/* Friend surface */}
         <Route path="/" element={<Landing />} />
         <Route path={LINK_ROUTE_PATTERN} element={<LinkPage />} />
-        <Route path="/s/:token" element={<ShelfPage />} />
+        <Route path={SHELF_ROUTE_PATTERN} element={<ShelfPage />} />
 
         {/* Admin surface */}
         <Route path="/admin/login" element={<Login />} />

@@ -10,3 +10,17 @@ export function inviteUrlPath(token: string): string {
 export function inviteUrl(token: string): string {
   return `${window.location.origin}${inviteUrlPath(token)}`;
 }
+
+// Single source of truth for the friend-facing shelf URL convention (the
+// gift shelf, /s/{shelf_token}) — same shape as the invite-link convention
+// above, one file so the route pattern and every rendered shelf URL can
+// never drift apart.
+export const SHELF_ROUTE_PATTERN = '/s/:token';
+
+export function shelfUrlPath(token: string): string {
+  return `/s/${token}`;
+}
+
+export function shelfUrl(token: string): string {
+  return `${window.location.origin}${shelfUrlPath(token)}`;
+}
