@@ -1,11 +1,15 @@
 //! Key builders + item (de)serialization. The item shapes here are the storage contract.
 use aws_sdk_dynamodb::types::AttributeValue;
-use domain::{Claim, ClaimState, Game, Link};
+use domain::{Claim, ClaimState, Friend, Game, Link};
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
 pub const GSI_LISTABLE: &str = "listable";
 pub const GSI_PENDING: &str = "pending-claims";
+/// Sparse gsi3: pk-only (`gsi3pk`, no sort key), hit only by links that carry a
+/// `friend_id` (`set_link_friend` / `link_item` are the only writers of `gsi3pk`).
+/// `Store::list_links_for_friend` is the one reader.
+pub const GSI_FRIEND_LINKS: &str = "friend-links";
 
 pub fn game_pk(id: &str) -> String {
     format!("GAME#{id}")
@@ -15,6 +19,20 @@ pub fn link_pk(token: &str) -> String {
 }
 pub fn claim_sk(claim_id: &str) -> String {
     format!("CLAIM#{claim_id}")
+}
+/// pk for a friend's own record: `FRIEND#<id>`. Also the exact `gsi3pk` value
+/// `set_link_friend`/`link_item` stamp on an assigned link — `list_links_for_friend`
+/// queries gsi3 for this same string, so a link's gsi3pk is literally a friend pk.
+pub fn friend_pk(id: &str) -> String {
+    format!("FRIEND#{id}")
+}
+/// pk for a shelf token's pointer record: `SHELF#<token>`. The pointer is the ONLY
+/// path from a bearer token to a friend id — `get_friend_by_shelf_token` reads it
+/// first, then resolves the friend by id. `create_friend`/`reissue_shelf_token`/
+/// `revoke_shelf_token` are its only writers, always inside a transaction with the
+/// friend record so a token and `Friend.shelf_token` can never drift apart.
+pub fn shelf_pk(token: &str) -> String {
+    format!("SHELF#{token}")
 }
 
 pub(crate) fn s(v: impl Into<String>) -> AttributeValue {
@@ -116,6 +134,8 @@ pub fn link_body(l: &Link) -> String {
         // deserialize drops the unknown field and its SET body write-back
         // erases it. Top-level is structurally out of that blast radius.
         curated_game_ids: _,
+        // authoritative top-level only; ALSO a gsi3 key — body copy would desync the index
+        friend_id: _,
         created_at,
     } = l;
     let stripped = Link {
@@ -130,6 +150,7 @@ pub fn link_body(l: &Link) -> String {
         expires_at: *expires_at,
         unlock_at: None,
         curated_game_ids: None,
+        friend_id: None,
         created_at: *created_at,
     };
     serde_json::to_string(&stripped).expect("link serializes")
@@ -190,6 +211,14 @@ pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
             "curated_game_ids".into(),
             AttributeValue::L(ids.iter().map(s).collect()),
         );
+    }
+    // friend_id + gsi3pk move together, ALWAYS (Store::set_link_friend's post-creation
+    // contract) — this is create-time's half of the same rule, so a link cut with a
+    // friend already assigned indexes on gsi3 without a second write. Omitted when
+    // None: gsi3 is sparse, and `link_from_item` treats absence as no-friend.
+    if let Some(fid) = &l.friend_id {
+        item.insert("friend_id".into(), s(fid));
+        item.insert("gsi3pk".into(), s(friend_pk(fid)));
     }
     item
 }
@@ -283,6 +312,50 @@ pub fn oidc_state_item(
         ("ctx".into(), s(ctx.to_string())),
         ("expires_epoch".into(), AttributeValue::N(epoch_str.clone())),
         ("ttl".into(), AttributeValue::N(epoch_str)),
+    ])
+}
+
+/// Build the full item for a friend record: `pk = FRIEND#<id>`, `sk = "META"`, PLUS
+/// `gsi1pk = "FRIEND"` / `gsi1sk = <name>` (the LISTABLE membership pattern reused with
+/// a different pk value, so `list_friends` gets an ordered-by-name list for free off the
+/// same index `game_item` already uses).
+///
+/// **Deliberately NO `body` attribute.** Every other item in this file carries a JSON
+/// blob for exactly this reason: so a struct can gain fields without a migration. A
+/// friend record is FOUR scalars total (id — carried by `pk`, stripped back out on read
+/// — name, shelf_token, created_at); a body blob here would recreate the exact
+/// top-level/body drift the `gift_note`/`friend_id` pattern exists to fight, for zero
+/// benefit (there is nothing left for a blob to carry). `friend_from_item` reads the
+/// three named attributes (plus `pk`) directly — no `parse_body` in this path.
+pub fn friend_item(f: &Friend) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        ("pk".into(), s(friend_pk(&f.id))),
+        ("sk".into(), s("META")),
+        ("name".into(), s(f.name.clone())),
+        ("shelf_token".into(), s(f.shelf_token.clone())),
+        (
+            "created_at".into(),
+            s(f.created_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339")),
+        ),
+        ("gsi1pk".into(), s("FRIEND")),
+        ("gsi1sk".into(), s(f.name.clone())),
+    ])
+}
+
+/// Build the item for a shelf-token pointer: `pk = SHELF#<token>`, `sk = "META"`,
+/// `friend_id` (S). The only path from a bearer token to a friend id —
+/// `Store::get_friend_by_shelf_token` reads this first, then resolves the friend by id.
+/// `create_friend` (initial), `reissue_shelf_token` (delete old + put new), and
+/// `revoke_shelf_token` (delete only) are its only writers, always transactionally
+/// paired with the friend record's own `shelf_token` attribute so the two can never
+/// drift: no pointer ever survives without a friend whose `shelf_token` matches it.
+pub fn shelf_pointer_item(token: &str, friend_id: &str) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        ("pk".into(), s(shelf_pk(token))),
+        ("sk".into(), s("META")),
+        ("friend_id".into(), s(friend_id)),
     ])
 }
 
