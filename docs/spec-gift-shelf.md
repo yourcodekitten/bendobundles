@@ -40,6 +40,9 @@ the shelf is where the unwraps go to live.
   haven't opened this yet" row is pressure, and pressure is shop grammar. (Family may overrule.)
 - **No wishes/requests, no whisper integration, no ben-facing scrapbook view** — each is a future
   spec if it earns one. v1 is the friend's shelf, read-only.
+- **No friend deletion in v1.** Revoke the shelf token and the page is gone; deleting the
+  record would dangle `friend_id`s on links for no user-visible gain. If real deletion is ever
+  wanted it arrives with its own cleanup design.
 - **No pagination.** One friend's claimed gifts across 15 years is dozens, not thousands; a single
   query page bounded far under the 1MB item cap. Stated so the future knows it was considered.
 
@@ -61,19 +64,29 @@ the shelf is where the unwraps go to live.
 - **Sparse GSI** (`gsi3pk = FRIEND#<friend_id>`) on LINK items, present only when `friend_id` is
   set → `list_links_for_friend`. Sparse means unassigned links simply don't exist to the shelf —
   backfill is optional per-link, zero migration.
-- Token minting reuses the link-token generator (same alphabet/entropy class).
+- Token minting: same idiom links use — two uuid-v4 concatenated, 64 hex, ≥128 bits (currently
+  inlined twice in admin-api at :240/:707; a third site extracts it into a helper all three call).
 
 **public-api**:
 - `GET /api/s/{token}` → `404` unknown/revoked · `200 {name, gifts: [...]}` where gifts =
-  friend's links (gsi3) → their claims in a success state → game + art via the same detail path
-  `handle_game_detail` uses. Each gift: `{title, artwork_url, given_at (claim.created_at),
+  friend's links (gsi3) → `claims_for_link` each → **`ClaimState::Fulfilled` only** (`Pending`
+  isn't a gift yet; `Failed` never was; `Compensated` is a gift that was *taken back* by
+  reconcile — rendering it would be a lie) → game + art. **`handle_game_detail` is link-scoped
+  (resolves a link from its path token first — verified lib.rs:1316) and cannot be reused as a
+  route; the detail-assembly under it (game record + steam cache join) gets extracted into a
+  helper both handlers call.** Each gift: `{title, artwork_url, given_at (claim.created_at),
   gift_note, thank_note, detail…}`. Read-only; thank-yous continue to live on link pages.
+- **Partial failure is whole failure**: if any sub-fetch (links, claims, games, cache) errors,
+  the response is a 500 in the brand's soft voice — a silently incomplete shelf reads as "ben
+  gave me less than he did," which is worse than an error.
 
 **admin-api**:
 - `POST /api/admin/friends` (create, mints token) · `GET /api/admin/friends` (list) ·
   `PATCH /api/admin/friends/{id}` (rename · reissue token) — input validation per the
   create-link 422 conventions.
 - `set_link_friend` wired to the existing link-edit surface (assign/reassign/clear).
+  **Reassigning a link moves its whole gift history between shelves — deliberately** (it exists
+  to fix mis-assignment); the old shelf visibly shrinks. Admin copy says so at reassign time.
 
 **web**:
 - Friend surface: `/s/{token}` → `ShelfPage` — new composition, inheriting the attic aesthetic
@@ -96,6 +109,11 @@ the shelf is where the unwraps go to live.
   ("first names are plenty").
 
 ## deploy notes
+
+- **`/s/{token}` needs zero CloudFront change — verified**: `spa_rewrite` rewrites every
+  extensionless URI to `/index.html` (aws-cloudfront.tf:13), so the new route is client-side
+  only. Steam art on the shelf is already within the CSP (`img-src *.steamstatic.com`, #81).
+  The steam-login `ctx` allowlist stays untouched: no steam flow exists on shelves.
 
 - New GSI on the existing table = in-place terraform update. **Run the runbook** (#217): derive
   the tfvars variable set, and any non-zero `destroy` on this code-only deploy is STOP.
