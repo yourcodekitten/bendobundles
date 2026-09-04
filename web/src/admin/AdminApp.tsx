@@ -65,6 +65,9 @@ export function AdminApp() {
         <NavLink to="/admin/links" className={navLinkClass}>
           links
         </NavLink>
+        <NavLink to="/admin/friends" className={navLinkClass}>
+          friends
+        </NavLink>
         <NavLink to="/admin/ops" className={navLinkClass}>
           ops
         </NavLink>

@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dynamo::{ClaimTxError, OwnedProxyOutcome, Store};
+use dynamo::{ClaimTxError, OwnedProxyOutcome, Store, StoreError};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -196,6 +196,25 @@ struct LinkView {
     unlocks_at: Option<String>,
 }
 
+/// One unwrapped gift on a friend's shelf — only `title` + `artwork_url` from
+/// `Game` (v1 does not touch the steam cache; see `assemble_shelf`).
+#[derive(Serialize)]
+struct ShelfGift {
+    game_id: String,
+    title: String,
+    artwork_url: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    unwrapped_at: OffsetDateTime,
+    gift_note: Option<String>,
+    thank_note: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ShelfResponse {
+    name: String,
+    gifts: Vec<ShelfGift>,
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 /// Build the axum router. `store` is `Arc<Store>` so callers can share one store
@@ -223,6 +242,7 @@ pub fn router(
         .route("/api/l/{token}/games/{id}/detail", get(handle_game_detail))
         .route("/api/steam/login", get(handle_steam_login))
         .route("/api/steam/return", get(handle_steam_return))
+        .route("/api/s/{token}", get(handle_get_shelf))
         .with_state(state)
         .fallback(handle_not_found)
 }
@@ -1407,6 +1427,99 @@ async fn handle_game_detail(
         })),
     )
         .into_response()
+}
+
+// ── GET /api/s/{token} — the gift shelf ─────────────────────────────────────────
+
+/// Resolve a bearer shelf token to its friend's shelf. Unknown AND revoked tokens
+/// share the byte-identical 404 (no oracle) via `link_not_found_response()`. Any
+/// store error anywhere — INCLUDING a gsi3 query error during the deploy backfill
+/// window — surfaces as 500; a partial or soft-empty shelf would be a lie.
+async fn handle_get_shelf(State(s): State<AppState>, Path(token): Path<String>) -> Response {
+    let friend = match s.store.get_friend_by_shelf_token(&token).await {
+        Ok(Some(f)) => f,
+        Ok(None) => return link_not_found_response(),
+        Err(_) => return shelf_error_response(),
+    };
+    match assemble_shelf(&s.store, friend).await {
+        Ok(shelf) => (StatusCode::OK, Json(shelf)).into_response(),
+        Err(_) => shelf_error_response(),
+    }
+}
+
+fn shelf_error_response() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "the shelf slipped — try again"})),
+    )
+        .into_response()
+}
+
+/// Build a friend's shelf: every Fulfilled claim across every link currently
+/// assigned to them (Pending isn't a gift yet, Failed never was, Compensated was
+/// taken back), oldest-unwrapped-first. No detail-assembly extraction in v1 — the
+/// shelf needs only `title` + `artwork_url` off `Game`, never the steam cache.
+///
+/// Every fallible step propagates with `?`: a gsi3 query error (deploy window), a
+/// claims-query error, or a batch-get error all become the caller's 500, never an
+/// `Ok(vec![])`. A claim whose game record went missing is `StoreError::Corrupt` —
+/// a partial shelf is a lie, not a skipped row.
+async fn assemble_shelf(
+    store: &Store,
+    friend: domain::Friend,
+) -> Result<ShelfResponse, StoreError> {
+    // Friend-scoped by construction: `list_links_for_friend` queries gsi3 for
+    // exactly this friend's links, so another friend's claims can never bleed in.
+    // A gsi3 query error (deploy-window fault injection) propagates via `?` — no
+    // `unwrap_or_default`, no `Ok(vec![])`.
+    let links = store.list_links_for_friend(&friend.id).await?;
+
+    // (claim, gift_note, thank_note) for every Fulfilled claim across those links —
+    // Pending isn't a gift yet, Failed never was, Compensated was taken back.
+    let mut fulfilled: Vec<(domain::Claim, Option<String>, Option<String>)> = Vec::new();
+    for link in &links {
+        let claims = store.claims_for_link(&link.token).await?;
+        for c in claims {
+            if c.state == domain::ClaimState::Fulfilled {
+                fulfilled.push((c, link.gift_note.clone(), link.thank_note.clone()));
+            }
+        }
+    }
+
+    // ONE batch_get_games call for every game on the shelf — never N serial gets.
+    // Deduped through a BTreeSet: DynamoDB BatchGetItem rejects duplicate keys, and the
+    // shelf must not depend on the distant one-Fulfilled-claim-per-game invariant to
+    // avoid them (results come back mapped by id, so input order carries no meaning).
+    let game_ids: Vec<String> = fulfilled
+        .iter()
+        .map(|(c, _, _)| c.game_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let games = store.batch_get_games(&game_ids).await?;
+
+    let mut gifts = Vec::with_capacity(fulfilled.len());
+    for (c, gift_note, thank_note) in fulfilled {
+        // A claim whose game record is missing is corruption, not an empty slot —
+        // a partial shelf would be a lie, so this is an error, not a skipped row.
+        let game = games.get(&c.game_id).ok_or(StoreError::Corrupt(
+            "shelf: fulfilled claim references a game record that no longer exists",
+        ))?;
+        gifts.push(ShelfGift {
+            game_id: c.game_id,
+            title: game.title.clone(),
+            artwork_url: game.artwork_url.clone(),
+            unwrapped_at: c.created_at,
+            gift_note,
+            thank_note,
+        });
+    }
+    gifts.sort_by_key(|g| g.unwrapped_at);
+
+    Ok(ShelfResponse {
+        name: friend.name,
+        gifts,
+    })
 }
 
 #[cfg(test)]

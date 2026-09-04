@@ -44,6 +44,23 @@ export type LinkView = {
   curated?: boolean;
 };
 
+export type ShelfGiftView = {
+  game_id: string;
+  title: string;
+  artwork_url: string | null;
+  /** rfc3339 — the friend's unwrap moment (claim.created_at), not when ben chose it. */
+  unwrapped_at: string;
+  gift_note: string | null;
+  thank_note: string | null;
+};
+
+export type ShelfView = {
+  name: string;
+  /** Oldest-first, as the server sorts (public-api's assemble_shelf) — the
+   * page never re-sorts; scroll IS the timeline. */
+  gifts: ShelfGiftView[];
+};
+
 export type ThanksResult =
   | { kind: 'sent'; thank_note: string }
   | { kind: 'refused'; message: string }
@@ -138,6 +155,18 @@ export type AdminLink = {
   created_at: string;
   /** ben's pick order; absent = open shelf. */
   curated_game_ids?: string[];
+  /** The friend this link is assigned to; absent = unassigned (rides the
+   * read-override — same shape as domain::Link.friend_id, skip-on-None). */
+  friend_id?: string;
+};
+
+// Admin view of a friend — `domain::Friend` serializes directly to this shape
+// (no view struct on the server); `shelf_token: ""` means revoked.
+export type AdminFriend = {
+  id: string;
+  name: string;
+  shelf_token: string;
+  created_at: string;
 };
 
 export type StatusView = {
@@ -200,6 +229,31 @@ export async function fetchLink(token: string): Promise<LinkView> {
 
   try {
     return (await response.json()) as LinkView;
+  } catch {
+    throw new FetchFailed();
+  }
+}
+
+// The gift shelf — a friend's persistent, read-only keepsake page (/s/{token}).
+// Same 404-is-oracle-proof / 500-is-transient contract as fetchLink above.
+export async function fetchShelf(token: string): Promise<ShelfView> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/s/${token}`);
+  } catch {
+    throw new FetchFailed();
+  }
+
+  if (response.status === 404) {
+    throw new NotFound();
+  }
+
+  if (response.status !== 200) {
+    throw new FetchFailed();
+  }
+
+  try {
+    return (await response.json()) as ShelfView;
   } catch {
     throw new FetchFailed();
   }
@@ -498,6 +552,96 @@ export async function adminLinkClaims(token: string): Promise<AdminClaimView[]> 
   const response = await fetch(`/admin/api/links/${token}/claims`);
   await checkOk(response, 'claims');
   return (await response.json()) as AdminClaimView[];
+}
+
+/** Assign (id) or clear (null) a link's owning friend. A 422 means the friend id
+ * doesn't resolve (unprocessable body, per admin-api's validate-before-touch shape) —
+ * surfaced via CreateLinkValidationError like the other 422-capable endpoints above. */
+export async function adminSetLinkFriend(
+  token: string,
+  friendId: string | null,
+): Promise<void> {
+  const response = await fetch(`/admin/api/links/${token}/friend`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
+    body: JSON.stringify({ friend_id: friendId }),
+  });
+  await checkUnauthorized(response);
+  if (!response.ok) {
+    await throwIfValidation422(response, 'unknown friend');
+    throw new Error("couldn't assign the friend — the link is unchanged");
+  }
+}
+
+export async function adminFriends(): Promise<AdminFriend[]> {
+  const response = await fetch('/admin/api/friends');
+  await checkOk(response, 'friends');
+  return (await response.json()) as AdminFriend[];
+}
+
+/** Create a friend + mint their first shelf token in one shot. Mirrors
+ * adminCreateLink's shape-validation: a 200 whose body isn't the friend
+ * contract must throw, never resolve a URL built from `undefined`. */
+export async function adminCreateFriend(
+  name: string,
+): Promise<{ id: string; name: string; shelf_token: string; shelf_url_path: string }> {
+  const response = await fetch('/admin/api/friends', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
+    body: JSON.stringify({ name }),
+  });
+
+  await checkUnauthorized(response);
+
+  if (!response.ok) {
+    await throwIfValidation422(response, 'invalid friend name');
+    throw new Error('failed to create friend');
+  }
+
+  const data = await response.json();
+  if (
+    typeof data?.id !== 'string' ||
+    typeof data?.name !== 'string' ||
+    typeof data?.shelf_token !== 'string' ||
+    typeof data?.shelf_url_path !== 'string'
+  ) {
+    throw new Error('create friend returned an unexpected response shape');
+  }
+  return data;
+}
+
+/** Reissue a friend's shelf token — the old link stops working, the returned
+ * one is what to hand them next. */
+export async function adminReissueFriendToken(
+  id: string,
+): Promise<{ shelf_token: string; shelf_url_path: string }> {
+  const response = await fetch(`/admin/api/friends/${id}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
+    body: JSON.stringify({ reissue: true }),
+  });
+  await checkUnauthorized(response);
+  if (!response.ok) {
+    throw new Error("couldn't reissue the shelf link — try again");
+  }
+  const data = await response.json();
+  if (typeof data?.shelf_token !== 'string' || typeof data?.shelf_url_path !== 'string') {
+    throw new Error('reissue returned an unexpected response shape');
+  }
+  return data;
+}
+
+/** Revoke a friend's shelf token — their page goes dead until reissued. */
+export async function adminRevokeFriendToken(id: string): Promise<void> {
+  const response = await fetch(`/admin/api/friends/${id}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
+    body: JSON.stringify({ revoke: true }),
+  });
+  await checkUnauthorized(response);
+  if (!response.ok) {
+    throw new Error("couldn't revoke the shelf link — it may still be live");
+  }
 }
 
 // Sync-now is fire-and-forget: the server returns 202 the moment the backfill

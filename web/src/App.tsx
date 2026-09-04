@@ -1,11 +1,13 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
-import { LINK_ROUTE_PATTERN } from './inviteUrl';
+import { LINK_ROUTE_PATTERN, SHELF_ROUTE_PATTERN } from './inviteUrl';
 import { Landing } from './friend/Landing';
 import { LinkPage } from './friend/LinkPage';
+import { ShelfPage } from './friend/ShelfPage';
 import { AdminApp } from './admin/AdminApp';
 import { Login } from './admin/Login';
 import { Catalog } from './admin/Catalog';
 import { Links } from './admin/Links';
+import { Friends } from './admin/Friends';
 import { Ops } from './admin/Ops';
 
 function App() {
@@ -15,6 +17,7 @@ function App() {
         {/* Friend surface */}
         <Route path="/" element={<Landing />} />
         <Route path={LINK_ROUTE_PATTERN} element={<LinkPage />} />
+        <Route path={SHELF_ROUTE_PATTERN} element={<ShelfPage />} />
 
         {/* Admin surface */}
         <Route path="/admin/login" element={<Login />} />
@@ -22,6 +25,7 @@ function App() {
           <Route index element={<Navigate to="catalog" replace />} />
           <Route path="catalog" element={<Catalog />} />
           <Route path="links" element={<Links />} />
+          <Route path="friends" element={<Friends />} />
           <Route path="ops" element={<Ops />} />
         </Route>
 

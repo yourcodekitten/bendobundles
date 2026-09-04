@@ -1,6 +1,7 @@
 use aws_sdk_dynamodb::types::AttributeValue;
 use domain::{
-    AppidSource, Claim, ClaimState, Game, GameStatus, HiddenSource, Link, SELF_LINK_TOKEN, game_id,
+    AppidSource, Claim, ClaimState, Friend, Game, GameStatus, HiddenSource, Link, SELF_LINK_TOKEN,
+    game_id,
 };
 use dynamo::{
     AppidWrite, AutoHideWrite, BellCounter, ClaimTxError, GuardedWrite, HiddenWrite, OwnedWrite,
@@ -90,7 +91,17 @@ fn link(token: &str) -> Link {
         expires_at: None,
         unlock_at: None,
         curated_game_ids: None,
+        friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
+    }
+}
+
+fn friend(id: &str, name: &str, tok2: &str) -> Friend {
+    Friend {
+        id: id.into(),
+        name: name.into(),
+        shelf_token: tok2.repeat(32),
+        created_at: time::macros::datetime!(2026-09-04 12:00 UTC),
     }
 }
 
@@ -1521,6 +1532,7 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
         expires_at: Some(datetime!(2020-01-01 00:00 UTC)),
         unlock_at: None,
         curated_game_ids: None,
+        friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     };
     // Top-level attrs are the AUTHORITATIVE truth: allowed=5, used=2, revoked=false, no expiry.
@@ -3970,4 +3982,195 @@ async fn whisper_mark_delivered_flips_exactly_that_slot() {
     all.sort_by(|a, b| a.slot.cmp(&b.slot));
     assert!(all[0].delivered);
     assert!(!all[1].delivered);
+}
+
+// ── gift shelf: friends + shelf tokens (2026-09-04) ──────────────────────────────────────────
+// Friend item = FOUR top-level scalars only (id via pk, name, shelf_token, created_at) + gsi1
+// membership. No body blob — four scalars can't drift, which is the whole point.
+
+#[tokio::test]
+async fn friend_create_resolve_and_list() {
+    let Some(store) = store_or_skip("friend_create").await else {
+        return;
+    };
+    let f = friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    let got = store
+        .get_friend_by_shelf_token(&f.shelf_token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.id, "f1");
+    assert_eq!(store.list_friends().await.unwrap().len(), 1);
+    assert!(
+        store
+            .get_friend_by_shelf_token(&"ff".repeat(32))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn reissue_kills_old_token_atomically() {
+    let Some(store) = store_or_skip("friend_reissue").await else {
+        return;
+    };
+    let f = friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    let new_tok = "bb".repeat(32);
+    store
+        .reissue_shelf_token("f1", &f.shelf_token, &new_tok)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_friend_by_shelf_token(&f.shelf_token)
+            .await
+            .unwrap()
+            .is_none(),
+        "old token must die"
+    );
+    let got = store
+        .get_friend_by_shelf_token(&new_tok)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        got.shelf_token, new_tok,
+        "friend record carries the new token"
+    );
+}
+
+#[tokio::test]
+async fn revoke_leaves_no_capability_at_rest() {
+    let Some(store) = store_or_skip("friend_revoke").await else {
+        return;
+    };
+    let f = friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    store
+        .revoke_shelf_token("f1", &f.shelf_token)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_friend_by_shelf_token(&f.shelf_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let raw = store.get_friend("f1").await.unwrap().unwrap();
+    assert_eq!(
+        raw.shelf_token, "",
+        "revoked friend must not retain the token"
+    );
+}
+
+/// The revoke→reissue lifecycle must be a road, not a dead-end: a revoked friend
+/// (shelf_token REMOVE'd, read back as `""`) can be handed a fresh token, and
+/// revoking twice is an idempotent success — neither sequence may surface the
+/// old delete-the-pointer transaction's `attribute_exists` cancellation as an
+/// error (review pass 2: both paths 500'd forever, since `""` keys the pointer
+/// delete at the literal pk `SHELF#`).
+#[tokio::test]
+async fn revoke_then_reissue_recovers_and_double_revoke_is_a_no_op() {
+    let Some(store) = store_or_skip("friend_revoke_reissue").await else {
+        return;
+    };
+    let f = friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    store
+        .revoke_shelf_token("f1", &f.shelf_token)
+        .await
+        .unwrap();
+
+    // double revoke: the friend's token is now "" — must be an idempotent Ok, not
+    // a cancelled transaction
+    store.revoke_shelf_token("f1", "").await.unwrap();
+
+    // reissue on the revoked friend: a fresh pointer goes live
+    let new_tok = "bb".repeat(32);
+    store.reissue_shelf_token("f1", "", &new_tok).await.unwrap();
+    let got = store
+        .get_friend_by_shelf_token(&new_tok)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.id, "f1");
+    assert_eq!(
+        got.shelf_token, new_tok,
+        "friend record carries the reissued token"
+    );
+    // the pre-revoke token stays dead — no resurrected pointer
+    assert!(
+        store
+            .get_friend_by_shelf_token(&f.shelf_token)
+            .await
+            .unwrap()
+            .is_none(),
+        "old token must stay dead across revoke→reissue"
+    );
+}
+
+#[tokio::test]
+async fn set_link_friend_moves_index_and_survives_round_trip() {
+    let Some(store) = store_or_skip("link_friend").await else {
+        return;
+    };
+    let l = link("t1"); // the store_test.rs `link()` fixture — Task 1 already added `friend_id: None`
+    store.create_link(&l).await.unwrap();
+    assert!(store.set_link_friend("t1", Some("f1")).await.unwrap());
+    let got = store.get_link("t1").await.unwrap().unwrap();
+    assert_eq!(got.friend_id.as_deref(), Some("f1"), "read override");
+    assert_eq!(
+        store.list_links_for_friend("f1").await.unwrap().len(),
+        1,
+        "sparse gsi hit"
+    );
+    assert!(store.set_link_friend("t1", None).await.unwrap());
+    assert!(
+        store.list_links_for_friend("f1").await.unwrap().is_empty(),
+        "unassign leaves the index"
+    );
+    assert!(
+        !store.set_link_friend("missing", Some("f1")).await.unwrap(),
+        "no upsert-from-nothing"
+    );
+}
+
+/// `friend_id` must survive `claim_game`'s `SET body` — the same war
+/// `gift_note_survives_claim_body_rewrite` (:236) fought for the note. A body-only
+/// `friend_id` is reverted by the friend claiming; a top-level attr + gsi3pk is not.
+#[tokio::test]
+async fn friend_id_survives_a_claim() {
+    let Some(store) = store_or_skip("friend-survives-claim").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    store
+        .create_friend(&friend("f1", "sarah", "aa"))
+        .await
+        .unwrap();
+    store.create_link(&link("tok-fr")).await.unwrap();
+    assert!(store.set_link_friend("tok-fr", Some("f1")).await.unwrap());
+
+    let now = datetime!(2026-07-02 12:00 UTC);
+    store
+        .claim_game("tok-fr", &game_id("gk1", "mn"), "c1", now)
+        .await
+        .unwrap();
+
+    let after = store.get_link("tok-fr").await.unwrap().unwrap();
+    assert_eq!(after.claims_used, 1, "sanity: the claim landed");
+    assert_eq!(
+        after.friend_id.as_deref(),
+        Some("f1"),
+        "claim's SET body must not disturb the top-level friend_id"
+    );
+    assert_eq!(
+        store.list_links_for_friend("f1").await.unwrap().len(),
+        1,
+        "and gsi3 still resolves the link to the friend"
+    );
 }

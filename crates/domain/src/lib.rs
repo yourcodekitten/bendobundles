@@ -164,6 +164,21 @@ pub struct Game {
     pub hidden_source: Option<HiddenSource>,
 }
 
+/// A friend — the person behind a shelf. The whole identity system: no auth,
+/// no email. `shelf_token` is the bearer capability for `/s/{token}`; it is
+/// cleared on revoke (no dead capability at rest) and replaced on reissue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Friend {
+    pub id: String,
+    pub name: String,
+    /// `""` means REVOKED: revoke REMOVEs the top-level attribute and the
+    /// read side restores absence as empty (admin renders "no shelf link").
+    /// A live token is always 64 hex.
+    pub shelf_token: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
     pub token: String,
@@ -233,6 +248,15 @@ pub struct Link {
     /// body = :b` write-back on rollback. See the rollback pin in store_test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curated_game_ids: Option<Vec<String>>,
+    /// The friend this link was cut for. Authoritative ONLY in a top-level
+    /// dynamo attribute (scoped update via `set_link_friend`), stripped from
+    /// the stored `body` blob, overridden on read — the `gift_note` pattern,
+    /// MECHANICALLY REQUIRED here: the claim tx writes `SET body = :b` from a
+    /// pre-transaction read, so a body-only field is silently reverted by the
+    /// friend claiming — while gsi3pk survives, desyncing index from record
+    /// (spec, family review; enforced by friend_id_survives_a_claim).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub friend_id: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -545,8 +569,40 @@ mod tests {
             expires_at: None,
             unlock_at: None,
             curated_game_ids: None,
+            friend_id: None,
             created_at: datetime!(2026-07-02 00:00 UTC),
         }
+    }
+
+    #[test]
+    fn friend_serde_round_trips() {
+        let f = Friend {
+            id: "f1".into(),
+            name: "sarah".into(),
+            shelf_token: "ab".repeat(32),
+            created_at: time::macros::datetime!(2026-09-04 12:00 UTC),
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        let back: Friend = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.id, f.id);
+        assert_eq!(back.shelf_token, f.shelf_token);
+        assert_eq!(back.name, f.name);
+        // created_at is the ONLY field with custom serde (rfc3339) — the round-trip is meaningless
+        // without asserting it (M3).
+        assert_eq!(back.created_at, f.created_at);
+    }
+
+    #[test]
+    fn link_friend_id_defaults_none_on_missing() {
+        // A pre-field stored record must deserialize (the zero-migration guarantee).
+        let json = serde_json::to_string(&link()).unwrap(); // `fn link()` — the existing fixture above
+        let stripped: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            stripped.get("friend_id").is_none(),
+            "None must not serialize"
+        );
+        let back: Link = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.friend_id, None);
     }
 
     #[test]

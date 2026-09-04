@@ -75,6 +75,36 @@
         ]
       }
     ],
+    "create_friend": [
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "FRIEND#"
+        ],
+        "attributes": [
+          "created_at",
+          "gsi1pk",
+          "gsi1sk",
+          "name",
+          "pk",
+          "shelf_token",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "SHELF#"
+        ],
+        "attributes": [
+          "friend_id",
+          "pk",
+          "sk"
+        ]
+      }
+    ],
     "create_link": [
       {
         "action": "dynamodb:PutItem",
@@ -250,6 +280,18 @@
         ]
       }
     ],
+    "list_friends": [
+      {
+        "action": "dynamodb:Query",
+        "index": "listable",
+        "leading_keys": [
+          "FRIEND"
+        ],
+        "attributes": [
+          "gsi1pk"
+        ]
+      }
+    ],
     "list_links": [
       {
         "action": "dynamodb:Scan",
@@ -287,6 +329,46 @@
         ]
       }
     ],
+    "reissue_shelf_token": [
+      {
+        "action": "dynamodb:DeleteItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "SHELF#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:PutItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "SHELF#"
+        ],
+        "attributes": [
+          "friend_id",
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "FRIEND#"
+        ],
+        "attributes": [
+          "pk",
+          "shelf_token",
+          "sk"
+        ],
+        "update_attributes": [
+          "shelf_token"
+        ]
+      }
+    ],
     "remove_link_unlock": [
       {
         "action": "dynamodb:UpdateItem",
@@ -300,6 +382,52 @@
         ],
         "update_attributes": [
           "unlock_at"
+        ]
+      }
+    ],
+    "rename_friend": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "FRIEND#"
+        ],
+        "attributes": [
+          "gsi1sk",
+          "name",
+          "pk",
+          "sk"
+        ],
+        "update_attributes": [
+          "gsi1sk",
+          "name"
+        ]
+      }
+    ],
+    "revoke_shelf_token": [
+      {
+        "action": "dynamodb:DeleteItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "SHELF#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:UpdateItem",
+        "via": "TransactWriteItems",
+        "leading_keys": [
+          "FRIEND#"
+        ],
+        "attributes": [
+          "pk",
+          "shelf_token",
+          "sk"
+        ],
+        "update_attributes": [
+          "shelf_token"
         ]
       }
     ],
@@ -371,6 +499,24 @@
           "sk",
           "status",
           "version"
+        ]
+      }
+    ],
+    "set_link_friend": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "LINK#"
+        ],
+        "attributes": [
+          "friend_id",
+          "gsi3pk",
+          "pk",
+          "sk"
+        ],
+        "update_attributes": [
+          "friend_id",
+          "gsi3pk"
         ]
       }
     ],
@@ -1325,6 +1471,28 @@
         ]
       }
     ],
+    "get_friend_by_shelf_token": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "FRIEND#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      },
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "SHELF#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
     "get_game": [
       {
         "action": "dynamodb:GetItem",
@@ -1370,6 +1538,18 @@
         "attributes": [
           "pk",
           "sk"
+        ]
+      }
+    ],
+    "list_links_for_friend": [
+      {
+        "action": "dynamodb:Query",
+        "index": "friend-links",
+        "leading_keys": [
+          "FRIEND#"
+        ],
+        "attributes": [
+          "gsi3pk"
         ]
       }
     ],

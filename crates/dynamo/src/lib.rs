@@ -9,7 +9,7 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, GlobalSecondaryIndex, KeySchemaElement, KeyType, Projection,
     ProjectionType, ScalarAttributeType,
 };
-use domain::{Claim, ClaimState, Game, GameStatus, Link};
+use domain::{Claim, ClaimState, Friend, Game, GameStatus, Link};
 use schema::{
     claim_item, claim_sk, game_item, game_pk, link_item, link_pk, oidc_state_item, oidc_state_pk,
     parse_body, session_item, session_pk, steam_app_item, steam_app_pk, steam_identity_item,
@@ -497,7 +497,62 @@ fn link_from_item(
         ),
         Some(_) => return Err(StoreError::Corrupt("curated_game_ids is not a list")),
     };
+    // The friend assignment follows the full gift_note/curated_game_ids contract:
+    // top-level attribute is the ONLY source (schema::link_body strips it from body),
+    // unconditional override — absence ⇒ None, same as expires_at/gift_note. This is
+    // the read half of the pair `set_link_friend` and `schema::link_item` write
+    // together with `gsi3pk`; a body-only friend_id would be silently reverted by
+    // claim_game's `SET body` from a pre-transaction read (friend_id_survives_a_claim).
+    link.friend_id = item
+        .get("friend_id")
+        .and_then(|v| v.as_s().ok())
+        .map(String::from);
     Ok(link)
+}
+
+/// Deserialize a FRIEND META item. No `body` blob exists (see `schema::friend_item`):
+/// `id` is stripped back out of `pk` (the pk/id mapping is `schema::friend_pk`'s
+/// exact inverse — the only place a friend pk is built), and `name`/`created_at` are
+/// read straight off their top-level attributes. `shelf_token` absent ⇒ `""` ⇒
+/// revoked (`revoke_shelf_token` REMOVEs it; there is no other representation of
+/// "no live shelf link" — see the doc on `Friend::shelf_token`).
+fn friend_from_item(
+    item: &HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Result<Friend, StoreError> {
+    let pk = item
+        .get("pk")
+        .and_then(|v| v.as_s().ok())
+        .ok_or(StoreError::Corrupt("friend item missing pk"))?;
+    let id = pk
+        .strip_prefix("FRIEND#")
+        .ok_or(StoreError::Corrupt("friend pk malformed"))?
+        .to_string();
+    let name = item
+        .get("name")
+        .and_then(|v| v.as_s().ok())
+        .ok_or(StoreError::Corrupt("friend item missing name"))?
+        .clone();
+    // Absent ⇒ "" ⇒ revoked (revoke_shelf_token REMOVEs the attribute entirely).
+    let shelf_token = item
+        .get("shelf_token")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let created_at_raw = item
+        .get("created_at")
+        .and_then(|v| v.as_s().ok())
+        .ok_or(StoreError::Corrupt("friend item missing created_at"))?;
+    let created_at = OffsetDateTime::parse(
+        created_at_raw,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|_| StoreError::Corrupt("friend created_at not rfc3339"))?;
+    Ok(Friend {
+        id,
+        name,
+        shelf_token,
+        created_at,
+    })
 }
 
 /// Map `claim_game`'s three-item transaction cancellation reasons to a `ClaimTxError`.
@@ -1010,6 +1065,364 @@ impl Store {
         // Enforcer fields (claims_used/claims_allowed/revoked/expires_at) come from the
         // authoritative top-level attributes, never the possibly-stale body — see link_from_item.
         out.item.map(|item| link_from_item(&item)).transpose()
+    }
+
+    /// Assign or clear a link's friend — `gift_note`'s scoped single-write shape, moving
+    /// TWO attributes atomically instead of one: `friend_id` (the readable pointer,
+    /// `link_from_item` overrides it on every read) and `gsi3pk` (the sparse-index key
+    /// `list_links_for_friend` queries). **They move together, always** — a friend_id
+    /// with no gsi3pk would be unreachable from the friend's side; a gsi3pk with no
+    /// friend_id would answer a query with a link that reads unassigned. `Some` ⇒ SET
+    /// both (`gsi3pk = FRIEND#<id>`, the exact value `schema::friend_pk` builds and the
+    /// exact string `list_links_for_friend`'s key condition queries for); `None` ⇒
+    /// REMOVE both, restoring gsi3 to sparse (no key = not on the index, not "null on
+    /// the index" — DynamoDB doesn't index missing attributes at all).
+    /// `attribute_exists(pk)` scopes it like every other scoped Link update: Ok(false)
+    /// on an unknown token, never an upsert-from-nothing.
+    pub async fn set_link_friend(
+        &self,
+        token: &str,
+        friend_id: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let (pk, sk) = schema::key_pair(link_pk(token), "META");
+        let req = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .condition_expression("attribute_exists(pk)");
+        let req = match friend_id {
+            Some(fid) => req
+                .update_expression("SET friend_id = :f, gsi3pk = :g")
+                .expression_attribute_values(":f", schema::s(fid))
+                .expression_attribute_values(":g", schema::s(schema::friend_pk(fid))),
+            None => req.update_expression("REMOVE friend_id, gsi3pk"),
+        };
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
+            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error(
+                "update_item",
+                &sdk_err,
+            ))),
+        }
+    }
+
+    /// Query gsi3 for every link currently assigned to a friend. Sparse index: a link
+    /// with no `friend_id` carries no `gsi3pk` at all (see `schema::link_item` /
+    /// `set_link_friend`), so it is structurally absent from this query rather than
+    /// present-with-a-null-key. Same exhaustive-pagination shape as
+    /// `list_listable_games` — a friend's shelf history should never silently
+    /// truncate at a 1 MB page boundary.
+    pub async fn list_links_for_friend(&self, friend_id: &str) -> Result<Vec<Link>, StoreError> {
+        let mut links = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .index_name(schema::GSI_FRIEND_LINKS)
+                .key_condition_expression("gsi3pk = :p")
+                .expression_attribute_values(":p", schema::s(schema::friend_pk(friend_id)))
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await
+                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("query", &e)))?;
+            for item in out.items() {
+                links.push(link_from_item(item)?);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(links)
+    }
+
+    /// Create a friend + their first shelf pointer atomically: put `FRIEND#<id>/META`
+    /// and put `SHELF#<token>/META {friend_id}`, both `attribute_not_exists(pk)`. One
+    /// transaction so a crash between the two writes can never leave a friend with no
+    /// live pointer, or a pointer aimed at a friend who doesn't exist.
+    pub async fn create_friend(&self, f: &Friend) -> Result<(), StoreError> {
+        let friend_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(schema::friend_item(f)))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .expect("friend_put");
+        let pointer_put = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(schema::shelf_pointer_item(&f.shelf_token, &f.id)))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .expect("pointer_put");
+        self.client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(friend_put)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(pointer_put)
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("transact_write_items", &e)))?;
+        Ok(())
+    }
+
+    /// Resolve a bearer shelf token to its friend: pointer get → friend get. Either
+    /// missing (unknown token, or a friend whose pointer outlived them — should never
+    /// happen given the transactional writers, but the read stays defensive) ⇒ `None`,
+    /// never a `Corrupt` — an absent shelf link and a dangling one both mean "this
+    /// friend isn't reachable by that token right now."
+    pub async fn get_friend_by_shelf_token(
+        &self,
+        token: &str,
+    ) -> Result<Option<Friend>, StoreError> {
+        let (pk, sk) = schema::key_pair(schema::shelf_pk(token), "META");
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+        let Some(item) = out.item else {
+            return Ok(None);
+        };
+        let Some(friend_id) = item.get("friend_id").and_then(|v| v.as_s().ok()) else {
+            return Ok(None);
+        };
+        self.get_friend(friend_id).await
+    }
+
+    pub async fn get_friend(&self, id: &str) -> Result<Option<Friend>, StoreError> {
+        let (pk, sk) = schema::key_pair(schema::friend_pk(id), "META");
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+        out.item.map(|item| friend_from_item(&item)).transpose()
+    }
+
+    /// Every friend, ordered by name for free: friend items carry `gsi1pk = "FRIEND"`,
+    /// `gsi1sk = <name>` — the LISTABLE membership pattern (`schema::game_item`'s
+    /// `gsi1pk = "LISTABLE"`) reused with a different pk value on the SAME index, so
+    /// this needs no new GSI. Same exhaustive-pagination shape as `list_listable_games`.
+    pub async fn list_friends(&self) -> Result<Vec<Friend>, StoreError> {
+        let mut friends = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .query()
+                .table_name(&self.table)
+                .index_name(schema::GSI_LISTABLE)
+                .key_condition_expression("gsi1pk = :p")
+                .expression_attribute_values(":p", schema::s("FRIEND"))
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await
+                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("query", &e)))?;
+            for item in out.items() {
+                friends.push(friend_from_item(item)?);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(friends)
+    }
+
+    /// Rename a friend via a scoped `SET`, `attribute_exists(pk)`. Also mirrors the new
+    /// name into `gsi1sk` in the SAME write — `gsi1sk` exists only to keep
+    /// `list_friends` ordered by name, so leaving it stale after a rename would silently
+    /// desync the list's order from the record it's supposedly ordering (the same
+    /// mirror-must-move-with-its-source rule `friend_id`/`gsi3pk` follow, applied to a
+    /// sort key instead of a lookup key). Ok(false) on an unknown id — never an
+    /// upsert-from-nothing.
+    pub async fn rename_friend(&self, id: &str, name: &str) -> Result<bool, StoreError> {
+        let (pk, sk) = schema::key_pair(schema::friend_pk(id), "META");
+        let req = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", pk)
+            .key("sk", sk)
+            .condition_expression("attribute_exists(pk)")
+            .update_expression("SET #n = :n, gsi1sk = :n")
+            .expression_attribute_names("#n", "name")
+            .expression_attribute_values(":n", schema::s(name));
+        match req.send().await {
+            Ok(_) => Ok(true),
+            Err(sdk_err) if is_ccf_update(&sdk_err) => Ok(false),
+            Err(sdk_err) => Err(StoreError::Aws(AwsFault::from_sdk_error(
+                "update_item",
+                &sdk_err,
+            ))),
+        }
+    }
+
+    /// Move a friend's live shelf token in ONE transaction: delete the OLD pointer
+    /// (`attribute_exists(pk)` — the token must actually be live), put the NEW pointer
+    /// (`attribute_not_exists(pk)` — refuse a token collision), and `SET shelf_token`
+    /// on the friend record. No window exists where both tokens are live, or where
+    /// neither is: a partial failure rolls back the whole transaction, never leaving a
+    /// half-issued token at rest.
+    ///
+    /// A REVOKED friend (`old_token == ""` — `revoke_shelf_token` REMOVEs the attribute
+    /// and `friend_from_item` reads the absence back as `""`) has no pointer to delete,
+    /// so the two-item branch runs instead: put the new pointer and `SET shelf_token`
+    /// guarded by `attribute_not_exists(shelf_token)` — a concurrent reissue racing this
+    /// one loses on that condition, so two live pointers for one friend stay
+    /// unrepresentable. (Review pass 2: the delete branch keyed the pointer at the
+    /// literal pk `SHELF#` here and its `attribute_exists` cancelled the whole
+    /// transaction — revoke→reissue was a 500 dead-end.)
+    pub async fn reissue_shelf_token(
+        &self,
+        id: &str,
+        old_token: &str,
+        new_token: &str,
+    ) -> Result<(), StoreError> {
+        if old_token.is_empty() {
+            let put_new = aws_sdk_dynamodb::types::Put::builder()
+                .table_name(&self.table)
+                .set_item(Some(schema::shelf_pointer_item(new_token, id)))
+                .condition_expression("attribute_not_exists(pk)")
+                .build()
+                .expect("put_new");
+            let friend_update = aws_sdk_dynamodb::types::Update::builder()
+                .table_name(&self.table)
+                .key("pk", schema::s(schema::friend_pk(id)))
+                .key("sk", schema::s("META"))
+                .update_expression("SET shelf_token = :new")
+                .condition_expression("attribute_exists(pk) AND attribute_not_exists(shelf_token)")
+                .expression_attribute_values(":new", schema::s(new_token))
+                .build()
+                .expect("friend_update");
+            self.client
+                .transact_write_items()
+                .transact_items(
+                    aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                        .put(put_new)
+                        .build(),
+                )
+                .transact_items(
+                    aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                        .update(friend_update)
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    StoreError::Aws(AwsFault::from_sdk_error("transact_write_items", &e))
+                })?;
+            return Ok(());
+        }
+        let delete_old = aws_sdk_dynamodb::types::Delete::builder()
+            .table_name(&self.table)
+            .key("pk", schema::s(schema::shelf_pk(old_token)))
+            .key("sk", schema::s("META"))
+            .condition_expression("attribute_exists(pk)")
+            .build()
+            .expect("delete_old");
+        let put_new = aws_sdk_dynamodb::types::Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(schema::shelf_pointer_item(new_token, id)))
+            .condition_expression("attribute_not_exists(pk)")
+            .build()
+            .expect("put_new");
+        let friend_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", schema::s(schema::friend_pk(id)))
+            .key("sk", schema::s("META"))
+            .update_expression("SET shelf_token = :new")
+            .condition_expression("attribute_exists(pk)")
+            .expression_attribute_values(":new", schema::s(new_token))
+            .build()
+            .expect("friend_update");
+        self.client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .delete(delete_old)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .put(put_new)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(friend_update)
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("transact_write_items", &e)))?;
+        Ok(())
+    }
+
+    /// Kill a friend's live shelf capability in ONE transaction: delete the pointer
+    /// (`attribute_exists(pk)`) and `REMOVE shelf_token` from the friend record. No
+    /// dead capability at rest — there is no representation of "revoked" that still
+    /// carries a live pointer or a non-empty token; `friend_from_item` reads the
+    /// resulting absence back as `""`.
+    ///
+    /// Revoking an ALREADY-revoked friend (`old_token == ""`) is an idempotent success:
+    /// there is no pointer to delete and no attribute to REMOVE, so the transaction is
+    /// skipped entirely rather than cancelling on its `attribute_exists` condition
+    /// (review pass 2: the double-revoke used to 500 forever).
+    pub async fn revoke_shelf_token(&self, id: &str, old_token: &str) -> Result<(), StoreError> {
+        if old_token.is_empty() {
+            return Ok(());
+        }
+        let delete_old = aws_sdk_dynamodb::types::Delete::builder()
+            .table_name(&self.table)
+            .key("pk", schema::s(schema::shelf_pk(old_token)))
+            .key("sk", schema::s("META"))
+            .condition_expression("attribute_exists(pk)")
+            .build()
+            .expect("delete_old");
+        let friend_update = aws_sdk_dynamodb::types::Update::builder()
+            .table_name(&self.table)
+            .key("pk", schema::s(schema::friend_pk(id)))
+            .key("sk", schema::s("META"))
+            .update_expression("REMOVE shelf_token")
+            .condition_expression("attribute_exists(pk)")
+            .build()
+            .expect("friend_update");
+        self.client
+            .transact_write_items()
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .delete(delete_old)
+                    .build(),
+            )
+            .transact_items(
+                aws_sdk_dynamodb::types::TransactWriteItem::builder()
+                    .update(friend_update)
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("transact_write_items", &e)))?;
+        Ok(())
     }
 
     pub async fn put_claim(&self, c: &Claim) -> Result<(), StoreError> {
@@ -3216,7 +3629,10 @@ impl Store {
         })
     }
 
-    /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform).
+    /// Test-only helper: create the table + GSIs (mirrors the Plan 4 terraform), INCLUDING
+    /// the sparse gsi3 (`schema::GSI_FRIEND_LINKS`) that backs `list_links_for_friend`.
+    /// [`create_table_for_tests_without_gsi3`](Self::create_table_for_tests_without_gsi3)
+    /// is the sibling that omits it.
     ///
     /// Deletes any pre-existing table of the same name FIRST (#80 finding 1): silently
     /// accepting a leftover table also accepts last run's rows, and fixed-name fixtures
@@ -3226,7 +3642,7 @@ impl Store {
     /// the old `let _ =` discard also swallowed genuine create failures.
     ///
     /// The create DRAINS its own delete (retries through ResourceInUseException, bounded)
-    /// and then WAITS for the table + both GSIs to read ACTIVE before returning (#168
+    /// and then WAITS for the table + all its GSIs to read ACTIVE before returning (#168
     /// mechanism a): under `--workspace` parallelism against one shared dynamodb-local,
     /// returning early let a caller's first GSI query race table creation, and the old
     /// fire-and-forget delete let the create land mid-DELETING.
@@ -3236,6 +3652,22 @@ impl Store {
     /// binary, and "test-only" enforced by prose is not enforced (review pass 2, F2).
     #[cfg(feature = "test-util")]
     pub async fn create_table_for_tests(&self) -> Result<(), StoreError> {
+        self.create_table_for_tests_inner(true).await
+    }
+
+    /// [`create_table_for_tests`](Self::create_table_for_tests) minus gsi3 — the deploy
+    /// window as a fixture (spec, Task 3): a real gsi3 rollout isn't ACTIVE the instant
+    /// the table is, so for a window in production a query against it ERRORS rather
+    /// than returning empty. This fixture makes that window reproducible in a test
+    /// instead of a story: `list_links_for_friend` against a store built by this
+    /// function must surface the error, never silently render an empty shelf.
+    #[cfg(feature = "test-util")]
+    pub async fn create_table_for_tests_without_gsi3(&self) -> Result<(), StoreError> {
+        self.create_table_for_tests_inner(false).await
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn create_table_for_tests_inner(&self, with_gsi3: bool) -> Result<(), StoreError> {
         let attr = |name: &str| {
             AttributeDefinition::builder()
                 .attribute_name(name)
@@ -3263,6 +3695,23 @@ impl Store {
                 .build()
                 .expect("gsi")
         };
+        // gsi3 is deliberately pk-ONLY (spec: sparse, membership-style — a link either
+        // carries gsi3pk or it isn't on the index at all, no ordering needed within a
+        // friend's links). `gsi` above REQUIRES a sort key; passing it a dummy sk would
+        // manufacture a range key nothing ever writes, so this is a sibling builder
+        // rather than a `gsi` call with a fake second argument.
+        let gsi_pk_only = |name: &str, pk: &str| {
+            GlobalSecondaryIndex::builder()
+                .index_name(name)
+                .key_schema(key(pk, KeyType::Hash))
+                .projection(
+                    Projection::builder()
+                        .projection_type(ProjectionType::All)
+                        .build(),
+                )
+                .build()
+                .expect("gsi_pk_only")
+        };
         // NotFound is the virgin-container case (CI's fresh service, first local run).
         let _ = self
             .client
@@ -3274,7 +3723,8 @@ impl Store {
         // that lands while the table is DELETING throws ResourceInUseException. Retry
         // the create through that window, bounded. (#168 mechanism a.)
         let create = || {
-            self.client
+            let mut req = self
+                .client
                 .create_table()
                 .table_name(&self.table)
                 .billing_mode(BillingMode::PayPerRequest)
@@ -3287,8 +3737,16 @@ impl Store {
                 .key_schema(key("pk", KeyType::Hash))
                 .key_schema(key("sk", KeyType::Range))
                 .global_secondary_indexes(gsi(schema::GSI_LISTABLE, "gsi1pk", "gsi1sk"))
-                .global_secondary_indexes(gsi(schema::GSI_PENDING, "gsi2pk", "gsi2sk"))
-                .send()
+                .global_secondary_indexes(gsi(schema::GSI_PENDING, "gsi2pk", "gsi2sk"));
+            if with_gsi3 {
+                // An AttributeDefinition for an attribute no key schema references is a
+                // CreateTable error — so gsi3pk's definition is conditional right alongside
+                // the index that's its only user, never unconditionally declared.
+                req = req
+                    .attribute_definitions(attr("gsi3pk"))
+                    .global_secondary_indexes(gsi_pk_only(schema::GSI_FRIEND_LINKS, "gsi3pk"));
+            }
+            req.send()
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -3347,10 +3805,12 @@ impl Store {
             };
             let table_active =
                 table.table_status() == Some(&aws_sdk_dynamodb::types::TableStatus::Active);
-            // len == 2, not just all-ACTIVE: `.all()` on an empty list is vacuously true,
-            // and this function itself just requested exactly two GSIs (review pass 2, F4).
+            // len == expected, not just all-ACTIVE: `.all()` on an empty list is vacuously
+            // true, and this function itself just requested exactly this many GSIs (review
+            // pass 2, F4) — 3 with gsi3, 2 without (create_table_for_tests_without_gsi3).
+            let want_gsis = if with_gsi3 { 3 } else { 2 };
             let gsis = table.global_secondary_indexes();
-            let gsis_active = gsis.len() == 2
+            let gsis_active = gsis.len() == want_gsis
                 && gsis.iter().all(|g| {
                     g.index_status() == Some(&aws_sdk_dynamodb::types::IndexStatus::Active)
                 });

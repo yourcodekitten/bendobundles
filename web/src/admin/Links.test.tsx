@@ -19,6 +19,8 @@ vi.mock('../api', async (importOriginal) => {
     adminSetLinkNote: vi.fn(),
     adminSetLinkUnlock: vi.fn(),
     adminDeleteLinkUnlock: vi.fn(),
+    adminFriends: vi.fn(),
+    adminSetLinkFriend: vi.fn(),
   };
 });
 import {
@@ -29,7 +31,10 @@ import {
   adminSetLinkNote,
   adminSetLinkUnlock,
   adminDeleteLinkUnlock,
+  adminFriends,
+  adminSetLinkFriend,
   CreateLinkValidationError,
+  type AdminFriend,
 } from '../api';
 
 function renderLinks() {
@@ -81,6 +86,9 @@ describe('Links', () => {
   // prototype getter). vi.restoreAllMocks() in afterEach cleans up the spy.
   beforeEach(() => {
     vi.clearAllMocks();
+    // Sane default so tests that don't care about friends aren't left hanging
+    // on an unresolved promise — override per-test where the friend list matters.
+    vi.mocked(adminFriends).mockResolvedValue([]);
     // Ensure clipboard object exists (happy-dom should provide it, but guard anyway)
     if (!navigator.clipboard) {
       Object.defineProperty(navigator, 'clipboard', {
@@ -921,6 +929,157 @@ describe('pick exposure readout', () => {
     expect(screen.getByLabelText('claims allowed')).toHaveAccessibleDescription('up to 2 of your monthly picks, if they claim');
     await user.click(screen.getByRole('button', { name: 'remove A from this gift' }));
     expect(screen.getByLabelText('claims allowed')).toHaveAccessibleDescription('up to 1 of your monthly picks, if they claim');
+  });
+});
+
+// ── Friend assignment (Task 6) ──────────────────────────────────────────────
+
+const maya: AdminFriend = {
+  id: 'f1',
+  name: 'Maya',
+  shelf_token: 'a'.repeat(64),
+  created_at: '2026-07-01T00:00:00Z',
+};
+
+const rae: AdminFriend = {
+  id: 'f2',
+  name: 'Rae',
+  shelf_token: 'b'.repeat(64),
+  created_at: '2026-06-01T00:00:00Z',
+};
+
+describe('friend assignment', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(adminFriends).mockResolvedValue([maya, rae]);
+  });
+
+  it('shows a friend picker on link create', async () => {
+    vi.mocked(adminLinks).mockResolvedValue([]);
+    renderLinks();
+
+    await waitFor(() => screen.getByLabelText(/puts this link on their shelf/i));
+    const picker = screen.getByLabelText(/puts this link on their shelf/i);
+    expect(picker.tagName).toBe('SELECT');
+    expect(screen.getByRole('option', { name: 'Maya' })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Rae' })).toBeInTheDocument();
+  });
+
+  it("shows a link's assigned friend name in its row", async () => {
+    vi.mocked(adminLinks).mockResolvedValue([{ ...link1, friend_id: 'f1' }, link2]);
+    renderLinks();
+
+    await waitFor(() => screen.getByText('Alice'));
+    // Scoped to the chip (not the reassign <option>, which also reads "Maya"
+    // in every row's picker) — the 🎀 marker is the chip's own text.
+    expect(screen.getByText(/🎀 Maya/)).toBeInTheDocument();
+  });
+
+  it('reassign fires POST /admin/api/links/{token}/friend only after an in-voice confirm', async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminLinks)
+      .mockResolvedValueOnce([{ ...link1, friend_id: 'f1' }])
+      .mockResolvedValueOnce([{ ...link1, friend_id: 'f2' }]);
+    vi.mocked(adminSetLinkFriend).mockResolvedValue(undefined);
+    renderLinks();
+
+    await waitFor(() => screen.getByText('Alice'));
+    const select = screen.getByLabelText(/reassign friend for alice/i);
+    await user.selectOptions(select, 'f2');
+
+    // The warning renders BEFORE the request fires — reassigning MOVES gifts
+    // already claimed on this link (AND any thank-you note on them — a
+    // private reply-to-ben) to the other friend's shelf.
+    expect(
+      screen.getByText(/this moves its gifts.*thank-you note.*to the other shelf/i),
+    ).toBeInTheDocument();
+    expect(adminSetLinkFriend).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: /confirm reassign for alice/i }));
+
+    await waitFor(() =>
+      expect(adminSetLinkFriend).toHaveBeenCalledWith('tok-abc123', 'f2'),
+    );
+  });
+
+  it("hedges the failure copy — the client can't know whether the reassign committed", async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminLinks).mockResolvedValue([{ ...link1, friend_id: 'f1' }]);
+    vi.mocked(adminSetLinkFriend).mockRejectedValue(new Error('boom'));
+    renderLinks();
+
+    await waitFor(() => screen.getByText('Alice'));
+    await user.selectOptions(screen.getByLabelText(/reassign friend for alice/i), 'f2');
+    await user.click(screen.getByRole('button', { name: /confirm reassign for alice/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        "couldn't reassign — the link's friend may be unchanged. try again.",
+      ),
+    );
+  });
+
+  it('creating a link with a friend picked fires the follow-up assignment POST with the new token', async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminLinks).mockResolvedValue([]);
+    vi.mocked(adminCreateLink).mockResolvedValue({
+      token: 'tok-new',
+      url_path: '/l/tok-new',
+    });
+    vi.mocked(adminSetLinkFriend).mockResolvedValue(undefined);
+    renderLinks();
+
+    await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+    await user.type(screen.getByRole('textbox', { name: 'label' }), 'Charlie');
+    await user.selectOptions(
+      screen.getByLabelText(/puts this link on their shelf/i),
+      'f1',
+    );
+    await user.click(screen.getByRole('button', { name: /create invite link/i }));
+
+    await waitFor(() =>
+      expect(adminSetLinkFriend).toHaveBeenCalledWith('tok-new', 'f1'),
+    );
+  });
+
+  it('clearing the assignment fires the request with friend_id: null', async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminLinks)
+      .mockResolvedValueOnce([{ ...link1, friend_id: 'f1' }])
+      .mockResolvedValueOnce([{ ...link1, friend_id: undefined }]);
+    vi.mocked(adminSetLinkFriend).mockResolvedValue(undefined);
+    renderLinks();
+
+    await waitFor(() => screen.getByText('Alice'));
+    const select = screen.getByLabelText(/reassign friend for alice/i);
+    await user.selectOptions(select, '');
+    await user.click(screen.getByRole('button', { name: /confirm reassign for alice/i }));
+
+    await waitFor(() =>
+      expect(adminSetLinkFriend).toHaveBeenCalledWith('tok-abc123', null),
+    );
+  });
+
+  it("shows the unassigned count, derived client-side from the fetched links", async () => {
+    vi.mocked(adminLinks).mockResolvedValue([
+      { ...link1, friend_id: 'f1' },
+      { ...link2, token: 'tok-ghi789', friend_id: undefined },
+      { ...link2, token: 'tok-jkl012', friend_id: undefined },
+    ]);
+    renderLinks();
+
+    await waitFor(() =>
+      expect(screen.getByText("2 gifts aren't on a shelf yet")).toBeInTheDocument(),
+    );
+  });
+
+  it('renders nothing when every link is assigned', async () => {
+    vi.mocked(adminLinks).mockResolvedValue([{ ...link1, friend_id: 'f1' }]);
+    renderLinks();
+
+    await waitFor(() => screen.getByText('Alice'));
+    expect(screen.queryByText(/gifts aren't on a shelf yet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/gift isn't on a shelf yet/i)).not.toBeInTheDocument();
   });
 });
 

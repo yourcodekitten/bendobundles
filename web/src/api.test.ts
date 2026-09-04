@@ -19,6 +19,12 @@ import {
   adminSetSteamIdentity,
   adminClearSteamIdentity,
   adminSetAppId,
+  adminFriends,
+  adminCreateFriend,
+  adminReissueFriendToken,
+  adminRevokeFriendToken,
+  adminSetLinkFriend,
+  CreateLinkValidationError,
   NotFound,
   FetchFailed,
   Unauthorized,
@@ -26,6 +32,7 @@ import {
   type StatusView,
   type AdminGame,
   type AdminLink,
+  type AdminFriend,
 } from './api';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -885,5 +892,225 @@ describe('seal verbs (wrapped gifts)', () => {
     expect(view.state).toBe('sealed');
     expect(view.unlocks_in_seconds).toBe(3600);
     expect(view.unlocks_at).toBe('2026-12-25T05:00:00Z');
+  });
+});
+
+describe('adminFriends', () => {
+  it('returns AdminFriend[] array passthrough on success', async () => {
+    const mockData: AdminFriend[] = [
+      { id: 'f1', name: 'Maya', shelf_token: 'a'.repeat(64), created_at: '2026-07-01T00:00:00Z' },
+      { id: 'f2', name: 'Revoked Rae', shelf_token: '', created_at: '2026-06-01T00:00:00Z' },
+    ];
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue(mockData),
+    });
+
+    const result = await adminFriends();
+
+    expect(result).toEqual(mockData);
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/friends');
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    mockFetch.mockResolvedValueOnce({
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    });
+
+    await expect(adminFriends()).rejects.toBeInstanceOf(Unauthorized);
+  });
+});
+
+describe('adminCreateFriend', () => {
+  it('returns {id, name, shelf_token, shelf_url_path} passthrough on success', async () => {
+    const mockData = {
+      id: 'f1',
+      name: 'Maya',
+      shelf_token: 'a'.repeat(64),
+      shelf_url_path: `/s/${'a'.repeat(64)}`,
+    };
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue(mockData),
+    });
+
+    const result = await adminCreateFriend('Maya');
+
+    expect(result).toEqual(mockData);
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/friends', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
+      body: JSON.stringify({ name: 'Maya' }),
+    });
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    mockFetch.mockResolvedValueOnce({
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    });
+
+    await expect(adminCreateFriend('Maya')).rejects.toBeInstanceOf(Unauthorized);
+  });
+
+  it('throws CreateLinkValidationError with the server message on 422', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      json: vi.fn().mockResolvedValue({ error: 'name must be 1-64 characters' }),
+    });
+
+    await expect(adminCreateFriend('')).rejects.toThrow('name must be 1-64 characters');
+  });
+
+  it('throws on a 200 whose body is missing the friend contract', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ message: 'ok' }),
+    });
+
+    await expect(adminCreateFriend('Maya')).rejects.toThrow(/create friend/);
+  });
+});
+
+describe('adminReissueFriendToken', () => {
+  it('returns {shelf_token, shelf_url_path} and posts {reissue: true}', async () => {
+    const mockData = { shelf_token: 'b'.repeat(64), shelf_url_path: `/s/${'b'.repeat(64)}` };
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue(mockData),
+    });
+
+    const result = await adminReissueFriendToken('f1');
+
+    expect(result).toEqual(mockData);
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/friends/f1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
+      body: JSON.stringify({ reissue: true }),
+    });
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    mockFetch.mockResolvedValueOnce({
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    });
+
+    await expect(adminReissueFriendToken('f1')).rejects.toBeInstanceOf(Unauthorized);
+  });
+
+  it('throws on 404 — a failed reissue must never look successful', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      json: vi.fn().mockResolvedValue({}),
+    });
+
+    await expect(adminReissueFriendToken('f1')).rejects.toThrow(/reissue/);
+  });
+});
+
+describe('adminRevokeFriendToken', () => {
+  it('posts {revoke: true} and resolves on 200', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue({ shelf_token: '' }),
+    });
+
+    await adminRevokeFriendToken('f1');
+
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/friends/f1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
+      body: JSON.stringify({ revoke: true }),
+    });
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    mockFetch.mockResolvedValueOnce({
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    });
+
+    await expect(adminRevokeFriendToken('f1')).rejects.toBeInstanceOf(Unauthorized);
+  });
+
+  it('throws on 500 — a failed revoke must never look successful', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      json: vi.fn().mockResolvedValue({}),
+    });
+
+    await expect(adminRevokeFriendToken('f1')).rejects.toThrow(/revoke/);
+  });
+});
+
+describe('adminSetLinkFriend', () => {
+  it('posts {friend_id} and resolves on 204', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 204,
+      json: vi.fn().mockResolvedValue({}),
+    });
+
+    await adminSetLinkFriend('tok', 'f1');
+
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/links/tok/friend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
+      body: JSON.stringify({ friend_id: 'f1' }),
+    });
+  });
+
+  it('posts {friend_id: null} to clear the assignment', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 204,
+      json: vi.fn().mockResolvedValue({}),
+    });
+
+    await adminSetLinkFriend('tok', null);
+    const [, init] = mockFetch.mock.calls.at(-1)!;
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.friend_id).toBeNull();
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    mockFetch.mockResolvedValueOnce({
+      status: 401,
+      json: vi.fn().mockResolvedValue({ error: 'unauthorized' }),
+    });
+
+    await expect(adminSetLinkFriend('tok', 'f1')).rejects.toBeInstanceOf(Unauthorized);
+  });
+
+  it('throws CreateLinkValidationError with the server message on 422 (unknown friend)', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 422,
+      json: vi.fn().mockResolvedValue({ error: 'unknown friend' }),
+    });
+
+    const err = await adminSetLinkFriend('tok', 'nope').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CreateLinkValidationError);
+    expect((err as Error).message).toBe('unknown friend');
+  });
+
+  it('throws on 404 (unknown link)', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      json: vi.fn().mockResolvedValue({}),
+    });
+
+    await expect(adminSetLinkFriend('tok', 'f1')).rejects.toThrow(/assign/);
   });
 });

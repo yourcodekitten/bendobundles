@@ -10,7 +10,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use domain::{Claim, ClaimState, Game, GameStatus, Link, game_id};
+use domain::{Claim, ClaimState, Friend, Game, GameStatus, Link, game_id};
 use dynamo::{SteamAppCache, SteamAppPutGuard, Store};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use public_api::{Invoker, router};
@@ -46,6 +46,37 @@ async fn store_or_skip(test: &str) -> Option<Arc<Store>> {
     // one table per test — no cross-test interference
     let store = Store::new(client, format!("t-pub-{test}"));
     store.create_table_for_tests().await.unwrap();
+    Some(Arc::new(store))
+}
+
+/// `store_or_skip`'s body, but the table is built WITHOUT gsi3 —
+/// `create_table_for_tests_without_gsi3` fixtures the deploy window where the index
+/// hasn't gone ACTIVE yet. `shelf_500s_when_index_absent_never_renders_empty` uses this
+/// to prove a gsi3 query error surfaces as 500, never a silently-empty shelf.
+async fn store_without_gsi3(test: &str) -> Option<Arc<Store>> {
+    let (url, explicit) = match std::env::var("DYNAMODB_LOCAL_URL") {
+        Ok(v) => (v, true),
+        Err(_) => ("http://localhost:8000".into(), false),
+    };
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(&url)
+        .region("us-east-1")
+        .test_credentials()
+        .load()
+        .await;
+    let client = aws_sdk_dynamodb::Client::new(&config);
+    if client.list_tables().send().await.is_err() {
+        if explicit {
+            panic!(
+                "DYNAMODB_LOCAL_URL is set but dynamodb-local is unreachable — \
+                 refusing to skip (this would forge a green run)"
+            );
+        }
+        eprintln!("SKIP {test}: no dynamodb-local at {url}");
+        return None;
+    }
+    let store = Store::new(client, format!("t-pub-{test}"));
+    store.create_table_for_tests_without_gsi3().await.unwrap();
     Some(Arc::new(store))
 }
 
@@ -86,7 +117,17 @@ fn test_link(token: &str) -> Link {
         expires_at: None,
         unlock_at: None,
         curated_game_ids: None,
+        friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
+    }
+}
+
+fn test_friend(id: &str, name: &str, tok2: &str) -> Friend {
+    Friend {
+        id: id.into(),
+        name: name.into(),
+        shelf_token: tok2.repeat(32),
+        created_at: datetime!(2026-09-04 12:00 UTC),
     }
 }
 
@@ -3373,4 +3414,150 @@ async fn detail_gate_opens_for_curated_pending_only() {
         .await
         .unwrap();
     assert_eq!(cross.status(), StatusCode::NOT_FOUND);
+}
+
+// ── GET /api/s/{token} — the gift shelf ────────────────────────────────────────
+
+/// Unknown token and a revoked one must 404 with the BYTE-IDENTICAL body — no
+/// enumeration oracle between "never existed" and "existed, then killed".
+#[tokio::test]
+async fn shelf_unknown_token_404s_byte_identical_to_revoked() {
+    let Some(store) = store_or_skip("shelf-404").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let req = Request::get("/api/s/no-such-shelf")
+        .body(Body::empty())
+        .unwrap();
+    let r1 = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), StatusCode::NOT_FOUND);
+    let f = test_friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    store
+        .revoke_shelf_token("f1", &f.shelf_token)
+        .await
+        .unwrap();
+    let req2 = Request::get(format!("/api/s/{}", f.shelf_token))
+        .body(Body::empty())
+        .unwrap();
+    let r2 = plain_router(store, mock).oneshot(req2).await.unwrap();
+    assert_eq!(r2.status(), StatusCode::NOT_FOUND);
+    // byte-identical bodies: no oracle
+    assert_eq!(body_json(r1).await, body_json(r2).await);
+}
+
+/// A Fulfilled claim on a link belonging to a friend. `put_claim` seeds it directly —
+/// built from the fields verified in `domain::Claim` (id, link_token, game_id, state,
+/// gift_url, revealed_key, created_at, choice_pre_tpks, failure_reason).
+fn claim(id: &str, token: &str, game_n: u32, state: ClaimState, year: i32) -> Claim {
+    Claim {
+        id: id.into(),
+        link_token: token.into(),
+        game_id: game_id(&format!("gk{game_n}"), "mn"),
+        state,
+        gift_url: Some("https://x.com/g".into()),
+        revealed_key: None,
+        created_at: datetime!(2024-01-01 00:00 UTC).replace_year(year).unwrap(),
+        choice_pre_tpks: None,
+        failure_reason: None,
+    }
+}
+
+#[tokio::test]
+async fn shelf_happy_fulfilled_only_no_cross_friend_bleed() {
+    let Some(store) = store_or_skip("shelf-filter").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    for n in 1..=3 {
+        store.put_game(&test_game(n)).await.unwrap();
+    }
+    // f1 ← t1 : Fulfilled g1 @2024, Fulfilled g3 @2026 (order test), Pending g2 (must be excluded)
+    let f1 = test_friend("f1", "sarah", "aa");
+    store.create_friend(&f1).await.unwrap();
+    let mut t1 = test_link("t1");
+    t1.gift_note = Some("for you ♡".into());
+    store.create_link(&t1).await.unwrap();
+    store.set_link_friend("t1", Some("f1")).await.unwrap();
+    store
+        .put_claim(&claim("c1", "t1", 1, ClaimState::Fulfilled, 2024))
+        .await
+        .unwrap();
+    store
+        .put_claim(&claim("c3", "t1", 3, ClaimState::Fulfilled, 2026))
+        .await
+        .unwrap();
+    store
+        .put_claim(&claim("c2", "t1", 2, ClaimState::Pending, 2025))
+        .await
+        .unwrap();
+    // f2 ← t2 : Fulfilled g3 — must NOT appear on f1's shelf
+    let f2 = test_friend("f2", "dave", "bb");
+    store.create_friend(&f2).await.unwrap();
+    store.create_link(&test_link("t2")).await.unwrap();
+    store.set_link_friend("t2", Some("f2")).await.unwrap();
+    store
+        .put_claim(&claim("c4", "t2", 3, ClaimState::Fulfilled, 2023))
+        .await
+        .unwrap();
+
+    let req = Request::get(format!("/api/s/{}", f1.shelf_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(store, mock).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK); // THE CANARY — cannot pass without the route
+    let j = body_json(resp).await;
+    assert_eq!(j["name"], "sarah");
+    let gifts = j["gifts"].as_array().unwrap();
+    assert_eq!(
+        gifts.len(),
+        2,
+        "Fulfilled only (Pending g2 excluded), and no g3-from-f2 bleed"
+    );
+    assert_eq!(
+        gifts[0]["game_id"],
+        game_id("gk1", "mn"),
+        "oldest first: 2024 before 2026"
+    );
+    assert_eq!(gifts[1]["game_id"], game_id("gk3", "mn"));
+    assert_eq!(
+        gifts[0]["gift_note"], "for you ♡",
+        "note rides from the link record"
+    );
+}
+
+#[tokio::test]
+async fn shelf_500s_when_index_absent_never_renders_empty() {
+    // The deploy window as a fixture: a store whose table has NO gsi3. A query against the
+    // absent index ERRORS; the handler must surface 500, never Ok(vec![]) (fail distinct).
+    let Some(store) = store_without_gsi3("shelf-noindex").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let f = test_friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    store.create_link(&test_link("t1")).await.unwrap();
+    // NOTE: set_link_friend writes gsi3pk too — on a table without gsi3 that write itself may
+    // error; if so, seed the friend_id via a create-path that doesn't require the index, or
+    // assert the 500 on the READ alone by pointing the friend at a link created before the
+    // assignment. The REQUIRED property: GET /api/s/<token> returns 500, body is NOT {name,gifts:[]}.
+    let req = Request::get(format!("/api/s/{}", f.shelf_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(store, mock).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let j = body_json(resp).await;
+    assert!(
+        j.get("gifts").is_none(),
+        "a query error must never collapse into an empty shelf"
+    );
 }

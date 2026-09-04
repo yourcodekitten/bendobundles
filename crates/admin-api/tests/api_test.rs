@@ -214,6 +214,7 @@ fn test_link(token: &str) -> Link {
         expires_at: None,
         unlock_at: None,
         curated_game_ids: None,
+        friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
 }
@@ -3207,4 +3208,368 @@ async fn delete_link_unlock_unseals_only_sealed() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+// ── Friends CRUD + link↔friend assignment (Task 4) ────────────────────────────
+
+#[tokio::test]
+async fn friends_create_list_rename_reissue_revoke() {
+    let Some(store) = store_or_skip("admin-friends").await else {
+        return;
+    };
+    let password = "pw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let call = |req| {
+        router(
+            Arc::clone(&store),
+            Arc::clone(&invoker),
+            admin_hash.clone(),
+            None,
+        )
+        .oneshot(req)
+    };
+    let post = |path: &str, body: serde_json::Value| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let get = |path: &str| {
+        Request::get(path)
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // create
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "sarah"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(r).await;
+    let id = j["id"].as_str().unwrap().to_string();
+    let tok1 = j["shelf_token"].as_str().unwrap().to_string();
+    assert_eq!(tok1.len(), 64);
+    assert_eq!(j["shelf_url_path"], format!("/s/{tok1}"));
+    // list shows it
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j.as_array().unwrap().len(), 1);
+    // rename — assert the VALUE changed, not just the 200 (a 200 proves nothing about the name)
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"name": "sara"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(
+        j[0]["name"], "sara",
+        "rename must actually change the stored name"
+    );
+    // reissue → token changes
+    let j = body_json(
+        call(post(
+            &format!("/admin/api/friends/{id}"),
+            serde_json::json!({"reissue": true}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let tok2 = j["shelf_token"].as_str().unwrap().to_string();
+    assert_ne!(tok1, tok2, "reissue must mint a new token");
+    // revoke → empty token in list
+    call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"revoke": true}),
+    ))
+    .await
+    .unwrap();
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j[0]["shelf_token"], "");
+}
+
+/// Revoke → reissue must hand the friend a fresh live shelf, and a second revoke must
+/// be an idempotent success — review pass 2 found both returned 500 forever, because the
+/// store's delete-the-old-pointer transaction keyed the pointer at the literal pk
+/// `SHELF#` (the revoked friend's `shelf_token` is `""`) and its `attribute_exists`
+/// condition cancelled the whole transaction.
+#[tokio::test]
+async fn friends_revoke_then_reissue_recovers() {
+    let Some(store) = store_or_skip("admin-friends-rerevoke").await else {
+        return;
+    };
+    let password = "pw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let call = |req| {
+        router(
+            Arc::clone(&store),
+            Arc::clone(&invoker),
+            admin_hash.clone(),
+            None,
+        )
+        .oneshot(req)
+    };
+    let post = |path: &str, body: serde_json::Value| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let get = |path: &str| {
+        Request::get(path)
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let j = body_json(
+        call(post(
+            "/admin/api/friends",
+            serde_json::json!({"name": "sarah"}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let id = j["id"].as_str().unwrap().to_string();
+    let tok1 = j["shelf_token"].as_str().unwrap().to_string();
+
+    // revoke
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"revoke": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // reissue on the revoked friend → 200 with a fresh live token, not a 500 dead-end
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"reissue": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "reissue after revoke must succeed"
+    );
+    let j = body_json(r).await;
+    let tok2 = j["shelf_token"].as_str().unwrap().to_string();
+    assert_eq!(tok2.len(), 64);
+    assert_ne!(tok1, tok2, "reissue must mint a new token");
+    assert_eq!(j["shelf_url_path"], format!("/s/{tok2}"));
+    // the reissued token is live in the store — the pointer + record moved together
+    let f = store.get_friend_by_shelf_token(&tok2).await.unwrap();
+    assert_eq!(f.unwrap().id, id, "fresh token resolves to the friend");
+
+    // second revoke (now on the live tok2), then revoke AGAIN on the already-revoked
+    // friend → idempotent 200, not a 500
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"revoke": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"revoke": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "double revoke must be an idempotent success"
+    );
+    let j = body_json(r).await;
+    assert_eq!(j["shelf_token"], "");
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j[0]["shelf_token"], "", "list agrees the friend is revoked");
+}
+
+#[tokio::test]
+async fn friends_validation_422s() {
+    let Some(store) = store_or_skip("admin-friends-422").await else {
+        return;
+    };
+    let password = "pw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let post = |path: &str, body: serde_json::Value| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let call = |req| {
+        router(
+            Arc::clone(&store),
+            Arc::clone(&invoker),
+            admin_hash.clone(),
+            None,
+        )
+        .oneshot(req)
+    };
+
+    // empty name
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "  "}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // the cap is measured in CHARACTERS, as the 422 message says — 33 CJK chars is
+    // 99 UTF-8 bytes but well under FRIEND_NAME_MAX_CHARS (review pass 2: `.len()`
+    // counted bytes and refused multibyte names the message promised to accept)
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "友".repeat(33)}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "33 chars must be accepted even at >64 bytes"
+    );
+    // 65 chars is over the cap regardless of byte width
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "a".repeat(65)}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // create one to mutate
+    let j = body_json(
+        call(post(
+            "/admin/api/friends",
+            serde_json::json!({"name": "sarah"}),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let id = j["id"].as_str().unwrap().to_string();
+    // two ops at once (rename AND revoke) → 422
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"name": "x", "revoke": true}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    // assign a nonexistent friend to a link → 422
+    let l = test_link("t1");
+    store.create_link(&l).await.unwrap();
+    let r = call(post(
+        "/admin/api/links/t1/friend",
+        serde_json::json!({"friend_id": "ghost"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// The friend name renders on the UNAUTHENTICATED `/s/{token}` shelf header ("ben's shelf
+/// for {name}") — same U+202E display-spoofing threat public-api's `sanitize_note` exists
+/// for on thank-you notes (review finding: the name previously got none of that
+/// treatment). Strip, not reject, matching the note path's own behavior — exercised at
+/// both write paths (create + rename).
+#[tokio::test]
+async fn friends_name_strips_spoofing_format_chars() {
+    let Some(store) = store_or_skip("admin-friends-spoof").await else {
+        return;
+    };
+    let password = "pw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let call = |req| {
+        router(
+            Arc::clone(&store),
+            Arc::clone(&invoker),
+            admin_hash.clone(),
+            None,
+        )
+        .oneshot(req)
+    };
+    let post = |path: &str, body: serde_json::Value| {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let get = |path: &str| {
+        Request::get(path)
+            .header("cookie", format!("session={session}"))
+            .header("x-admin-request", "1")
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    // create with a bidi override + zero-width space smuggled in → stored name is clean
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "sarah\u{202E}\u{200B}"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(r).await;
+    assert_eq!(
+        j["name"], "sarah",
+        "spoofing format chars must be stripped from the CREATE response, not stored"
+    );
+    let id = j["id"].as_str().unwrap().to_string();
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(j[0]["name"], "sarah", "and from the persisted record");
+
+    // rename with the same smuggle attempt → same treatment
+    let r = call(post(
+        &format!("/admin/api/friends/{id}"),
+        serde_json::json!({"name": "sar\u{202E}ah"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let j = body_json(call(get("/admin/api/friends")).await.unwrap()).await;
+    assert_eq!(
+        j[0]["name"], "sarah",
+        "rename must sanitize the same way create does"
+    );
+
+    // a name that sanitizes down to nothing is refused as empty, matching sanitize_note's
+    // own ordering (sanitize BEFORE the emptiness check)
+    let r = call(post(
+        "/admin/api/friends",
+        serde_json::json!({"name": "\u{202E}\u{200B}"}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
