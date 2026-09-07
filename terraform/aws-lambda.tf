@@ -111,6 +111,9 @@ module "lambda_public_api" {
     # lambda_http return the stage-less path so the routes match. Verified
     # against lambda_http 0.14 request.rs::apigw_path_with_stage.
     AWS_LAMBDA_HTTP_IGNORE_STAGE_IN_PATH = "true"
+    # Template for unfurl HTML (spec D3): public-api fetches index.html from
+    # this bucket, swaps the og block, and serves it for /l/* + /s/*.
+    WEB_BUCKET = module.site.s3_bucket_id
   }
 
   addl_inline_policies = {
@@ -125,6 +128,14 @@ module "lambda_public_api" {
           Resource = [aws_ssm_parameter.steam_web_api_key.arn]
         }
       ]
+    })
+    web_index = jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = ["${module.site.s3_bucket_arn}/index.html"]
+      }]
     })
   }
 }

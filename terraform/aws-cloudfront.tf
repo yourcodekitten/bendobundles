@@ -109,6 +109,30 @@ resource "aws_cloudfront_response_headers_policy" "site" {
   }
 }
 
+module "label_unfurl_cache" {
+  source  = "bendoerr-terraform-modules/label/null"
+  version = "1.0.1"
+  context = module.context.shared
+  name    = "unfurl-cache"
+}
+
+# 60s shared cache for personalized unfurl HTML (spec D4/OQ2): per-path keys —
+# the token is the path; DECIDED cost: up to 60s of revocation latency on the
+# card (the page itself stays live-checked). No cookies/headers/query in key.
+resource "aws_cloudfront_cache_policy" "unfurl" {
+  name        = module.label_unfurl_cache.id
+  default_ttl = 60
+  max_ttl     = 60
+  min_ttl     = 0
+  parameters_in_cache_key_and_forwarded_to_origin {
+    cookies_config { cookie_behavior = "none" }
+    headers_config { header_behavior = "none" }
+    query_strings_config { query_string_behavior = "none" }
+    enable_accept_encoding_gzip   = true
+    enable_accept_encoding_brotli = true
+  }
+}
+
 module "site" {
   source  = "bendoerr-terraform-modules/cloudfront-and-s3-origin/aws"
   version = "0.6.0"
@@ -138,6 +162,12 @@ module "site" {
   ordered_cache_behaviors = [
     { path_pattern = "/api/*", target_origin_id = "api" },
     { path_pattern = "/admin/api/*", target_origin_id = "api" },
+    { path_pattern    = "/l/*", target_origin_id = "api",
+      allowed_methods = ["GET", "HEAD"], cached_methods = ["GET", "HEAD"],
+    cache_policy_id = aws_cloudfront_cache_policy.unfurl.id },
+    { path_pattern    = "/s/*", target_origin_id = "api",
+      allowed_methods = ["GET", "HEAD"], cached_methods = ["GET", "HEAD"],
+    cache_policy_id = aws_cloudfront_cache_policy.unfurl.id },
   ]
 
   providers = {

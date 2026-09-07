@@ -72,9 +72,12 @@ HTML comment markers, not tag parsing. **Marker absence gets a witness (Lilith):
 index.html ever lacks the markers, the swap must not silently no-op forever — the lambda emits a
 structured ERROR log + CloudWatch metric on anchor absence while serving the generic card, so the
 degradation announces itself. The web-side vitest guards the artifact where it is BUILT; the
-lambda's witness guards what actually reached the bucket — different failure, different guard. New IAM: public-api gains `s3:GetObject` on
-`index.html` only — the iam_capture corpus gains the grant (gift-shelf pass-2 lesson: corpus
-must see every new store/client call).
+lambda's witness guards what actually reached the bucket — different failure, different guard. New
+IAM: public-api gains `s3:GetObject` on `index.html` only. The `iam_capture` corpus is
+DYNAMO-scoped by design (`crates/dynamo/tests/iam_capture.rs:1` captures x-amz-target request
+shapes) — it does not see this grant. Non-dynamo grants follow the hand-written inline-policy
+pattern instead (`aws-lambda.tf` ssm precedent); this S3 grant does the same: single object, no
+wildcard.
 
 ### D4 — routing: `/l/*` and `/s/*` become CloudFront API-origin behaviors
 Two new ordered cache behaviors (`/l/*`, `/s/*` → api origin), placed after the `/api/*`
