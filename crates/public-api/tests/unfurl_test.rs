@@ -244,6 +244,88 @@ async fn unfurl_template_without_markers_serves_generic_and_is_loud() {
     // metric UnfurlMarkerAbsent=1) — the handler path here proves the DEGRADE half.
 }
 
+/// D5 oracle, executable witness for the REVOKED arm (BLOCKER-2, 2026-09-07
+/// final review — the ledger flagged this branch as untested at handler level:
+/// only the unknown-token arm had a witness). Seeds a live link, revokes it, and
+/// asserts a revoked token's response is byte-identical to an unknown token's —
+/// status, content-type, cache-control, AND body — not merely "both equal TPL",
+/// so a future edit that special-cases one branch's headers is caught even if it
+/// happens to leave the body alone.
+#[tokio::test]
+async fn revoked_link_unfurl_is_byte_identical_to_unknown() {
+    let Some(store) = store_or_skip("unfurl-revoked").await else {
+        return;
+    };
+    let revoked_token = "3".repeat(64);
+    let mut lnk = test_link(&revoked_token);
+    lnk.revoked = true;
+    store.create_link(&lnk).await.unwrap();
+
+    let unknown_token = "e".repeat(64);
+
+    let app = router_with_template(
+        store,
+        mock_invoker(),
+        None,
+        TEST_BASE_URL.into(),
+        Some(Arc::new(StubTemplate(TPL.into()))),
+    );
+
+    let revoked_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/l/{revoked_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let unknown_res = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/l/{unknown_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(revoked_res.status(), unknown_res.status());
+    assert_eq!(revoked_res.status(), StatusCode::OK);
+    assert_eq!(
+        revoked_res.headers()["content-type"],
+        unknown_res.headers()["content-type"]
+    );
+    assert_eq!(
+        revoked_res.headers()["cache-control"],
+        unknown_res.headers()["cache-control"]
+    );
+
+    let revoked_body = String::from_utf8(
+        axum::body::to_bytes(revoked_res.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let unknown_body = String::from_utf8(
+        axum::body::to_bytes(unknown_res.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        revoked_body, unknown_body,
+        "revoked and unknown tokens must be byte-identical (spec D5 oracle)"
+    );
+    assert_eq!(
+        revoked_body, TPL,
+        "both arms must also equal the template verbatim"
+    );
+}
+
 #[tokio::test]
 async fn unfurl_source_failure_is_500_json() {
     let Some(store) = store_or_skip("unfurl-fail").await else {

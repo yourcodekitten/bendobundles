@@ -64,7 +64,11 @@ fn meta_block(title: &str, desc: &str, image: &str, alt: &str) -> String {
     // INVARIANT (tested, not asserted): every interpolated value has passed
     // og_text — including image URLs (escaping a URL is harmless and correct in
     // attribute context; &→&amp;) — so a future base_url-from-Host refactor
-    // cannot bypass the escaper silently (Lilith's MAJOR-1).
+    // cannot bypass the escaper silently (Lilith's MAJOR-1). `alt` is run through
+    // og_text HERE (not by callers) so the invariant holds regardless of what a
+    // future caller passes — both call sites are literals today, so this is a
+    // no-op on current output (MINOR-1, 2026-09-07 final review).
+    let alt = og_text(alt, 200);
     format!(
         "<meta property=\"og:type\" content=\"website\" />\n\
          <meta property=\"og:site_name\" content=\"bendobundles\" />\n\
@@ -290,7 +294,15 @@ pub(crate) async fn handle_unfurl_link(
     match swap_og_block(&template, &meta_html) {
         Ok(swapped) => html_response(swapped),
         Err(MarkerAbsent) => {
-            tracing::error!(token, "unfurl: deployed template is missing the og markers");
+            // MINOR-2 (2026-09-07 final review): marker absence is a DEPLOY
+            // property (the template is missing markers), not a per-token one —
+            // the witness needs no token at all. A capability token doesn't
+            // belong in logs at full length, so only a short, non-reconstructible
+            // prefix is logged, purely to help correlate repeated hits.
+            tracing::error!(
+                token_prefix = format!("{}…", &token[..8.min(token.len())]),
+                "unfurl: deployed template is missing the og markers"
+            );
             emit_marker_absent_metric();
             html_response(template)
         }
@@ -318,8 +330,11 @@ pub(crate) async fn handle_unfurl_shelf(
     match swap_og_block(&template, &meta_html) {
         Ok(swapped) => html_response(swapped),
         Err(MarkerAbsent) => {
+            // MINOR-2 (2026-09-07 final review): same rationale as the link
+            // handler above — marker absence is a deploy property, no full
+            // token needed, only a short prefix for correlation.
             tracing::error!(
-                token,
+                token_prefix = format!("{}…", &token[..8.min(token.len())]),
                 "unfurl: deployed template is missing the og markers (shelf)"
             );
             emit_marker_absent_metric();

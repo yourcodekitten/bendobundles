@@ -1,14 +1,23 @@
-//! S3Template integration tests against moto (repo convention: moto on :8000,
-//! the same instance the DynamoDB-backed suites use — see `crates/dynamo`'s
-//! `store_or_skip` for the pattern this mirrors: env var override, explicit-set
-//! panics rather than skips, unset-and-unreachable skips quietly).
+//! S3Template integration tests against moto.
+//!
+//! Contract (BLOCKER-1, 2026-09-07 final review): this suite reads its OWN env
+//! var, `S3_LOCAL_URL` — never `DYNAMODB_LOCAL_URL`. CI's dynamo suites run
+//! against `amazon/dynamodb-local`, which implements ONLY the DynamoDB API and
+//! does NOT answer S3; reusing that var here made both tests here guaranteed-red
+//! in CI while reading green on every local box that happens to run moto (moto's
+//! server mode DOES answer every AWS service on one endpoint, so a local moto at
+//! `DYNAMODB_LOCAL_URL` masked the gap completely). CI now runs a dedicated
+//! `motoserver/moto` service and points `S3_LOCAL_URL` at it.
+//!
+//! `s3_or_skip` mirrors `crates/dynamo`'s `store_or_skip` pattern: env var
+//! explicitly set ⇒ the endpoint MUST work, panic loudly on failure (refusing to
+//! forge a green run); env var unset ⇒ skip quietly with an eprintln naming
+//! `S3_LOCAL_URL`, so a local run without moto up doesn't fail, but a CI run
+//! (which always sets it) can never silently skip.
 use public_api::{S3Template, TemplateSource};
 
-/// Reuses `DYNAMODB_LOCAL_URL` (not a new S3-specific var) because moto's server
-/// mode answers every AWS service on one endpoint — the same box the dynamo
-/// suites point at IS the S3 endpoint here too.
 async fn s3_or_skip(test: &str) -> Option<(aws_sdk_s3::Client, String)> {
-    let (url, explicit) = match std::env::var("DYNAMODB_LOCAL_URL") {
+    let (url, explicit) = match std::env::var("S3_LOCAL_URL") {
         Ok(v) => (v, true),
         Err(_) => ("http://localhost:8000".into(), false),
     };
@@ -27,11 +36,11 @@ async fn s3_or_skip(test: &str) -> Option<(aws_sdk_s3::Client, String)> {
     if client.list_buckets().send().await.is_err() {
         if explicit {
             panic!(
-                "DYNAMODB_LOCAL_URL is set but moto is unreachable — \
+                "S3_LOCAL_URL is set but moto is unreachable — \
                  refusing to skip (this would forge a green run)"
             );
         }
-        eprintln!("SKIP {test}: no moto/s3-local at {url}");
+        eprintln!("SKIP {test}: S3_LOCAL_URL not set and no moto/s3-local at {url}");
         return None;
     }
     let bucket = format!("t-unfurl-{test}");
