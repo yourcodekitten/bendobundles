@@ -105,4 +105,25 @@ data "aws_iam_policy_document" "app_boundary" {
     actions   = ["lambda:InvokeFunction"]
     resources = ["arn:aws:lambda:${local.region}:${local.account}:function:${local.app_prefix}*"]
   }
+
+  # Site template read — the unfurl handler (/l/*, /s/*) fetches the DEPLOYED
+  # index.html out of the web bucket and swaps its og block before serving it.
+  # Added 2026-09-07 on Ben's authorization: the app role's own inline grant for
+  # this already shipped, but the boundary carried NO s3 statement at all, so the
+  # intersection was empty and every GetObject 500'd. No identity-side grant could
+  # ever have fixed that.
+  #
+  # OBJECT-LEVEL ON PURPOSE — not "${local.app_prefix}-site/*". A boundary is the
+  # CEILING, not a grant: widening it to the whole bucket gives the lambda nothing
+  # today and makes every FUTURE inline grant on this bucket effective without
+  # another review. The narrow ARN costs one boundary edit next feature; the wide
+  # one costs the review itself. It also matches the app role's shipped inline
+  # policy (module.site.s3_bucket_arn/index.html) — a boundary wider than the
+  # grant it caps has stopped describing the intent.
+  statement {
+    sid       = "SiteTemplateRead"
+    effect    = "Allow"
+    actions   = ["s3:GetObject"]
+    resources = ["arn:aws:s3:::${local.app_prefix}-site/index.html"]
+  }
 }
