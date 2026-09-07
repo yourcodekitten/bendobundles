@@ -27,7 +27,7 @@
 ## File Structure
 
 - `crates/domain/src/lib.rs` — add `og_text`, `is_spoofing_format_char` (moved in), unit tests.
-- `crates/public-api/src/lib.rs` — remove local `is_spoofing_format_char` (use domain's); add unfurl module wiring: `TemplateSource` trait + `swap_og_block` + meta builders + 2 handlers + 2 routes; `router()` gains a 5th param.
+- `crates/public-api/src/lib.rs` — remove local `is_spoofing_format_char` (use domain's); add unfurl module wiring: `TemplateSource` trait + `swap_og_block` + meta builders + 2 handlers + 2 routes; `router()` KEEPS its 4-arg signature — `router_with_template` carries the 5th param (Task 3).
 - `crates/public-api/src/unfurl.rs` — NEW: everything unfurl (trait, S3 impl, cache, swap, meta, hash). Keeps lib.rs from growing another 400 lines.
 - `crates/public-api/src/main.rs` — wire S3 client from `WEB_BUCKET` env.
 - `crates/public-api/Cargo.toml` — add `aws-sdk-s3` (same feature shape as the other SDK deps).
@@ -384,7 +384,7 @@ Add `mod unfurl;` in `lib.rs` (top, near other mods).
   - `pub(crate) fn wrap_variant(token: &str) -> &'static str`
   - `pub(crate) fn meta_for_link(link: &domain::Link, now: time::OffsetDateTime, base_url: &str) -> Option<String>`
     (`None` = dead state ⇒ serve the template unmodified)
-  - `pub(crate) fn meta_for_shelf(friend: &domain::Friend, base_url: &str) -> String'
+  - `pub(crate) fn meta_for_shelf(friend: &domain::Friend, base_url: &str) -> String`
 - Produces: `#[async_trait] pub trait TemplateSource: Send + Sync { async fn fetch(&self) -> Result<String, TemplateError>; }` — VERIFIED at review: the crate already uses `async_trait` (lib.rs:9, `Invoker` at :27); mirror that idiom, no new dep. `pub struct S3Template { … }` with `pub fn new(client: aws_sdk_s3::Client, bucket: String) -> Self`, 60s in-memory cache (`tokio::sync::RwLock<Option<(std::time::Instant, String)>>`). **`router()` KEEPS its 4-arg signature** (103 existing call sites, 95 in api_test.rs — measured;
 breaking it is 103 mechanical edits for nothing). Add
 `pub fn router_with_template(store, invoker, steam, base_url, template: Option<std::sync::Arc<dyn TemplateSource>>) -> Router`
