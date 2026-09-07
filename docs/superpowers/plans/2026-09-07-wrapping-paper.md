@@ -1,0 +1,572 @@
+# The Wrapping Paper 🎁 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Per-gift and per-shelf chat unfurls — `/l/<token>` and `/s/<token>` serve the deployed SPA `index.html` with a personalized OpenGraph block swapped in at the origin, so the link Ben pastes unfurls as a wrapped present for THAT friend.
+
+**Architecture:** CloudFront gains two API-origin behaviors (`/l/*`, `/s/*`); API Gateway gains matching proxy paths; public-api serves the web bucket's `index.html` (cached ~60s) with the og block replaced via explicit HTML comment markers. One dynamo read per unfurl (`get_link` / `get_friend_by_shelf_token`). Wrap art = 8 deterministic gift PNGs (token-hashed) + 1 shelf PNG, static web assets.
+
+**Tech Stack:** Rust (axum, lambda_http, aws-sdk-s3 NEW dep), existing dynamo store, Terraform (CF module `ordered_cache_behaviors` with `cache_policy_id`), Vite/React web (markers + assets only), vitest, moto for S3 integration.
+
+**Spec:** `docs/spec-wrapping-paper.md` (r2.4, family-signed 2026-09-07 — the plan argues from it; executors read both)
+
+## Global Constraints
+
+- Identical bytes to every fetcher of a path — NO UA-conditional responses (spec non-goals).
+- The unfurl is the wrapped box, never the contents: no game titles/art in meta, count at most.
+- Personalized states: `active` and `sealed` ONLY. `revoked|expired|exhausted|unknown` → the template's own generic og block, byte-identical to what S3 serves today (spec D5).
+- Sealed copy carries NO date: `sealed for now. good things wait.` (spec D6).
+- All injected text passes `domain::og_text` (strip control+format chars → clamp → attribute-escape `& < > " '`); `"` is the breakout char. Property: hostile label CANNOT alter tag structure.
+- Marker absence = ERROR log + EMF metric `UnfurlMarkerAbsent`, then serve generic (spec D3 witness).
+- The escaper lives ONCE, in `crates/domain`. `is_spoofing_format_char` MOVES from public-api to domain (re-used there); admin-api's copy is untouched this arc — no third implementation.
+- Wrap hash: FNV-1a 64 over the token bytes, `% 8` — deterministic forever; golden test pins it.
+- Cache: CF custom cache policy default/max TTL 60s on both behaviors; lambda sends `Cache-Control: public, max-age=60` on personalized 200s, and `no-store` never (that's the JSON API's sealed rule, not ours — our sealed card is stable copy).
+- Commits: signed (`-S`), conventional-ish gift-shelf style, author `code kitten <yourcodekitten@gmail.com>`.
+- Heavy builds ride CI; locally run only `cargo test -p <crate>` (box linker constraint).
+
+## File Structure
+
+- `crates/domain/src/lib.rs` — add `og_text`, `is_spoofing_format_char` (moved in), unit tests.
+- `crates/public-api/src/lib.rs` — remove local `is_spoofing_format_char` (use domain's); add unfurl module wiring: `TemplateSource` trait + `swap_og_block` + meta builders + 2 handlers + 2 routes; `router()` gains a 5th param.
+- `crates/public-api/src/unfurl.rs` — NEW: everything unfurl (trait, S3 impl, cache, swap, meta, hash). Keeps lib.rs from growing another 400 lines.
+- `crates/public-api/src/main.rs` — wire S3 client from `WEB_BUCKET` env.
+- `crates/public-api/Cargo.toml` — add `aws-sdk-s3` (same feature shape as the other SDK deps).
+- `crates/public-api/tests/unfurl_moto.rs` — NEW: moto S3 integration.
+- `web/index.html` — og markers around the existing block.
+- `web/src/App.test.tsx` (or new `web/src/ogMarkers.test.ts`) — marker contract test.
+- `web/public/art/wrap-{clay,rust,mustard,moss,pine,slate,heather,mauve}.png`, `web/public/art/wrap-shelf.png` — NEW assets (pre-staged by the main session, see Task 4).
+- `terraform/aws-apigateway.tf` — `/l/{proxy+}` + `/s/{proxy+}` paths.
+- `terraform/aws-cloudfront.tf` — cache policy resource + 2 ordered behaviors.
+- `terraform/aws-lambda.tf` — `WEB_BUCKET` env + `s3` inline policy on public-api.
+- `docs/spec-wrapping-paper.md` — r2.5 correction (Task 5) + BUILT flip (Task 6).
+- `DESIGN.md` — wrap-art palette note (Task 6).
+
+---
+
+### Task 1: domain — `og_text` sanitizer/escaper (single home)
+
+**Files:**
+- Modify: `crates/domain/src/lib.rs` (append at end, before tests mod if one exists)
+- Modify: `crates/public-api/src/lib.rs:1043-1051` (delete local `is_spoofing_format_char`, import domain's)
+
+**Interfaces:**
+- Produces: `pub fn domain::is_spoofing_format_char(c: char) -> bool` (moved, body verbatim from `public-api:1043`) and `pub fn domain::og_text(raw: &str, max_chars: usize) -> String` — strips `char::is_control` and spoofing format chars, clamps to `max_chars` chars (char-boundary safe), then escapes `& < > " '` in that order (`&` first). Later tasks call `og_text(label, 80)`.
+
+- [ ] **Step 1: Write the failing tests** (in `crates/domain/src/lib.rs` tests mod)
+
+```rust
+#[test]
+fn og_text_escapes_attribute_breakers() {
+    assert_eq!(domain_crate_name::og_text(r#"a"b<c>d&e'f"#, 80),
+        "a&quot;b&lt;c&gt;d&amp;e&#39;f");
+}
+
+#[test]
+fn og_text_strips_control_and_format_chars() {
+    // \u{202E} RLO is the bidi spoof char; \u{0007} is control
+    assert_eq!(domain_crate_name::og_text("a\u{202E}b\u{0007}c", 80), "abc");
+}
+
+#[test]
+fn og_text_clamps_on_char_boundaries() {
+    assert_eq!(domain_crate_name::og_text("héllo", 3), "hél");
+}
+
+#[test]
+fn og_text_hostile_label_cannot_change_tag_structure() {
+    // Structure-invariance (Lilith): render into the exact attribute template and
+    // assert the parsed tag count and attribute value survive.
+    let hostile = r#"" onload=x><script>alert(1)</script>"#;
+    let content = domain_crate_name::og_text(hostile, 200);
+    let tag = format!(r#"<meta property="og:title" content="{content}" />"#);
+    // No new element boundaries: exactly one '<' and one '>' pair belonging to
+    // the meta tag itself; the escaped payload contributes zero raw < > ".
+    assert_eq!(tag.matches('<').count(), 1);
+    assert_eq!(tag.matches('>').count(), 1);
+    assert_eq!(tag.matches('"').count(), 4); // the four template quotes only
+}
+```
+(Use the crate's real name in place of `domain_crate_name` — check `crates/domain/Cargo.toml` `[package] name`.)
+
+- [ ] **Step 2: Run to verify failure** — `cargo test -p domain og_text` → FAIL: function not found.
+- [ ] **Step 3: Implement** (append to `crates/domain/src/lib.rs`):
+
+```rust
+/// True for Unicode format chars that can visually spoof text (bidi controls,
+/// zero-widths). MOVED VERBATIM from public-api (which now re-uses this) —
+/// admin-api holds a deliberate second copy (see its :997 sync note); this
+/// move keeps the count at two, adding no third.
+pub fn is_spoofing_format_char(c: char) -> bool {
+    // ⬅ paste the body verbatim from crates/public-api/src/lib.rs:1043-1051
+    matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+    // ^ EXECUTOR: replace this line with the exact body found at public-api:1043 —
+    // the real predicate is the source of truth, not this plan's recollection.
+}
+
+/// Sanitize + attribute-escape text bound for an HTML attribute (og meta
+/// content). Strip → clamp → escape, in that order; `&` escapes first.
+/// `"` is the breakout character for attribute context — never skip it.
+pub fn og_text(raw: &str, max_chars: usize) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_spoofing_format_char(*c))
+        .take(max_chars)
+        .collect();
+    let mut out = String::with_capacity(cleaned.len());
+    for c in cleaned.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+```
+
+- [ ] **Step 4:** `cargo test -p domain` → PASS (all four + existing suite).
+- [ ] **Step 5:** In `crates/public-api/src/lib.rs`: delete fn `is_spoofing_format_char` (:1043-1051), add `use domain::is_spoofing_format_char;` near the other domain imports (grep `use domain::` for the exact block). `cargo test -p public-api` → PASS (its existing sanitize tests now exercise the moved fn).
+- [ ] **Step 6: Commit** — `git add -A && git commit -S -m "🎁 domain: og_text attribute escaper; is_spoofing_format_char moves to its single home"`
+
+### Task 2: public-api — `swap_og_block` + meta builders (pure core)
+
+**Files:**
+- Create: `crates/public-api/src/unfurl.rs`
+- Modify: `crates/public-api/src/lib.rs` (add `mod unfurl;` + `pub use` for tests)
+
+**Interfaces:**
+- Consumes: `domain::og_text`, `domain::Link` (fields `label: String`, `curated_game_ids: Option<Vec<String>>`, `can_claim(now) -> Result<(), ClaimRefusal>`), `domain::Friend` (field `name: String`).
+- Produces (Task 3 relies on these exact names):
+  - `pub(crate) const OG_BEGIN: &str = "<!-- og:begin -->";` / `OG_END`
+  - `pub(crate) fn swap_og_block(template: &str, meta_html: &str) -> Result<String, MarkerAbsent>` (`pub(crate) struct MarkerAbsent;`)
+  - `pub(crate) fn wrap_variant(token: &str) -> &'static str` → one of `"clay","rust","mustard","moss","pine","slate","heather","mauve"` via FNV-1a64 % 8 (order exactly as listed — golden-pinned)
+  - `pub(crate) fn meta_for_link(link: &domain::Link, now: time::OffsetDateTime, base_url: &str) -> Option<String>` — `Some(meta_html)` for active/sealed, `None` for every dead state
+  - `pub(crate) fn meta_for_shelf(friend: &domain::Friend, base_url: &str) -> String`
+
+- [ ] **Step 1: failing tests** (in `unfurl.rs` `#[cfg(test)] mod tests`):
+
+```rust
+#[test]
+fn wrap_variant_is_pinned_forever() {
+    // GOLDEN: these exact pairs may never change — the paper is a promise (spec D1).
+    assert_eq!(wrap_variant("0000000000000000000000000000000000000000000000000000000000000000"),
+        wrap_variant("0000000000000000000000000000000000000000000000000000000000000000"));
+    let all: std::collections::HashSet<_> =
+        (0..64).map(|i| wrap_variant(&format!("{i:064x}"))).collect();
+    assert!(all.len() >= 6, "64 tokens should hit most of 8 buckets: got {}", all.len());
+}
+
+#[test]
+fn swap_og_block_replaces_between_markers() {
+    let t = "head\n<!-- og:begin -->\nOLD\n<!-- og:end -->\ntail";
+    let out = swap_og_block(t, "NEW").unwrap();
+    assert!(out.contains("NEW") && !out.contains("OLD"));
+    assert!(out.starts_with("head\n") && out.ends_with("\ntail"));
+}
+
+#[test]
+fn swap_og_block_absent_marker_is_typed() {
+    assert!(swap_og_block("no markers here", "X").is_err());
+}
+
+#[test]
+fn meta_for_link_active_curated_counts_in_words() {
+    let mut link = test_link(); // build with the same helper style store tests use
+    link.curated_game_ids = Some(vec!["a".into(), "b".into(), "c".into()]);
+    let m = meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example").unwrap();
+    assert!(m.contains("three treasures inside, chosen for you. tap to unwrap."));
+    assert!(m.contains("ben wrapped something for"));
+    assert!(m.contains("/art/wrap-")); // one of the 8
+}
+
+#[test]
+fn meta_for_link_sealed_has_state_but_never_a_clock() {
+    let mut link = test_link();
+    link.unlock_at = Some(time::OffsetDateTime::now_utc() + time::Duration::days(2));
+    let m = meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example").unwrap();
+    assert!(m.contains("sealed for now. good things wait."));
+    let year = time::OffsetDateTime::now_utc().year().to_string();
+    assert!(!m.contains(&year), "no date-ish content in a broadcast card");
+}
+
+#[test]
+fn meta_for_link_dead_states_are_none() {
+    let mut link = test_link();
+    link.revoked = true; // adjust to the real field the domain uses for revocation
+    assert!(meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example").is_none());
+}
+
+#[test]
+fn hostile_label_cannot_change_structure_at_the_meta_layer() {
+    let mut link = test_link();
+    link.label = r#"" onload=x><script>"#.into();
+    let m = meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example").unwrap();
+    // No raw < > outside tag boundaries: every line parses as a <meta …/> element.
+    for line in m.lines().filter(|l| !l.trim().is_empty()) {
+        let l = line.trim();
+        assert!(l.starts_with("<meta ") && l.ends_with("/>"), "unexpected line: {l}");
+        assert_eq!(l.matches('<').count(), 1, "injected < in: {l}");
+    }
+}
+```
+(`test_link()`: construct a `domain::Link` the way `crates/dynamo` store tests do — grep `fn test_link` / a literal `Link {` in `crates/dynamo/src/lib.rs` tests and mirror the minimal valid struct. EXECUTOR: read the real `Link` fields for revocation — the plan's `link.revoked = true` line must become whatever field/state `can_claim` maps to `ClaimRefusal::Revoked`.)
+
+- [ ] **Step 2:** `cargo test -p public-api unfurl` → FAIL (module absent).
+- [ ] **Step 3: implement `unfurl.rs` core:**
+
+```rust
+//! The wrapping paper: per-token og meta swapped into the deployed index.html.
+//! Spec: docs/spec-wrapping-paper.md (r2). The card is the wrapped box, never
+//! the contents; personalized ONLY for active|sealed; audience = the room.
+use domain::og_text;
+
+pub(crate) const OG_BEGIN: &str = "<!-- og:begin -->";
+pub(crate) const OG_END: &str = "<!-- og:end -->";
+
+pub(crate) struct MarkerAbsent;
+
+pub(crate) fn swap_og_block(template: &str, meta_html: &str) -> Result<String, MarkerAbsent> {
+    let start = template.find(OG_BEGIN).ok_or(MarkerAbsent)?;
+    let end_rel = template[start..].find(OG_END).ok_or(MarkerAbsent)?;
+    let end = start + end_rel + OG_END.len();
+    let mut out = String::with_capacity(template.len() + meta_html.len());
+    out.push_str(&template[..start]);
+    out.push_str(OG_BEGIN);
+    out.push('\n');
+    out.push_str(meta_html);
+    out.push('\n');
+    out.push_str(OG_END);
+    out.push_str(&template[end..]);
+    Ok(out)
+}
+
+const WRAPS: [&str; 8] = ["clay", "rust", "mustard", "moss", "pine", "slate", "heather", "mauve"];
+
+pub(crate) fn wrap_variant(token: &str) -> &'static str {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in token.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    WRAPS[(h % 8) as usize]
+}
+
+fn count_words(n: usize) -> String {
+    const W: [&str; 12] = ["one","two","three","four","five","six","seven","eight","nine","ten","eleven","twelve"];
+    if (1..=12).contains(&n) { W[n - 1].to_string() } else { "a dozen and more".to_string() }
+}
+
+fn meta_block(title: &str, desc: &str, image: &str, alt: &str) -> String {
+    // Every value is PRE-ESCAPED by og_text before reaching here.
+    format!(
+        "<meta property=\"og:type\" content=\"website\" />\n\
+         <meta property=\"og:site_name\" content=\"bendobundles\" />\n\
+         <meta property=\"og:title\" content=\"{title}\" />\n\
+         <meta property=\"og:description\" content=\"{desc}\" />\n\
+         <meta property=\"og:image\" content=\"{image}\" />\n\
+         <meta property=\"og:image:width\" content=\"1200\" />\n\
+         <meta property=\"og:image:height\" content=\"630\" />\n\
+         <meta property=\"og:image:alt\" content=\"{alt}\" />\n\
+         <meta name=\"twitter:card\" content=\"summary_large_image\" />"
+    )
+}
+
+pub(crate) fn meta_for_link(
+    link: &domain::Link,
+    now: time::OffsetDateTime,
+    base_url: &str,
+) -> Option<String> {
+    let sealed = match link.can_claim(now) {
+        Ok(()) => false,
+        Err(domain::ClaimRefusal::Sealed) => true,
+        Err(_) => return None, // revoked|expired|exhausted → generic (spec D5)
+    };
+    let label = og_text(&link.label, 80);
+    let title = format!("🎁 ben wrapped something for {label} ♡");
+    let desc = if sealed {
+        "sealed for now. good things wait.".to_string()
+    } else {
+        match &link.curated_game_ids {
+            Some(ids) if !ids.is_empty() => {
+                let n = ids.len();
+                let s = if n == 1 { "" } else { "s" };
+                format!("{} treasure{s} inside, chosen for you. tap to unwrap.", count_words(n))
+            }
+            _ => "treasures inside, chosen for you. tap to unwrap.".to_string(),
+        }
+    };
+    let image = format!("{base_url}/art/wrap-{}.png", wrap_variant(&link.token));
+    Some(meta_block(&title, &og_text(&desc, 200), &image,
+        "a pixel-art wrapped present in ben's pea-green attic"))
+}
+
+pub(crate) fn meta_for_shelf(friend: &domain::Friend, base_url: &str) -> String {
+    let name = og_text(&friend.name, 80);
+    meta_block(
+        &format!("📚 the shelf ben keeps for {name}"),
+        "every game he's given you, all in one warm place.",
+        &format!("{base_url}/art/wrap-shelf.png"),
+        "a pixel-art shelf of games in ben's attic",
+    )
+}
+```
+Add `mod unfurl;` in `lib.rs` (top, near other mods).
+
+- [ ] **Step 4:** `cargo test -p public-api unfurl` → PASS. Fix the `test_link` revocation field per the real domain struct while here.
+- [ ] **Step 5: Commit** — `git commit -S -m "🎁 public-api: unfurl core — marker swap, pinned wrap hash, meta builders (structure-invariant)"`
+
+### Task 3: public-api — TemplateSource, S3 fetch + cache, handlers, routes
+
+**Files:**
+- Modify: `crates/public-api/src/unfurl.rs` (append), `crates/public-api/src/lib.rs` (router + AppState), `crates/public-api/src/main.rs`, `crates/public-api/Cargo.toml`
+- Create: `crates/public-api/tests/unfurl_moto.rs`
+
+**Interfaces:**
+- Consumes: Task 2's names verbatim.
+- Produces: `pub trait TemplateSource: Send + Sync { fn fetch(&self) -> BoxFuture<'_, Result<String, TemplateError>>; }` — or simpler: `#[async_trait] pub trait TemplateSource` if the crate already uses async_trait (CHECK; if not, use a boxed-future fn to avoid a new dep). `pub struct S3Template { … }` with `pub fn new(client: aws_sdk_s3::Client, bucket: String) -> Self`, 60s in-memory cache (`tokio::sync::RwLock<Option<(std::time::Instant, String)>>`). `router()` gains 5th param `template: Option<std::sync::Arc<dyn TemplateSource>>`; ALL existing `router(` call sites (main.rs + every test) add `None`.
+
+- [ ] **Step 1: failing handler tests** (unit, stub source — in `unfurl.rs` tests):
+
+```rust
+struct StubTemplate(String);
+impl TemplateSource for StubTemplate { /* returns Ok(self.0.clone()) */ }
+struct FailingTemplate;
+impl TemplateSource for FailingTemplate { /* returns Err(TemplateError::Unavailable) */ }
+
+const TPL: &str = "<html><head>\n<!-- og:begin -->\nGENERIC\n<!-- og:end -->\n</head><body></body></html>";
+
+#[tokio::test]
+async fn unfurl_link_serves_personalized_html_with_cache_header() {
+    // oneshot the router the way existing lib.rs tests do (grep `oneshot` there
+    // and mirror the store+invoker fixtures), with a seeded active curated link.
+    // assert: 200, content-type text/html, body contains "ben wrapped something for",
+    // body does NOT contain "GENERIC", header cache-control == "public, max-age=60".
+}
+
+#[tokio::test]
+async fn unfurl_dead_token_serves_template_byte_identical() {
+    // unknown token → 200, body == TPL exactly (generic block untouched).
+}
+
+#[tokio::test]
+async fn unfurl_template_without_markers_serves_generic_and_is_loud() {
+    // StubTemplate without markers + valid link → 200 with the RAW template,
+    // and the EMF metric line was emitted (assert via tracing/log capture if the
+    // crate has a helper; otherwise unit-test emit_marker_absent_metric()'s JSON
+    // shape directly: {"_aws":{"CloudWatchMetrics":[{"Namespace":"bendobundles/unfurl",
+    // "Metrics":[{"Name":"UnfurlMarkerAbsent"}],"Dimensions":[[]]}],"Timestamp":…},
+    // "UnfurlMarkerAbsent":1}
+}
+
+#[tokio::test]
+async fn unfurl_source_failure_is_500_json() {
+    // FailingTemplate → 500 {"error":"try again"} — same shape as the API's own 500s.
+}
+```
+
+- [ ] **Step 2:** run → FAIL (trait absent).
+- [ ] **Step 3: implement.** Key pieces:
+
+```rust
+pub enum TemplateError { Unavailable }
+
+pub struct S3Template {
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    cache: tokio::sync::RwLock<Option<(std::time::Instant, String)>>,
+}
+
+impl S3Template {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    pub fn new(client: aws_sdk_s3::Client, bucket: String) -> Self { /* … */ }
+    async fn fetch_inner(&self) -> Result<String, TemplateError> {
+        if let Some((at, s)) = self.cache.read().await.as_ref() {
+            if at.elapsed() < Self::TTL { return Ok(s.clone()); }
+        }
+        let out = self.client.get_object().bucket(&self.bucket).key("index.html")
+            .send().await.map_err(|_| TemplateError::Unavailable)?;
+        let bytes = out.body.collect().await.map_err(|_| TemplateError::Unavailable)?;
+        let s = String::from_utf8(bytes.into_bytes().to_vec()).map_err(|_| TemplateError::Unavailable)?;
+        *self.cache.write().await = Some((std::time::Instant::now(), s.clone()));
+        Ok(s)
+    }
+}
+```
+
+Handlers (axum, in unfurl.rs; wire from lib.rs routes `/l/{token}` and `/s/{token}`):
+- fetch template (None source or Err → 500 JSON `{"error":"try again"}`);
+- dynamo read (`get_link` / `get_friend_by_shelf_token`); `Ok(None)`/dead → serve template UNMODIFIED with `text/html` + `Cache-Control: public, max-age=60` (generic card, 200 — spec D5);
+- meta build → `swap_og_block`; `Err(MarkerAbsent)` → `tracing::error!` + EMF line to stdout (`println!` of the serde_json EMF blob — namespace `bendobundles/unfurl`, metric `UnfurlMarkerAbsent`, value 1) → serve template unmodified;
+- success → swapped HTML, `text/html; charset=utf-8`, `Cache-Control: public, max-age=60`.
+
+`Cargo.toml`: `aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }` (mirror line 18's shape).
+`main.rs`: read `WEB_BUCKET` env; when present build `aws_sdk_s3::Client` from the same shared `aws_config` the other clients use and pass `Some(Arc::new(S3Template::new(...)))`, else `None`.
+`router()` signature: add the param; update every call site (`grep -n 'router(' crates/public-api` — tests pass `None`, the four new tests pass stubs).
+
+- [ ] **Step 4:** `cargo test -p public-api` → PASS entire crate.
+- [ ] **Step 5: moto integration** (`tests/unfurl_moto.rs`): mirror the moto harness style from `crates/dynamo` tests (grep `moto` there for endpoint/env conventions): create bucket, put an `index.html` WITH markers, build `S3Template` against the moto endpoint, assert fetch returns it, overwrite the object, assert the cached copy survives within TTL (fetch again immediately → OLD bytes; this pins the cache semantics). Run: `cargo test -p public-api --test unfurl_moto` (moto on :8000 per repo convention — kill it after).
+- [ ] **Step 6: Commit** — `git commit -S -m "🎁 public-api: unfurl routes — S3 template with 60s cache, loud marker witness, one dynamo read per card"`
+
+### Task 4: web — markers, marker contract test, wrap art
+
+**Files:**
+- Modify: `web/index.html:21-33`
+- Create: `web/src/ogMarkers.test.ts`
+- Create: `web/public/art/wrap-*.png` (9 files, pre-staged — see Step 4)
+
+**Interfaces:**
+- Produces: `index.html` og block wrapped in `<!-- og:begin -->` / `<!-- og:end -->` EXACTLY (Task 2's constants); art filenames exactly `wrap-clay.png … wrap-mauve.png`, `wrap-shelf.png` (Task 2's `WRAPS` order/names).
+
+- [ ] **Step 1: failing test** (`web/src/ogMarkers.test.ts`):
+
+```ts
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { describe, expect, it } from "vitest";
+
+// The lambda swaps the og block anchored on these exact markers (spec D3).
+// This test is the BUILD-side half of the contract; the lambda's marker
+// witness is the bucket-side half. Change one, change both.
+describe("og markers", () => {
+  const html = readFileSync(resolve(__dirname, "../index.html"), "utf8");
+  it("carries begin/end markers in order, once each", () => {
+    const b = html.indexOf("<!-- og:begin -->");
+    const e = html.indexOf("<!-- og:end -->");
+    expect(b).toBeGreaterThan(-1);
+    expect(e).toBeGreaterThan(b);
+    expect(html.indexOf("<!-- og:begin -->", b + 1)).toBe(-1);
+    expect(html.indexOf("<!-- og:end -->", e + 1)).toBe(-1);
+  });
+  it("wraps the og block (og:title inside the markers)", () => {
+    const inner = html.slice(html.indexOf("<!-- og:begin -->"), html.indexOf("<!-- og:end -->"));
+    expect(inner).toContain('property="og:title"');
+  });
+  it("ships all nine wrap art assets", () => {
+    for (const v of ["clay","rust","mustard","moss","pine","slate","heather","mauve","shelf"]) {
+      expect(() => readFileSync(resolve(__dirname, `../public/art/wrap-${v}.png`))).not.toThrow();
+    }
+  });
+});
+```
+
+- [ ] **Step 2:** `npx vitest run src/ogMarkers.test.ts` (from `web/`) → FAIL.
+- [ ] **Step 3:** Edit `web/index.html`: insert `<!-- og:begin -->` on the line BEFORE the `<!-- open graph … -->` comment (:21) and `<!-- og:end -->` after the last og/twitter meta of that block (after :33 — read the file; include any `twitter:` tags in the block so the swap replaces them coherently).
+- [ ] **Step 4 (MAIN SESSION, not a subagent — billable art + judgment):** stage the 9 PNGs. The master is `<scratchpad>/wrap-art/wrap-master-final.png` (1216×640, high quality, generated 07:14). Recipe, already proven on the draft:
+
+```bash
+cd <scratchpad>/wrap-art
+# re-sample the FINAL master's bow (it may differ from the draft's):
+convert wrap-master-final.png -crop 24x24+<bow-x>+<bow-y> +repage -resize 1x1 txt:-
+# recompute per-token (L%,S%,hue-arg) with the python block from the session
+# (targets: index.css:34-41 oklch values → sRGB), then per variant:
+convert wrap-master-final.png -modulate "$L,$S,$H" shift.png
+convert wrap-master-final.png shift.png mask.png -compose Over -composite full.png
+convert full.png -gravity center -crop 1200x630+0+0 +repage wrap-<name>.png
+# rust variant = the master itself, center-cropped (its bow IS rust).
+# shelf: separate gpt-image edit of the master — same room, present replaced by a
+#   small wooden shelf of game boxes, NO accent color pop (reads as furniture,
+#   disjoint-palette rule) — then center-crop identically.
+pngquant/optipng if available; copy all 9 into web/public/art/.
+```
+Eyeball all 9 at once before committing (montage). Muted is correct; illegible is not.
+
+- [ ] **Step 5:** `npx vitest run` (full web suite) → PASS.
+- [ ] **Step 6: Commit** — `git commit -S -m "🎁 web: og markers + marker contract test + nine wrapping papers (muted-earth, token-pinned)"`
+
+### Task 5: terraform — gateway paths, behaviors, cache policy, IAM, env
+
+**Files:**
+- Modify: `terraform/aws-apigateway.tf` (paths map), `terraform/aws-cloudfront.tf` (cache policy + behaviors), `terraform/aws-lambda.tf` (public-api env + policy)
+- Modify: `docs/spec-wrapping-paper.md` (r2.5 correction)
+
+**Interfaces:**
+- Consumes: web bucket = `module.site.s3_bucket_id` / `.s3_bucket_arn` (aws-cloudfront.tf:112 module).
+- Produces: infra reaching Task 3's lambda at `/l/*` + `/s/*` with `WEB_BUCKET` set.
+
+- [ ] **Step 1:** `aws-apigateway.tf`: add two path entries to the OpenAPI `paths` map, copying the `"/api/{proxy+}"` block verbatim with keys `"/l/{proxy+}"` and `"/s/{proxy+}"`, both targeting `module.lambda_public_api.lambda_function_arn` (GET-only is tempting but keep ANY-method parity with the siblings — the lambda 404s the rest).
+- [ ] **Step 2:** `aws-cloudfront.tf`: add
+
+```hcl
+module "label_unfurl_cache" {
+  source  = "bendoerr-terraform-modules/label/null"
+  version = "1.0.1"
+  context = module.context.shared
+  name    = "unfurl-cache"
+}
+
+# 60s shared cache for personalized unfurl HTML (spec D4/OQ2): per-path keys —
+# the token is the path; DECIDED cost: up to 60s of revocation latency on the
+# card (the page itself stays live-checked). No cookies/headers/query in key.
+resource "aws_cloudfront_cache_policy" "unfurl" {
+  name        = module.label_unfurl_cache.id
+  default_ttl = 60
+  max_ttl     = 60
+  min_ttl     = 0
+  parameters_in_cache_key_and_forwarded_to_origin {
+    cookies_config       { cookie_behavior = "none" }
+    headers_config       { header_behavior = "none" }
+    query_strings_config { query_string_behavior = "none" }
+    enable_accept_encoding_gzip   = true
+    enable_accept_encoding_brotli = true
+  }
+}
+```
+
+and extend `ordered_cache_behaviors` (AFTER the two api rows — order is evaluation order):
+
+```hcl
+    { path_pattern = "/l/*", target_origin_id = "api",
+      allowed_methods = ["GET", "HEAD"], cached_methods = ["GET", "HEAD"],
+      cache_policy_id = aws_cloudfront_cache_policy.unfurl.id },
+    { path_pattern = "/s/*", target_origin_id = "api",
+      allowed_methods = ["GET", "HEAD"], cached_methods = ["GET", "HEAD"],
+      cache_policy_id = aws_cloudfront_cache_policy.unfurl.id },
+```
+
+- [ ] **Step 3:** `aws-lambda.tf` public-api module: env gains `WEB_BUCKET = module.site.s3_bucket_id` (comment: template for unfurl HTML — spec D3); `addl_inline_policies` gains, mirroring the ssm entry's hand-written shape:
+
+```hcl
+    web_index = jsonencode({
+      Version = "2012-10-17"
+      Statement = [{
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = ["${module.site.s3_bucket_arn}/index.html"]
+      }]
+    })
+```
+
+- [ ] **Step 4 (spec r2.5):** in `docs/spec-wrapping-paper.md` D3, replace the iam_capture sentence: the corpus is DYNAMO-scoped by design (`crates/dynamo/tests/iam_capture.rs:1` captures x-amz-target request shapes); non-dynamo grants follow the hand-written inline-policy pattern (`aws-lambda.tf` ssm precedent) — this S3 grant does the same, single object, no wildcard.
+- [ ] **Step 5:** `terraform fmt -check terraform/` → clean. READ the three diffs line-by-line (no local plan — deploy-time plan is the gate, runbook #217: infra-change arc, non-zero destroy = read-every-line).
+- [ ] **Step 6: Commit** — `git commit -S -m "🎁 terraform: /l/* + /s/* to the api origin, 60s unfurl cache policy, WEB_BUCKET + single-object s3 read"`
+
+### Task 6: docs — spec flip + DESIGN.md palette note
+
+**Files:**
+- Modify: `docs/spec-wrapping-paper.md` (status line), `DESIGN.md`
+
+- [ ] **Step 1:** spec status → `BUILT (2026-09-07) — r2 as reviewed; see PR`.
+- [ ] **Step 2:** `DESIGN.md`, after the Title-Hash Rule section, add:
+
+```markdown
+**The Wrapping-Paper Rule.** Gift unfurl art (`web/public/art/wrap-*.png`) draws its accent from
+the same muted-earth tokens as the title-hash palette, keyed by FNV-1a64(link token) % 8 — the
+same gift wears the same paper forever (re-pastes unfurl identically). The shelf card is ONE
+design with no accent pop: a shelf is a different KIND of object, not another present, and a
+disjoint look takes the shelf-matches-a-gift-paper collision to zero by construction
+(1−(7/8)ⁿ ≈ 33% at three gifts if it were hashed — spec D1). Changing the hash, the bucket
+order, or the filenames breaks the promise; don't.
+```
+
+- [ ] **Step 3:** `npx vitest run` (web) + `cargo test -p public-api -p domain` one last local pass → PASS.
+- [ ] **Step 4: Commit** — `git commit -S -m "🎁 docs: spec flipped BUILT; DESIGN.md learns the wrapping-paper rule"`
+
+---
+
+## Self-review notes (run at plan time, kept for the executor)
+- Spec coverage: D1→T2/T4/T6 · D2→(non-goal, no task) · D3→T3/T4/T5(+r2.5) · D4→T5 · D5→T3 (dead→byte-identical test) · D6→T2 (copy verbatim in builders + tests) · witness→T3/T4 · resolutions→T5 cache policy comment.
+- The two plan-marked EXECUTOR notes (predicate body verbatim; revocation field name) are deliberate read-the-source pins, not placeholders — the source outranks the plan's recollection.
+- Type consistency: `wrap_variant` names == art filenames == vitest list == WRAPS order (single source: this plan, golden-pinned in T2, contract-tested in T4).
