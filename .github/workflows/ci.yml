@@ -18,7 +18,7 @@ jobs:
       # 2026-09-07 final review) — falling back to the dynamo endpoint locally would
       # re-open the exact trap this fixes.
       moto:
-        image: motoserver/moto:latest
+        image: motoserver/moto:5.2.3
         ports: ["5000:5000"]
     env:
       DYNAMODB_LOCAL_URL: http://localhost:8000
