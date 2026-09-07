@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use public_api::{Invoker, LambdaInvoker, router};
+use public_api::{Invoker, LambdaInvoker, S3Template, TemplateSource, router_with_template};
 use steam_client::SteamClient;
 
 async fn get_secret(client: &aws_sdk_ssm::Client, param: &str) -> Option<String> {
@@ -56,7 +56,17 @@ async fn main() {
     };
     let steam = SteamClient::configure(steam_key);
 
-    lambda_http::run(router(store, invoker, steam, base_url))
-        .await
-        .expect("lambda_http run failed");
+    // WEB_BUCKET absent ⇒ no unfurl personalization (spec: docs/spec-wrapping-paper.md) —
+    // `/l/*` and `/s/*` 500 rather than silently going stale. Shares the same `cfg` as
+    // every other client here (one credential/region resolution for the whole lambda).
+    let web_bucket = std::env::var("WEB_BUCKET").ok();
+    let template: Option<Arc<dyn TemplateSource>> = web_bucket.map(|bucket| {
+        Arc::new(S3Template::new(aws_sdk_s3::Client::new(&cfg), bucket)) as Arc<dyn TemplateSource>
+    });
+
+    lambda_http::run(router_with_template(
+        store, invoker, steam, base_url, template,
+    ))
+    .await
+    .expect("lambda_http run failed");
 }

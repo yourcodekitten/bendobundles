@@ -12,8 +12,17 @@ jobs:
       dynamodb:
         image: amazon/dynamodb-local:2.5.2
         ports: ["8000:8000"]
+      # dynamodb-local answers ONLY the DynamoDB API — it does not speak S3, so the
+      # unfurl_moto suite needs its own service. moto/server answers S3 (and more)
+      # on one endpoint; kept separate from DYNAMODB_LOCAL_URL on purpose (BLOCKER-1,
+      # 2026-09-07 final review) — falling back to the dynamo endpoint locally would
+      # re-open the exact trap this fixes.
+      moto:
+        image: motoserver/moto:5.2.3
+        ports: ["5000:5000"]
     env:
       DYNAMODB_LOCAL_URL: http://localhost:8000
+      S3_LOCAL_URL: http://localhost:5000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

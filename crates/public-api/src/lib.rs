@@ -4,6 +4,10 @@
 //!         `POST /api/l/{token}/thanks`,
 //!         `GET /api/steam/login`, `GET /api/steam/return`,
 //!         `GET /api/l/{token}/steam/owned/{steamid}`, fallback 404.
+mod unfurl;
+
+pub use unfurl::{S3Template, TemplateError, TemplateSource};
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -14,6 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use domain::is_spoofing_format_char;
 use dynamo::{ClaimTxError, OwnedProxyOutcome, Store, StoreError};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::{Deserialize, Serialize};
@@ -86,6 +91,12 @@ pub struct AppState {
     /// Used to reconstruct `expected_return_to` in the OpenID return endpoint
     /// from config — NEVER from Host/X-Forwarded-* headers.
     base_url: String,
+    /// Where `/l/{token}` and `/s/{token}` fetch the deployed `index.html` to
+    /// swap the og block into (spec: docs/spec-wrapping-paper.md). `None` in
+    /// every one of the 103 existing `router()` call sites — those never hit
+    /// the unfurl routes, so it's inert there; `Some` only via
+    /// `router_with_template` (main.rs, unfurl tests).
+    template: Option<Arc<dyn TemplateSource>>,
 }
 
 // ── Response shapes ───────────────────────────────────────────────────────────
@@ -219,17 +230,36 @@ struct ShelfResponse {
 
 /// Build the axum router. `store` is `Arc<Store>` so callers can share one store
 /// across multiple oneshot calls in tests.
+///
+/// Keeps its 4-arg signature on purpose (103 existing call sites) — a plain
+/// delegate to `router_with_template` with no template source, so `/l/*` and
+/// `/s/*` fall back to the 500 `router_with_template` gives an unconfigured
+/// template source. Only `main.rs` and the unfurl tests need the 5-arg form.
 pub fn router(
     store: Arc<Store>,
     invoker: Arc<dyn Invoker>,
     steam: Option<Arc<SteamClient>>,
     base_url: String,
 ) -> Router {
+    router_with_template(store, invoker, steam, base_url, None)
+}
+
+/// Same as [`router`], plus the unfurl routes' template source (spec:
+/// docs/spec-wrapping-paper.md). `None` disables `/l/{token}` and `/s/{token}`
+/// personalization — they 500 rather than silently serving stale/no HTML.
+pub fn router_with_template(
+    store: Arc<Store>,
+    invoker: Arc<dyn Invoker>,
+    steam: Option<Arc<SteamClient>>,
+    base_url: String,
+    template: Option<Arc<dyn TemplateSource>>,
+) -> Router {
     let state = AppState {
         store,
         invoker,
         steam,
         base_url,
+        template,
     };
     Router::new()
         .route("/api/l/{token}", get(handle_get_link))
@@ -243,6 +273,8 @@ pub fn router(
         .route("/api/steam/login", get(handle_steam_login))
         .route("/api/steam/return", get(handle_steam_return))
         .route("/api/s/{token}", get(handle_get_shelf))
+        .route("/l/{token}", get(unfurl::handle_unfurl_link))
+        .route("/s/{token}", get(unfurl::handle_unfurl_shelf))
         .with_state(state)
         .fallback(handle_not_found)
 }
@@ -1020,51 +1052,6 @@ async fn handle_post_claim(
 /// Same budget as the gift note it answers (admin-api's `GIFT_NOTE_MAX_CHARS`) —
 /// the correspondence is symmetric on purpose.
 const THANK_NOTE_MAX_CHARS: usize = 500;
-
-/// Characters that can visually reorder or invisibly pad the note when it renders
-/// beside trusted admin chrome — the friend's text sits immediately before the
-/// "— label, date" attribution ben reads, and a U+202E override would let it spoof
-/// that signature (OMBB, #76 review; display-spoofing, not XSS — React escaping
-/// holds). This is the Unicode Cf (format) category minus three carve-outs,
-/// spelled out because `char::is_control` covers only Cc: bidi
-/// embeddings/overrides/isolates, zero-width space, soft hyphen, word joiner +
-/// invisible operators + deprecated formatting (the FULL U+2060–206F block —
-/// pass 2 caught pass 1 stopping at 2069 and re-opening the invisible-note hole
-/// through U+206A–206F; U+2065 is unassigned-and-default-ignorable, swept on
-/// purpose), Arabic/Syriac/other prepended marks, interlinear annotation,
-/// musical formatting, BOM, and the tag block (U+E0000–E007F — note this
-/// degrades RGI subdivision-flag emoji like Scotland's to a plain black flag; an
-/// accepted trade-off, the tag block is the canonical invisible-smuggling
-/// channel and the base flag survives). Carve-outs, all "load-bearing in real
-/// scripts, zero reordering power": ZWJ/ZWNJ (U+200C/D — emoji sequences, Indic)
-/// and MVS (U+180E — selects Mongolian final-vowel forms; bidi class BN).
-/// Intrinsic RTL text (Arabic/Hebrew letters) is untouched — only the invisible
-/// controls are the spoofing vector.
-fn is_spoofing_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{0600}'..='\u{0605}'
-            | '\u{061C}'
-            | '\u{06DD}'
-            | '\u{070F}'
-            | '\u{0890}'..='\u{0891}'
-            | '\u{08E2}'
-            | '\u{200B}'
-            | '\u{200E}'
-            | '\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{110BD}'
-            | '\u{110CD}'
-            | '\u{13430}'..='\u{1343F}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E007F}'
-    )
-}
 
 /// Kept by the sanitizer (legitimate in real text) but rendering as nothing when
 /// standing alone: the ZWJ/ZWNJ/MVS carve-outs, variation selectors, and the

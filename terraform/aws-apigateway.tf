@@ -51,6 +51,42 @@ module "apigateway" {
           responses = { "200" = { description = "proxied" } }
         }
       }
+      "/l/{proxy+}" = {
+        x-amazon-apigateway-any-method = {
+          parameters = [{
+            name     = "proxy"
+            in       = "path"
+            required = true
+            schema   = { type = "string" }
+          }]
+          x-amazon-apigateway-integration = {
+            uri                 = "arn:aws:apigateway:${var.region}:lambda:path/2015-03-31/functions/${module.lambda_public_api.lambda_function_arn}/invocations"
+            type                = "aws_proxy"
+            httpMethod          = "POST"
+            passthroughBehavior = "when_no_match"
+            timeoutInMillis     = 29000
+          }
+          responses = { "200" = { description = "proxied" } }
+        }
+      }
+      "/s/{proxy+}" = {
+        x-amazon-apigateway-any-method = {
+          parameters = [{
+            name     = "proxy"
+            in       = "path"
+            required = true
+            schema   = { type = "string" }
+          }]
+          x-amazon-apigateway-integration = {
+            uri                 = "arn:aws:apigateway:${var.region}:lambda:path/2015-03-31/functions/${module.lambda_public_api.lambda_function_arn}/invocations"
+            type                = "aws_proxy"
+            httpMethod          = "POST"
+            passthroughBehavior = "when_no_match"
+            timeoutInMillis     = 29000
+          }
+          responses = { "200" = { description = "proxied" } }
+        }
+      }
       "/admin/api/{proxy+}" = {
         x-amazon-apigateway-any-method = {
           parameters = [{

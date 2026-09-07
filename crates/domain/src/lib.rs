@@ -551,6 +551,78 @@ pub fn match_artwork<'a>(
     None
 }
 
+/// Characters that can visually reorder or invisibly pad the note when it renders
+/// beside trusted admin chrome — the friend's text sits immediately before the
+/// "— label, date" attribution ben reads, and a U+202E override would let it spoof
+/// that signature (OMBB, #76 review; display-spoofing, not XSS — React escaping
+/// holds). This is the Unicode Cf (format) category minus three carve-outs,
+/// spelled out because `char::is_control` covers only Cc: bidi
+/// embeddings/overrides/isolates, zero-width space, soft hyphen, word joiner +
+/// invisible operators + deprecated formatting (the FULL U+2060–206F block —
+/// pass 2 caught pass 1 stopping at 2069 and re-opening the invisible-note hole
+/// through U+206A–206F; U+2065 is unassigned-and-default-ignorable, swept on
+/// purpose), Arabic/Syriac/other prepended marks, interlinear annotation,
+/// musical formatting, BOM, and the tag block (U+E0000–E007F — note this
+/// degrades RGI subdivision-flag emoji like Scotland's to a plain black flag; an
+/// accepted trade-off, the tag block is the canonical invisible-smuggling
+/// channel and the base flag survives). Carve-outs, all "load-bearing in real
+/// scripts, zero reordering power": ZWJ/ZWNJ (U+200C/D — emoji sequences, Indic)
+/// and MVS (U+180E — selects Mongolian final-vowel forms; bidi class BN).
+/// Intrinsic RTL text (Arabic/Hebrew letters) is untouched — only the invisible
+/// controls are the spoofing vector.
+///
+/// MOVED VERBATIM from public-api (which now re-uses this) — admin-api holds a
+/// deliberate second copy (see its :997 sync note); this move keeps the count
+/// at two, adding no third.
+pub fn is_spoofing_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Sanitize + attribute-escape text bound for an HTML attribute (og meta
+/// content). Strip → clamp → escape, in that order; `&` escapes first.
+/// `"` is the breakout character for attribute context — never skip it.
+pub fn og_text(raw: &str, max_chars: usize) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_spoofing_format_char(*c))
+        .take(max_chars)
+        .collect();
+    let mut out = String::with_capacity(cleaned.len());
+    for c in cleaned.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1366,5 +1438,38 @@ mod tests {
         );
         assert_eq!(merged.appid_source, Some(AppidSource::Humble));
         assert_eq!(merged.status, GameStatus::Pending);
+    }
+
+    #[test]
+    fn og_text_escapes_attribute_breakers() {
+        assert_eq!(
+            super::og_text(r#"a"b<c>d&e'f"#, 80),
+            "a&quot;b&lt;c&gt;d&amp;e&#39;f"
+        );
+    }
+
+    #[test]
+    fn og_text_strips_control_and_format_chars() {
+        // \u{202E} RLO is the bidi spoof char; \u{0007} is control
+        assert_eq!(super::og_text("a\u{202E}b\u{0007}c", 80), "abc");
+    }
+
+    #[test]
+    fn og_text_clamps_on_char_boundaries() {
+        assert_eq!(super::og_text("héllo", 3), "hél");
+    }
+
+    #[test]
+    fn og_text_hostile_label_cannot_change_tag_structure() {
+        // Structure-invariance (Lilith): render into the exact attribute template and
+        // assert the parsed tag count and attribute value survive.
+        let hostile = r#"" onload=x><script>alert(1)</script>"#;
+        let content = super::og_text(hostile, 200);
+        let tag = format!(r#"<meta property="og:title" content="{content}" />"#);
+        // No new element boundaries: exactly one '<' and one '>' pair belonging to
+        // the meta tag itself; the escaped payload contributes zero raw < > ".
+        assert_eq!(tag.matches('<').count(), 1);
+        assert_eq!(tag.matches('>').count(), 1);
+        assert_eq!(tag.matches('"').count(), 4); // the four template quotes only
     }
 }
