@@ -47,10 +47,13 @@
 
 **Files:**
 - Modify: `crates/domain/src/lib.rs` (append at end, before tests mod if one exists)
-- Modify: `crates/public-api/src/lib.rs:1043-1051` (delete local `is_spoofing_format_char`, import domain's)
+- Modify: `crates/public-api/src/lib.rs` — cut `fn is_spoofing_format_char` WHOLE: from its doc
+  comment through its closing `}` (**20 match arms; first `'\u{00AD}'`, last
+  `'\u{E0000}'..='\u{E007F}'` — count them after the cut**). Cite-by-symbol, not by line: the
+  file is 1543 lines and this task edits it.
 
 **Interfaces:**
-- Produces: `pub fn domain::is_spoofing_format_char(c: char) -> bool` (moved, body verbatim from `public-api:1043`) and `pub fn domain::og_text(raw: &str, max_chars: usize) -> String` — strips `char::is_control` and spoofing format chars, clamps to `max_chars` chars (char-boundary safe), then escapes `& < > " '` in that order (`&` first). Later tasks call `og_text(label, 80)`.
+- Produces: `pub fn domain::is_spoofing_format_char(c: char) -> bool` (moved, body verbatim — the whole 20-arm `matches!`) and `pub fn domain::og_text(raw: &str, max_chars: usize) -> String` — strips `char::is_control` and spoofing format chars, clamps to `max_chars` chars (char-boundary safe), then escapes `& < > " '` in that order (`&` first). Later tasks call `og_text(label, 80)`.
 
 - [ ] **Step 1: Write the failing tests** (in `crates/domain/src/lib.rs` tests mod)
 
@@ -97,8 +100,11 @@ fn og_text_hostile_label_cannot_change_tag_structure() {
 /// admin-api holds a deliberate second copy (see its :997 sync note); this
 /// move keeps the count at two, adding no third.
 pub fn is_spoofing_format_char(c: char) -> bool {
-    // BODY COMES FROM THE CUT — do Step 3 in this order: FIRST open
-    // crates/public-api/src/lib.rs:1043-1051 and CUT the function body out
+    // BODY COMES FROM THE CUT — do Step 3 in this order: FIRST locate
+    // `fn is_spoofing_format_char` in crates/public-api/src/lib.rs and CUT the
+    // ENTIRE function (doc comment through closing brace — 20 match arms; a
+    // partial cut compiles once the parens balance and silently shrinks the
+    // spoof set, so verify the arm count in the paste)
     // (public-api gets `use domain::is_spoofing_format_char;` in its place),
     // THEN paste that body here verbatim. The plan deliberately does not
     // restate the body: a restated body is a recollection wearing source's
@@ -337,13 +343,24 @@ Add `mod unfurl;` in `lib.rs` (top, near other mods).
 - Create: `crates/public-api/tests/unfurl_moto.rs`
 
 **Interfaces:**
-- Consumes: Task 2's names verbatim.
-- Produces: `#[async_trait] pub trait TemplateSource: Send + Sync { async fn fetch(&self) -> Result<String, TemplateError>; }` — VERIFIED at review: the crate already uses `async_trait` (lib.rs:9, `Invoker` at :27); mirror that idiom, no new dep. `pub struct S3Template { … }` with `pub fn new(client: aws_sdk_s3::Client, bucket: String) -> Self`, 60s in-memory cache (`tokio::sync::RwLock<Option<(std::time::Instant, String)>>`). `router()` gains 5th param `template: Option<std::sync::Arc<dyn TemplateSource>>`; ALL existing `router(` call sites (main.rs + every test) add `None`.
+- Consumes (from Task 2, exact signatures inlined — the executor sees only this block):
+  - `pub(crate) const OG_BEGIN: &str = "<!-- og:begin -->";` and `OG_END: &str = "<!-- og:end -->";`
+  - `pub(crate) fn swap_og_block(template: &str, meta_html: &str) -> Result<String, MarkerAbsent>`
+    (`pub(crate) struct MarkerAbsent;`)
+  - `pub(crate) fn wrap_variant(token: &str) -> &'static str`
+  - `pub(crate) fn meta_for_link(link: &domain::Link, now: time::OffsetDateTime, base_url: &str) -> Option<String>`
+    (`None` = dead state ⇒ serve the template unmodified)
+  - `pub(crate) fn meta_for_shelf(friend: &domain::Friend, base_url: &str) -> String'
+- Produces: `#[async_trait] pub trait TemplateSource: Send + Sync { async fn fetch(&self) -> Result<String, TemplateError>; }` — VERIFIED at review: the crate already uses `async_trait` (lib.rs:9, `Invoker` at :27); mirror that idiom, no new dep. `pub struct S3Template { … }` with `pub fn new(client: aws_sdk_s3::Client, bucket: String) -> Self`, 60s in-memory cache (`tokio::sync::RwLock<Option<(std::time::Instant, String)>>`). **`router()` KEEPS its 4-arg signature** (103 existing call sites, 95 in api_test.rs — measured;
+breaking it is 103 mechanical edits for nothing). Add
+`pub fn router_with_template(store, invoker, steam, base_url, template: Option<std::sync::Arc<dyn TemplateSource>>) -> Router`
+holding the real body; `router(a,b,c,d)` becomes a one-line delegate passing `None`. Only main.rs
+and the new unfurl tests call the 5-arg form.
 
 - [ ] **Step 1: failing handler tests** — Create `crates/public-api/tests/unfurl_test.rs`,
-**mirroring `tests/api_test.rs` EXACTLY** (same imports, same `store_or_skip` helper copied in or
-factored, same MockInvoker; `router(...)` there gains the 5th arg — update api_test.rs call sites
-to `None` in this same task). Full file skeleton:
+**mirroring `tests/api_test.rs` EXACTLY** (same imports, same `store_or_skip` helper copied in,
+same MockInvoker; api_test.rs is UNTOUCHED — `router()` keeps its arity, these tests call
+`router_with_template`). Full file skeleton:
 
 ```rust
 //! Unfurl route integration tests. Store-backed via store_or_skip (CI runs them,
@@ -351,7 +368,7 @@ to `None` in this same task). Full file skeleton:
 use std::sync::Arc;
 use async_trait::async_trait;
 use axum::{body::Body, http::{Request, StatusCode}};
-use public_api::{router, TemplateSource, TemplateError};
+use public_api::{router_with_template, TemplateSource, TemplateError};
 use tower::ServiceExt;
 
 const TPL: &str = "<html><head>\n<!-- og:begin -->\nGENERIC\n<!-- og:end -->\n</head><body></body></html>";
@@ -375,7 +392,7 @@ async fn unfurl_link_serves_personalized_html_with_cache_header() {
     let Some(store) = store_or_skip("unfurl-personalized").await else { return };
     // seed an ACTIVE link with curated_game_ids = ["a","b","c"] the way api_test.rs
     // seeds links (mirror its seeding helper; token = a fixed 64-hex literal)
-    let app = router(store, mock_invoker(), None, "https://x.example".into(),
+    let app = router_with_template(store, mock_invoker(), None, "https://x.example".into(),
         Some(Arc::new(StubTemplate(TPL.into()))));
     let res = app.oneshot(Request::builder().uri("/l/<the-token>").body(Body::empty()).unwrap())
         .await.unwrap();
@@ -391,7 +408,7 @@ async fn unfurl_link_serves_personalized_html_with_cache_header() {
 #[tokio::test]
 async fn unfurl_dead_token_serves_template_byte_identical() {
     let Some(store) = store_or_skip("unfurl-dead").await else { return };
-    let app = router(store, mock_invoker(), None, "https://x.example".into(),
+    let app = router_with_template(store, mock_invoker(), None, "https://x.example".into(),
         Some(Arc::new(StubTemplate(TPL.into()))));
     let res = app.oneshot(Request::builder().uri(&format!("/l/{}", "f".repeat(64))).body(Body::empty()).unwrap())
         .await.unwrap();
@@ -404,7 +421,7 @@ async fn unfurl_dead_token_serves_template_byte_identical() {
 async fn unfurl_template_without_markers_serves_generic_and_is_loud() {
     let Some(store) = store_or_skip("unfurl-markerless").await else { return };
     // seed a VALID active link; template WITHOUT markers
-    let app = router(store, mock_invoker(), None, "https://x.example".into(),
+    let app = router_with_template(store, mock_invoker(), None, "https://x.example".into(),
         Some(Arc::new(StubTemplate("<html>no markers</html>".into()))));
     let res = app.oneshot(Request::builder().uri("/l/<the-token>").body(Body::empty()).unwrap())
         .await.unwrap();
@@ -419,7 +436,7 @@ async fn unfurl_template_without_markers_serves_generic_and_is_loud() {
 #[tokio::test]
 async fn unfurl_source_failure_is_500_json() {
     let Some(store) = store_or_skip("unfurl-fail").await else { return };
-    let app = router(store, mock_invoker(), None, "https://x.example".into(),
+    let app = router_with_template(store, mock_invoker(), None, "https://x.example".into(),
         Some(Arc::new(FailingTemplate)));
     let res = app.oneshot(Request::builder().uri(&format!("/l/{}", "a".repeat(64))).body(Body::empty()).unwrap())
         .await.unwrap();
@@ -476,12 +493,12 @@ Handlers (axum, in unfurl.rs; wire from lib.rs routes `/l/{token}` and `/s/{toke
 ### Task 4: web — markers, marker contract test, wrap art
 
 **Files:**
-- Modify: `web/index.html:21-33`
+- Modify: `web/index.html:21-42` (og block :21-33 AND twitter block :35-42 — both go inside the markers)
 - Create: `web/src/ogMarkers.test.ts`
 - Create: `web/public/art/wrap-*.png` (9 files, pre-staged — see Step 4)
 
 **Interfaces:**
-- Produces: `index.html` og block wrapped in `<!-- og:begin -->` / `<!-- og:end -->` EXACTLY (Task 2's constants); art filenames exactly `wrap-clay.png … wrap-mauve.png`, `wrap-shelf.png` (Task 2's `WRAPS` order/names).
+- Produces: `index.html` og AND twitter blocks (:21-42) wrapped in `<!-- og:begin -->` / `<!-- og:end -->` EXACTLY (Task 2's constants); art filenames exactly `wrap-clay.png … wrap-mauve.png`, `wrap-shelf.png` (Task 2's `WRAPS` order/names).
 
 - [ ] **Step 1: failing test** (`web/src/ogMarkers.test.ts`):
 
