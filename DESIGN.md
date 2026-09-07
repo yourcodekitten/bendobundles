@@ -161,6 +161,14 @@ at matched mid-tones. The SAME game must render the SAME color on every surface,
 palette change must preserve determinism and cross-surface agreement, and goes through the
 shared module, never a local copy.
 
+**The Wrapping-Paper Rule.** Gift unfurl art (`web/public/art/wrap-*.png`) draws its accent from
+the same muted-earth tokens as the title-hash palette, keyed by FNV-1a64(link token) % 8 — the
+same gift wears the same paper forever (re-pastes unfurl identically). The shelf card is ONE
+design with no accent pop: a shelf is a different KIND of object, not another present, and a
+disjoint look takes the shelf-matches-a-gift-paper collision to zero by construction
+(1−(7/8)ⁿ ≈ 33% at three gifts if it were hashed — spec D1). Changing the hash, the bucket
+order, or the filenames breaks the promise; don't.
+
 **The Light Text Rule.** Status *text* on light surfaces uses the deep end of its hue
 (green-700, amber-800, red-700) — the pale 300/400 tones that read on dark are invisible on
 olive and are forbidden as inline text here.

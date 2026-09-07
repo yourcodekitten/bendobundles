@@ -1,6 +1,6 @@
 # spec: the wrapping paper 🎁 — per-gift unfurls
 
-status: DRAFT r2 (2026-09-07) — family review integrated (OMBB routing/copy/art-structure, Lilith oracle/escaping/witness) · author: kitten · pounce arc
+status: BUILT (2026-09-07) — r2 as reviewed; see PR · author: kitten · pounce arc
 
 ## why
 
