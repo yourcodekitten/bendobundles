@@ -31,6 +31,7 @@
 - `crates/public-api/src/unfurl.rs` — NEW: everything unfurl (trait, S3 impl, cache, swap, meta, hash). Keeps lib.rs from growing another 400 lines.
 - `crates/public-api/src/main.rs` — wire S3 client from `WEB_BUCKET` env.
 - `crates/public-api/Cargo.toml` — add `aws-sdk-s3` (same feature shape as the other SDK deps).
+- `crates/public-api/tests/unfurl_test.rs` — NEW: handler integration (store_or_skip harness).
 - `crates/public-api/tests/unfurl_moto.rs` — NEW: moto S3 integration.
 - `web/index.html` — og markers around the existing block.
 - `web/src/App.test.tsx` (or new `web/src/ogMarkers.test.ts`) — marker contract test.
@@ -104,8 +105,9 @@ pub fn is_spoofing_format_char(c: char) -> bool {
     // `fn is_spoofing_format_char` in crates/public-api/src/lib.rs and CUT the
     // ENTIRE function (doc comment through closing brace — 20 match arms; a
     // partial cut compiles once the parens balance and silently shrinks the
-    // spoof set, so verify the arm count in the paste)
-    // (public-api gets `use domain::is_spoofing_format_char;` in its place),
+    // spoof set, so verify the arm count in the paste). Step 3 CUTS AND PASTES
+    // ONLY — the import and public-api's green run belong to Step 5, one owner
+    // per edit
     // THEN paste that body here verbatim. The plan deliberately does not
     // restate the body: a restated body is a recollection wearing source's
     // clothes, and cut-first makes keeping a guessed body impossible —
@@ -165,14 +167,18 @@ exercise the moved fn).
 ```rust
 #[test]
 fn wrap_variant_is_pinned_forever() {
-    // GOLDEN: literal pairs — the paper is a promise (spec D1). Procedure: after
-    // implementing, print wrap_variant for these three tokens ONCE, then hard-code
-    // the observed names below and never change them. A determinism-only or
-    // spread-only assertion would let a refactor of the hash constants slip
-    // through green (review MAJOR-1); only literals pin the promise.
-    assert_eq!(wrap_variant(&"0".repeat(64)), "<PIN-ME-AT-IMPL>");
-    assert_eq!(wrap_variant(&"deadbeef".repeat(8)), "<PIN-ME-AT-IMPL>");
-    assert_eq!(wrap_variant(&"42".repeat(32)), "<PIN-ME-AT-IMPL>");
+    // GOLDEN: literal pairs — the paper is a promise (spec D1). A determinism-only
+    // or spread-only assertion lets a hash-constant refactor slip through green;
+    // only independently-computed literals pin the promise.
+    // Pins computed INDEPENDENTLY of the implementation (two seats agreeing
+    // digit-for-digit) — never print-then-pin, which goldens the first bug.
+    // And never PERIODIC tokens: FNV-1a's step is a bijection on Z/8 and the
+    // offset basis &7 = 5, so every short-unit-repeated token lands on
+    // WRAPS[5] "slate" — three periodic pins are one assertion in a trenchcoat
+    // (Lilith's blocker, mechanism verified on a second seat).
+    assert_eq!(wrap_variant("8af17e0500caf83ec1172baf05a661ba1ee4ab02114f643b4ab5d2efe9ed80ec"), "clay");
+    assert_eq!(wrap_variant("b8b7c23ab0e0c45567869d4c98c9d489c8000a21da777c54e4cdeba61a513957"), "rust");
+    assert_eq!(wrap_variant("a0a8bddef089f638f98ca3f13aead6a96aaf25955eaeaa1a614c9a38427e6092"), "mustard");
     let all: std::collections::HashSet<_> =
         (0..64).map(|i| wrap_variant(&format!("{i:064x}"))).collect();
     assert!(all.len() >= 6, "64 tokens should hit most of 8 buckets: got {}", all.len());
@@ -214,8 +220,19 @@ fn meta_for_link_sealed_has_state_but_never_a_clock() {
 #[test]
 fn meta_for_link_dead_states_are_none() {
     let mut link = test_link();
-    link.revoked = true; // adjust to the real field the domain uses for revocation
+    link.revoked = true;
     assert!(meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example").is_none());
+}
+
+#[test]
+fn hostile_base_url_cannot_change_structure_either() {
+    // base_url is server config today (router()'s 4th param) — this arm exists
+    // for the future refactor that derives it from a request.
+    let link = test_link();
+    let m = meta_for_link(&link, time::OffsetDateTime::now_utc(), r#"https://x"><script>"#).unwrap();
+    for line in m.lines().filter(|l| !l.trim().is_empty()) {
+        assert_eq!(line.trim().matches('<').count(), 1, "injected < in: {line}");
+    }
 }
 
 #[test]
@@ -231,7 +248,10 @@ fn hostile_label_cannot_change_structure_at_the_meta_layer() {
     }
 }
 ```
-(`test_link()`: construct a `domain::Link` the way `crates/dynamo` store tests do — grep `fn test_link` / a literal `Link {` in `crates/dynamo/src/lib.rs` tests and mirror the minimal valid struct. EXECUTOR: read the real `Link` fields for revocation — the plan's `link.revoked = true` line must become whatever field/state `can_claim` maps to `ClaimRefusal::Revoked`.)
+(`test_link()`: construct a `domain::Link` the way `crates/dynamo` store tests do — grep a
+literal `Link {` in the dynamo tests and mirror the minimal valid struct. Field names verified
+against `domain:183-262` at review: `revoked: bool` · `unlock_at: Option<OffsetDateTime>` ·
+`curated_game_ids: Option<Vec<String>>` — as written above, no adjustment needed.)
 
 - [ ] **Step 2:** `cargo test -p public-api unfurl` → FAIL (module absent).
 - [ ] **Step 3: implement `unfurl.rs` core:**
@@ -279,7 +299,10 @@ fn count_words(n: usize) -> String {
 }
 
 fn meta_block(title: &str, desc: &str, image: &str, alt: &str) -> String {
-    // Every value is PRE-ESCAPED by og_text before reaching here.
+    // INVARIANT (tested, not asserted): every interpolated value has passed
+    // og_text — including image URLs (escaping a URL is harmless and correct in
+    // attribute context; &→&amp;) — so a future base_url-from-Host refactor
+    // cannot bypass the escaper silently (Lilith's MAJOR-1).
     format!(
         "<meta property=\"og:type\" content=\"website\" />\n\
          <meta property=\"og:site_name\" content=\"bendobundles\" />\n\
@@ -320,7 +343,7 @@ pub(crate) fn meta_for_link(
             _ => "treasures inside, chosen for you. tap to unwrap.".to_string(),
         }
     };
-    let image = format!("{base_url}/art/wrap-{}.png", wrap_variant(&link.token));
+    let image = og_text(&format!("{base_url}/art/wrap-{}.png", wrap_variant(&link.token)), 200);
     Some(meta_block(&title, &og_text(&desc, 200), &image,
         "a pixel-art wrapped present in ben's pea-green attic"))
 }
@@ -330,7 +353,7 @@ pub(crate) fn meta_for_shelf(friend: &domain::Friend, base_url: &str) -> String 
     meta_block(
         &format!("📚 the shelf ben keeps for {name}"),
         "every game he's given you, all in one warm place.",
-        &format!("{base_url}/art/wrap-shelf.png"),
+        &og_text(&format!("{base_url}/art/wrap-shelf.png"), 200),
         "a pixel-art shelf of games in ben's attic",
     )
 }
@@ -344,7 +367,8 @@ Add `mod unfurl;` in `lib.rs` (top, near other mods).
 
 **Files:**
 - Modify: `crates/public-api/src/unfurl.rs` (append), `crates/public-api/src/lib.rs` (router + AppState), `crates/public-api/src/main.rs`, `crates/public-api/Cargo.toml`
-- Create: `crates/public-api/tests/unfurl_moto.rs`
+- Create: `crates/public-api/tests/unfurl_test.rs` (handler integration, Step 1)
+- Create: `crates/public-api/tests/unfurl_moto.rs` (S3 template integration, Step 5)
 
 **Interfaces:**
 - Consumes (from Task 2, exact signatures inlined — the executor sees only this block):
@@ -656,6 +680,12 @@ order, or the filenames breaks the promise; don't.
 - [ ] **Step 4: Commit** — `git commit -S -m "🎁 docs: spec flipped BUILT; DESIGN.md learns the wrapping-paper rule"`
 
 ---
+
+## Product ruling recorded (Lilith's review question)
+Sealed outranks Expired/Exhausted (`domain:319`), so a sealed-and-expired link unfurls
+"sealed for now" warm — INTENDED: it mirrors the JSON API's own ranking exactly (no new oracle),
+and Revoked outranks Sealed, so Ben can silence any dead sealed link by revoking it. The card
+never promises a claim, only warmth.
 
 ## Self-review notes (run at plan time, kept for the executor)
 - Spec coverage: D1→T2/T4/T6 · D2→(non-goal, no task) · D3→T3/T4/T5(+r2.5) · D4→T5 · D5→T3 (dead→byte-identical test) · D6→T2 (copy verbatim in builders + tests) · witness→T3/T4 · resolutions→T5 cache policy comment.
