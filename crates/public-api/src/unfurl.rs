@@ -109,7 +109,11 @@ pub(crate) fn meta_for_link(
                     count_words(n)
                 )
             }
-            _ => "treasures inside, chosen for you. tap to unwrap.".to_string(),
+            // Open-shelf link (curated_game_ids: None or empty) — NOT curated,
+            // so this must not borrow the curated row's "chosen for you" claim
+            // (pass-1 product review, MAJOR: 18/18 production links are this
+            // shape as of docs/spec-attic-whispers.md's census).
+            _ => "the attic is open for you. tap to look inside.".to_string(),
         }
     };
     let image = og_text(
@@ -450,6 +454,32 @@ mod tests {
         assert!(m.contains("three treasures inside, chosen for you. tap to unwrap."));
         assert!(m.contains("ben wrapped something for"));
         assert!(m.contains("/art/wrap-")); // one of the 8
+    }
+
+    #[test]
+    fn meta_for_link_active_uncurated_is_open_shelf_not_chosen_for_you() {
+        // pass-1 product review MAJOR: curated_game_ids: None means open shelf
+        // (whole catalog, nothing hand-picked) — the copy must not assert
+        // curation that didn't happen.
+        let link = test_link(); // curated_game_ids: None, from the shared helper
+        let m = super::meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example")
+            .unwrap();
+        assert!(m.contains("the attic is open for you. tap to look inside."));
+        assert!(
+            !m.contains("chosen for you"),
+            "open-shelf card must not claim curation"
+        );
+    }
+
+    #[test]
+    fn meta_for_link_active_empty_curated_list_is_also_open_shelf() {
+        // Some(vec![]) must hit the same open-shelf arm as None — both mean
+        // "nothing was actually chosen."
+        let mut link = test_link();
+        link.curated_game_ids = Some(vec![]);
+        let m = super::meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example")
+            .unwrap();
+        assert!(m.contains("the attic is open for you. tap to look inside."));
     }
 
     #[test]

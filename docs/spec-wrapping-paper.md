@@ -106,10 +106,19 @@ different blast radius; that asymmetry is why the card carries only label + coun
 ### D6 — what the meta says, exactly (copy is part of the spec)
 | state | og:title | og:description |
 |---|---|---|
-| gift, n games | `🎁 ben wrapped something for {label} ♡` | `{n_word} treasure{s} inside, chosen for you. tap to unwrap.` |
+| gift, n games (curated: `Some(non-empty)`) | `🎁 ben wrapped something for {label} ♡` | `{n_word} treasure{s} inside, chosen for you. tap to unwrap.` |
+| gift, uncurated / open shelf (`curated_game_ids: None` or `Some(empty)`) | `🎁 ben wrapped something for {label} ♡` | `the attic is open for you. tap to look inside.` |
 | gift, sealed (unlock in future) | `🎁 ben wrapped something for {label} ♡` | `sealed for now. good things wait.` |
 | shelf | `📚 the shelf ben keeps for {name}` | `every game he's given you, all in one warm place.` |
 | dead/unknown | (today's generic block verbatim) | (generic) |
+
+**Uncurated-row rationale (pass-1 product review, MAJOR):** `None` = open shelf; chosen-for-you
+would assert curation that didn't happen (pass-1 product review, 18/18 production links are
+open-shelf).
+
+**Accepted staleness (pass-1 product review):** a re-pasted link's count reflects the wrapping
+moment (`curated_game_ids` never shrinks) — accepted like the 60s cache, the card is a snapshot of
+the gift as wrapped.
 
 **Sealed-row rationale (r2): state yes, clock never — a date is a spoiler with a calendar attached
 (OMBB). The unfurl may reveal that a sealed thing exists (the act of pasting already does); the only
@@ -166,11 +175,50 @@ not receipts.
 - CI: existing suite lanes; no new workflow.
 
 ## deploy shape (runbook #217 applies)
-terraform: 2 CF behaviors + 1 IAM statement + (no new lambda). Derive the tfvars variable set
+terraform: 2 CF behaviors + 1 IAM statement + new routes on the EXISTING public-api lambda (no new
+lambda resource, but new code on the one that's there). Derive the tfvars variable set
 (`grep -hoP 'variable "\K[a-z0-9_]+' terraform/*.tf`); this arc is NOT code-only, so a non-zero
 destroy is READ-EVERY-LINE, not auto-STOP (CF behavior edits can legitimately replace). Zips
 from green MAIN run. Wrap PNGs ship in `web/public/` (S3, long-cache) — art is a web asset,
 not a lambda payload.
+
+**A single `terraform apply` is NOT safe for this arc (pass-1 deploy review, MAJOR).** `/l/*` is
+not a crawler-only path — it's the real URL ben sends friends (`web/src/inviteUrl.ts`,
+`LinkPage.tsx`'s live React-Router route). This PR moves `/l/*`/`/s/*` from CloudFront's default
+S3/SPA behavior to new ordered behaviors targeting the API origin. `module.lambda_public_api` and
+`module.site` (CF) have no `depends_on` between them, so a single apply gives no ordering
+guarantee — if the new CF behaviors go live before the new lambda code, real friends clicking an
+existing gift link get a 404 JSON from the OLD lambda (which has no `/l/{token}` route at all),
+not just crawlers hitting a stale unfurl. Deploy in two phases instead, so that state is
+structurally impossible rather than merely a fast-enough-timing bet:
+
+1. **Upload lambda zips, then `terraform apply -target=module.lambda_public_api`** — lands the new
+   code + `WEB_BUCKET` env + the new inline IAM statement, while CF is still routing `/l/*`/`/s/*`
+   to the old S3/SPA default behavior (inert; nobody can reach the new routes yet).
+   **Verify** before opening the front door: `curl` the API Gateway stage URL directly (bypasses
+   CF entirely) — `curl -sI "$STAGE_URL/l/deadbeef"` should come back 200/302, not 404.
+2. **Sync web** — `./deploy-web.sh` (full `web/dist`: the new `<!-- og:begin -->`/`<!-- og:end -->`
+   markers in `index.html` AND the 9 `wrap-*.png` files, one `aws s3 sync --delete`) — **before**
+   phase 3, not after, so the moment CF starts sending `/l/*` traffic to the lambda, both the
+   markers and the art are already fully present in S3 (closes the marker/art-upload race for
+   free; costs nothing since `deploy-web.sh` doesn't depend on the CF/apigw side going first).
+3. **Full `terraform apply`** — everything else: apigw path additions (triggers an automatic stage
+   redeployment, body-hash-triggered, no manual step needed) + the 2 CF behaviors + the new cache
+   policy. This is the step that actually flips `/l/*`/`/s/*` live — it now runs last, after both
+   the lambda code and the web assets it depends on are already serving correctly.
+4. **Post-deploy check**: if any transient error (404/500) occurred during rollout, check
+   `x-cache`/`age` on `/l/*` — `curl -sI https://bendobundles.com/l/<a-real-token> | grep -i
+   'age:\|x-cache:'`. The new cache policy's 60s TTL has no `custom_error_response` carve-out, so a
+   bad response could get pinned at an edge; a non-zero `age:` right after such an error is the
+   signal to invalidate that path rather than wait out the TTL.
+
+**Rollback:** revert the two CF `ordered_cache_behaviors` entries (+ the new cache policy) first
+if the unfurl misbehaves live — this sends `/l/*`/`/s/*` back to the default S3/SPA behavior for
+every viewer regardless of lambda state, and is the fastest full restore. **Never unset
+`WEB_BUCKET` alone while CF still routes `/l/*`/`/s/*` to the lambda** — that deterministically
+turns every hit into a 500 JSON, which is strictly worse than whatever prompted the rollback (a
+wrong-but-rendering card is still a working page; a 500 is not). Nothing in this arc is one-way;
+the 60s cache TTL is the only non-instant factor and it's self-healing.
 
 ## resolutions (r2) — the r1 open-questions block is retired; every OQ re-derived from the body
 - **routing**: one path, always-lambda, all viewers. Two code paths for one URL put the unfurl on
