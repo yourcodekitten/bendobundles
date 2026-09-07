@@ -46,11 +46,13 @@ design, and not as phasing: variants exist to distinguish multiple objects belon
 and a friend has exactly one shelf — token-hashed shelf art would distinguish it from nothing, and a
 shared hash could coincidentally dress a shelf in one of that friend's gift papers, a coincidence
 that looks like the system saying something (OMBB). If shelf variety ever earns its way in, hash
-something meaningful (shelf size, first-gift year), never the token — **and in a DIFFERENT hash
-domain than gift art (distinct salt/prefix): a shared domain makes the shelf-matches-a-gift-paper
-collision guaranteed by construction for some friends, and it would read as a bug in the art
-rather than the keying (Lilith). One sentence now; finding it later costs a re-roll of everyone's
-paper, which D1 promises never to do.**
+something meaningful (shelf size, first-gift year), never the token — **and draw shelf art from a
+DISJOINT PALETTE gifts never use. Not a salt: `Friend.shelf_token` (`domain:177`) and `Link.token`
+(`:184`) are distinct fields already, so the hashes are decorrelated under any keying, and
+independent draws into 8 buckets still collide 1-in-8 per gift by chance — a birthday problem no
+salt escapes (OMBB, refuting a salt sentence r2.1 briefly carried). A disjoint palette takes the
+collision to zero by construction, and it says the true thing visually: a shelf is a different
+KIND of object, not another present.**
 
 ### D2 — meta text carries the personalization; images are pre-baked
 Per-name *rendered* images (label drawn into the PNG) are explicitly **out of scope** for this
