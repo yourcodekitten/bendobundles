@@ -113,10 +113,17 @@ temporal disclosure was the date, and you can't un-broadcast one.**
 escaping; `sanitize_note` (:1102) is a control/bidi STRIPPER that leaves `" < > &` intact and has
 only ever applied to `note`; `label` is a bare String passed through (:165, :663, :794). The
 protection to date lived in React's JSX rendering — and the lambda has no React. Therefore:
-1. A dedicated attribute-context escaper for `{label}`/`{name}`/all injected text — `& < > " '`
-   — because og meta lands in `content="…"` and **`"` is the breakout character** element-text
-   escaping forgets. Bidi/format-char stripping (the `sanitize_friend_name` treatment) applies ON
-   TOP, plus length clamp.
+1. A dedicated attribute-context escaper for ALL injected text — `& < > " '` — because og meta
+   lands in `content="…"` and **`"` is the breakout character** element-text escaping forgets.
+   **The two fields have different write-time histories and D6 names them separately (Lilith):**
+   `{name}` is stripped at create by `sanitize_friend_name` (`admin-api:1032`, applied `:1056`);
+   `{label}` has NO sanitizer anywhere — a length cap and nothing else. The lambda treats them
+   IDENTICALLY anyway (strip format/control chars + escape + clamp, at render): render-side
+   protection must not trust write-side history, and write-side history must not excuse a field.
+   **Placement:** `sanitize_friend_name` already mirrors `public-api::is_spoofing_format_char`
+   with a keep-in-sync comment (`admin-api:997-999`) — two implementations of one rule. The
+   escaper+stripper for this arc lives ONCE, in the `domain` crate, and the render path calls it;
+   this arc does NOT refactor the two existing copies (scope), but the new code adds no third.
 2. **Blast radius is the live page, not the card** — D3 serves identical bytes to humans, so a
    broken attribute in `<head>` is injection for every human booting the SPA.
 3. **Provenance, measured (independently by me and OMBB, agreeing):** `Link.label` has exactly one
