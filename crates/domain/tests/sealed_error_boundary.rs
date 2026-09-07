@@ -406,6 +406,11 @@ const DEP_VERDICTS: &[(&str, &str, &str)] = &[
         "re-exports checked: aws-smithy SdkError",
     ),
     (
+        "aws-sdk-s3",
+        "ReviewedSafe",
+        "re-exports checked: aws-smithy SdkError; discarded via .map_err(|_| TemplateError::Unavailable) at public-api/src/unfurl.rs fetch_inner — never stored, not even as a String",
+    ),
+    (
         "aws-sdk-ssm",
         "ReviewedSafe",
         "re-exports checked: aws-smithy SdkError",
