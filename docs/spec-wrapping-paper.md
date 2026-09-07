@@ -46,7 +46,11 @@ design, and not as phasing: variants exist to distinguish multiple objects belon
 and a friend has exactly one shelf — token-hashed shelf art would distinguish it from nothing, and a
 shared hash could coincidentally dress a shelf in one of that friend's gift papers, a coincidence
 that looks like the system saying something (OMBB). If shelf variety ever earns its way in, hash
-something meaningful (shelf size, first-gift year), never the token.
+something meaningful (shelf size, first-gift year), never the token — **and in a DIFFERENT hash
+domain than gift art (distinct salt/prefix): a shared domain makes the shelf-matches-a-gift-paper
+collision guaranteed by construction for some friends, and it would read as a bug in the art
+rather than the keying (Lilith). One sentence now; finding it later costs a re-roll of everyone's
+paper, which D1 promises never to do.**
 
 ### D2 — meta text carries the personalization; images are pre-baked
 Per-name *rendered* images (label drawn into the PNG) are explicitly **out of scope** for this
@@ -115,11 +119,16 @@ protection to date lived in React's JSX rendering — and the lambda has no Reac
    TOP, plus length clamp.
 2. **Blast radius is the live page, not the card** — D3 serves identical bytes to humans, so a
    broken attribute in `<head>` is injection for every human booting the SPA.
-3. **Provenance, measured:** `Link.label` is Ben-authored behind admin auth (`admin-api:757`);
+3. **Provenance, measured (independently by me and OMBB, agreeing):** `Link.label` has exactly one
+   write path — `admin-api:757`, admin body; `public-api` holds field + two reads, no write. And
+   the only validation on it is `LABEL_MAX_CHARS` (`admin-api:657`) — **a length cap bounds count,
+   never structure; `" onload=x>` is eleven characters. A cap reads like validation and validates
+   nothing this section cares about (OMBB).**
    `Friend.name` likewise + bidi-stripped at create (:1056); steam `personaname` flows to neither
-   on main. Severity today: low — fix fully anyway. **This is a recorded ASSUMPTION: any feature
-   that lets a friend set their own display name (e.g. the humble-self-login branch) re-triggers
-   this section's severity review.**
+   on main. Severity today: low — fix fully anyway. **Recorded ASSUMPTION: any feature letting a
+   friend set their own display name re-triggers this section's severity review.** (The
+   humble-self-login branch adds no label write — but it is 345 lines against main's 1543, so
+   that is evidence about a stale snapshot, not about the design that ships.)
 4. Property test (hers, adopted): a label of `" onload=x><script>` CANNOT change the tag
    structure of the output — structure-invariance, not "is escaped," so the assertion survives a
    future escaper swap.
