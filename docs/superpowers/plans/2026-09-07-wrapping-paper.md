@@ -174,10 +174,14 @@ fn wrap_variant_is_pinned_forever() {
     // digit-for-digit) — never print-then-pin, which goldens the first bug.
     // And never REPEATED-UNIT tokens: FNV-1a's step is a bijection on Z/8 and
     // the offset basis &7 = 5, so a unit repeated >=4 times lands on WRAPS[5]
-    // "slate" every time (measured; reps=2 is mixed ~64/36) — three such pins
-    // are one assertion in a trenchcoat. Rule: COMPUTE the bucket for a
-    // candidate pin, never classify the token (Lilith's blocker, OMBB's
-    // quantifier, both verified on this seat).
+    // "slate" every time (measured; reps=2 is mixed ~60/40) — three such pins
+    // are one assertion in a trenchcoat. The exact law (2000/2000 trials): a
+    // repeated unit lands on slate iff the ORDER of its per-period permutation
+    // divides the repeat count — observed orders {1,2,4}, so any reps
+    // divisible by 4 returns to the offset basis; ">=4" coincides only because
+    // 64 is a power of two. Rule: COMPUTE the bucket for a candidate pin,
+    // never classify the token (Lilith's blocker + law, OMBB's quantifier,
+    // both verified on this seat).
     assert_eq!(wrap_variant("8af17e0500caf83ec1172baf05a661ba1ee4ab02114f643b4ab5d2efe9ed80ec"), "clay");
     assert_eq!(wrap_variant("b8b7c23ab0e0c45567869d4c98c9d489c8000a21da777c54e4cdeba61a513957"), "rust");
     assert_eq!(wrap_variant("a0a8bddef089f638f98ca3f13aead6a96aaf25955eaeaa1a614c9a38427e6092"), "mustard");
