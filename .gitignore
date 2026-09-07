@@ -16,11 +16,23 @@ terraform/artifacts/
 terraform/*.tfplan
 terraform/*.plan
 terraform/*.tfvars
+# The `-out=<f>` glob only catches files ENDING `.tfplan`/`.plan`. A JSON/text
+# EXPORT of a plan (`terraform show -json … > plan.json`) carries the same
+# cleartext secrets and matches none of the above. Added 2026-09-07 after a
+# `git add -A` beside a fresh `plan.json` (AWS keys inside) was stopped by
+# GitHub push protection — the backstop below is so the next one never reaches
+# the wire in the first place. `tfplan*` catches bare `tfplan`/`tfplan.bin` too.
+terraform/plan.json
+terraform/plan.txt
+terraform/tfplan*
 terraform-iam/.terraform/
 terraform-iam/backend.hcl
 terraform-iam/*.tfplan
 terraform-iam/*.plan
 terraform-iam/*.tfvars
+terraform-iam/plan.json
+terraform-iam/plan.txt
+terraform-iam/tfplan*
 
 # impeccable ephemeral state is ignored by .impeccable/.gitignore (live/sessions/,
 # live/annotations/, live/server.json); design.json + live/config.json are tracked
