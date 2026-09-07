@@ -304,7 +304,7 @@ pub(crate) async fn handle_unfurl_link(
             // belong in logs at full length, so only a short, non-reconstructible
             // prefix is logged, purely to help correlate repeated hits.
             tracing::error!(
-                token_prefix = format!("{}…", &token[..8.min(token.len())]),
+                token_prefix = format!("{}…", token.chars().take(8).collect::<String>()),
                 "unfurl: deployed template is missing the og markers"
             );
             emit_marker_absent_metric();
@@ -338,7 +338,7 @@ pub(crate) async fn handle_unfurl_shelf(
             // handler above — marker absence is a deploy property, no full
             // token needed, only a short prefix for correlation.
             tracing::error!(
-                token_prefix = format!("{}…", &token[..8.min(token.len())]),
+                token_prefix = format!("{}…", token.chars().take(8).collect::<String>()),
                 "unfurl: deployed template is missing the og markers (shelf)"
             );
             emit_marker_absent_metric();

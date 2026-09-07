@@ -67,7 +67,11 @@ identical bytes — no UA cloaking anywhere). Vite hashes bundle filenames, so t
 embed `index.html` at build time without deploy-order coupling. Instead: **public-api fetches
 `index.html` from the web S3 bucket** (in-memory cache, short TTL ~60s), replaces the delimited
 og block (`<!-- open graph … -->` … end marker added by this arc) with per-token meta, and
-serves it. Web deploys keep working with zero coordination; the swap is anchored on explicit
+serves it. Web deploys keep working with zero coordination — with one measured window: the
+lambda's 60s template cache stacked on CF's 60s unfurl TTL can serve a pre-deploy `index.html`
+for up to ~2 min after a web sync (CF invalidation cannot reach the lambda's memory). That is
+why `deploy-web.sh` retains old hashed bundles instead of `--delete`-ing them (pass-2 review):
+a stale index in that window must still find its scripts. The swap is anchored on explicit
 HTML comment markers, not tag parsing. **Marker absence gets a witness (Lilith):** if a deployed
 index.html ever lacks the markers, the swap must not silently no-op forever — the lambda emits a
 structured ERROR log + CloudWatch metric on anchor absence while serving the generic card, so the
@@ -87,7 +91,14 @@ are the capability. **My lean on the latency/availability trade** (open question
 ALL viewers from the lambda, no UA sniffing — a UA roster rots (this repo's own
 hand-written-roster scar tissue), rust lambda cold starts are small, and the SPA is already
 useless when public-api is down, so the added SPOF surface is thin. Failure posture: if the
-lambda 5xxes, CloudFront's custom error responses serve the themed fallback.
+lambda 5xxes, the viewer gets the 500 JSON (`{"error": "try again"}`), which CF error-caches
+for ~10s. There are **no** distribution-wide custom error responses — deliberately
+(`aws-cloudfront.tf:147`): the spa-error-handling knob would clobber the API's real status
+codes, including the 404 token-oracle posture this same spec mandates. A themed human-facing
+fallback would have to be served by the lambda itself — flagged as a possible follow-up at the
+pass-2 review (2026-09-07), not built in this arc. *(This paragraph previously cited "CloudFront's
+custom error responses" as the safety net; that net was never configured — pass-2 fresh-eyes
+review caught the spec asserting machinery the terraform explicitly declines.)*
 
 ### D5 — dead tokens unfurl warm and generic
 **The unfurl's audience is the room at paste time, not the clicker** (OMBB) — every disclosure
@@ -198,7 +209,8 @@ structurally impossible rather than merely a fast-enough-timing bet:
    **Verify** before opening the front door: `curl` the API Gateway stage URL directly (bypasses
    CF entirely) — `curl -sI "$STAGE_URL/l/deadbeef"` should come back 200/302, not 404.
 2. **Sync web** — `./deploy-web.sh` (full `web/dist`: the new `<!-- og:begin -->`/`<!-- og:end -->`
-   markers in `index.html` AND the 9 `wrap-*.png` files, one `aws s3 sync --delete`) — **before**
+   markers in `index.html` AND the 9 `wrap-*.png` files; the script retains old hashed bundles
+   and refuses a marker-less dist — pass-2 review) — **before**
    phase 3, not after, so the moment CF starts sending `/l/*` traffic to the lambda, both the
    markers and the art are already fully present in S3 (closes the marker/art-upload race for
    free; costs nothing since `deploy-web.sh` doesn't depend on the CF/apigw side going first).
