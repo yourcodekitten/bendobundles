@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use domain::is_spoofing_format_char;
 use dynamo::{ClaimTxError, OwnedProxyOutcome, Store, StoreError};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::{Deserialize, Serialize};
@@ -1020,51 +1021,6 @@ async fn handle_post_claim(
 /// Same budget as the gift note it answers (admin-api's `GIFT_NOTE_MAX_CHARS`) —
 /// the correspondence is symmetric on purpose.
 const THANK_NOTE_MAX_CHARS: usize = 500;
-
-/// Characters that can visually reorder or invisibly pad the note when it renders
-/// beside trusted admin chrome — the friend's text sits immediately before the
-/// "— label, date" attribution ben reads, and a U+202E override would let it spoof
-/// that signature (OMBB, #76 review; display-spoofing, not XSS — React escaping
-/// holds). This is the Unicode Cf (format) category minus three carve-outs,
-/// spelled out because `char::is_control` covers only Cc: bidi
-/// embeddings/overrides/isolates, zero-width space, soft hyphen, word joiner +
-/// invisible operators + deprecated formatting (the FULL U+2060–206F block —
-/// pass 2 caught pass 1 stopping at 2069 and re-opening the invisible-note hole
-/// through U+206A–206F; U+2065 is unassigned-and-default-ignorable, swept on
-/// purpose), Arabic/Syriac/other prepended marks, interlinear annotation,
-/// musical formatting, BOM, and the tag block (U+E0000–E007F — note this
-/// degrades RGI subdivision-flag emoji like Scotland's to a plain black flag; an
-/// accepted trade-off, the tag block is the canonical invisible-smuggling
-/// channel and the base flag survives). Carve-outs, all "load-bearing in real
-/// scripts, zero reordering power": ZWJ/ZWNJ (U+200C/D — emoji sequences, Indic)
-/// and MVS (U+180E — selects Mongolian final-vowel forms; bidi class BN).
-/// Intrinsic RTL text (Arabic/Hebrew letters) is untouched — only the invisible
-/// controls are the spoofing vector.
-fn is_spoofing_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{0600}'..='\u{0605}'
-            | '\u{061C}'
-            | '\u{06DD}'
-            | '\u{070F}'
-            | '\u{0890}'..='\u{0891}'
-            | '\u{08E2}'
-            | '\u{200B}'
-            | '\u{200E}'
-            | '\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{110BD}'
-            | '\u{110CD}'
-            | '\u{13430}'..='\u{1343F}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E007F}'
-    )
-}
 
 /// Kept by the sanitizer (legitimate in real text) but rendering as nothing when
 /// standing alone: the ZWJ/ZWNJ/MVS carve-outs, variation selectors, and the
