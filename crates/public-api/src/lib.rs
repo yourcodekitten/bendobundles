@@ -4,6 +4,8 @@
 //!         `POST /api/l/{token}/thanks`,
 //!         `GET /api/steam/login`, `GET /api/steam/return`,
 //!         `GET /api/l/{token}/steam/owned/{steamid}`, fallback 404.
+mod unfurl;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
