@@ -421,6 +421,35 @@ data "aws_iam_policy_document" "deploy" {
     ]
     resources = ["*"]
   }
+  # The site module now MANAGES a cache policy of its own
+  # (aws_cloudfront_cache_policy), which is a different relationship from the
+  # managed-policy lookup above: that one this role only reads, this one it
+  # owns. Granted as the full create/update/delete lifecycle in one change,
+  # deliberately — a resource Terraform creates it will also reconfigure and
+  # destroy, so Create alone buys a 403 on the first config edit and a second
+  # on the first teardown. That is NOT the rides-along pattern the
+  # GetResponseHeadersPolicy comment above rejects: there the role reads a
+  # policy someone else owns, so writes would be speculative scope; here the
+  # writes ARE the managed lifecycle, and splitting them across three PRs
+  # reviews the same grant three times without ever making it smaller.
+  # CreateCachePolicy is a create-type action with no resource to scope to.
+  # Update/Delete are scopeable in principle, but the policy id is generated
+  # at create time, so scoping means hard-coding a UUID that does not exist
+  # until after the first apply — same reason GetCachePolicy stays on *.
+  # Kept OUT of the read statement above on purpose: that one carries
+  # ListCachePolicies, which must stay *-scoped, and folding writes in is what
+  # would make a future resource-scoping silently drop the list grant — the
+  # exact hazard its own comment names.
+  statement {
+    sid    = "CloudFrontCachePolicyWrite"
+    effect = "Allow"
+    actions = [
+      "cloudfront:CreateCachePolicy",
+      "cloudfront:UpdateCachePolicy",
+      "cloudfront:DeleteCachePolicy",
+    ]
+    resources = ["*"]
+  }
   statement {
     sid    = "Acm"
     effect = "Allow"
