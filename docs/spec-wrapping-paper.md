@@ -49,8 +49,9 @@ that looks like the system saying something (OMBB). If shelf variety ever earns 
 something meaningful (shelf size, first-gift year), never the token — **and draw shelf art from a
 DISJOINT PALETTE gifts never use. Not a salt: `Friend.shelf_token` (`domain:177`) and `Link.token`
 (`:184`) are distinct fields already, so the hashes are decorrelated under any keying, and
-independent draws into 8 buckets still collide 1-in-8 per gift by chance — a birthday problem no
-salt escapes (OMBB, refuting a salt sentence r2.1 briefly carried). A disjoint palette takes the
+independent draws into 8 buckets still collide 1-in-8 per gift — compounding to 1−(7/8)ⁿ ≈ 33%
+that the shelf matches SOME gift for the canonical three-treasure friend (Lilith's number) — a
+birthday problem no salt escapes (OMBB, refuting a salt sentence r2.1 briefly carried). A disjoint palette takes the
 collision to zero by construction, and it says the true thing visually: a shelf is a different
 KIND of object, not another present.**
 
