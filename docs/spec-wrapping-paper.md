@@ -20,11 +20,11 @@ Pasting a **gift link** `/l/<token>` into Discord/iMessage/Slack unfurls as:
 
 > **🎁 ben wrapped something for {label} ♡**
 > three treasures inside, chosen for you. tap to unwrap.
-> `[wrap-art image: a pixel-art wrapped present in one of 8 muted-earth papers]`
+> `[wrap-art image: a tiny pixel adventurer walking toward a wrapped present — one pea-green scene, bow accent = one of 8 muted-earth tokens]`
 
 Pasting a **shelf link** `/s/<token>` unfurls as:
 
-> **📚 the shelf ben keeps for {name}**
+> **📚 the shelf ben keeps for {name} ♡**
 > every game he's given you, all in one warm place.
 > `[wrap-art image: shelf variant]`
 
@@ -107,9 +107,9 @@ different blast radius; that asymmetry is why the card carries only label + coun
 | state | og:title | og:description |
 |---|---|---|
 | gift, n games (curated: `Some(non-empty)`) | `🎁 ben wrapped something for {label} ♡` | `{n_word} treasure{s} inside, chosen for you. tap to unwrap.` |
-| gift, uncurated / open shelf (`curated_game_ids: None` or `Some(empty)`) | `🎁 ben wrapped something for {label} ♡` | `the attic is open for you. tap to look inside.` |
+| gift, uncurated / open shelf (`curated_game_ids: None` or `Some(empty)`) | `🎁 ben wrapped something for {label} ♡` | `ben opened his stash for you. tap to look inside.` |
 | gift, sealed (unlock in future) | `🎁 ben wrapped something for {label} ♡` | `sealed for now. good things wait.` |
-| shelf | `📚 the shelf ben keeps for {name}` | `every game he's given you, all in one warm place.` |
+| shelf | `📚 the shelf ben keeps for {name} ♡` | `every game he's given you, all in one warm place.` |
 | dead/unknown | (today's generic block verbatim) | (generic) |
 
 **Uncurated-row rationale (pass-1 product review, MAJOR):** `None` = open shelf; chosen-for-you

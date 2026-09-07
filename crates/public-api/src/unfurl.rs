@@ -113,7 +113,7 @@ pub(crate) fn meta_for_link(
             // so this must not borrow the curated row's "chosen for you" claim
             // (pass-1 product review, MAJOR: 18/18 production links are this
             // shape as of docs/spec-attic-whispers.md's census).
-            _ => "the attic is open for you. tap to look inside.".to_string(),
+            _ => "ben opened his stash for you. tap to look inside.".to_string(),
         }
     };
     let image = og_text(
@@ -124,17 +124,17 @@ pub(crate) fn meta_for_link(
         &title,
         &og_text(&desc, 200),
         &image,
-        "a pixel-art wrapped present in ben's pea-green attic",
+        "a tiny pixel adventurer walking toward a wrapped present, drawn in shades of pea green",
     ))
 }
 
 pub(crate) fn meta_for_shelf(friend: &domain::Friend, base_url: &str) -> String {
     let name = og_text(&friend.name, 80);
     meta_block(
-        &format!("📚 the shelf ben keeps for {name}"),
+        &format!("📚 the shelf ben keeps for {name} ♡"),
         "every game he's given you, all in one warm place.",
         &og_text(&format!("{base_url}/art/wrap-shelf.png"), 200),
-        "a pixel-art shelf of games in ben's attic",
+        "a tiny pixel adventurer walking toward a shelf of games, drawn in shades of pea green",
     )
 }
 
@@ -464,7 +464,7 @@ mod tests {
         let link = test_link(); // curated_game_ids: None, from the shared helper
         let m = super::meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example")
             .unwrap();
-        assert!(m.contains("the attic is open for you. tap to look inside."));
+        assert!(m.contains("ben opened his stash for you. tap to look inside."));
         assert!(
             !m.contains("chosen for you"),
             "open-shelf card must not claim curation"
@@ -479,7 +479,7 @@ mod tests {
         link.curated_game_ids = Some(vec![]);
         let m = super::meta_for_link(&link, time::OffsetDateTime::now_utc(), "https://x.example")
             .unwrap();
-        assert!(m.contains("the attic is open for you. tap to look inside."));
+        assert!(m.contains("ben opened his stash for you. tap to look inside."));
     }
 
     #[test]
