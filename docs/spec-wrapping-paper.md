@@ -1,6 +1,6 @@
 # spec: the wrapping paper 🎁 — per-gift unfurls
 
-status: DRAFT r1 (2026-09-07) · author: kitten · pounce arc
+status: DRAFT r2 (2026-09-07) — family review integrated (OMBB routing/copy/art-structure, Lilith oracle/escaping/witness) · author: kitten · pounce arc
 
 ## why
 
@@ -41,8 +41,12 @@ rust, mauve, pine, clay). Wrap art ships as **8 pre-designed pixel-art present P
 one per palette token, picked by the same style of stable hash over the link token. Consequence
 worth the sentence: **the same gift always wears the same wrapping paper** — re-pasting the link
 re-unfurls identically, and two different gifts to the same friend look like two different
-presents. Shelf cards get the same treatment with a shelf-flavored composition (8 more PNGs, or
-1 shared shelf design in phase 1 — see OQ3).
+presents. **Scope of the promise (r2): "same art forever" is a GIFT-link promise.** Shelves ship ONE shared
+design, and not as phasing: variants exist to distinguish multiple objects belonging to one person,
+and a friend has exactly one shelf — token-hashed shelf art would distinguish it from nothing, and a
+shared hash could coincidentally dress a shelf in one of that friend's gift papers, a coincidence
+that looks like the system saying something (OMBB). If shelf variety ever earns its way in, hash
+something meaningful (shelf size, first-gift year), never the token.
 
 ### D2 — meta text carries the personalization; images are pre-baked
 Per-name *rendered* images (label drawn into the PNG) are explicitly **out of scope** for this
@@ -57,7 +61,11 @@ embed `index.html` at build time without deploy-order coupling. Instead: **publi
 `index.html` from the web S3 bucket** (in-memory cache, short TTL ~60s), replaces the delimited
 og block (`<!-- open graph … -->` … end marker added by this arc) with per-token meta, and
 serves it. Web deploys keep working with zero coordination; the swap is anchored on explicit
-HTML comment markers, not tag parsing. New IAM: public-api gains `s3:GetObject` on
+HTML comment markers, not tag parsing. **Marker absence gets a witness (Lilith):** if a deployed
+index.html ever lacks the markers, the swap must not silently no-op forever — the lambda emits a
+structured ERROR log + CloudWatch metric on anchor absence while serving the generic card, so the
+degradation announces itself. The web-side vitest guards the artifact where it is BUILT; the
+lambda's witness guards what actually reached the bucket — different failure, different guard. New IAM: public-api gains `s3:GetObject` on
 `index.html` only — the iam_capture corpus gains the grant (gift-shelf pass-2 lesson: corpus
 must see every new store/client call).
 
@@ -72,24 +80,52 @@ useless when public-api is down, so the added SPOF surface is thin. Failure post
 lambda 5xxes, CloudFront's custom error responses serve the themed fallback.
 
 ### D5 — dead tokens unfurl warm and generic
-Revoked/consumed/unknown tokens serve the CURRENT generic card (site-wide og block, exactly
-what today's index.html serves) with 200 — never an error card in a chat, and no new oracle:
-`/api/l/<token>` already distinguishes valid tokens to any holder; the unfurl adds no channel
-that the JSON API doesn't already have. Content-timing note: personalized-vs-generic is
-observable to a token-guesser exactly as far as the existing API is — acceptable, same trust
-model (the token IS the auth).
+**The unfurl's audience is the room at paste time, not the clicker** (OMBB) — every disclosure
+here is graded against "safe to broadcast to a channel," not "less than the page."
+Revoked/consumed/unknown tokens serve the CURRENT generic card (site-wide og block, exactly what
+today's index.html serves) with 200 — never an error card in a chat. Oracle status, verified at
+`public-api/src/lib.rs:624-629` (Lilith): the JSON API already returns byte-identical
+`link_not_found_response()` for ANY invalid token, so the unfurl adds no valid/invalid channel —
+and it is STRICTLY COARSER than the API it rides beside: the API distinguishes
+`active|sealed|revoked|expired|exhausted` to a requester; the unfurl collapses every dead and
+unknown state into one generic card. Caveat carried with the claim: equivalent information is not
+equivalent disclosure — the API oracle requires someone to make a request; the unfurl fires because
+a platform bot fetched automatically, then renders and caches the answer into a room. Same bits,
+different blast radius; that asymmetry is why the card carries only label + count.
 
 ### D6 — what the meta says, exactly (copy is part of the spec)
 | state | og:title | og:description |
 |---|---|---|
 | gift, n games | `🎁 ben wrapped something for {label} ♡` | `{n_word} treasure{s} inside, chosen for you. tap to unwrap.` |
-| gift, sealed (unlock in future) | `🎁 ben wrapped something for {label} ♡` | `sealed until {date-ish}. good things wait.` |
+| gift, sealed (unlock in future) | `🎁 ben wrapped something for {label} ♡` | `sealed for now. good things wait.` |
 | shelf | `📚 the shelf ben keeps for {name}` | `every game he's given you, all in one warm place.` |
 | dead/unknown | (today's generic block verbatim) | (generic) |
 
-`{label}`/`{name}` are HTML-escaped and length-clamped (the friend-name sanitize rules from the
-gift-shelf arc apply verbatim — bidi/format chars stripped). Counts use lowercase words
-("three"), capped at "a dozen" style phrasing above 12 — chat cards, not receipts.
+**Sealed-row rationale (r2): state yes, clock never — a date is a spoiler with a calendar attached
+(OMBB). The unfurl may reveal that a sealed thing exists (the act of pasting already does); the only
+temporal disclosure was the date, and you can't un-broadcast one.**
+
+**Escaping is NEW CODE, not reuse (Lilith, measured on main):** public-api contains zero HTML
+escaping; `sanitize_note` (:1102) is a control/bidi STRIPPER that leaves `" < > &` intact and has
+only ever applied to `note`; `label` is a bare String passed through (:165, :663, :794). The
+protection to date lived in React's JSX rendering — and the lambda has no React. Therefore:
+1. A dedicated attribute-context escaper for `{label}`/`{name}`/all injected text — `& < > " '`
+   — because og meta lands in `content="…"` and **`"` is the breakout character** element-text
+   escaping forgets. Bidi/format-char stripping (the `sanitize_friend_name` treatment) applies ON
+   TOP, plus length clamp.
+2. **Blast radius is the live page, not the card** — D3 serves identical bytes to humans, so a
+   broken attribute in `<head>` is injection for every human booting the SPA.
+3. **Provenance, measured:** `Link.label` is Ben-authored behind admin auth (`admin-api:757`);
+   `Friend.name` likewise + bidi-stripped at create (:1056); steam `personaname` flows to neither
+   on main. Severity today: low — fix fully anyway. **This is a recorded ASSUMPTION: any feature
+   that lets a friend set their own display name (e.g. the humble-self-login branch) re-triggers
+   this section's severity review.**
+4. Property test (hers, adopted): a label of `" onload=x><script>` CANNOT change the tag
+   structure of the output — structure-invariance, not "is escaped," so the assertion survives a
+   future escaper swap.
+
+Counts use lowercase words ("three"), capped at "a dozen" style phrasing above 12 — chat cards,
+not receipts.
 
 ## non-goals
 - per-name rendered og images (v2, see D2)
@@ -114,12 +150,17 @@ destroy is READ-EVERY-LINE, not auto-STOP (CF behavior edits can legitimately re
 from green MAIN run. Wrap PNGs ship in `web/public/` (S3, long-cache) — art is a web asset,
 not a lambda payload.
 
-## open questions (family, step 2)
-- **OQ1**: all-viewers-through-lambda (my lean, D4) vs edge UA-sniff bots-only vs something
-  smarter? The trade is first-hop latency/availability vs a UA roster that rots.
-- **OQ2**: is 60s CF caching of personalized HTML acceptable, or should unfurl HTML be
-  no-cache (every paste hits the lambda)?
-- **OQ3**: shelf art — 8 variants like gifts, or one shared shelf design in phase 1?
-- **OQ4**: does the sealed-gift state deserve its own copy row (D6 line 2), or is that a
-  content leak of "there is a timed thing"? (my read: the SealedGift page already shows the
-  countdown to the token holder; the unfurl says less than the page.)
+## resolutions (r2) — the r1 open-questions block is retired; every OQ re-derived from the body
+- **routing**: one path, always-lambda, all viewers. Two code paths for one URL put the unfurl on
+  the branch nobody can test; UA-in-cache-key fragments the cache the sniff protects; unknown-UA
+  fails silently boring (OMBB). (r1's OQ1 offered an option the non-goals already forbade —
+  process note: OQ blocks are re-derived from the body, never edited in place.)
+- **caching**: 60s CF TTL, per-path keys. Named cost, decided not defaulted: up to 60s of
+  revocation latency on the card — acceptable because the card carries only label+count and the
+  page stays live-checked. INVARIANT: the token is a path segment on both routes, never a query
+  param; a future query-param route must enter the cache key or it cross-serves.
+- **shelf art**: one shared design, structural (see D1).
+- **sealed copy**: state without clock (see D6).
+- open for execution only (mine): metric shape for the marker witness (log+metric-filter vs
+  put-metric), and whether the witness alarm joins aws-cloudwatch-alarms.tf in this arc or a
+  follow-up.
