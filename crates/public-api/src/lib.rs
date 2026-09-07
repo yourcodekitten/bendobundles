@@ -6,6 +6,8 @@
 //!         `GET /api/l/{token}/steam/owned/{steamid}`, fallback 404.
 mod unfurl;
 
+pub use unfurl::{S3Template, TemplateError, TemplateSource};
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -89,6 +91,12 @@ pub struct AppState {
     /// Used to reconstruct `expected_return_to` in the OpenID return endpoint
     /// from config — NEVER from Host/X-Forwarded-* headers.
     base_url: String,
+    /// Where `/l/{token}` and `/s/{token}` fetch the deployed `index.html` to
+    /// swap the og block into (spec: docs/spec-wrapping-paper.md). `None` in
+    /// every one of the 103 existing `router()` call sites — those never hit
+    /// the unfurl routes, so it's inert there; `Some` only via
+    /// `router_with_template` (main.rs, unfurl tests).
+    template: Option<Arc<dyn TemplateSource>>,
 }
 
 // ── Response shapes ───────────────────────────────────────────────────────────
@@ -222,17 +230,36 @@ struct ShelfResponse {
 
 /// Build the axum router. `store` is `Arc<Store>` so callers can share one store
 /// across multiple oneshot calls in tests.
+///
+/// Keeps its 4-arg signature on purpose (103 existing call sites) — a plain
+/// delegate to `router_with_template` with no template source, so `/l/*` and
+/// `/s/*` fall back to the 500 `router_with_template` gives an unconfigured
+/// template source. Only `main.rs` and the unfurl tests need the 5-arg form.
 pub fn router(
     store: Arc<Store>,
     invoker: Arc<dyn Invoker>,
     steam: Option<Arc<SteamClient>>,
     base_url: String,
 ) -> Router {
+    router_with_template(store, invoker, steam, base_url, None)
+}
+
+/// Same as [`router`], plus the unfurl routes' template source (spec:
+/// docs/spec-wrapping-paper.md). `None` disables `/l/{token}` and `/s/{token}`
+/// personalization — they 500 rather than silently serving stale/no HTML.
+pub fn router_with_template(
+    store: Arc<Store>,
+    invoker: Arc<dyn Invoker>,
+    steam: Option<Arc<SteamClient>>,
+    base_url: String,
+    template: Option<Arc<dyn TemplateSource>>,
+) -> Router {
     let state = AppState {
         store,
         invoker,
         steam,
         base_url,
+        template,
     };
     Router::new()
         .route("/api/l/{token}", get(handle_get_link))
@@ -246,6 +273,8 @@ pub fn router(
         .route("/api/steam/login", get(handle_steam_login))
         .route("/api/steam/return", get(handle_steam_return))
         .route("/api/s/{token}", get(handle_get_shelf))
+        .route("/l/{token}", get(unfurl::handle_unfurl_link))
+        .route("/s/{token}", get(unfurl::handle_unfurl_shelf))
         .with_state(state)
         .fallback(handle_not_found)
 }
