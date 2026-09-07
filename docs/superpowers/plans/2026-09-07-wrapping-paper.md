@@ -138,7 +138,11 @@ pub fn og_text(raw: &str, max_chars: usize) -> String {
 ```
 
 - [ ] **Step 4:** `cargo test -p domain` → PASS (all four + existing suite).
-- [ ] **Step 5:** In `crates/public-api/src/lib.rs`: delete fn `is_spoofing_format_char` (:1043-1051), add `use domain::is_spoofing_format_char;` near the other domain imports (grep `use domain::` for the exact block). `cargo test -p public-api` → PASS (its existing sanitize tests now exercise the moved fn).
+- [ ] **Step 5:** The cut already happened in Step 3 (whole symbol, doc comment through closing
+brace). Here: add `use domain::is_spoofing_format_char;` near the other domain imports in
+`crates/public-api/src/lib.rs` (grep `use domain::` for the exact block), then
+`cargo test -p public-api` → PASS (its existing sanitize tests, e.g. the :1108 caller, now
+exercise the moved fn).
 - [ ] **Step 6: Commit** — `git add -A && git commit -S -m "🎁 domain: og_text attribute escaper; is_spoofing_format_char moves to its single home"`
 
 ### Task 2: public-api — `swap_og_block` + meta builders (pure core)
