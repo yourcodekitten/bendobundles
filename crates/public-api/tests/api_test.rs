@@ -1827,6 +1827,62 @@ async fn game_view_carries_steam_app_id() {
     );
 }
 
+/// GameView carries acquired_at (rfc3339) when known, omits the key entirely when not
+/// (spec docs/spec-postmark.md D5/D6: absence must render as exactly the today-state).
+#[tokio::test]
+async fn game_view_carries_acquired_at_and_omits_when_absent() {
+    let Some(store) = store_or_skip("game-view-acquired").await else {
+        return;
+    };
+    let mut g = test_game(1);
+    g.acquired_at = Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC));
+    store.put_game(&g).await.unwrap();
+    let dateless = test_game(2);
+    store.put_game(&dateless).await.unwrap();
+    let lnk = test_link("acquired-tok");
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let req = Request::get("/api/l/acquired-tok")
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(Arc::clone(&store), mock.clone())
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let games = j["games"].as_array().unwrap();
+    assert_eq!(games.len(), 2, "both games listed");
+    // select BY id, never by index — payload ordering is unpinned
+    let by_id = |id: &str| {
+        games
+            .iter()
+            .find(|x| x["id"] == id)
+            .unwrap_or_else(|| panic!("game {id} in payload"))
+    };
+    // PARSE-BACK, not string equality: time's Rfc3339 formatter may trim trailing
+    // subsecond zeros, so the pinned property is the INSTANT.
+    let wire = by_id(&g.id)["acquired_at"]
+        .as_str()
+        .expect("acquired_at present");
+    let parsed = time::OffsetDateTime::parse(
+        wire,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("wire value is rfc3339");
+    assert_eq!(
+        parsed,
+        time::macros::datetime!(2012-08-15 19:41:25.765070 UTC)
+    );
+    assert!(
+        by_id(&dateless.id).get("acquired_at").is_none(),
+        "dateless game must omit the key entirely"
+    );
+}
+
 // ── I1: steamid validation on public owned proxy ──────────────────────────────
 
 /// I1-RED: live link + 16-digit steamid → 400 (must fail before fix).
