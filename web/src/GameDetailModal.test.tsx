@@ -122,6 +122,99 @@ describe("GameDetailModal", () => {
     clearGameDetailCache();
   });
 
+  it("shows the postmark chip on the non-steam path", async () => {
+    const g = {
+      ...friendGame,
+      steam_app_id: null,
+      acquired_at: "2012-08-15T19:41:25.765070Z",
+    };
+    vi.mocked(fetchGameDetail).mockResolvedValue({ game: g, steam: null });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={g}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    expect(await screen.findByText("📮 aug 2012")).toBeInTheDocument();
+  });
+
+  it("renders no postmark anywhere when acquired_at is absent (non-steam)", async () => {
+    const g = { ...friendGame, steam_app_id: null };
+    vi.mocked(fetchGameDetail).mockResolvedValue({ game: g, steam: null });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={g}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText(g.bundle)).toBeInTheDocument());
+    expect(screen.queryByText(/📮/)).toBeNull();
+  });
+
+  it("shows the attic line on the steam path (spec D6.1 as amended)", async () => {
+    const g = { ...friendGame, acquired_at: "2012-08-15T19:41:25.765070Z" };
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: g,
+      steam: {
+        detail: steamDetailFixture,
+        overall: overallFixture,
+        recent: recentFixture,
+      },
+    });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={g}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    expect(
+      await screen.findByText(
+        `📮 from ${g.bundle} · tucked into the attic aug 2012`,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("renders no postmark on the steam path when acquired_at is absent", async () => {
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: friendGame,
+      steam: {
+        detail: steamDetailFixture,
+        overall: overallFixture,
+        recent: recentFixture,
+      },
+    });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={friendGame}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/ConcernedApe/)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/📮/)).toBeNull();
+  });
+
   it("renders full detail variant from a mocked response", async () => {
     vi.mocked(fetchGameDetail).mockResolvedValue({
       game: friendGame,

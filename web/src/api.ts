@@ -12,6 +12,8 @@ export type GameView = {
   tags?: string[];
   /** ghost marker (curated links): a chosen game in a decided non-listable state. cause-blind by decision (spec §2). */
   gone?: boolean;
+  /** 📮 rfc3339 instant when ben's bundle purchase created this order; absent when unknown. */
+  acquired_at?: string;
 };
 
 export type ClaimView = {
@@ -98,6 +100,11 @@ export type AdminGame = {
   id: string;
   title: string;
   bundle: string;
+  /** 📮 rfc3339 acquisition instant. The admin payload does NOT currently send
+   *  this (spec docs/spec-postmark.md non-goal: no admin surface change) — typed
+   *  optional so the shared modal's postmark rendering typechecks across the
+   *  union; absent ⇒ exactly the today-state, on admin as everywhere. */
+  acquired_at?: string;
   key_type: string;
   giftable: boolean;
   hidden: boolean;

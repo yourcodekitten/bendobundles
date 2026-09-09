@@ -7,6 +7,7 @@ import type {
   SelfClaimResult,
 } from "./api";
 import { MediaHeader } from "./MediaHeader";
+import { postmark, waitedYears } from "./postmark";
 import { ClaimChest } from "./ClaimChest";
 import { DESCRIPTOR_LABELS, displayTags } from "./tags";
 import { titleColorClass, titleHueVar } from "./titleColor";
@@ -332,6 +333,11 @@ export function GameDetailModal(props: GameDetailModalProps) {
                       <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
                         {game.key_type}
                       </span>
+                      {postmark(game.acquired_at) !== null && (
+                        <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
+                          {`📮 ${postmark(game.acquired_at)}`}
+                        </span>
+                      )}
                     </div>
                     <p className="text-sm text-dust">
                       no steam page for this one.
@@ -405,6 +411,16 @@ export function GameDetailModal(props: GameDetailModalProps) {
                             <p className="text-sm leading-relaxed text-ink-soft">
                               {detail.short_description}
                             </p>
+                            {/* 📮 the attic line (spec D6.1 as amended): the steam
+                                path has no bundle chip row, so provenance rides a
+                                small line — and restores the bundle name to a path
+                                that had lost it. Single template expression: the
+                                render tests match ONE text node. */}
+                            {postmark(game.acquired_at) !== null && (
+                              <p className="text-xs text-dust">
+                                {`📮 from ${game.bundle} · tucked into the attic ${postmark(game.acquired_at)}`}
+                              </p>
+                            )}
                             {/* content descriptors: admin-only (#71); ?? [] guards the
                                 deploy window where an old lambda omits the keys */}
                             {mount === "admin" &&
@@ -492,6 +508,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
                   charge={claimCharge}
                   phase={claimPhase}
                   pulse={claimPulse}
+                  waitedYears={waitedYears(game.acquired_at)}
                   onMash={mashClaim}
                   onCancel={cancelClaim}
                 />
