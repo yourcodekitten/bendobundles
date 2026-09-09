@@ -106,8 +106,10 @@ No privacy dimension — it is ben's own nostalgia, deliberately shared.
    never names the bundle at all), so "chip beside the bundle chip, both paths" was written
    against a layout that only exists on the non-steam path. As amended: **non-steam path** — a
    postmark chip beside the existing bundle chip, `📮 mar 2013` (lowercase month, attic voice);
-   **steam path** — a small attic line after the description, `📮 from {bundle} · tucked into
-   the attic mar 2013`, which also restores the bundle name to a path that had lost it
+   **steam path** — a small attic line at the FOOT of the steam section, below the review
+   meter and OUTSIDE the detail gate (review pass 1: a reviews-only cache item — steam
+   non-null, `detail: null` — must not hide the year), `📮 from {bundle} · tucked into the
+   attic mar 2013`, which also restores the bundle name to a path that had lost it
    (provenance is the story). Both paths render-tested. No chip/line when `acquired_at` is
    absent — absence renders as exactly the today-state, never as "unknown".
 2. **Claim ceremony**: on the win moment (`it's yours ♡`), when the game was acquired ≥ 1 year

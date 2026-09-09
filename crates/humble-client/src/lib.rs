@@ -1970,6 +1970,30 @@ mod parse_created_tests {
     use super::parse_created;
 
     #[test]
+    fn order_wire_created_is_lenient_at_the_type_layer() {
+        // Review pass 2: a non-string `created` (numeric epoch — the API-modernises
+        // future) must NEVER fail the whole OrderWire deserialize; key truth is the
+        // meal, the postmark is garnish (D1).
+        let numeric: crate::model::OrderWire = serde_json::from_value(serde_json::json!({
+            "gamekey": "gk", "product": {"human_name": "B"},
+            "tpkd_dict": {"all_tpks": []}, "created": 1344973285
+        }))
+        .expect("numeric created must not fail the order parse");
+        assert_eq!(numeric.created.as_deref(), Some("1344973285"));
+        assert_eq!(
+            parse_created("1344973285"),
+            None,
+            "a bare epoch is rejected by parse_created (caller warns loudly)"
+        );
+        let object: crate::model::OrderWire = serde_json::from_value(serde_json::json!({
+            "gamekey": "gk", "product": {"human_name": "B"},
+            "tpkd_dict": {"all_tpks": []}, "created": {"weird": true}
+        }))
+        .expect("object created must not fail the order parse");
+        assert_eq!(object.created, None);
+    }
+
+    #[test]
     fn parse_created_live_specimen_naive_six_frac_digits() {
         // THE pinned live specimen (spec D1, measured 2026-09-09) — six fractional digits,
         // no offset. A description that fails to consume the subsecond fails HERE.
