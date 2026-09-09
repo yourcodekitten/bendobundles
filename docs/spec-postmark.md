@@ -101,9 +101,15 @@ No privacy dimension — it is ben's own nostalgia, deliberately shared.
 
 **D6 — web, the actual feature.** Two sites, friend surface only:
 
-1. **Detail modal**: a postmark chip beside the bundle chip, both render paths (steam and
-   non-steam): `📮 mar 2013`. Lowercase month, the attic voice. No chip when `acquired_at`
-   is absent — absence renders as exactly the today-state, never as "unknown".
+1. **Detail modal — per-path treatment (AMENDED pre-build, plan review Q1):** the steam path
+   has NO bundle chip row to sit beside (measured: it shows dev · publisher · release-date and
+   never names the bundle at all), so "chip beside the bundle chip, both paths" was written
+   against a layout that only exists on the non-steam path. As amended: **non-steam path** — a
+   postmark chip beside the existing bundle chip, `📮 mar 2013` (lowercase month, attic voice);
+   **steam path** — a small attic line after the description, `📮 from {bundle} · tucked into
+   the attic mar 2013`, which also restores the bundle name to a path that had lost it
+   (provenance is the story). Both paths render-tested. No chip/line when `acquired_at` is
+   absent — absence renders as exactly the today-state, never as "unknown".
 2. **Claim ceremony**: on the win moment (`it's yours ♡`), when the game was acquired ≥ 1 year
    ago, a second line: `it waited {N} year{s} for you ♡` (floor of whole years, N ≥ 1 only —
    "waited 0 years" is worse than silence). Absent date or < 1 year ⇒ no line.
