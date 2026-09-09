@@ -215,6 +215,32 @@ describe("GameDetailModal", () => {
     expect(screen.queryByText(/📮/)).toBeNull();
   });
 
+  it("shows the attic line even when steam has reviews but no detail blob", async () => {
+    // review pass 1 MINOR 1: a cache item can hold overall/recent with detail:null;
+    // the postmark must not hide behind the detail gate.
+    const g = { ...friendGame, acquired_at: "2012-08-15T19:41:25.765070Z" };
+    vi.mocked(fetchGameDetail).mockResolvedValue({
+      game: g,
+      steam: { detail: null, overall: overallFixture, recent: recentFixture },
+    });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={g}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    expect(
+      await screen.findByText(
+        `📮 from ${g.bundle} · tucked into the attic aug 2012`,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("renders full detail variant from a mocked response", async () => {
     vi.mocked(fetchGameDetail).mockResolvedValue({
       game: friendGame,

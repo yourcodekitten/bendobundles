@@ -93,7 +93,7 @@ export function ClaimChest({
         {bursting ? (
           <>
             <p className="cg-win">it&apos;s yours ♡</p>
-            {waitedYears != null && (
+            {waitedYears != null && waitedYears >= 1 && (
               <p className="cg-win-sub">
                 it waited {waitedYears} {waitedYears === 1 ? "year" : "years"}{" "}
                 for you ♡

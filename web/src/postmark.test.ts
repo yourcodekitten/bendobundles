@@ -5,6 +5,9 @@ describe("postmark", () => {
   it("renders lowercase month + year, UTC", () => {
     expect(postmark("2012-08-15T19:41:25.765070Z")).toBe("aug 2012");
     expect(postmark("2013-03-27T18:22:58Z")).toBe("mar 2013");
+    // the SHIPPED wire shape: time's rfc3339 formatter trims trailing subsecond
+    // zeros, so the pinned instant arrives with FIVE fractional digits
+    expect(postmark("2012-08-15T19:41:25.76507Z")).toBe("aug 2012");
   });
   it("is null on absent or junk", () => {
     expect(postmark(undefined)).toBeNull();

@@ -411,16 +411,6 @@ export function GameDetailModal(props: GameDetailModalProps) {
                             <p className="text-sm leading-relaxed text-ink-soft">
                               {detail.short_description}
                             </p>
-                            {/* 📮 the attic line (spec D6.1 as amended): the steam
-                                path has no bundle chip row, so provenance rides a
-                                small line — and restores the bundle name to a path
-                                that had lost it. Single template expression: the
-                                render tests match ONE text node. */}
-                            {postmark(game.acquired_at) !== null && (
-                              <p className="text-xs text-dust">
-                                {`📮 from ${game.bundle} · tucked into the attic ${postmark(game.acquired_at)}`}
-                              </p>
-                            )}
                             {/* content descriptors: admin-only (#71); ?? [] guards the
                                 deploy window where an old lambda omits the keys */}
                             {mount === "admin" &&
@@ -497,6 +487,18 @@ export function GameDetailModal(props: GameDetailModalProps) {
                               )
                             )}
                           </div>
+                        )}
+                        {/* 📮 the attic line (spec D6.1 as amended): the steam path
+                            has no bundle chip row, so provenance rides a small line —
+                            and restores the bundle name to a path that had lost it.
+                            OUTSIDE the detail-null gate deliberately (review pass 1):
+                            it depends only on game.bundle/acquired_at, and a
+                            reviews-only cache item must not hide the year. Single
+                            template expression: the render tests match ONE text node. */}
+                        {postmark(game.acquired_at) !== null && (
+                          <p className="px-6 text-xs text-dust">
+                            {`📮 from ${game.bundle} · tucked into the attic ${postmark(game.acquired_at)}`}
+                          </p>
                         )}
                       </div>
                     );
