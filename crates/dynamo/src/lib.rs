@@ -415,6 +415,35 @@ fn is_ccf_update<R>(
 /// body-only editable field gets silently reverted by claim's `SET body` from a
 /// pre-transaction read.
 ///
+/// SECOND AXIS, INDEPENDENT OF THE ONE ABOVE — deployment skew, not concurrency. Everything
+/// above is a lost-update between writers racing at runtime. This one needs no race at all:
+/// every body writer does `SET body = :b` from a round-tripped struct, so a binary whose
+/// struct LACKS a field deserialize-ignores it and re-serializes without it. The field is
+/// erased by an ordinary, uncontended write. Deploy-order runbooks cover the FIRST rollout
+/// only; a ROLLBACK (bad deploy reverted, lambda pinned to an older image) reopens the hole
+/// for as long as the old binary serves.
+///
+/// This is not a corner case of this file, it is the house write pattern: eight live
+/// `SET body` expressions here, five of them on the game item, plus `put_game`'s put_item.
+/// `flip_game_from_pending` is the clean specimen — read the item, deserialize into the
+/// struct, mutate one field, `SET body = :b` — and `set_game_hidden` / `auto_hide_game`
+/// are the same read-modify-write shape through `put_game_if_unchanged`.
+///
+/// So `immutable` does not qualify a field for `body`, and neither does `single-writer`:
+/// immutability answers the edit-race, single-writer removes contention, and skew is
+/// indifferent to both. The property that makes body survivable is RE-DERIVABILITY — a
+/// writer that runs again and re-establishes the value, which turns an erasure into a gap
+/// instead of a death. A field that is written once from something no longer available
+/// (`first_seen_at` and friends) is single-writer, immutable, and still unsafe in body.
+///
+/// AND RE-DERIVABILITY IS NOT A PROPERTY OF THE FIELD. It is a property of the writer that
+/// re-establishes it — for game fields, of the sync walking EVERY gamekey each pass. Make
+/// that walk incremental (new orders only, the obvious optimisation) and every body-only
+/// field silently loses its net, on a change that reads as a performance win and whose
+/// author has no reason to look in this file. So the rule carries its own expiry: body is
+/// safe for a field the FULL walk re-derives, and that safety dies the day the walk stops
+/// being full.
+///
 /// `expires_at` absence is authoritative too — `link_item` omits it and `update_link_meta`
 /// REMOVEs it for never-expires — so the override is unconditional, not only-when-present.
 fn link_from_item(
