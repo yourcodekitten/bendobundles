@@ -920,10 +920,7 @@ mod tests {
             None,
         );
         let fields = v["embeds"][0]["fields"].as_array().unwrap();
-        let bundle = fields
-            .iter()
-            .find(|f| f["name"] == "bundle")
-            .unwrap()["value"]
+        let bundle = fields.iter().find(|f| f["name"] == "bundle").unwrap()["value"]
             .as_str()
             .unwrap();
         assert_eq!(bundle, "Humble Test Bundle (steam, 2013)");

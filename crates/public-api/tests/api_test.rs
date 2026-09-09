@@ -1868,11 +1868,8 @@ async fn game_view_carries_acquired_at_and_omits_when_absent() {
     let wire = by_id(&g.id)["acquired_at"]
         .as_str()
         .expect("acquired_at present");
-    let parsed = time::OffsetDateTime::parse(
-        wire,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .expect("wire value is rfc3339");
+    let parsed = time::OffsetDateTime::parse(wire, &time::format_description::well_known::Rfc3339)
+        .expect("wire value is rfc3339");
     assert_eq!(
         parsed,
         time::macros::datetime!(2012-08-15 19:41:25.765070 UTC)

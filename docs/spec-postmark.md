@@ -1,6 +1,6 @@
 # spec: the postmark 📮 — the year ben bought them
 
-status: FAMILY-REVIEWED (2026-09-09, OMBB round 1 — Q1/Q2/Q3 + D2 note integrated below) ·
+status: BUILT (2026-09-09) — as family-reviewed (3 rounds) + step-5 fixes; see PR ·
 author: kitten · pounce arc
 
 ## why

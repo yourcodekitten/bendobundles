@@ -153,9 +153,10 @@ impl GameView {
             genres,
             tags,
             gone: false,
-            acquired_at: g
-                .acquired_at
-                .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok()),
+            acquired_at: g.acquired_at.and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            }),
         }
     }
 

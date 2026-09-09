@@ -448,6 +448,14 @@ pub fn sync_status(redeemed: bool, expired: bool) -> GameStatus {
     }
 }
 
+/// The postmark merge rule, spec docs/spec-postmark.md section D3: sync-authoritative with
+/// never-erase. Named — and called explicitly in BOTH merge branches — because a `..fresh`
+/// rest-pattern is the catch-all for a new FIELD that the no-`_` rule bans for a new VARIANT
+/// (family review, 2026-09-09).
+fn merge_acquired_at(existing: &Game, fresh: &Game) -> Option<OffsetDateTime> {
+    fresh.acquired_at.or(existing.acquired_at)
+}
+
 /// Merge rule for `steam_app_id` + `appid_source`. Precedence is **Manual > Humble > Title**, with
 /// fresh preferred on equal source (a sync refresh). The one non-obvious rung is that Humble is
 /// authoritative over Title: a fresh Title-sourced id must NOT overwrite an existing Humble one.
@@ -460,13 +468,6 @@ pub fn sync_status(redeemed: bool, expired: bool) -> GameStatus {
 /// 3. `fresh.steam_app_id.is_some()` → take fresh's pair (refresh; a Humble id upgrades a Title one;
 ///    a new id fills a None).
 /// 4. else → keep existing's pair (fresh has no id; don't clear an existing one).
-/// D3 (docs/spec-postmark.md): sync-authoritative with never-erase. Named — and called
-/// explicitly in BOTH merge branches — because a `..fresh` rest-pattern is the catch-all for a
-/// new FIELD that the no-`_` rule bans for a new VARIANT (family review, 2026-09-09).
-fn merge_acquired_at(existing: &Game, fresh: &Game) -> Option<OffsetDateTime> {
-    fresh.acquired_at.or(existing.acquired_at)
-}
-
 fn merge_appid(existing: &Game, fresh: &Game) -> (Option<u32>, Option<AppidSource>) {
     if existing.appid_source == Some(AppidSource::Manual) {
         // Admin override — untouchable
@@ -1191,7 +1192,7 @@ mod tests {
         let g = fresh_game();
         let mut v = serde_json::to_value(&g).unwrap();
         v.as_object_mut().unwrap().remove("acquired_at"); // absent under skip_serializing when
-                                                          // None anyway — this pins it explicitly
+        // None anyway — this pins it explicitly
         let back: Game = serde_json::from_value(v).unwrap();
         assert_eq!(back.acquired_at, None);
         // And a Some survives the round-trip through the body blob's serde path.
