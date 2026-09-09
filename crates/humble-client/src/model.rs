@@ -19,6 +19,11 @@ pub(crate) struct OrderWire {
     pub tpkd_dict: Option<TpkdDict>,
     #[serde(default)]
     pub subproducts: Vec<SubproductWire>,
+    /// Humble's order-creation stamp — the postmark's source (docs/spec-postmark.md D1).
+    /// Measured live 2026-09-09: NAIVE (no offset), six fractional digits. Absent/junk is
+    /// fine — the postmark is garnish; key truth stays the meal.
+    #[serde(default)]
+    pub created: Option<String>,
 }
 
 #[derive(Deserialize)]

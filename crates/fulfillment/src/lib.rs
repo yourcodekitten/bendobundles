@@ -5428,6 +5428,7 @@ mod tests {
                 product_machine_name: "may_2026_choice".into(),
                 keys,
                 subproducts: vec![],
+                created: None,
             }
         }
         // 0 new (order key already in pre) → None.

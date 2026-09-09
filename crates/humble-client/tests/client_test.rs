@@ -47,6 +47,11 @@ async fn parses_order_key_states() {
     assert_eq!(order.bundle_name, "Humble Indie Bundle 99");
     assert_eq!(order.gamekey, "AAAAbbbbCCCC");
     assert_eq!(order.product_machine_name, "hib99_bundle"); // Task 6: order-product identity (D2 rung 3 / D3)
+    assert_eq!(
+        order.created,
+        Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC)),
+        "fixture pins the live specimen (spec docs/spec-postmark.md D1)"
+    );
     assert_eq!(order.keys.len(), 3);
 
     let fresh = &order.keys[0];
