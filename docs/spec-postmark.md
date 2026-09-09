@@ -60,8 +60,9 @@ silently drops it. (`dynamo/src/lib.rs:405-416` documents the *edit-race*, a DIF
 the general lesson goes into that file's own comment — OMBB is opening that against the
 doctrine file himself, round 3.) What makes body storage CORRECT for this field is not
 "immutable" — D3 lets a corrected date propagate, so it isn't — and not "single-writer" alone
-either (skew doesn't count writers: three fns rewrite a game body and a stale binary drops the
-field through any of them). **The property is RE-DERIVABILITY: the sync walk re-stamps every
+either (skew doesn't count writers: eight live `SET body` expressions in dynamo, FIVE on the
+game item plus `put_game`'s put_item — Lilith's measured count, round 3, replacing the round-1
+floor of three — and a stale binary drops the field through any of them). **The property is RE-DERIVABILITY: the sync walk re-stamps every
 pass, so a skew-loss is a gap, not a death — and single-writer is what makes that re-derivation
 uncontested** (OMBB round 3; his contrast case: a hypothetical `first_seen_at` is single-writer
 and NOT re-derivable — one stale lambda loses it permanently). **Plus the EXPIRY CONDITION
