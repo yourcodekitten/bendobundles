@@ -415,6 +415,21 @@ fn is_ccf_update<R>(
 /// body-only editable field gets silently reverted by claim's `SET body` from a
 /// pre-transaction read.
 ///
+/// SECOND AXIS, INDEPENDENT OF THE ONE ABOVE — deployment skew, not concurrency. Everything
+/// above is a lost-update between writers racing at runtime. This one needs no race at all:
+/// every body writer does `SET body = :b` from a round-tripped struct, so a binary whose
+/// struct LACKS a field deserialize-ignores it and re-serializes without it. The field is
+/// erased by an ordinary, uncontended write. Deploy-order runbooks cover the FIRST rollout
+/// only; a ROLLBACK (bad deploy reverted, lambda pinned to an older image) reopens the hole
+/// for as long as the old binary serves.
+///
+/// So `immutable` does not qualify a field for `body`, and neither does `single-writer`:
+/// immutability answers the edit-race, single-writer removes contention, and skew is
+/// indifferent to both. The property that makes body survivable is RE-DERIVABILITY — a
+/// writer that runs again and re-establishes the value, which turns an erasure into a gap
+/// instead of a death. A field that is written once from something no longer available
+/// (`first_seen_at` and friends) is single-writer, immutable, and still unsafe in body.
+///
 /// `expires_at` absence is authoritative too — `link_item` omits it and `update_link_meta`
 /// REMOVEs it for never-expires — so the override is unconditional, not only-when-present.
 fn link_from_item(
