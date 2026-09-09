@@ -278,6 +278,30 @@ pub enum HumbleError {
     TpkdDictAbsent(String),
 }
 
+/// Parse humble's order `created`. RFC3339 is tried FIRST even though the measured
+/// live wire (2026-09-09) is NAIVE — the directions are not symmetric (spec D1,
+/// family review): RFC3339 on a naive string MUST fail (no offset to find), while a
+/// naive parser on an offset-carrying string could silently swallow the offset.
+/// RFC3339-first is never worse — and the unmeasured era is the recent one, where an
+/// API modernises. Naive (six-fraction-digit live specimen) is ASSUMED UTC (D1; the
+/// slack can flip the displayed YEAR only within hours of jan 1, ~0.1% — accepted
+/// deliberately). None on anything else; callers warn, never fail (D1).
+pub(crate) fn parse_created(raw: &str) -> Option<time::OffsetDateTime> {
+    use time::{format_description::well_known::Rfc3339, macros::format_description};
+    if let Ok(t) = time::OffsetDateTime::parse(raw, &Rfc3339) {
+        return Some(t);
+    }
+    let naive_frac =
+        format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond]");
+    let naive = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+    if let Ok(p) = time::PrimitiveDateTime::parse(raw, naive_frac) {
+        return Some(p.assume_utc());
+    }
+    time::PrimitiveDateTime::parse(raw, naive)
+        .ok()
+        .map(time::PrimitiveDateTime::assume_utc)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Order {
     pub gamekey: String,
@@ -287,6 +311,9 @@ pub struct Order {
     pub product_machine_name: String,
     pub keys: Vec<KeyEntry>,
     pub subproducts: Vec<Subproduct>,
+    /// When ben bought this order — parsed lenient from the wire's `created` (the
+    /// postmark, docs/spec-postmark.md D1). `None` on absent/unparseable, never an error.
+    pub created: Option<time::OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,10 +761,19 @@ impl HumbleClient {
         let tpkd_dict = wire
             .tpkd_dict
             .ok_or_else(|| HumbleError::TpkdDictAbsent(gamekey.to_string()))?;
+        let created = wire.created.as_deref().and_then(|raw| {
+            let parsed = parse_created(raw);
+            if parsed.is_none() {
+                // D1: a bad stamp must be LOUD in logs and harmless everywhere else.
+                tracing::warn!(gamekey = %gamekey, raw = %raw, "order `created` unparseable — postmark will be absent");
+            }
+            parsed
+        });
         Ok(Order {
             gamekey: wire.gamekey,
             bundle_name: wire.product.human_name,
             product_machine_name: wire.product.machine_name,
+            created,
             keys: tpkd_dict
                 .all_tpks
                 .into_iter()
@@ -1926,5 +1962,63 @@ mod step_up_tests {
         assert!(!shown.contains("hunter2"));
         assert!(!shown.contains("person@example.com"));
         assert!(!shown.contains("GEZDGNBV"));
+    }
+}
+
+#[cfg(test)]
+mod parse_created_tests {
+    use super::parse_created;
+
+    #[test]
+    fn order_wire_created_is_lenient_at_the_type_layer() {
+        // Review pass 2: a non-string `created` (numeric epoch — the API-modernises
+        // future) must NEVER fail the whole OrderWire deserialize; key truth is the
+        // meal, the postmark is garnish (D1).
+        let numeric: crate::model::OrderWire = serde_json::from_value(serde_json::json!({
+            "gamekey": "gk", "product": {"human_name": "B"},
+            "tpkd_dict": {"all_tpks": []}, "created": 1344973285
+        }))
+        .expect("numeric created must not fail the order parse");
+        assert_eq!(numeric.created.as_deref(), Some("1344973285"));
+        assert_eq!(
+            parse_created("1344973285"),
+            None,
+            "a bare epoch is rejected by parse_created (caller warns loudly)"
+        );
+        let object: crate::model::OrderWire = serde_json::from_value(serde_json::json!({
+            "gamekey": "gk", "product": {"human_name": "B"},
+            "tpkd_dict": {"all_tpks": []}, "created": {"weird": true}
+        }))
+        .expect("object created must not fail the order parse");
+        assert_eq!(object.created, None);
+    }
+
+    #[test]
+    fn parse_created_live_specimen_naive_six_frac_digits() {
+        // THE pinned live specimen (spec D1, measured 2026-09-09) — six fractional digits,
+        // no offset. A description that fails to consume the subsecond fails HERE.
+        let t = parse_created("2012-08-15T19:41:25.765070").expect("specimen must parse");
+        assert_eq!(t, time::macros::datetime!(2012-08-15 19:41:25.765070 UTC));
+    }
+
+    #[test]
+    fn parse_created_tolerates_no_fraction_rfc3339_offsets_and_garbage() {
+        assert_eq!(
+            parse_created("2013-03-27T18:22:58"),
+            Some(time::macros::datetime!(2013-03-27 18:22:58 UTC))
+        );
+        assert_eq!(
+            parse_created("2020-01-02T03:04:05Z"),
+            Some(time::macros::datetime!(2020-01-02 03:04:05 UTC))
+        );
+        // OFFSET SEMANTICS PINNED (family review): an offset-carrying stamp must resolve
+        // to the correct INSTANT — never be naively read with its offset swallowed.
+        // +02:00 wall 03:04 is 01:04 UTC; a swallowed offset would read 03:04 UTC.
+        assert_eq!(
+            parse_created("2020-01-02T03:04:05+02:00"),
+            Some(time::macros::datetime!(2020-01-02 01:04:05 UTC))
+        );
+        assert_eq!(parse_created("not a date"), None);
+        assert_eq!(parse_created(""), None);
     }
 }

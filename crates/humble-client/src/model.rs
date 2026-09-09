@@ -19,6 +19,16 @@ pub(crate) struct OrderWire {
     pub tpkd_dict: Option<TpkdDict>,
     #[serde(default)]
     pub subproducts: Vec<SubproductWire>,
+    /// Humble's order-creation stamp — the postmark's source (docs/spec-postmark.md D1).
+    /// Measured live 2026-09-09: NAIVE (no offset), six fractional digits. Absent/junk is
+    /// fine — the postmark is garnish; key truth stays the meal. LENIENT AT THE TYPE
+    /// LAYER TOO (review pass 2): a plain Option<String> would fail the WHOLE OrderWire
+    /// deserialize on a non-string `created` (e.g. a numeric epoch — precisely the
+    /// API-modernises future the rfc3339-first parser exists for), taking key truth down
+    /// with the garnish. Numbers stringify (parse_created rejects them loudly via the
+    /// caller's warn); other shapes read as absent.
+    #[serde(default, deserialize_with = "lenient_created")]
+    pub created: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -193,4 +203,18 @@ pub(crate) struct SubProductWire {
 pub(crate) struct SubContentChoiceData {
     #[serde(default)]
     pub game_data: std::collections::HashMap<String, ContentChoiceGame>,
+}
+
+/// D1's leniency enforced at the type layer: any JSON shape deserializes; only a
+/// string or number yields a value. See `OrderWire::created`.
+fn lenient_created<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    })
 }

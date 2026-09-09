@@ -7,6 +7,7 @@ import type {
   SelfClaimResult,
 } from "./api";
 import { MediaHeader } from "./MediaHeader";
+import { postmark, waitedYears } from "./postmark";
 import { ClaimChest } from "./ClaimChest";
 import { DESCRIPTOR_LABELS, displayTags } from "./tags";
 import { titleColorClass, titleHueVar } from "./titleColor";
@@ -332,6 +333,11 @@ export function GameDetailModal(props: GameDetailModalProps) {
                       <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
                         {game.key_type}
                       </span>
+                      {postmark(game.acquired_at) !== null && (
+                        <span className="rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
+                          {`📮 ${postmark(game.acquired_at)}`}
+                        </span>
+                      )}
                     </div>
                     <p className="text-sm text-dust">
                       no steam page for this one.
@@ -482,6 +488,18 @@ export function GameDetailModal(props: GameDetailModalProps) {
                             )}
                           </div>
                         )}
+                        {/* 📮 the attic line (spec D6.1 as amended): the steam path
+                            has no bundle chip row, so provenance rides a small line —
+                            and restores the bundle name to a path that had lost it.
+                            OUTSIDE the detail-null gate deliberately (review pass 1):
+                            it depends only on game.bundle/acquired_at, and a
+                            reviews-only cache item must not hide the year. Single
+                            template expression: the render tests match ONE text node. */}
+                        {postmark(game.acquired_at) !== null && (
+                          <p className="px-6 text-xs text-dust">
+                            {`📮 from ${game.bundle} · tucked into the attic ${postmark(game.acquired_at)}`}
+                          </p>
+                        )}
                       </div>
                     );
                   })()}
@@ -492,6 +510,7 @@ export function GameDetailModal(props: GameDetailModalProps) {
                   charge={claimCharge}
                   phase={claimPhase}
                   pulse={claimPulse}
+                  waitedYears={waitedYears(game.acquired_at)}
                   onMash={mashClaim}
                   onCancel={cancelClaim}
                 />

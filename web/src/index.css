@@ -1325,6 +1325,12 @@
   font-size: 1.25rem;
   color: var(--color-give-soft);
 }
+.cg-win-sub {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  color: var(--color-dust);
+}
 .cg-cancel {
   font-family: var(--font-sans);
   font-size: 0.72rem;

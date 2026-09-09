@@ -1,6 +1,10 @@
 {
   "gamekey": "AAAAbbbbCCCC",
-  "product": { "human_name": "Humble Indie Bundle 99", "machine_name": "hib99_bundle" },
+  "created": "2012-08-15T19:41:25.765070",
+  "product": {
+    "human_name": "Humble Indie Bundle 99",
+    "machine_name": "hib99_bundle"
+  },
   "tpkd_dict": {
     "all_tpks": [
       {
@@ -27,7 +31,16 @@
     ]
   },
   "subproducts": [
-    { "machine_name": "stardew_valley", "human_name": "Stardew Valley", "icon": "https://hb.imgix.net/stardew.png", "downloads": [] },
-    { "machine_name": "noicon_game", "human_name": "No Icon Game", "downloads": [] }
+    {
+      "machine_name": "stardew_valley",
+      "human_name": "Stardew Valley",
+      "icon": "https://hb.imgix.net/stardew.png",
+      "downloads": []
+    },
+    {
+      "machine_name": "noicon_game",
+      "human_name": "No Icon Game",
+      "downloads": []
+    }
   ]
 }

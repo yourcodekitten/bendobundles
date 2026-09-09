@@ -125,6 +125,11 @@ struct GameView {
     /// Cause-blind by decision (spec §2) — never add the cause here casually.
     #[serde(skip_serializing_if = "is_false")]
     gone: bool,
+    /// 📮 when ben's bundle purchase created this order (RFC3339). Absent when
+    /// unknown — the friend surface renders absence as exactly the today-state
+    /// (docs/spec-postmark.md D5/D6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acquired_at: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -148,6 +153,10 @@ impl GameView {
             genres,
             tags,
             gone: false,
+            acquired_at: g.acquired_at.and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            }),
         }
     }
 
@@ -1316,7 +1325,7 @@ fn link_not_found_response() -> Response {
 ///
 /// Response shape:
 /// ```json
-/// { "game": { "id","title","bundle","key_type","artwork_url","steam_app_id" },
+/// { "game": { "id","title","bundle","key_type","artwork_url","steam_app_id","acquired_at"? },
 ///   "steam": { "detail":…|null, "overall":…|null, "recent":…|null } | null }
 /// ```
 /// `steam: null` ⟺ game has no steam_app_id OR no cache item exists yet.

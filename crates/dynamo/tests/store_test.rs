@@ -75,6 +75,7 @@ fn game(n: u32, listable: bool) -> Game {
         appid_source: None,
         owned_by_ben: false,
         hidden_source: None,
+        acquired_at: None,
     }
 }
 

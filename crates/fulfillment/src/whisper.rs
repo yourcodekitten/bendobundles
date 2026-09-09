@@ -313,7 +313,20 @@ fn build_embeds(
     }
     fields.push((
         "bundle".into(),
-        format!("{} ({})", game.bundle, game.key_type),
+        // D7 (docs/spec-postmark.md): year in the EMBED FIELD only — the content
+        // line (:196) is reviewed voice under a contended cap and stays untouched.
+        // UTC year, matching web's getUTCFullYear — a bare t.year() computes in the
+        // STORED offset, so an rfc3339 stamp near jan 1 with a non-Z offset would
+        // show one year here and another on the friend's chip (review pass 1).
+        match game.acquired_at {
+            Some(t) => format!(
+                "{} ({}, {})",
+                game.bundle,
+                game.key_type,
+                t.to_offset(time::UtcOffset::UTC).year()
+            ),
+            None => format!("{} ({})", game.bundle, game.key_type),
+        },
     ));
 
     trimmed |= fields
@@ -454,6 +467,7 @@ mod tests {
             appid_source: None,
             owned_by_ben: false,
             hidden_source: None,
+            acquired_at: None,
         }
     }
 
@@ -895,6 +909,48 @@ mod tests {
                 .iter()
                 .all(|e| !e["url"].as_str().unwrap().contains("#more"))
         );
+    }
+
+    #[test]
+    fn bundle_field_carries_year_when_postmarked() {
+        // D7 (docs/spec-postmark.md): year in the EMBED FIELD only; the content line is
+        // reviewed voice and stays untouched. The full-blob test's unchanged bundle
+        // assertion ("Humble Test Bundle (steam)") is the dateless arm of this pair.
+        let mut g = game("g1", "Overgrowth", Some("https://art/x.png"));
+        g.acquired_at = Some(time::macros::datetime!(2013-03-27 18:22:58 UTC));
+        let v = whisper_card(
+            &g,
+            Some(&steam_cache(2, true)),
+            "https://s",
+            3,
+            "2026-W36",
+            None,
+            None,
+        );
+        let fields = v["embeds"][0]["fields"].as_array().unwrap();
+        let bundle = fields.iter().find(|f| f["name"] == "bundle").unwrap()["value"]
+            .as_str()
+            .unwrap();
+        assert_eq!(bundle, "Humble Test Bundle (steam, 2013)");
+
+        // UTC-year pin (review pass 1): an offset-carrying stamp near jan 1 must
+        // show the UTC year — +02:00 wall 01:00 on 2013-01-01 is 2012-12-31 UTC.
+        let mut g2 = game("g2", "Overgrowth", Some("https://art/x.png"));
+        g2.acquired_at = Some(time::macros::datetime!(2013-01-01 01:00:00 +02:00));
+        let v2 = whisper_card(
+            &g2,
+            Some(&steam_cache(2, true)),
+            "https://s",
+            3,
+            "2026-W36",
+            None,
+            None,
+        );
+        let fields2 = v2["embeds"][0]["fields"].as_array().unwrap();
+        let bundle2 = fields2.iter().find(|f| f["name"] == "bundle").unwrap()["value"]
+            .as_str()
+            .unwrap();
+        assert_eq!(bundle2, "Humble Test Bundle (steam, 2012)");
     }
 
     #[test]

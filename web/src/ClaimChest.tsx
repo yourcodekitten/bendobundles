@@ -23,6 +23,8 @@ type ClaimChestProps = {
   pulse: number;
   onMash: () => void;
   onCancel: () => void;
+  /** whole calendar years the treasure waited; null/absent ⇒ no line (spec D6.2). */
+  waitedYears?: number | null;
 };
 
 export function ClaimChest({
@@ -31,6 +33,7 @@ export function ClaimChest({
   pulse,
   onMash,
   onCancel,
+  waitedYears,
 }: ClaimChestProps) {
   const artRef = useRef<HTMLDivElement>(null);
 
@@ -88,7 +91,15 @@ export function ClaimChest({
         </div>
 
         {bursting ? (
-          <p className="cg-win">it&apos;s yours ♡</p>
+          <>
+            <p className="cg-win">it&apos;s yours ♡</p>
+            {waitedYears != null && waitedYears >= 1 && (
+              <p className="cg-win-sub">
+                it waited {waitedYears} {waitedYears === 1 ? "year" : "years"}{" "}
+                for you ♡
+              </p>
+            )}
+          </>
         ) : (
           <>
             <div
