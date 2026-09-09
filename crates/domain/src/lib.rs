@@ -162,6 +162,28 @@ pub struct Game {
     /// `#[serde(default)]`: records written before this field existed deserialize to `None`.
     #[serde(default)]
     pub hidden_source: Option<HiddenSource>,
+
+    /// When ben's bundle purchase created this game's order — the postmark 📮
+    /// (docs/spec-postmark.md). Sync-owned; merged via `merge_acquired_at` (fresh
+    /// `Some` wins, fresh `None` never erases — D3). Storage is the BODY BLOB, and
+    /// the recorded reason is the honest one (D2, family review): under DEPLOYMENT
+    /// SKEW, a stale binary's `SET body` round-trip drops this field silently
+    /// through ANY body writer (read-modify-write is the house pattern — five
+    /// game-item `SET body` sites; `flip_game_from_pending` is the clean specimen).
+    /// What makes that survivable is RE-DERIVABILITY — run_sync re-stamps every
+    /// gamekey each pass, so a skew-loss is a gap, not a death — with single-writer
+    /// making the re-derivation uncontested. ⚠️ EXPIRY CONDITION (family review,
+    /// 2026-09-09): re-derivability is a property of the FULL walk, not of this
+    /// field — if run_sync ever goes incremental (new orders only), every
+    /// body-only field silently loses this durability net on a change that reads
+    /// as a performance win. BOTH clauses + a still-full walk required before
+    /// copying this placement. `#[serde(default)]`: pre-field bodies read None.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub acquired_at: Option<OffsetDateTime>,
 }
 
 /// A friend — the person behind a shelf. The whole identity system: no auth,
@@ -438,6 +460,13 @@ pub fn sync_status(redeemed: bool, expired: bool) -> GameStatus {
 /// 3. `fresh.steam_app_id.is_some()` → take fresh's pair (refresh; a Humble id upgrades a Title one;
 ///    a new id fills a None).
 /// 4. else → keep existing's pair (fresh has no id; don't clear an existing one).
+/// D3 (docs/spec-postmark.md): sync-authoritative with never-erase. Named — and called
+/// explicitly in BOTH merge branches — because a `..fresh` rest-pattern is the catch-all for a
+/// new FIELD that the no-`_` rule bans for a new VARIANT (family review, 2026-09-09).
+fn merge_acquired_at(existing: &Game, fresh: &Game) -> Option<OffsetDateTime> {
+    fresh.acquired_at.or(existing.acquired_at)
+}
+
 fn merge_appid(existing: &Game, fresh: &Game) -> (Option<u32>, Option<AppidSource>) {
     if existing.appid_source == Some(AppidSource::Manual) {
         // Admin override — untouchable
@@ -474,6 +503,7 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                     // instead of flipping. A stale `true` must never survive a fresh `false`,
                     // nor the reverse.
                     let (steam_app_id, appid_source) = merge_appid(existing_game, &fresh);
+                    let acquired_at = merge_acquired_at(existing_game, &fresh);
                     Game {
                         id: existing_game.id.clone(),
                         title: fresh.title,
@@ -492,21 +522,38 @@ pub fn merge_sync(existing: Option<&Game>, fresh: Game) -> Option<Game> {
                         steam_app_id,
                         appid_source,
                         owned_by_ben: existing_game.owned_by_ben,
+                        acquired_at,
                     }
                 }
                 GameStatus::Available | GameStatus::BenRedeemed | GameStatus::Expired => {
-                    // Humble-owned: fresh wins entirely except hidden, owned_by_ben, and the
-                    // appid pair (which follows its own precedence). No catch-all `_` —
-                    // a future GameStatus variant must be consciously classified here,
-                    // same as the no-`_` rule in fulfillment's gift_decision.
+                    // Humble-owned: fresh wins except the sticky/app-owned fields and the
+                    // two fields with their own precedence (appid pair, acquired_at).
+                    // EXPLICIT LITERAL, NO `..fresh` — a rest-pattern is the catch-all for
+                    // a new FIELD that the no-`_` rule below bans for a new VARIANT: every
+                    // future field must be consciously classified here (family review,
+                    // 2026-09-09). Same rule as the no-catch-all `_` on GameStatus, as in
+                    // fulfillment's gift_decision.
                     let (steam_app_id, appid_source) = merge_appid(existing_game, &fresh);
+                    let acquired_at = merge_acquired_at(existing_game, &fresh);
                     Game {
+                        id: fresh.id,
+                        title: fresh.title,
+                        bundle: fresh.bundle,
+                        gamekey: fresh.gamekey,
+                        machine_name: fresh.machine_name,
+                        key_type: fresh.key_type,
+                        giftable: fresh.giftable,
                         hidden: existing_game.hidden,
                         hidden_source: existing_game.hidden_source,
-                        owned_by_ben: existing_game.owned_by_ben,
+                        status: fresh.status,
+                        claim_id: fresh.claim_id,
+                        artwork_url: fresh.artwork_url,
+                        keyindex: fresh.keyindex,
+                        requires_choice: fresh.requires_choice,
                         steam_app_id,
                         appid_source,
-                        ..fresh
+                        owned_by_ben: existing_game.owned_by_ben,
+                        acquired_at,
                     }
                 }
             };
@@ -758,6 +805,7 @@ mod tests {
             appid_source: None,
             owned_by_ben: false,
             hidden_source: None,
+            acquired_at: None,
         };
         assert!(g.is_listable());
         g.hidden = true;
@@ -959,6 +1007,7 @@ mod tests {
             appid_source: None,
             owned_by_ben: false,
             hidden_source: None,
+            acquired_at: None,
         }
     }
 
@@ -1088,6 +1137,68 @@ mod tests {
         fresh.title = "renamed".into();
         let merged = merge_sync(Some(&existing), fresh).expect("title differs → Some");
         assert_eq!(merged.hidden_source, Some(HiddenSource::Admin));
+    }
+
+    #[test]
+    fn merge_sync_acquired_at_dateless_fresh_never_erases_in_fresh_wins_branch() {
+        // The (former ..fresh) Available branch is the one that would silently erase (spec
+        // docs/spec-postmark.md D3, family review: "..fresh is the catch-all for a new FIELD").
+        let mut existing = fresh_game();
+        existing.acquired_at = Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC));
+        let mut fresh = fresh_game();
+        fresh.title = "renamed".into(); // force a real diff so merge returns Some
+        fresh.acquired_at = None;
+        let merged = merge_sync(Some(&existing), fresh).expect("title differs → Some");
+        assert_eq!(
+            merged.acquired_at,
+            Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC)),
+            "a transiently dateless read stripped the postmark"
+        );
+    }
+
+    #[test]
+    fn merge_sync_acquired_at_fresh_some_wins_over_differing_some() {
+        let mut existing = fresh_game();
+        existing.acquired_at = Some(time::macros::datetime!(2013-01-01 00:00:00 UTC));
+        let mut fresh = fresh_game();
+        fresh.acquired_at = Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC));
+        let merged = merge_sync(Some(&existing), fresh).expect("acquired_at differs → Some");
+        assert_eq!(
+            merged.acquired_at,
+            Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC)),
+            "a corrected wire date must propagate (sync-authoritative)"
+        );
+    }
+
+    #[test]
+    fn merge_sync_acquired_at_updates_in_app_owned_branch_too() {
+        let mut existing = fresh_game();
+        existing.status = GameStatus::Gifted; // app-owned branch (explicit literal)
+        existing.acquired_at = None;
+        let mut fresh = fresh_game();
+        fresh.acquired_at = Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC));
+        let merged = merge_sync(Some(&existing), fresh).expect("acquired_at gained → Some");
+        assert_eq!(merged.status, GameStatus::Gifted, "app still owns status");
+        assert!(
+            merged.acquired_at.is_some(),
+            "postmark must land even on gifted rows"
+        );
+    }
+
+    #[test]
+    fn game_body_without_acquired_at_reads_none_and_roundtrips() {
+        // Pre-field record: deserialize a body written before the field existed.
+        let g = fresh_game();
+        let mut v = serde_json::to_value(&g).unwrap();
+        v.as_object_mut().unwrap().remove("acquired_at"); // absent under skip_serializing when
+                                                          // None anyway — this pins it explicitly
+        let back: Game = serde_json::from_value(v).unwrap();
+        assert_eq!(back.acquired_at, None);
+        // And a Some survives the round-trip through the body blob's serde path.
+        let mut g2 = fresh_game();
+        g2.acquired_at = Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC));
+        let back2: Game = serde_json::from_str(&serde_json::to_string(&g2).unwrap()).unwrap();
+        assert_eq!(back2.acquired_at, g2.acquired_at);
     }
 
     #[test]

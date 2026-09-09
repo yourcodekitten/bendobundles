@@ -198,6 +198,7 @@ fn test_game(n: u32) -> Game {
         appid_source: None,
         owned_by_ben: false,
         hidden_source: None,
+        acquired_at: None,
     }
 }
 
@@ -1506,6 +1507,7 @@ fn sample_game(id: &str) -> Game {
         appid_source: None,
         owned_by_ben: false,
         hidden_source: None,
+        acquired_at: None,
     }
 }
 

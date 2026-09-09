@@ -3596,6 +3596,7 @@ async fn run_sync(deps: &Deps) {
                 steam_app_id: key.steam_app_id,
                 appid_source: key.steam_app_id.map(|_| AppidSource::Humble),
                 owned_by_ben: false,
+                acquired_at: None,
             };
             match deps.store.upsert_game_from_sync(game).await {
                 Ok(SyncWrite::Written) => games_written += 1,
@@ -4154,6 +4155,7 @@ async fn discover_choice_games(
                 steam_app_id: None,
                 appid_source: None,
                 owned_by_ben: false,
+                acquired_at: None,
             };
             match deps.store.upsert_game_from_sync(game).await {
                 Ok(SyncWrite::Written) => written += 1,
