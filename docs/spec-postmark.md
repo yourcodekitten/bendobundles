@@ -64,9 +64,13 @@ either (skew doesn't count writers: three fns rewrite a game body and a stale bi
 field through any of them). **The property is RE-DERIVABILITY: the sync walk re-stamps every
 pass, so a skew-loss is a gap, not a death — and single-writer is what makes that re-derivation
 uncontested** (OMBB round 3; his contrast case: a hypothetical `first_seen_at` is single-writer
-and NOT re-derivable — one stale lambda loses it permanently). Both clauses required before
-this placement is reused. No new dynamo attribute, no GSI, no schema change; no claim path
-reads it.
+and NOT re-derivable — one stale lambda loses it permanently). **Plus the EXPIRY CONDITION
+(Lilith round 3): re-derivability is a property of run_sync's FULL walk, not of the field — if
+the walk ever goes incremental (new orders only, the obvious optimisation), every body-only
+field silently loses this durability net on a change that reads as a performance win. Body is
+safe for a field the full walk re-derives; that safety dies the day the walk stops being full.**
+Both clauses + a still-full walk required before this placement is reused. No new dynamo
+attribute, no GSI, no schema change; no claim path reads it.
 
 **D3 — merge rule (merge_sync).** Sync-authoritative, absence-tolerant both directions:
 `fresh.acquired_at = Some` wins over existing anything (a corrected wire date propagates);
