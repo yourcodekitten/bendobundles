@@ -5407,6 +5407,7 @@ async fn sync_walk_carries_tier1_appid() {
         .and(path("/api/v1/order/gk-tier1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "gamekey": "gk-tier1",
+            "created": "2012-08-15T19:41:25.765070",
             "product": { "human_name": "Test Bundle" },
             "tpkd_dict": { "all_tpks": [{
                 "machine_name": "dota2_steam",
@@ -5441,6 +5442,11 @@ async fn sync_walk_carries_tier1_appid() {
         game.appid_source,
         Some(AppidSource::Humble),
         "tier-1: appid_source must be Humble"
+    );
+    assert_eq!(
+        game.acquired_at,
+        Some(time::macros::datetime!(2012-08-15 19:41:25.765070 UTC)),
+        "walk must stamp the postmark from the order's created (end-to-end through parse_created)"
     );
 }
 

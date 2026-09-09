@@ -313,7 +313,12 @@ fn build_embeds(
     }
     fields.push((
         "bundle".into(),
-        format!("{} ({})", game.bundle, game.key_type),
+        // D7 (docs/spec-postmark.md): year in the EMBED FIELD only — the content
+        // line (:196) is reviewed voice under a contended cap and stays untouched.
+        match game.acquired_at {
+            Some(t) => format!("{} ({}, {})", game.bundle, game.key_type, t.year()),
+            None => format!("{} ({})", game.bundle, game.key_type),
+        },
     ));
 
     trimmed |= fields
@@ -896,6 +901,32 @@ mod tests {
                 .iter()
                 .all(|e| !e["url"].as_str().unwrap().contains("#more"))
         );
+    }
+
+    #[test]
+    fn bundle_field_carries_year_when_postmarked() {
+        // D7 (docs/spec-postmark.md): year in the EMBED FIELD only; the content line is
+        // reviewed voice and stays untouched. The full-blob test's unchanged bundle
+        // assertion ("Humble Test Bundle (steam)") is the dateless arm of this pair.
+        let mut g = game("g1", "Overgrowth", Some("https://art/x.png"));
+        g.acquired_at = Some(time::macros::datetime!(2013-03-27 18:22:58 UTC));
+        let v = whisper_card(
+            &g,
+            Some(&steam_cache(2, true)),
+            "https://s",
+            3,
+            "2026-W36",
+            None,
+            None,
+        );
+        let fields = v["embeds"][0]["fields"].as_array().unwrap();
+        let bundle = fields
+            .iter()
+            .find(|f| f["name"] == "bundle")
+            .unwrap()["value"]
+            .as_str()
+            .unwrap();
+        assert_eq!(bundle, "Humble Test Bundle (steam, 2013)");
     }
 
     #[test]

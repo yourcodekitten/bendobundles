@@ -3596,7 +3596,9 @@ async fn run_sync(deps: &Deps) {
                 steam_app_id: key.steam_app_id,
                 appid_source: key.steam_app_id.map(|_| AppidSource::Humble),
                 owned_by_ben: false,
-                acquired_at: None,
+                // 📮 the postmark (docs/spec-postmark.md): the order's creation stamp,
+                // parsed lenient at the client edge; None flows through harmlessly.
+                acquired_at: order.created,
             };
             match deps.store.upsert_game_from_sync(game).await {
                 Ok(SyncWrite::Written) => games_written += 1,
@@ -3788,8 +3790,8 @@ async fn shelf_truth_audit(deps: &Deps, scan: &[Game], truth: &TruthMap) -> (u32
                 .or(g.appid_source),
             ..g.clone() // id (own id — NOT the D7 routing ladder: correcting an existing row, not
                         // minting), title, bundle, artwork_url, gamekey, machine_name, hidden,
-                        // hidden_source, claim_id, requires_choice, owned_by_ben all carry from the
-                        // row being corrected.
+                        // hidden_source, claim_id, requires_choice, owned_by_ben, acquired_at all
+                        // carry from the row being corrected.
         };
         let reason = if entry.expired {
             "expired"
@@ -4155,6 +4157,12 @@ async fn discover_choice_games(
                 steam_app_id: None,
                 appid_source: None,
                 owned_by_ben: false,
+                // No postmark at discovery time — this ingest holds OrderIndex
+                // (tpk-name lists only), never Order, so the order's `created` is
+                // simply not in scope here. Like `key_type` above, this
+                // self-corrects: once a pick is spent, the key-sync fresh (same id)
+                // carries the real postmark and never-erase is irrelevant (None
+                // never wins). Spec docs/spec-postmark.md D4.
                 acquired_at: None,
             };
             match deps.store.upsert_game_from_sync(game).await {
