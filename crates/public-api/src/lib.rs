@@ -130,6 +130,12 @@ struct GameView {
     /// (docs/spec-postmark.md D5/D6).
     #[serde(skip_serializing_if = "Option::is_none")]
     acquired_at: Option<String>,
+    /// ✍️ ben's per-game gift tag (curated links only; spec-gift-tags D3).
+    /// Absent when unset — open-shelf payloads stay byte-identical. Populated
+    /// ONLY by the link-scoped overlay sites (curated partition + detail);
+    /// `from_game`/`ghost` are link-agnostic and always build it None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -157,6 +163,7 @@ impl GameView {
                 t.format(&time::format_description::well_known::Rfc3339)
                     .ok()
             }),
+            note: None,
         }
     }
 
@@ -763,7 +770,7 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
                             // live vs ghost: the ONE computation, shared with the
                             // detail gate. (Membership is tautological here — g came
                             // from the set — but the shared fn is the point.)
-                            if live_on_link(&link, g) {
+                            let mut view = if live_on_link(&link, g) {
                                 let gt = g.steam_app_id.and_then(|id| caches.get(&id));
                                 let genres = gt
                                     .map(|c| c.genres.iter().take(5).cloned().collect())
@@ -772,7 +779,14 @@ async fn handle_get_link(State(s): State<AppState>, Path(token): Path<String>) -
                                 GameView::from_game(g.clone(), genres, tags)
                             } else {
                                 GameView::ghost(g.clone())
-                            }
+                            };
+                            // ✍️ the link-scoped overlay — live AND ghost rows both
+                            // (spec D3.2: the why is part of what the gift WAS).
+                            view.note = link
+                                .curated_notes
+                                .as_ref()
+                                .and_then(|m| m.get(&g.id).cloned());
+                            view
                         })
                         .collect()
                 }
@@ -1413,7 +1427,13 @@ async fn handle_game_detail(
 
     // Genres and tags deliberately empty (keys omitted on the wire): the modal reads
     // the full steam blob below instead.
-    let game_view = GameView::from_game(game, vec![], vec![]);
+    let mut game_view = GameView::from_game(game, vec![], vec![]);
+    // ✍️ same link-scoped overlay as the grid — one projection, two wires,
+    // deliberately unable to drift (spec-gift-tags D3.3).
+    game_view.note = link
+        .curated_notes
+        .as_ref()
+        .and_then(|m| m.get(&game_view.id).cloned());
 
     (
         StatusCode::OK,

@@ -3157,6 +3157,115 @@ async fn curated_link_serves_the_set_in_ben_order_with_ghosts() {
     }
 }
 
+/// ✍️ notes ride curated rows — live and ghost both (D3.2: the why is part of
+/// what the gift WAS) — and a curated game without a note carries no key.
+#[tokio::test]
+async fn curated_link_carries_per_game_notes_on_live_and_ghost_rows() {
+    let Some(store) = store_or_skip("curated-notes-view").await else {
+        return;
+    };
+    store.put_game(&test_game(2)).await.unwrap();
+    let mut gifted = test_game(1);
+    gifted.status = domain::GameStatus::Gifted;
+    store.put_game(&gifted).await.unwrap();
+    store.put_game(&test_game(3)).await.unwrap();
+
+    let mut lnk = test_link("noted-tok");
+    lnk.curated_game_ids = Some(vec![test_game(1).id, test_game(2).id, test_game(3).id]);
+    lnk.curated_notes = Some(std::collections::BTreeMap::from([
+        (test_game(1).id, "you finished the demo".to_string()),
+        (test_game(2).id, "the soundtrack alone".to_string()),
+    ]));
+    store.create_link(&lnk).await.unwrap();
+
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(
+            Request::get("/api/l/noted-tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let games = j["games"].as_array().unwrap();
+    assert_eq!(games.len(), 3);
+    // g1: GHOST with its note intact
+    assert_eq!(games[0]["gone"], serde_json::json!(true));
+    assert_eq!(games[0]["note"], serde_json::json!("you finished the demo"));
+    // g2: live with its note
+    assert_eq!(games[1]["note"], serde_json::json!("the soundtrack alone"));
+    // g3: curated, live, NO note entry ⇒ no key at all
+    assert!(
+        games[2].get("note").is_none(),
+        "unnoted curated card carries no note key"
+    );
+}
+
+/// ✍️ open-shelf wire never grows the field, even with stray stored notes
+/// (invariant 1: byte-identical payloads).
+#[tokio::test]
+async fn open_shelf_payload_has_no_note_key() {
+    let Some(store) = store_or_skip("openshelf-no-note").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let lnk = test_link("open-tok");
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(Request::get("/api/l/open-tok").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let raw = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        !raw.contains("\"note\""),
+        "open-shelf wire must not carry a note key (gift_note/thank_note do not match this needle): {raw}"
+    );
+}
+
+/// ✍️ detail carries the same note — one projection, two wires, can't drift (D3.3).
+#[tokio::test]
+async fn game_detail_carries_note_on_curated_link() {
+    let Some(store) = store_or_skip("detail-note").await else {
+        return;
+    };
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut lnk = test_link("dnote-tok");
+    lnk.curated_game_ids = Some(vec![test_game(1).id]);
+    lnk.curated_notes = Some(std::collections::BTreeMap::from([(
+        test_game(1).id,
+        "because of you".to_string(),
+    )]));
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let uri = format!("/api/l/dnote-tok/games/{}/detail", test_game(1).id);
+    let resp = plain_router(Arc::clone(&store), mock)
+        .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let j: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(j["game"]["note"], serde_json::json!("because of you"));
+}
+
 #[tokio::test]
 async fn pending_curated_game_rides_live_not_ghost() {
     let Some(store) = store_or_skip("curated-pending").await else {
