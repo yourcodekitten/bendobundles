@@ -186,3 +186,10 @@ the shelf is where the unwraps go to live.
 3. **raw vs hashed shelf token** — raw, re-argued on the table's actual contents (claims hold
    `gift_url`/`revealed_key`) rather than my refuted symmetry premise; lifetime asymmetry
    acknowledged, reissue is the leak response.
+
+## gift tags ✍️ (added 2026-09-11, gift-tags arc)
+
+When this surface un-darkens: fold the per-game gift tag onto `ShelfGift` (additive `note`
+field, same presence-gating as the link page) — deferred from `docs/spec-gift-tags.md` D6
+because an additive field on a dark surface is unverifiable by construction. Verify it live
+as part of the un-darkening, not by assuming the field works because it exists.
