@@ -700,6 +700,7 @@ mod tests {
             expires_at: None,
             unlock_at: None,
             curated_game_ids: None,
+            curated_notes: None,
             friend_id: None,
             created_at: datetime!(2026-07-02 00:00 UTC),
         }
