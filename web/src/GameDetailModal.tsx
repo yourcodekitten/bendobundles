@@ -295,6 +295,19 @@ export function GameDetailModal(props: GameDetailModalProps) {
               <div
                 className={`handheld-screen${props.mount === "friend" && claimPhase !== "idle" ? " is-dimmed" : ""}`}
               >
+                {/* ✍️ ben's gift tag — steam-independent (it's data already in
+                    hand, so it never waits on the detail fetch) and presence-
+                    gated: no note, no pixels (spec-gift-tags D4.2). Floor panel,
+                    Chivo prose, no shadow (The Ceremony Rule), no ♡. */}
+                {"note" in game && game.note && (
+                  <div className="mx-6 mt-4 rounded-lg bg-floor px-4 py-3">
+                    <p className="text-sm text-ink">&ldquo;{game.note}&rdquo;</p>
+                    <p className="mt-1 font-pixel text-[0.8125rem] text-dust">
+                      — ben
+                    </p>
+                  </div>
+                )}
+
                 {loadState.phase === "loading" && (
                   <p className="px-6 py-8 text-center text-dust">loading...</p>
                 )}

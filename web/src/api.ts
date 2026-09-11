@@ -14,6 +14,8 @@ export type GameView = {
   gone?: boolean;
   /** 📮 rfc3339 instant when ben's bundle purchase created this order; absent when unknown. */
   acquired_at?: string;
+  /** ✍️ ben's per-game gift tag (curated links only); absent when unset — every render is presence-gated. */
+  note?: string;
 };
 
 export type ClaimView = {

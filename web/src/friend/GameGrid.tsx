@@ -122,6 +122,14 @@ function GameGridImpl({ games, curated, owned, onDetail }: GameGridProps) {
                 you own this
               </span>
             )}
+            {/* ✍️ presence marker only — the tag's text lives in the detail modal
+                (carts stay compact; spec-gift-tags D4.1). floor chip, no burgundy:
+                the tag is not the act of claiming. */}
+            {game.note && (
+              <span className="rounded bg-floor px-2 py-0.5 text-xs text-ink-soft">
+                ✍ from ben
+              </span>
+            )}
           </div>
         );
 
