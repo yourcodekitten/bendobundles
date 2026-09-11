@@ -99,8 +99,10 @@ export function Links() {
   // reload already yields []. ABSENT must mean UNKNOWN, never false — the exposure
   // readout depends on telling those apart, and a required boolean would erase the
   // distinction at the type level.
+  // ✍️ note: the per-pick gift tag draft — optional, create-time only
+  // (spec-gift-tags D5). Router-state arrivals carry no note.
   const [picked, setPicked] = useState<
-    { id: string; title: string; requiresChoice?: boolean }[]
+    { id: string; title: string; requiresChoice?: boolean; note?: string }[]
   >(
     () =>
       (
@@ -176,8 +178,24 @@ export function Links() {
     // how a gift opens at 7pm).
     const unlock = unlockAt !== '' ? new Date(unlockAt).toISOString() : undefined;
     const gameIds = picked.length > 0 ? picked.map((p) => p.id) : undefined;
+    // ✍️ per-pick tags: trimmed, blanks omitted, whole field omitted when none —
+    // the server re-normalizes; this keeps the wire clean (gift_note's rule).
+    const noted = picked.filter((p) => p.note?.trim());
+    const gameNotes =
+      noted.length > 0
+        ? Object.fromEntries(noted.map((p) => [p.id, p.note!.trim()]))
+        : undefined;
     withAuth(
-      () => adminCreateLink(trimmedLabel, claimsAllowed, expires, note, unlock, gameIds),
+      () =>
+        adminCreateLink(
+          trimmedLabel,
+          claimsAllowed,
+          expires,
+          note,
+          unlock,
+          gameIds,
+          gameNotes,
+        ),
       navigate,
     )
       .then((result) => {
@@ -551,10 +569,11 @@ export function Links() {
         {picked.length > 0 && (
           <div className="flex flex-col gap-1 text-xs text-dust">
             <span>chosen for this gift ({picked.length})</span>
-            <ul className="flex flex-wrap gap-1.5">
+            <ul className="flex flex-col gap-1.5">
               {picked.map((p, i) => (
                 <li key={p.id}
-                  className="flex items-center gap-1 rounded bg-shelf px-2 py-0.5 text-xs text-ink-soft">
+                  className="flex flex-col gap-1 rounded bg-shelf px-2 py-1 text-xs text-ink-soft">
+                  <span className="flex items-center gap-1">
                   {p.title}
                   <button type="button" aria-label={`move ${p.title} earlier`}
                     disabled={i === 0} className="disabled:opacity-40"
@@ -578,6 +597,24 @@ export function Links() {
                     })}>↓</button>
                   <button type="button" aria-label={`remove ${p.title} from this gift`}
                     onClick={() => setPicked((cur) => cur.filter((q) => q.id !== p.id))}>×</button>
+                  </span>
+                  {/* ✍️ the gift tag — optional per pick, create-time only
+                      (spec-gift-tags D5; edit = re-cut the link) */}
+                  <input
+                    type="text"
+                    aria-label={`note for ${p.title}`}
+                    placeholder="why this one? (optional)"
+                    maxLength={280}
+                    value={p.note ?? ''}
+                    onChange={(e) =>
+                      setPicked((cur) =>
+                        cur.map((q) =>
+                          q.id === p.id ? { ...q, note: e.target.value } : q,
+                        ),
+                      )
+                    }
+                    className="rounded border border-line bg-floor px-2 py-1 text-xs text-ink placeholder:text-dust"
+                  />
                 </li>
               ))}
             </ul>
@@ -824,6 +861,21 @@ export function Links() {
                 <p className="mt-2 text-xs italic text-dust">
                   &ldquo;{link.gift_note}&rdquo;
                 </p>
+              )}
+
+              {/* ✍️ per-game gift tags — read-only read-back (spec-gift-tags
+                  D5.2): ben can see what he wrote; no editor (D2.1 — edit =
+                  re-cut the link). The list payload carries game IDS only, so
+                  the id renders in mono beside the words. */}
+              {link.curated_notes !== undefined && (
+                <ul className="mt-2 flex flex-col gap-0.5">
+                  {Object.entries(link.curated_notes).map(([gid, tagNote]) => (
+                    <li key={gid} className="text-xs text-dust">
+                      ✍ &ldquo;{tagNote}&rdquo;{' '}
+                      <span className="font-mono text-[0.6875rem]">{gid}</span>
+                    </li>
+                  ))}
+                </ul>
               )}
 
               {/* The friend's thank-you — read-only, ben receives their words.

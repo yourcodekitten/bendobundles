@@ -526,6 +526,19 @@ fn link_from_item(
         ),
         Some(_) => return Err(StoreError::Corrupt("curated_game_ids is not a list")),
     };
+    // ✍️ Same contract, one field over: top-level attr is the ONLY source
+    // (schema::link_body strips it from body). Absent = no tags. Malformed
+    // entries are a Corrupt read, not a silent skip.
+    link.curated_notes = match item.get("curated_notes") {
+        None => None,
+        Some(aws_sdk_dynamodb::types::AttributeValue::M(m)) => Some(
+            m.iter()
+                .map(|(k, v)| v.as_s().map(|s| (k.clone(), s.clone())))
+                .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+                .map_err(|_| StoreError::Corrupt("curated_notes holds a non-string"))?,
+        ),
+        Some(_) => return Err(StoreError::Corrupt("curated_notes is not a map")),
+    };
     // The friend assignment follows the full gift_note/curated_game_ids contract:
     // top-level attribute is the ONLY source (schema::link_body strips it from body),
     // unconditional override — absence ⇒ None, same as expires_at/gift_note. This is

@@ -14,6 +14,8 @@ export type GameView = {
   gone?: boolean;
   /** 📮 rfc3339 instant when ben's bundle purchase created this order; absent when unknown. */
   acquired_at?: string;
+  /** ✍️ ben's per-game gift tag (curated links only); absent when unset — every render is presence-gated. */
+  note?: string;
 };
 
 export type ClaimView = {
@@ -162,6 +164,9 @@ export type AdminLink = {
   created_at: string;
   /** ben's pick order; absent = open shelf. */
   curated_game_ids?: string[];
+  /** ✍️ per-game gift tags keyed by game_id; absent when none (list serializes
+   * domain::Link; read via the top-level attr — spec-gift-tags D1/D5.2). */
+  curated_notes?: Record<string, string>;
   /** The friend this link is assigned to; absent = unassigned (rides the
    * read-override — same shape as domain::Link.friend_id, skip-on-None). */
   friend_id?: string;
@@ -444,6 +449,9 @@ export async function adminCreateLink(
   giftNote?: string,
   unlockAt?: string,
   gameIds?: string[],
+  /** ✍️ per-pick gift tags keyed by game_id; keys must be ⊆ gameIds (the
+   * server 422s orphans). Omit entirely when no pick carries a note. */
+  gameNotes?: Record<string, string>,
 ): Promise<{ token: string; url_path: string }> {
   const response = await fetch('/admin/api/links', {
     method: 'POST',
@@ -455,6 +463,7 @@ export async function adminCreateLink(
       gift_note: giftNote,
       unlock_at: unlockAt,
       game_ids: gameIds,
+      game_notes: gameNotes,
     }),
   });
 

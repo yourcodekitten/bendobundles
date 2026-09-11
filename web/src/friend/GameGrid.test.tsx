@@ -187,4 +187,19 @@ describe('GameGrid', () => {
     render(<GameGrid games={games} onDetail={vi.fn()} />);
     expect(screen.getByText('×2 copies')).toBeInTheDocument();
   });
+
+  it('marks a noted game with the ✍ chip and leaves unnoted games unmarked', () => {
+    const games = [
+      makeGame({ id: '1', title: 'Portal 2', note: 'because of you' }),
+      makeGame({ id: '2', title: 'Celeste' }),
+    ];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.getAllByText('✍ from ben')).toHaveLength(1);
+  });
+
+  it('renders no ✍ chip anywhere when no game carries a note', () => {
+    const games = [makeGame({ id: '1', title: 'Portal 2' })];
+    render(<GameGrid games={games} onDetail={vi.fn()} />);
+    expect(screen.queryByText(/from ben/)).not.toBeInTheDocument();
+  });
 });

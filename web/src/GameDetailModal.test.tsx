@@ -958,4 +958,39 @@ describe("focus trap", () => {
     expect(screen.queryByText(/Some nudity\./)).not.toBeInTheDocument();
   });
 
+  it("renders ben's gift tag when the game carries a note", async () => {
+    const g = { ...friendGame, steam_app_id: null, note: "the soundtrack alone" };
+    vi.mocked(fetchGameDetail).mockResolvedValue({ game: g, steam: null });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={g}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    expect(await screen.findByText(/the soundtrack alone/)).toBeInTheDocument();
+    expect(screen.getByText(/— ben/)).toBeInTheDocument();
+  });
+
+  it("renders no tag section when the game has no note", async () => {
+    const g = { ...friendGame, steam_app_id: null };
+    vi.mocked(fetchGameDetail).mockResolvedValue({ game: g, steam: null });
+    render(
+      <GameDetailModal
+        mount="friend"
+        token="tok123"
+        game={g}
+        active={true}
+        onClaim={vi.fn()}
+        onClose={vi.fn()}
+        loadDetail={friendLoadDetail}
+      />,
+    );
+    expect(await screen.findByText(/no steam page/)).toBeInTheDocument();
+    expect(screen.queryByText(/— ben/)).not.toBeInTheDocument();
+  });
 });

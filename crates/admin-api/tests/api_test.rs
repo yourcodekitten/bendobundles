@@ -215,6 +215,7 @@ fn test_link(token: &str) -> Link {
         expires_at: None,
         unlock_at: None,
         curated_game_ids: None,
+        curated_notes: None,
         friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
@@ -694,6 +695,163 @@ async fn cur_create_unlistable_game_is_422_naming_it() {
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let j = body_json(resp).await;
     assert!(j["error"].as_str().unwrap().contains(&g.id));
+}
+
+/// ✍️ notes ride only on curated links — game_notes without game_ids is refused.
+#[tokio::test]
+async fn notes_create_refuses_game_notes_without_game_ids() {
+    let Some(store) = store_or_skip("notes-no-ids").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1,
+            "game_notes": {"g1": "hi"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"]
+            .as_str()
+            .unwrap()
+            .contains("game_notes requires game_ids"),
+        "error must say notes need curation, got: {j}"
+    );
+}
+
+/// ✍️ a note keyed by a game not in the curated set names the orphan id.
+#[tokio::test]
+async fn notes_create_refuses_orphan_key_naming_it() {
+    let Some(store) = store_or_skip("notes-orphan").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    store.put_game(&test_game(1)).await.unwrap();
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1,
+            "game_ids": [test_game(1).id],
+            "game_notes": {"not-in-set": "hi"}}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    assert!(
+        j["error"].as_str().unwrap().contains("not-in-set"),
+        "error must name the orphan key, got: {j}"
+    );
+}
+
+/// ✍️ stored: trimmed, empty-after-trim dropped, all-blank collapses to None
+/// (absence has one spelling — spec invariant 6).
+#[tokio::test]
+async fn notes_create_stores_trimmed_and_drops_blanks() {
+    let Some(store) = store_or_skip("notes-trim").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    store.put_game(&test_game(1)).await.unwrap();
+    store.put_game(&test_game(2)).await.unwrap();
+    let mut notes = serde_json::Map::new();
+    notes.insert(test_game(1).id, "  the soundtrack alone  ".into());
+    notes.insert(test_game(2).id, "   ".into());
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "for maya", "claims_allowed": 1,
+            "game_ids": [test_game(1).id, test_game(2).id],
+            "game_notes": notes}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let token = j["token"].as_str().unwrap();
+    let stored = store.get_link(token).await.unwrap().unwrap();
+    assert_eq!(
+        stored.curated_notes,
+        Some(std::collections::BTreeMap::from([(
+            test_game(1).id,
+            "the soundtrack alone".to_string()
+        )])),
+        "trimmed kept, blank dropped"
+    );
+
+    // all-blank collapses to None, never Some(empty)
+    let mut blank = serde_json::Map::new();
+    blank.insert(test_game(1).id, "  ".into());
+    let resp2 = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "quiet", "claims_allowed": 1,
+            "game_ids": [test_game(1).id],
+            "game_notes": blank}),
+    )
+    .await;
+    assert_eq!(resp2.status(), StatusCode::OK);
+    let j2 = body_json(resp2).await;
+    let stored2 = store
+        .get_link(j2["token"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored2.curated_notes, None,
+        "all-blank ⇒ None, never Some({{}})"
+    );
+}
+
+/// ✍️ per-note cap at 280 chars (measured on the TRIMMED text), error names the id.
+#[tokio::test]
+async fn notes_create_refuses_note_over_280_chars() {
+    let Some(store) = store_or_skip("notes-cap").await else {
+        return;
+    };
+    let password = "valpw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    store.put_game(&test_game(1)).await.unwrap();
+    let mut long = serde_json::Map::new();
+    long.insert(test_game(1).id, "a".repeat(281).into());
+    let resp = post_create_link(
+        &store,
+        &invoker,
+        &admin_hash,
+        &session,
+        serde_json::json!({"label": "x", "claims_allowed": 1,
+            "game_ids": [test_game(1).id],
+            "game_notes": long}),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let j = body_json(resp).await;
+    let msg = j["error"].as_str().unwrap();
+    assert!(msg.contains("at most 280"), "cap named, got: {j}");
+    assert!(
+        msg.contains(&test_game(1).id),
+        "offending id named, got: {j}"
+    );
 }
 
 /// game_ids input-shape 422s: empty, duplicate, claims_allowed > set size, set > CURATED_GAMES_MAX.

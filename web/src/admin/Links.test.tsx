@@ -340,7 +340,7 @@ describe('Links', () => {
       const expectedUrl = `${window.location.origin}/l/tok-new`;
       await waitFor(() => {
         expect(adminCreateLink).toHaveBeenCalledWith(
-          'Charlie', 1, undefined, undefined, undefined, undefined,
+          'Charlie', 1, undefined, undefined, undefined, undefined, undefined,
         );
         expect(screen.getByText(expectedUrl)).toBeInTheDocument();
       });
@@ -373,6 +373,7 @@ describe('Links', () => {
           1,
           undefined,
           'enjoy the trove!',
+          undefined,
           undefined,
           undefined,
         );
@@ -515,7 +516,7 @@ describe('Links', () => {
       await user.click(screen.getByRole('button', { name: /create invite link/i }));
       await waitFor(() => {
         expect(adminCreateLink).toHaveBeenCalledWith(
-          'for maya', 1, undefined, undefined, undefined, ['g-3', 'g-1'],
+          'for maya', 1, undefined, undefined, undefined, ['g-3', 'g-1'], undefined,
         );
       });
     });
@@ -535,7 +536,7 @@ describe('Links', () => {
       await user.click(screen.getByRole('button', { name: /create invite link/i }));
       await waitFor(() => {
         expect(adminCreateLink).toHaveBeenCalledWith(
-          'x', 1, undefined, undefined, undefined, ['g-3', 'g-1'],
+          'x', 1, undefined, undefined, undefined, ['g-3', 'g-1'], undefined,
         );
       });
     });
@@ -1080,6 +1081,79 @@ describe('friend assignment', () => {
     await waitFor(() => screen.getByText('Alice'));
     expect(screen.queryByText(/gifts aren't on a shelf yet/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/gift isn't on a shelf yet/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('gift tags ✍️ (per-pick notes)', () => {
+  it('sends game_notes for picks with notes and omits blank ones', async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminLinks).mockResolvedValue([]);
+    vi.mocked(adminCreateLink).mockResolvedValue({
+      token: 'tok-tagged',
+      url_path: '/l/tok-tagged',
+    });
+    renderLinksWithPicks([
+      { id: 'g1', title: 'Portal 2' },
+      { id: 'g2', title: 'Celeste' },
+    ]);
+    await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+    await user.type(screen.getByRole('textbox', { name: 'label' }), 'Maya');
+    await user.type(
+      screen.getByRole('textbox', { name: 'note for Portal 2' }),
+      '  because of you  ',
+    );
+    await user.click(screen.getByRole('button', { name: /create invite link/i }));
+    await waitFor(() => {
+      expect(adminCreateLink).toHaveBeenCalledWith(
+        'Maya',
+        1,
+        undefined,
+        undefined,
+        undefined,
+        ['g1', 'g2'],
+        { g1: 'because of you' },
+      );
+    });
+  });
+
+  it('omits game_notes entirely when no pick has a note', async () => {
+    const user = userEvent.setup();
+    vi.mocked(adminLinks).mockResolvedValue([]);
+    vi.mocked(adminCreateLink).mockResolvedValue({
+      token: 'tok-plain',
+      url_path: '/l/tok-plain',
+    });
+    renderLinksWithPicks([{ id: 'g1', title: 'Portal 2' }]);
+    await waitFor(() => screen.getByRole('button', { name: /create invite link/i }));
+    await user.type(screen.getByRole('textbox', { name: 'label' }), 'Maya');
+    await user.click(screen.getByRole('button', { name: /create invite link/i }));
+    await waitFor(() => {
+      expect(adminCreateLink).toHaveBeenCalledWith(
+        'Maya',
+        1,
+        undefined,
+        undefined,
+        undefined,
+        ['g1'],
+        undefined,
+      );
+    });
+  });
+
+  it("renders an existing link's tags read-only (D5.2 read-back)", async () => {
+    vi.mocked(adminLinks).mockResolvedValue([
+      {
+        ...link1,
+        curated_game_ids: ['g1'],
+        curated_notes: { g1: 'because of you' },
+      },
+      link2,
+    ]);
+    renderLinks();
+    await waitFor(() => screen.getByText('Alice'));
+    expect(screen.getByText(/✍ .*because of you/)).toBeInTheDocument();
+    // link2 has no notes — exactly one tag line in the whole list
+    expect(screen.getAllByText(/✍ /)).toHaveLength(1);
   });
 });
 

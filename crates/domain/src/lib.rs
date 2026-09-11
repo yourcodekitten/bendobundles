@@ -270,6 +270,17 @@ pub struct Link {
     /// body = :b` write-back on rollback. See the rollback pin in store_test.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curated_game_ids: Option<Vec<String>>,
+    /// ✍️ per-game gift tags on a curated link, keyed by game_id — the finest
+    /// grain of chosen-for-you: `gift_note` is the card on the whole present,
+    /// these are the stickers on each item. Storage follows `curated_game_ids`'
+    /// exact contract: top-level attribute is the ONLY source, stripped from
+    /// body (`schema::link_body`), written once at create, no update expression
+    /// anywhere names it — claim-path (`claim_game`'s SET body, reached from
+    /// public-api) and rollback erasure are impossible by construction
+    /// (docs/spec-gift-tags.md D1; the SET-body doctrine at dynamo/src/lib.rs:419).
+    /// This serde is the ADMIN-WIRE shape (list serializes domain::Link).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curated_notes: Option<std::collections::BTreeMap<String, String>>,
     /// The friend this link was cut for. Authoritative ONLY in a top-level
     /// dynamo attribute (scoped update via `set_link_friend`), stripped from
     /// the stored `body` blob, overridden on read — the `gift_note` pattern,
@@ -689,6 +700,7 @@ mod tests {
             expires_at: None,
             unlock_at: None,
             curated_game_ids: None,
+            curated_notes: None,
             friend_id: None,
             created_at: datetime!(2026-07-02 00:00 UTC),
         }
