@@ -567,6 +567,7 @@ const CLAIMS_ALLOWED_MAX: u32 = 100;
 const LABEL_MAX_CHARS: usize = 200;
 const GIFT_NOTE_MAX_CHARS: usize = 500; // fits the friend page's dialog box without scrolling
 const CURATED_GAMES_MAX: usize = 100; // an unbounded admin array is still an unbounded array
+const GAME_NOTE_MAX_CHARS: usize = 280; // ✍️ a sticker, not a letter — gift_note (500) is the card; provisional layout invariant (spec-gift-tags D2)
 
 /// Single owner of the gift-note input rules — create and edit-after-the-fact both
 /// call this, so the two paths can never drift apart, and validation can't be
@@ -635,6 +636,11 @@ struct CreateLinkBody {
     /// Curated shelf: the admin's pick order, preserved verbatim (never sorted/deduped-by-
     /// reorder — order IS meaning, storage and wire). Omitted/absent means open-shelf.
     game_ids: Option<Vec<String>>,
+    /// ✍️ per-game gift tags, keyed by game_id — every key must appear in
+    /// `game_ids` (notes only exist on curated links; spec-gift-tags D2).
+    /// Create-time only: no edit endpoint (D2.1 — edit = re-cut the link).
+    #[serde(default)]
+    game_notes: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl CreateLinkBody {
@@ -682,6 +688,27 @@ impl CreateLinkBody {
                     self.claims_allowed,
                     ids.len()
                 ));
+            }
+        }
+        // ✍️ gift tags ride only on curated links, keyed into the set, capped
+        // per note ON THE TRIMMED TEXT (trailing whitespace shouldn't eat the
+        // budget — parse_gift_note's rule, one grain finer). Blank notes are
+        // legal here and DROPPED at store time (absence has one spelling).
+        if let Some(notes) = &self.game_notes {
+            let Some(ids) = &self.game_ids else {
+                return Err(
+                    "game_notes requires game_ids (notes only exist on curated links)".into(),
+                );
+            };
+            for (id, note) in notes {
+                if !ids.contains(id) {
+                    return Err(format!("game_notes[\"{id}\"] has no matching game_ids entry"));
+                }
+                if note.trim().chars().count() > GAME_NOTE_MAX_CHARS {
+                    return Err(format!(
+                        "game_notes[\"{id}\"] must be at most {GAME_NOTE_MAX_CHARS} characters"
+                    ));
+                }
             }
         }
         Ok(())
@@ -761,7 +788,17 @@ async fn handle_create_link(
         expires_at,
         unlock_at,
         curated_game_ids: body.game_ids.clone(),
-        curated_notes: None, // Task 2 (gift tags) wires body.game_notes through validation here
+        // ✍️ trimmed at the door; blanks dropped; all-blank collapses to None —
+        // absence has ONE spelling (spec-gift-tags invariant 6), so the storage
+        // layer never sees Some(empty).
+        curated_notes: body.game_notes.as_ref().and_then(|m| {
+            let kept: std::collections::BTreeMap<_, _> = m
+                .iter()
+                .filter(|(_, v)| !v.trim().is_empty())
+                .map(|(k, v)| (k.clone(), v.trim().to_string()))
+                .collect();
+            (!kept.is_empty()).then_some(kept)
+        }),
         friend_id: None,
         created_at: now,
     };
