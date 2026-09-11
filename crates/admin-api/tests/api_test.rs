@@ -719,7 +719,10 @@ async fn notes_create_refuses_game_notes_without_game_ids() {
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let j = body_json(resp).await;
     assert!(
-        j["error"].as_str().unwrap().contains("game_notes requires game_ids"),
+        j["error"]
+            .as_str()
+            .unwrap()
+            .contains("game_notes requires game_ids"),
         "error must say notes need curation, got: {j}"
     );
 }
@@ -812,7 +815,10 @@ async fn notes_create_stores_trimmed_and_drops_blanks() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored2.curated_notes, None, "all-blank ⇒ None, never Some({{}})");
+    assert_eq!(
+        stored2.curated_notes, None,
+        "all-blank ⇒ None, never Some({{}})"
+    );
 }
 
 /// ✍️ per-note cap at 280 chars (measured on the TRIMMED text), error names the id.
@@ -842,7 +848,10 @@ async fn notes_create_refuses_note_over_280_chars() {
     let j = body_json(resp).await;
     let msg = j["error"].as_str().unwrap();
     assert!(msg.contains("at most 280"), "cap named, got: {j}");
-    assert!(msg.contains(&test_game(1).id), "offending id named, got: {j}");
+    assert!(
+        msg.contains(&test_game(1).id),
+        "offending id named, got: {j}"
+    );
 }
 
 /// game_ids input-shape 422s: empty, duplicate, claims_allowed > set size, set > CURATED_GAMES_MAX.

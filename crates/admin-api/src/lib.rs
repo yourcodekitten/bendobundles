@@ -702,7 +702,9 @@ impl CreateLinkBody {
             };
             for (id, note) in notes {
                 if !ids.contains(id) {
-                    return Err(format!("game_notes[\"{id}\"] has no matching game_ids entry"));
+                    return Err(format!(
+                        "game_notes[\"{id}\"] has no matching game_ids entry"
+                    ));
                 }
                 if note.trim().chars().count() > GAME_NOTE_MAX_CHARS {
                     return Err(format!(

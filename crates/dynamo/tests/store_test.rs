@@ -632,7 +632,9 @@ async fn stale_binary_write_back_cannot_erase_notes() {
     let got = store.get_link("notes-stale").await.unwrap().unwrap();
     assert!(got.revoked, "the stale write itself must land");
     assert_eq!(
-        got.curated_notes.as_ref().map(std::collections::BTreeMap::len),
+        got.curated_notes
+            .as_ref()
+            .map(std::collections::BTreeMap::len),
         Some(1),
         "recoverable-and-loud: the notes attr survives a pre-field binary's write-back"
     );
