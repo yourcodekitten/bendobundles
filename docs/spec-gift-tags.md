@@ -123,6 +123,12 @@ note: Option<String>,
   strangely — but ghosts are **cause-blind by decision** (GameView.gone's own doc), so the tag
   never contradicts a displayed cause; the strangeness is bounded and accepted (family q2,
   Lilith's caveat recorded).
+  **D3.2.1 — reach, named at review pass 1 (2026-09-11):** the ghost CARD is deliberately inert
+  (no modal — the detail gate 404s non-claimed ghosts anyway) and claims-history rows do not
+  open the modal today, so a ghost's tag is **wire-complete but UI-latent**: it renders nowhere
+  until a claims-receipt surface gains a detail affordance. Kept on the wire anyway — the claims
+  detail path (a friend re-opening something they claimed off this link) is ACCESSIBLE
+  server-side and carries the note, so the first such surface lights it up with zero API work.
 - **D3.3 — the detail endpoint carries the note.** RESOLVED (draft v1 left this an `iff`; a
   fork in a spec becomes a coin-flip in execution — Lilith): `handle_game_detail` is
   token-scoped and resolves the link before projecting the game, so the same overlay applies
