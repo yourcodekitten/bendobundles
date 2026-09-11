@@ -43,8 +43,12 @@ have no referent there, and the open-shelf wire stays byte-identical.
 - **No update expression anywhere names the attribute.** That is the whole point:
   `claim_game`'s `SET body` and `update_link_meta`'s `SET body` cannot touch it in ANY binary,
   old or new — claim-erasure and rollback-erasure die **by construction**, not by runbook.
-  Pinned by a `curated_notes_survive_a_claim`-shaped test
-  (`gift_note_scoped_write_survives_stale_body_writers` is the house pattern).
+  Pinned by a `curated_notes_survive_a_claim`-shaped test — twin of the existing
+  `claim_leaves_curated_attribute_standing` (store_test.rs:449), which pins this same contract
+  for `curated_game_ids`. And the contract has live in-repo precedent beyond the create path:
+  `compensate_claim` and `fail_claim_dead_key` (Lilith's identity-key census: 5 link-META
+  writers total — create · update_link_meta · claim_game · those two) have touched link META
+  for their whole lives without disturbing the body — scoped writes work here, measured.
 - **Residual skew, stated honestly:** an old `public-api` binary (its own rollout window, or a
   rollback) lacks the read-override and serves note-less links — the friend sees no tags for
   those minutes. A **display gap, self-healing on read; zero data loss.** No deploy-order
@@ -52,8 +56,10 @@ have no referent there, and the open-shelf wire stays byte-identical.
 - BTreeMap for deterministic serialization on the admin wire and stable attr bytes.
 - **Cost rides shotgun with correctness (OMBB, ×2'd by Lilith):** `claim_game` rewrites the
   whole body on the friend-facing hot path via `transact_write_items` — billed at **2 WCU per
-  KB**, link and game items both riding — so body-carried notes would cost **~56–224 WCU per
-  claim at the cap** vs today's handful. (Billing model at worst case, not a table
+  KB**, and the transaction carries THREE items (link update + game update + claim put; OMBB's
+  count, `grep -c '.transact_items('` = 3) — so body-carried notes would cost **~56–224 WCU per
+  claim at the cap** vs today's handful (the link dominates; the number survives, the
+  enumeration was two-of-three). (Billing model at worst case, not a table
   measurement; a cap exists to bound the worst case.) The attribute keeps the claim write
   exactly as big as it is today. Correctness-plus-cost is why this storage decision is
   forced, not preferred.
