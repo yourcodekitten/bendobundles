@@ -92,6 +92,7 @@ fn link(token: &str) -> Link {
         expires_at: None,
         unlock_at: None,
         curated_game_ids: None,
+        curated_notes: None,
         friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     }
@@ -506,6 +507,135 @@ fn pre_field_link_body_json_parses_with_none_curation() {
     let legacy = r#"{"token":"t","label":"l","claims_allowed":1,"claims_used":0,"revoked":false,"expires_at":null,"created_at":"2026-01-01T00:00:00Z"}"#;
     let l: domain::Link = serde_json::from_str(legacy).expect("legacy body parses");
     assert_eq!(l.curated_game_ids, None);
+}
+
+/// ✍️ the notes attr round-trips create→read, the body never carries it, and
+/// absence has one spelling (no attr at all). Contract copied from
+/// curated_game_ids (spec-gift-tags D1) — same block of pins, one field over.
+#[tokio::test]
+async fn curated_notes_round_trip_via_attr_and_never_in_body() {
+    let Some(store) = store_or_skip("notes-roundtrip").await else {
+        return;
+    };
+    let mut l = link("tok-notes");
+    l.curated_game_ids = Some(vec!["g-1".into(), "g-2".into()]);
+    l.curated_notes = Some(std::collections::BTreeMap::from([(
+        "g-1".to_string(),
+        "the soundtrack alone".to_string(),
+    )]));
+    store.create_link(&l).await.unwrap();
+
+    let client = raw_client("notes-roundtrip").await;
+    let item = client
+        .get_item()
+        .table_name("t-notes-roundtrip")
+        .key("pk", AttributeValue::S("LINK#tok-notes".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item
+        .expect("META item exists");
+    let attr = item
+        .get("curated_notes")
+        .expect("top-level curated_notes attr")
+        .as_m()
+        .expect("attr is an M");
+    assert_eq!(
+        attr.get("g-1").unwrap().as_s().unwrap(),
+        "the soundtrack alone"
+    );
+    let body = item.get("body").unwrap().as_s().unwrap();
+    assert!(
+        !body.contains("curated_notes"),
+        "the body must never carry the notes (spec D1): {body}"
+    );
+
+    let got = store.get_link("tok-notes").await.unwrap().unwrap();
+    assert_eq!(got.curated_notes, l.curated_notes);
+
+    // absence has one spelling: a link with no notes has NO attr at all
+    let bare = link("tok-bare");
+    store.create_link(&bare).await.unwrap();
+    let bare_item = client
+        .get_item()
+        .table_name("t-notes-roundtrip")
+        .key("pk", AttributeValue::S("LINK#tok-bare".into()))
+        .key("sk", AttributeValue::S("META".into()))
+        .send()
+        .await
+        .unwrap()
+        .item
+        .unwrap();
+    assert!(
+        !bare_item.contains_key("curated_notes"),
+        "no notes ⇒ no attribute, never an empty M"
+    );
+}
+
+/// ✍️ a claim's SET body cannot erase the tags — the attr is out of its blast
+/// radius by construction (the family-review blocker, pinned forever). Twin of
+/// claim_leaves_curated_attribute_standing one field over; live in-repo
+/// precedent that scoped META writes leave the body alone: compensate_claim
+/// and fail_claim_dead_key (Lilith's identity-key census, 2026-09-11).
+#[tokio::test]
+async fn curated_notes_survive_a_claim() {
+    let Some(store) = store_or_skip("notes-claim-pin").await else {
+        return;
+    };
+    store.put_game(&game(1, true)).await.unwrap();
+    let mut l = link("notes-claim");
+    l.curated_game_ids = Some(vec![game(1, true).id]);
+    l.curated_notes = Some(std::collections::BTreeMap::from([(
+        game(1, true).id,
+        "you finished the demo".to_string(),
+    )]));
+    store.create_link(&l).await.unwrap();
+    store
+        .claim_game(
+            "notes-claim",
+            &game(1, true).id,
+            "claim-1",
+            time::OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    let got = store.get_link("notes-claim").await.unwrap().unwrap();
+    assert_eq!(
+        got.curated_notes, l.curated_notes,
+        "claim's SET body rewrite must not touch the top-level notes attribute"
+    );
+}
+
+/// ✍️ THE ROLLBACK PIN, notes edition (same doctrine as
+/// stale_binary_write_back_cannot_erase_curation): a pre-field binary
+/// deserializes this link with curated_notes: None and calls update_link_meta.
+/// The attribute survives because the SET expression does not name it.
+#[tokio::test]
+async fn stale_binary_write_back_cannot_erase_notes() {
+    let Some(store) = store_or_skip("notes-rollback-pin").await else {
+        return;
+    };
+    let mut l = link("notes-stale");
+    l.curated_game_ids = Some(vec!["g-1".into()]);
+    l.curated_notes = Some(std::collections::BTreeMap::from([(
+        "g-1".to_string(),
+        "because of you".to_string(),
+    )]));
+    store.create_link(&l).await.unwrap();
+
+    let mut stale_view = store.get_link("notes-stale").await.unwrap().unwrap();
+    stale_view.curated_notes = None; // what a pre-field Link deserialize produces
+    stale_view.revoked = true; // the realistic stale write: a revoke
+    store.update_link_meta(&stale_view).await.unwrap();
+
+    let got = store.get_link("notes-stale").await.unwrap().unwrap();
+    assert!(got.revoked, "the stale write itself must land");
+    assert_eq!(
+        got.curated_notes.as_ref().map(std::collections::BTreeMap::len),
+        Some(1),
+        "recoverable-and-loud: the notes attr survives a pre-field binary's write-back"
+    );
 }
 
 /// `set_link_thanks` is write-once by construction: the conditional update refuses a
@@ -1533,6 +1663,7 @@ async fn get_link_overrides_all_enforcer_fields_from_top_level() {
         expires_at: Some(datetime!(2020-01-01 00:00 UTC)),
         unlock_at: None,
         curated_game_ids: None,
+        curated_notes: None,
         friend_id: None,
         created_at: datetime!(2026-07-02 00:00 UTC),
     };

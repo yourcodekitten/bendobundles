@@ -134,6 +134,11 @@ pub fn link_body(l: &Link) -> String {
         // deserialize drops the unknown field and its SET body write-back
         // erases it. Top-level is structurally out of that blast radius.
         curated_game_ids: _,
+        // ✍️ Stripped for the same reason, one field over: top-level
+        // `curated_notes` attr is the ONLY source — a body copy would be
+        // erased by any old binary's SET body (claim path included; that is
+        // the whole reason it isn't here). spec-gift-tags D1.
+        curated_notes: _,
         // authoritative top-level only; ALSO a gsi3 key — body copy would desync the index
         friend_id: _,
         created_at,
@@ -150,6 +155,7 @@ pub fn link_body(l: &Link) -> String {
         expires_at: *expires_at,
         unlock_at: None,
         curated_game_ids: None,
+        curated_notes: None,
         friend_id: None,
         created_at: *created_at,
     };
@@ -210,6 +216,17 @@ pub fn link_item(l: &Link) -> HashMap<String, AttributeValue> {
         item.insert(
             "curated_game_ids".into(),
             AttributeValue::L(ids.iter().map(s).collect()),
+        );
+    }
+    // ✍️ Same contract as curated_game_ids: written once here, and no update
+    // expression anywhere names this attribute — that absence IS the rollback
+    // and claim-path immunity spec-gift-tags D1 pins (curated_notes_survive_a_claim,
+    // stale_binary_write_back_cannot_erase_notes). M of S, keyed by game_id.
+    // Omitted when None: absence has one spelling, never an empty M.
+    if let Some(notes) = &l.curated_notes {
+        item.insert(
+            "curated_notes".into(),
+            AttributeValue::M(notes.iter().map(|(k, v)| (k.clone(), s(v))).collect()),
         );
     }
     // friend_id + gsi3pk move together, ALWAYS (Store::set_link_friend's post-creation

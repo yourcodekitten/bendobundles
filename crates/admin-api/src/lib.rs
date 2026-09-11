@@ -761,6 +761,7 @@ async fn handle_create_link(
         expires_at,
         unlock_at,
         curated_game_ids: body.game_ids.clone(),
+        curated_notes: None, // Task 2 (gift tags) wires body.game_notes through validation here
         friend_id: None,
         created_at: now,
     };
