@@ -242,6 +242,10 @@ The test set — one test per spec-owed contract, names fixed (the review gate g
         // Control: an unsealed curated link's waiting row has sealed_until == None,
         // and a PAST unlock_at (NOW - 1 day) also yields None — the filter is
         // sealed-AT-now, not attribute-present.
+        // AND the masking arm: a sealed-AND-expired link (unlock NOW+10d, expires
+        // NOW-1d — constructible only in a fixture; both admin write paths refuse
+        // the pair) is NOT in waiting: Sealed outranks Expired in can_claim, and
+        // link_waits' re-check is the only thing that sees through the mask.
     }
     #[test]
     fn tag_read_only_for_entry_games() {
@@ -361,7 +365,15 @@ fn link_waits(l: &Link, now: OffsetDateTime) -> bool {
     use domain::ClaimRefusal as R;
     match l.can_claim(now) {
         Ok(()) => true,
-        Err(R::Sealed) => true, // waiting tolerates the seal, and only it
+        // Tolerate the seal but STILL require not-expired: `Sealed` OUTRANKS
+        // Expired by design ("a sealed link reports sealed whatever else is
+        // wrong with it"), so a bare `=> true` would trust that masking — and
+        // its correctness would hang on `unlock_at < expires_at`, an invariant
+        // enforced two crates away and preserved today by an accident of
+        // update_link_meta's caller list. This re-check deletes that remote
+        // dependency instead of documenting it (OMBB, step-5 postscript):
+        // the arm is right whether the invariant survives or not.
+        Err(R::Sealed) => l.expires_at.is_none_or(|e| e > now),
         Err(R::Revoked) | Err(R::Expired) | Err(R::Exhausted) => false,
     }
 }
