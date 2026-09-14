@@ -163,9 +163,76 @@ git commit -S -m "📖 dynamo: list_claims() — all claims across LINK# partiti
 ### Task 2: composition + `GET /admin/api/scrapbook`
 
 **Files:**
+- Modify: `crates/domain/src/lib.rs` (add `Link::can_claim_if_unsealed`, refactor `can_claim`
+  to delegate — the tolerance lives where the rule lives; + one domain test pinning the
+  mask-divergence)
 - Create: `crates/admin-api/src/scrapbook.rs` (composition — pure, clock-injected)
 - Modify: `crates/admin-api/src/lib.rs` (module decl, route, handler)
 - Test: composition unit tests **inside `scrapbook.rs`** (`#[cfg(test)]` — pure fixtures, no store); one store-backed endpoint test appended to `crates/admin-api/tests/api_test.rs`
+
+**Step 0 (domain first, its own red/green):** failing domain test in `domain`'s test mod
+(beside `can_claim_sealed_before_unlock`, ~`:741`):
+
+```rust
+#[test]
+fn sealed_masks_exhaustion_and_if_unsealed_unmasks_it() {
+    // sealed AND exhausted — constructible here though both admin write paths
+    // make it awkward (the unlock edit never checks claims remaining, which is
+    // exactly why a consumer must not trust the Sealed mask):
+    let mut l = test_link();               // use the mod's existing Link fixture
+    l.unlock_at = Some(datetime!(2026-12-25 0:00 UTC));
+    l.claims_used = l.claims_allowed;      // exhausted
+    let now = datetime!(2026-09-14 12:00 UTC);
+    assert_eq!(l.can_claim(now), Err(ClaimRefusal::Sealed));               // the mask
+    assert_eq!(l.can_claim_if_unsealed(now), Err(ClaimRefusal::Exhausted)); // unmasked
+}
+```
+
+Then implement:
+
+```rust
+    /// "Would this link be claimable if it weren't wrapped?" — every refusal
+    /// EXCEPT the seal, in can_claim's own order. The scrapbook's waiting
+    /// section tolerates exactly the seal; it must not inherit the seal's
+    /// masking (Sealed outranks Expired AND Exhausted), and no consumer
+    /// should re-derive that precedence outside this crate. A future refusal
+    /// variant is placed here or in the seal wrapper AT ITS DEFINITION.
+    pub fn can_claim_if_unsealed(&self, now: OffsetDateTime) -> Result<(), ClaimRefusal> {
+        if self.revoked {
+            return Err(ClaimRefusal::Revoked);
+        }
+        if let Some(exp) = self.expires_at
+            && exp <= now
+        {
+            return Err(ClaimRefusal::Expired);
+        }
+        if self.claims_used >= self.claims_allowed {
+            return Err(ClaimRefusal::Exhausted);
+        }
+        Ok(())
+    }
+```
+
+and `can_claim` becomes (order preserved EXACTLY — Revoked still outranks Sealed):
+
+```rust
+    pub fn can_claim(&self, now: OffsetDateTime) -> Result<(), ClaimRefusal> {
+        if self.revoked {
+            return Err(ClaimRefusal::Revoked);
+        }
+        if let Some(unlock) = self.unlock_at
+            && unlock > now
+        {
+            return Err(ClaimRefusal::Sealed);
+        }
+        self.can_claim_if_unsealed(now)
+    }
+```
+
+(The delegate re-checks `revoked` — harmless, already refused above; kept so
+`can_claim_if_unsealed` is complete standalone.) Run `cargo test -p domain` — the new test
+green, `can_claim_sealed_before_unlock` and every existing arm test still green (the refactor
+must not move any observable result).
 
 **Interfaces:**
 - Consumes: `Store::list_claims()` (Task 1), existing `list_links` / `list_friends` / `batch_get_games`, `domain::{Claim, ClaimState, Friend, Game, Link, SELF_LINK_TOKEN}`.
@@ -242,10 +309,13 @@ The test set — one test per spec-owed contract, names fixed (the review gate g
         // Control: an unsealed curated link's waiting row has sealed_until == None,
         // and a PAST unlock_at (NOW - 1 day) also yields None — the filter is
         // sealed-AT-now, not attribute-present.
-        // AND the masking arm: a sealed-AND-expired link (unlock NOW+10d, expires
-        // NOW-1d — constructible only in a fixture; both admin write paths refuse
-        // the pair) is NOT in waiting: Sealed outranks Expired in can_claim, and
-        // link_waits' re-check is the only thing that sees through the mask.
+        // AND both masking arms — states the admin write paths forbid or never
+        // check, constructed freely here (the whole argument for the pure fn):
+        // sealed∧EXPIRED (unlock NOW+10d, expires NOW-1d) → NOT in waiting;
+        // sealed∧EXHAUSTED (unlock NOW+10d, claims_used == claims_allowed —
+        // reachable live: the unlock edit never checks claims remaining) → NOT
+        // in waiting. can_claim reports Sealed for both; can_claim_if_unsealed
+        // is what sees through the mask.
     }
     #[test]
     fn tag_read_only_for_entry_games() {
@@ -351,31 +421,18 @@ fn scrapbook_game(id: &str, games: &HashMap<String, Game>) -> ScrapbookGame {
     }
 }
 
-/// TWO predicates, deliberately — the seal splits them (step-5 B1, decided in spec):
-/// a curated sealed link's games are chosen-and-waiting (the friend just can't open
-/// yet); a sealed uncurated link is NOT an open door — it is wrapped. Both call the
-/// canonical `Link::can_claim` (domain:372) rather than restating a subset of its
-/// four arms — a hand-rolled copy that drops one arm is the drift class this fixes.
+/// TWO predicates, deliberately — the seal splits them (step-5 B1 → three rounds of
+/// convergence, each shrinking the surface): a curated sealed link's games are
+/// chosen-and-waiting (the friend just can't open yet); a sealed uncurated link is
+/// NOT an open door — it is wrapped. NO precedence knowledge lives here: `Sealed`
+/// outranks Expired AND Exhausted inside `can_claim`, so any consumer that
+/// hand-tolerates `Err(Sealed)` re-derives an ordering documented three crates
+/// away (a sealed EXHAUSTED link — reachable, the unlock-edit never checks claims
+/// remaining — would render as a wrapped gift nobody can ever open). The tolerance
+/// lives in domain instead: `can_claim_if_unsealed` asks "claimable if it weren't
+/// wrapped?", and a future fifth refusal is handled at the definition site.
 fn link_waits(l: &Link, now: OffsetDateTime) -> bool {
-    // Tolerates the seal AND NOTHING ELSE. Wildcard-free on purpose: ClaimRefusal
-    // is NOT #[non_exhaustive] (domain:352), so a future fifth refusal is a COMPILE
-    // ERROR here — the decision "does waiting tolerate it?" must be made by name,
-    // not defaulted (OMBB's step-5 form; matches!/Err(_) would silently exclude,
-    // safe-direction but decisionless — "exhaustiveness asserts the cells you didn't").
-    use domain::ClaimRefusal as R;
-    match l.can_claim(now) {
-        Ok(()) => true,
-        // Tolerate the seal but STILL require not-expired: `Sealed` OUTRANKS
-        // Expired by design ("a sealed link reports sealed whatever else is
-        // wrong with it"), so a bare `=> true` would trust that masking — and
-        // its correctness would hang on `unlock_at < expires_at`, an invariant
-        // enforced two crates away and preserved today by an accident of
-        // update_link_meta's caller list. This re-check deletes that remote
-        // dependency instead of documenting it (OMBB, step-5 postscript):
-        // the arm is right whether the invariant survives or not.
-        Err(R::Sealed) => l.expires_at.is_none_or(|e| e > now),
-        Err(R::Revoked) | Err(R::Expired) | Err(R::Exhausted) => false,
-    }
+    l.can_claim_if_unsealed(now).is_ok()
 }
 fn link_is_open_door(l: &Link, now: OffsetDateTime) -> bool {
     l.can_claim(now).is_ok()
