@@ -84,11 +84,9 @@ async fn list_claims_spans_links_and_includes_self() {
 }
 ```
 
-⚠️ The `Claim` literal above lists every current field. If the struct has grown a field this
-plan doesn't know, the compiler will say so — add it with its obvious default rather than
-trimming the test. Check the exact field set against `crates/domain/src/lib.rs:298` first.
-If `store_test.rs` has no `link(tok)` helper, build the `Link` literal the way the file's
-existing link tests do — copy their fixture shape, not a fresh invention.
+The `Claim` literal lists every field, **verified against `crates/domain/src/lib.rs:298-330`**
+(9 fields incl. `failure_reason: Option<String>` at `:330`). `store_test.rs` **has** the
+`link(token)` helper at `:82` — use it as written above.
 
 - [ ] **Step 2: Run it to make sure it fails**
 
@@ -359,6 +357,11 @@ pub fn compose_scrapbook(
     let links_by_token: HashMap<String, &Link> =
         links.iter().map(|l| (l.token.clone(), l)).collect();
 
+    // Sort BEFORE formatting: string-sorting mixed-precision RFC3339 missorts
+    // ("…08.123Z" < "…08Z" lexically while 08.123 > 08 in time) — plan-review find.
+    let mut claims = claims;
+    claims.sort_by(|a, b| (a.created_at, a.game_id.as_str()).cmp(&(b.created_at, b.game_id.as_str())));
+
     let mut entries = Vec::new();
     let mut orphan_claim_count = 0u32;
     let mut stale_pending_count = 0u32;
@@ -398,10 +401,7 @@ pub fn compose_scrapbook(
             link_label: link.label.clone(),
         });
     }
-    entries.sort_by(|a, b| {
-        (a.claimed_at.as_str(), a.game.id.as_str())
-            .cmp(&(b.claimed_at.as_str(), b.game.id.as_str()))
-    });
+    // entries inherit the pre-format sort — no string sort here (see above).
 
     let mut waiting = Vec::new();
     let mut doors_open = Vec::new();
@@ -441,13 +441,16 @@ pub fn compose_scrapbook(
 }
 ```
 
-(Sorting `claimed_at` as a string is correct: RFC3339 UTC strings from one formatter sort
-chronologically. If `is_none_or` is not on the crate's MSRV, use `map_or(true, |e| e > now)`.)
+(`is_none_or` is fine: the workspace toolchain is pinned `1.97.1` in `rust-toolchain.toml`,
+well past its 1.82 stabilization — verified at plan review.)
 
 - [ ] **Step 4: Wire the module + route + handler in `lib.rs`**
 
 Module: `mod scrapbook;` + `pub use scrapbook::*;` near the other module decls.
-Route, in the session-protected block (with the other `/admin/api/*` GETs, ~line 126):
+Route: the router builds a `protected` sub-router (`let protected = Router::new()` …) that ends
+with `.route_layer(… session_middleware)`; login/logout sit OUTSIDE it. **Add the route inside
+the `protected` chain, anywhere before `.route_layer`** — never by line number, the block has
+grown before:
 
 ```rust
         .route("/admin/api/scrapbook", get(handle_scrapbook))
@@ -484,10 +487,9 @@ async fn handle_scrapbook(State(s): State<AppState>) -> Response {
 }
 ```
 
-⚠️ Check `batch_get_games`' real signature at `crates/dynamo/src/lib.rs:782` before writing
-this — if it takes `&[String]` and returns `Vec<Game>` rather than a map, build the
-`HashMap<String, Game>` here (`.into_iter().map(|g| (g.id.clone(), g)).collect()`); the
-composition's contract is the map. If it returns a map keyed by id, pass it through.
+**Verified** (plan review, `crates/dynamo/src/lib.rs:782`): `batch_get_games(&self, ids:
+&[String]) -> Result<HashMap<String, Game>, StoreError>` — already the map keyed by id; pass it
+straight into `compose_scrapbook`. No conversion.
 
 - [ ] **Step 5: Store-backed endpoint test** (append to `crates/admin-api/tests/api_test.rs`, following the file's existing store-backed idiom — session cookie via the file's login helper, `router(...)` construction copied from a neighboring store-backed test):
 
@@ -545,20 +547,27 @@ describe('adminScrapbook', () => {
       entries: [], waiting: [], doors_open: [],
       orphan_claim_count: 0, stale_pending_count: 0,
     };
-    mockFetch.mockResolvedValueOnce(jsonResponse(200, view));
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue(view),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
     const result = await adminScrapbook();
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/scrapbook');
     expect(result.stale_pending_count).toBe(0);
   });
   it('throws Unauthorized on 401', async () => {
-    mockFetch.mockResolvedValueOnce(jsonResponse(401, {}));
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 401, json: vi.fn() });
     await expect(adminScrapbook()).rejects.toBeInstanceOf(Unauthorized);
   });
 });
 ```
 
-(Use the file's actual response-builder helper — read how the `adminLinks` tests build a
-`Response`; if it's not called `jsonResponse`, use theirs.)
+(**Verified idiom**: `api.test.ts` has NO response-builder helper — every test builds an inline
+`{ ok, status, json: vi.fn().mockResolvedValue(...) }` literal against the file's shared
+`mockFetch` (`vi.stubGlobal('fetch', mockFetch)` in `beforeEach`). The blocks above ARE that
+idiom; import `adminScrapbook` in the file's existing import list.)
 
 - [ ] **Step 2: Run to fail** — `cd web && npx vitest run src/api.test.ts` → FAIL (no export).
 
@@ -623,7 +632,7 @@ git commit -S -m "📖 web: adminScrapbook() + waitedYears call-site contract pi
 
 **Files:**
 - Create: `web/src/admin/Scrapbook.tsx`
-- Modify: `web/src/App.tsx` (route, in the `/admin` children ~line 29), `web/src/admin/AdminApp.tsx` (fifth NavLink after `friends` ~line 70; **fix the comment at line 16 to `// One place for the nav active/inactive style — every NavLink shares it.` — drop the number, don't increment it**)
+- Modify: `web/src/App.tsx` (route, in the `/admin` children ~line 29), `web/src/admin/AdminApp.tsx` (fifth NavLink after `friends` ~line 70; **fix the comment at line 16 to `// One place for the nav active/inactive style — every NavLink shares it.` — drop the number, don't increment it**), `web/src/admin/Links.tsx` (row anchors + hash-scroll, for the card deep-link — spec: "the card deep-links to its owning links-tab row")
 - Test: `web/src/admin/Scrapbook.test.tsx`
 
 **Interfaces:**
@@ -685,6 +694,20 @@ whole line omitted when `bought` is null (card still shows `opened {opened}`). B
 statusBadge's pending). Styling: follow the admin pages' existing className/inline-style
 idiom — warm, no metric cards, lowercase copy throughout.
 
+**Card deep-link (spec: "deep-links to its owning links-tab row"):** the card's recipient/label
+line is a react-router `<Link to={{ pathname: '/admin/links', hash: `#link-${e.link_token}` }}>`.
+In `Links.tsx`: give each link row `id={`link-${l.token}`}`, and add a mount effect —
+
+```tsx
+const { hash } = useLocation();
+useEffect(() => {
+  if (hash) document.getElementById(hash.slice(1))?.scrollIntoView();
+}, [hash, links]);   // re-run when rows land — the anchor doesn't exist until data loads
+```
+
+— because react-router does not scroll to hashes on its own. Test (in `Scrapbook.test.tsx`):
+the card link's `href` ends with `/admin/links#link-<token>`.
+
 - [ ] **Step 4: Route + nav.** `App.tsx`: `<Route path="scrapbook" element={<Scrapbook />} />` with the other admin children. `AdminApp.tsx`: NavLink `scrapbook` after `friends`, plus the line-16 comment fix (Global note: **drop the number**).
 
 - [ ] **Step 5: Run** — `npx vitest run src/admin/Scrapbook.test.tsx src/admin/AdminApp.test.tsx && npx tsc --noEmit` → PASS (AdminApp tests may assert nav contents — update its expectations if the fifth tab breaks them, that's a legitimate ripple, not scope creep).
@@ -725,8 +748,10 @@ it('quiet footnotes render ONLY when counts are nonzero', ...);
 - [ ] **Step 2: Run to fail.**
 
 - [ ] **Step 3: Implement.** Waiting section: per `ScrapbookWaitingLink`, heading "for
-{recipient}", game rows with `postmark(acquired_at)` + default-now `waitedYears(acquired_at)`
-("waiting N years" clause omitted when null). Doors: own `<section>` headed `doors left open`,
+{recipient}", game rows with `postmark(g.acquired_at ?? undefined)` + default-now
+`waitedYears(g.acquired_at ?? undefined)` ("waiting N years" clause omitted when null) —
+the `?? undefined` coercion is required: API types are `string | null`, the postmark helpers
+take `string | undefined`. Doors: own `<section>` headed `doors left open`,
 one line per door — `the door ben left open for {recipient}` + (waitedYears(created_at) ?
 ` · open {n} years` : ``) + ` · {claims_left} claims left` (singular "claim" when 1). Summary
 sentence above everything, derived client-side from `view` (distinct `recipient` strings ⇒
@@ -789,3 +814,28 @@ NEVER `statusCheckRollup`). Green required before requesting review.
 - **Spec coverage:** every "tests owed by this spec" item has a named test: waiting-is-listability + stale-Pending arm (T2 `waiting_is_listability_not_claim_absence`), 48h boundary frozen-clock (T2 `pending_boundary_47h_badges_49h_drops_and_counts`), revoked two-half (T2 `revoked_link_keeps_entry_loses_waiting`), SELF-drop + orphan (T2, two tests), frozen-clock postmark divergence (T3). Doors `created_at`, `stale_pending_count`, footnotes, summary-as-derivation, jump-list, comment fixes — all in T3–T5. ✅
 - **Placeholders:** T2 Step-1 test bodies and T4/T5 `it(...)` lists are fixture *recipes with stated expected values* — the executor writes literals from them; no TBDs remain. ✅
 - **Type consistency:** `ScrapbookView` field names identical across T2 (serde), T3 (TS types), T4/T5 (consumption); `compose_scrapbook` signature stated once and consumed once; `STALE_PENDING_HOURS` named in T2 and referenced nowhere else (the web never re-derives it — counts arrive computed). ✅
+
+## Plan-review record (implementation-plan-review, 2026-09-14, integrated in place)
+
+Cold-subagent walkthrough + reality checks against the tree. **Verdict after fixes: ready to
+execute.** Findings, all fixed above:
+- **B1 (spec coverage)**: the card's deep-link-to-links-row was in the spec and in no task →
+  T4 gains the `Links.tsx` anchors + hash-scroll effect + href test.
+- **B2 (nonexistent helper)**: T3's fetcher test used a `jsonResponse` builder `api.test.ts`
+  does not have (verified: inline `{ok, status, json}` literals only) → rewritten in the real
+  idiom.
+- **M1 (latent missort)**: sorting formatted RFC3339 strings missorts mixed subsecond
+  precision (`…08.123Z` < `…08Z` lexically) → sort on parsed `OffsetDateTime` BEFORE
+  formatting; string sort removed.
+- **M2 (deferred signature)**: `batch_get_games` hedge resolved by reading it —
+  `&[String] → HashMap<String, Game>`, pass-through.
+- **M3 (line-number anchor)**: route placement re-anchored structurally (inside `protected`
+  before `.route_layer`), not by line.
+- **M4 (cross-crate fixture temptation)**: T2's fixture recipes say copy-the-shape; sharpened
+  with the reminder that dynamo's test helpers cannot be imported across crates.
+- **m1**: T1's `link()` helper confirmed to exist (`store_test.rs:82`) — conditional removed.
+  **m2**: `Claim` 9-field literal verified against `domain:298-330`. **m3**: `is_none_or` MSRV
+  hedge removed (toolchain pinned 1.97.1). **m4**: T5's `?? undefined` coercion stated.
+- Interface table: T1→T2 (`list_claims`), T2→T3 (JSON contract), T3→T4/T5
+  (`adminScrapbook` + types), T4→T5 (single-fetch component) — all matched, no forward
+  references, no orphan Produces.
