@@ -353,10 +353,17 @@ fn scrapbook_game(id: &str, games: &HashMap<String, Game>) -> ScrapbookGame {
 /// canonical `Link::can_claim` (domain:372) rather than restating a subset of its
 /// four arms — a hand-rolled copy that drops one arm is the drift class this fixes.
 fn link_waits(l: &Link, now: OffsetDateTime) -> bool {
-    // tolerates the seal AND NOTHING ELSE — a future fifth refusal lands
-    // excluded-by-default and must be NAMED to be tolerated (Lilith's form;
-    // the exhaustiveness argument Notify::resolve's own doc makes one crate over)
-    matches!(l.can_claim(now), Ok(()) | Err(domain::ClaimRefusal::Sealed))
+    // Tolerates the seal AND NOTHING ELSE. Wildcard-free on purpose: ClaimRefusal
+    // is NOT #[non_exhaustive] (domain:352), so a future fifth refusal is a COMPILE
+    // ERROR here — the decision "does waiting tolerate it?" must be made by name,
+    // not defaulted (OMBB's step-5 form; matches!/Err(_) would silently exclude,
+    // safe-direction but decisionless — "exhaustiveness asserts the cells you didn't").
+    use domain::ClaimRefusal as R;
+    match l.can_claim(now) {
+        Ok(()) => true,
+        Err(R::Sealed) => true, // waiting tolerates the seal, and only it
+        Err(R::Revoked) | Err(R::Expired) | Err(R::Exhausted) => false,
+    }
 }
 fn link_is_open_door(l: &Link, now: OffsetDateTime) -> bool {
     l.can_claim(now).is_ok()
