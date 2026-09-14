@@ -32,3 +32,21 @@ describe("waitedYears", () => {
     expect(waitedYears("junk", now)).toBeNull();
   });
 });
+
+describe('waitedYears — the two scrapbook call shapes (frozen clock)', () => {
+  // characterization: these pin EXISTING semantics the scrapbook relies on.
+  const acquired = '2014-08-15T00:00:00Z';
+
+  it('keepsake card: span ends at the unwrap, not today', () => {
+    // opened sep 2023 — anniversary passed → 9 (the spec's own example line)
+    expect(waitedYears(acquired, Date.parse('2023-09-20T00:00:00Z'))).toBe(9);
+  });
+
+  it('same acquired_at, waiting-shaped now, DIFFERENT answer — the divergence is the bug class', () => {
+    expect(waitedYears(acquired, Date.parse('2026-09-14T00:00:00Z'))).toBe(12);
+  });
+
+  it('anniversary not reached rounds down (mar 2023 → 8, not 9)', () => {
+    expect(waitedYears(acquired, Date.parse('2023-03-10T00:00:00Z'))).toBe(8);
+  });
+});

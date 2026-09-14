@@ -589,6 +589,60 @@ export async function adminSetLinkFriend(
   }
 }
 
+// The scrapbook 📖 — ben's story of giving (docs/spec-scrapbook.md). Read-only;
+// every filter (listability, seal, staleness) is applied SERVER-side, so these
+// types deliberately carry no status/giftable/hidden for the client to mis-apply.
+export type ScrapbookGame = {
+  id: string;
+  title: string;
+  artwork_url: string | null;
+  acquired_at: string | null;
+};
+
+export type ScrapbookEntry = {
+  claimed_at: string;
+  state: 'pending' | 'fulfilled' | 'compensated' | 'failed';
+  game: ScrapbookGame;
+  recipient: string;
+  gift_note: string | null;
+  tag: string | null;
+  thank_note: string | null;
+  thanked_at: string | null;
+  link_token: string;
+  link_label: string;
+};
+
+export type ScrapbookWaitingLink = {
+  link_token: string;
+  link_label: string;
+  recipient: string;
+  /** RFC3339 unlock moment, present only while sealed — "wrapped until ⟨date⟩". */
+  sealed_until: string | null;
+  games: ScrapbookGame[];
+};
+
+export type ScrapbookDoor = {
+  link_token: string;
+  link_label: string;
+  recipient: string;
+  claims_left: number;
+  created_at: string;
+};
+
+export type ScrapbookView = {
+  entries: ScrapbookEntry[];
+  waiting: ScrapbookWaitingLink[];
+  doors_open: ScrapbookDoor[];
+  orphan_claim_count: number;
+  stale_pending_count: number;
+};
+
+export async function adminScrapbook(): Promise<ScrapbookView> {
+  const response = await fetch('/admin/api/scrapbook');
+  await checkOk(response, 'scrapbook');
+  return (await response.json()) as ScrapbookView;
+}
+
 export async function adminFriends(): Promise<AdminFriend[]> {
   const response = await fetch('/admin/api/friends');
   await checkOk(response, 'friends');

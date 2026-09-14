@@ -13,7 +13,7 @@ export type AdminOutletContext = {
   refreshStatus: () => void;
 };
 
-// One place for the nav active/inactive style — three NavLinks share it.
+// One place for the nav active/inactive style — every NavLink shares it.
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
   isActive ? 'text-ink font-medium' : 'text-dust hover:text-ink-soft';
 
@@ -67,6 +67,9 @@ export function AdminApp() {
         </NavLink>
         <NavLink to="/admin/friends" className={navLinkClass}>
           friends
+        </NavLink>
+        <NavLink to="/admin/scrapbook" className={navLinkClass}>
+          scrapbook
         </NavLink>
         <NavLink to="/admin/ops" className={navLinkClass}>
           ops

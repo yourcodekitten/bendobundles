@@ -381,6 +381,24 @@ impl Link {
         {
             return Err(ClaimRefusal::Sealed);
         }
+        self.can_claim_if_unsealed(now)
+    }
+
+    /// "Would this link be claimable if it weren't wrapped?" — every refusal
+    /// EXCEPT the seal, in `can_claim`'s own order. `Sealed` outranks Expired
+    /// AND Exhausted there ("a sealed link reports sealed whatever else is
+    /// wrong with it"), so a consumer that tolerates the seal — the
+    /// scrapbook's chosen-and-waiting section — must not inherit the seal's
+    /// masking, and must not re-derive that precedence outside this crate.
+    /// A future refusal variant is placed here or in the seal wrapper AT ITS
+    /// DEFINITION, never decided by a remote match arm. Checks `revoked`
+    /// itself (redundant on the `can_claim` path, already refused above) so
+    /// it is correct standalone — a helper that is only correct when called
+    /// from one place is a trap with a docstring.
+    pub fn can_claim_if_unsealed(&self, now: OffsetDateTime) -> Result<(), ClaimRefusal> {
+        if self.revoked {
+            return Err(ClaimRefusal::Revoked);
+        }
         if let Some(exp) = self.expires_at
             && exp <= now
         {
@@ -761,6 +779,24 @@ mod tests {
         l.revoked = true;
         l.unlock_at = Some(now + time::Duration::hours(1));
         assert_eq!(l.can_claim(now), Err(ClaimRefusal::Revoked));
+    }
+
+    #[test]
+    fn sealed_masks_exhaustion_and_if_unsealed_unmasks_it() {
+        // sealed AND exhausted — constructible here though the admin write paths
+        // make it awkward (the unlock edit never checks claims remaining, which
+        // is exactly why a consumer must not trust the Sealed mask). The
+        // assertion is the DIVERGENCE itself, not either answer alone: same
+        // link, same instant, two different refusals.
+        let mut l = link();
+        let now = datetime!(2026-07-02 12:00 UTC);
+        l.unlock_at = Some(now + time::Duration::days(10));
+        l.claims_used = l.claims_allowed; // exhausted
+        assert_eq!(l.can_claim(now), Err(ClaimRefusal::Sealed)); // the mask
+        assert_eq!(
+            l.can_claim_if_unsealed(now),
+            Err(ClaimRefusal::Exhausted) // unmasked
+        );
     }
 
     #[test]

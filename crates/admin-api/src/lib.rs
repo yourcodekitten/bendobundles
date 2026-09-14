@@ -29,6 +29,9 @@
 //! All `/admin/api/steam/*` routes additionally require a configured steam client; absent → 503.
 use std::sync::Arc;
 
+mod scrapbook;
+pub use scrapbook::*;
+
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -124,6 +127,7 @@ pub fn router(
         )
         .route("/admin/api/friends/{id}", post(handle_patch_friend))
         .route("/admin/api/claims/self", get(handle_self_claims))
+        .route("/admin/api/scrapbook", get(handle_scrapbook))
         .route("/admin/api/sync", post(handle_sync))
         .route("/admin/api/status", get(handle_status))
         .route(
@@ -825,6 +829,35 @@ async fn handle_list_links(State(s): State<AppState>) -> Response {
         Ok(links) => (StatusCode::OK, Json(links)).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+// ── GET /admin/api/scrapbook ───────────────────────────────────────────────────
+
+async fn handle_scrapbook(State(s): State<AppState>) -> Response {
+    let (claims, links, friends) = match tokio::try_join!(
+        s.store.list_claims(),
+        s.store.list_links(),
+        s.store.list_friends(),
+    ) {
+        Ok(t) => t,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    // ids the view needs: every claim's game + every curated id on any link
+    // (over-fetching a dead link's ids is harmless; the composition filters).
+    let mut ids: Vec<String> = claims.iter().map(|c| c.game_id.clone()).collect();
+    for l in &links {
+        if let Some(cur) = &l.curated_game_ids {
+            ids.extend(cur.iter().cloned());
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    let games = match s.store.batch_get_games(&ids).await {
+        Ok(g) => g,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let view = compose_scrapbook(claims, links, friends, games, OffsetDateTime::now_utc());
+    (StatusCode::OK, Json(view)).into_response()
 }
 
 // ── POST /admin/api/links/{token}/revoke ───────────────────────────────────────

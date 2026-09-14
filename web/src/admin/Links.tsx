@@ -72,6 +72,16 @@ export function Links() {
   // feeds a picker/name-lookup, so a friends-fetch failure must not blank the
   // links page. `friends` stays [] until it resolves; every lookup already
   // tolerates "not found".
+  // Deep-link from the scrapbook: /admin/links#link-<token> scrolls to the
+  // owning row once the rows exist (react-router does not scroll to hashes on
+  // its own; the anchor isn't in the DOM until the list loads, hence `state`
+  // in the deps).
+  useEffect(() => {
+    if (location.hash && state.phase === 'loaded') {
+      document.getElementById(location.hash.slice(1))?.scrollIntoView();
+    }
+  }, [location.hash, state]);
+
   const [friends, setFriends] = useState<AdminFriend[]>([]);
   useEffect(() => {
     withAuth(() => adminFriends(), navigate)
@@ -688,7 +698,7 @@ export function Links() {
           const assignedFriendName = friendName(link.friend_id);
 
           return (
-            <div key={link.token} className="rounded bg-floor p-4">
+            <div key={link.token} id={`link-${link.token}`} className="rounded bg-floor p-4">
               {/* Row: label, meta, actions */}
               <div className="flex flex-wrap items-center gap-3">
                 <span className="font-medium text-ink">{link.label}</span>

@@ -3733,3 +3733,83 @@ async fn friends_name_strips_spoofing_format_chars() {
     .unwrap();
     assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+/// GET /admin/api/scrapbook — server-side composition end-to-end: recipient
+/// resolved (friend name > label), the curated tag on the entry, an uncurated
+/// live link as a door, both counts zero on healthy data.
+#[tokio::test]
+async fn scrapbook_endpoint_composes() {
+    let Some(store) = store_or_skip("scrapbook").await else {
+        return;
+    };
+    let password = "scrappw";
+    let admin_hash = test_admin_hash(password);
+    let invoker: Arc<dyn AdminInvoker> = MockAdminInvoker::new();
+
+    // seed: friend sam · one curated link (friend-assigned, tagged) with a
+    // fulfilled claim · one uncurated live link (the door)
+    let g = test_game(1);
+    store.put_game(&g).await.unwrap();
+    let friend = domain::Friend {
+        id: "f-sam".into(),
+        name: "sam".into(),
+        shelf_token: "ab".repeat(32),
+        created_at: datetime!(2026-09-04 12:00 UTC),
+    };
+    store.create_friend(&friend).await.unwrap();
+    let mut l = test_link("tok-entry");
+    l.friend_id = Some("f-sam".into());
+    l.gift_note = Some("happy birthday ♡".into());
+    l.curated_game_ids = Some(vec![g.id.clone()]);
+    l.curated_notes = Some(std::collections::BTreeMap::from([(
+        g.id.clone(),
+        "picked this one for you".to_string(),
+    )]));
+    store.create_link(&l).await.unwrap();
+    let door = test_link("tok-door");
+    store.create_link(&door).await.unwrap();
+    let claim = Claim {
+        id: "c-1".into(),
+        link_token: "tok-entry".into(),
+        game_id: g.id.clone(),
+        state: ClaimState::Fulfilled,
+        gift_url: Some("https://humble/gift".into()),
+        revealed_key: None,
+        created_at: datetime!(2023-09-20 12:00 UTC),
+        choice_pre_tpks: None,
+        failure_reason: None,
+    };
+    store.put_claim(&claim).await.unwrap();
+
+    let session = admin_login(&store, &invoker, &admin_hash, password).await;
+    let req = Request::get("/admin/api/scrapbook")
+        .header("cookie", format!("session={session}"))
+        .header("x-admin-request", "1")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router(Arc::clone(&store), Arc::clone(&invoker), admin_hash, None)
+        .oneshot(req)
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+
+    let entries = j["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["recipient"], "sam");
+    assert_eq!(entries[0]["tag"], "picked this one for you");
+    assert_eq!(entries[0]["gift_note"], "happy birthday ♡");
+    assert_eq!(entries[0]["state"], "fulfilled");
+    // the claimed game left Available ⇒ nothing waits… but this seed never
+    // flipped game status (put_claim direct, no claim_game tx), so the game is
+    // STILL Available and curated ⇒ it legitimately appears in waiting. Assert
+    // what the data actually says rather than what a tidier seed would say:
+    let waiting = j["waiting"].as_array().unwrap();
+    assert_eq!(waiting.len(), 1);
+    let doors = j["doors_open"].as_array().unwrap();
+    assert_eq!(doors.len(), 1);
+    assert_eq!(doors[0]["link_token"], "tok-door");
+    assert_eq!(doors[0]["claims_left"], 3);
+    assert_eq!(j["orphan_claim_count"], 0);
+    assert_eq!(j["stale_pending_count"], 0);
+}

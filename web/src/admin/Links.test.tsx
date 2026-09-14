@@ -1157,3 +1157,24 @@ describe('gift tags ✍️ (per-pick notes)', () => {
   });
 });
 
+
+describe('deep-link hash', () => {
+  it('scrolls to the owning row when the hash names it', async () => {
+    const scrollSpy = vi.fn();
+    // jsdom doesn't implement scrollIntoView — an unstubbed call throws,
+    // which is the honest red if the effect never fires.
+    HTMLElement.prototype.scrollIntoView = scrollSpy;
+    vi.mocked(adminLinks).mockResolvedValue([link1, link2]);
+    render(
+      <MemoryRouter initialEntries={['/admin/links#link-tok-abc123']}>
+        <Routes>
+          <Route path="/admin/links" element={<Links />} />
+          <Route path="/admin/login" element={<div>login page</div>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    await screen.findByText('Alice');
+    expect(document.getElementById('link-tok-abc123')).not.toBeNull();
+    expect(scrollSpy).toHaveBeenCalled();
+  });
+});
