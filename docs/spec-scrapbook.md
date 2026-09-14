@@ -150,10 +150,17 @@ second member of that list.
                    "link_token", "link_label" } ],
     "waiting": [ { "link_token", "link_label", "recipient",
                    "games": [ {"id","title","artwork_url","acquired_at"} ] } ],
-    "doors_open": [ { "link_token", "link_label", "recipient", "claims_left" } ],
-    "orphan_claim_count": 0
+    "doors_open": [ { "link_token", "link_label", "recipient", "claims_left", "created_at" } ],
+    "orphan_claim_count": 0,
+    "stale_pending_count": 0
   }
   ```
+  **`stale_pending_count`** (Lilith's vanish-twin catch): a stale-Pending game vanishes from the
+  page entirely — not a card, not waiting — and unlike the revoked-link vanish (Ben's own act,
+  documented above) a stuck claim is a defect he never chose. The count rides the same quiet
+  footnote pattern as `orphan_claim_count` (rendered only when nonzero), so the page cannot lie
+  by omission about gifts it is deliberately not showing. The systemic gap itself is filed as
+  bendobundles#234, not here.
   The payload stays thin **because every filter is server-side**: `is_listable()` is applied
   during composition (OMBB B2 — the client never receives `status`/`giftable`/`hidden` and so
   can never mis-apply them), stale-Pending is dropped during composition, `recipient` is
@@ -170,8 +177,13 @@ The default is correct for exactly one of this page's two calls:
 - **keepsake card**: `waitedYears(game.acquired_at, Date.parse(entry.claimed_at))` — the span
   **ended at the unwrap**. Called with the default it renders "waited 12 years" today and 13
   next January: well-formatted, plausible, drifting.
-- **waiting / doors sections**: `waitedYears(game.acquired_at)` — still waiting, the span
-  genuinely runs to now; the default is right here.
+- **waiting section**: `waitedYears(game.acquired_at)` — still waiting, the span genuinely runs
+  to now; the default is right here.
+- **doors section**: `waitedYears(link.created_at)` — a **different field** (an uncurated link
+  has no chosen game by definition, so there is no `acquired_at` to span; Lilith's v2 catch —
+  the first draft of this list claimed a call site the payload could not feed). The door line
+  may say "open 2 years"; under a year `waitedYears` returns null and the clause is omitted,
+  same rule as the cards. Default-now is correct here too: the door is still open.
 A **frozen-clock test pins the divergence** (both call shapes, one fixture, different expected
 years). And `postmark.ts:39`'s doc comment "`now` is injectable for tests" gets amended in the
 same edit — the keepsake card is a *production* caller that must inject, and a comment labeling
@@ -213,8 +225,8 @@ number is dated and re-derivable, not a law.
 - **48h boundary, frozen clock** (OMBB round 2 — a time-relative rule reuses the frozen clock or
   it reintroduces the class it fixed): the composition takes `now: OffsetDateTime` as a
   parameter (the handler passes `now_utc()`); fixtures sit ON the boundary — one Pending aged
-  47h renders as a badged card, one aged 49h is dropped. A fixture aged 3h asserts nothing
-  about a 48h rule.
+  47h renders as a badged card, one aged 49h is dropped **and increments
+  `stale_pending_count`**. A fixture aged 3h asserts nothing about a 48h rule.
 - **SELF-drop + orphan count** (OMBB B3): a `LINK#SELF` claim → absent everywhere,
   `orphan_claim_count` 0; a synthetic non-SELF orphan → counted.
 
