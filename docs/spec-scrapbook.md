@@ -1,7 +1,8 @@
 # the scrapbook 📖 — spec
 
-*2026-09-14, kitten. Status: DRAFT v1 → family crossfire. Where narrative and **decisions**
-disagree, the decisions win.*
+*2026-09-14, kitten. Status: v2 — both crossfire passes integrated (OMBB: 3 blockers, 4 majors,
+3 unasked; Lilith: 1 blocker, 4 contracts, 3 unasked; Q1–Q4 resolved, Q3 by their synthesis).
+Where narrative and **decisions** disagree, the decisions win.*
 
 ## why this exists
 
@@ -26,31 +27,78 @@ This is composition, not construction. Every raw material already exists and is 
 **A new admin page at `/admin/scrapbook`** (fifth nav tab, behind the existing login), read-only,
 in the brand voice:
 
-- **The story, grouped by year of unwrap** (claim `created_at`), **oldest year first** — a
-  scrapbook reads forward; the story of fifteen years lands harder than a reverse-chron feed.
-  Entry counts are dozens, not thousands (same scale argument as the shelf); no pagination.
+- **The story, grouped by year of unwrap** (`claimed_at`), **oldest year first** — a scrapbook
+  reads forward. Within a year: **ascending chronological, tiebroken `(claimed_at, game_id)`**
+  (Lilith: a bulk unwrap lands several claims in one second; without a secondary sort the page
+  reshuffles between loads). Entry counts are dozens, not thousands (same scale argument as the
+  shelf); no pagination. **A year jump-list rides the top of the page** (Lilith #6: oldest-first
+  is right for a story and wrong for a habit — the jump-list keeps both, and the story axis is
+  the one guaranteed to grow).
 - **Each opened gift is a keepsake card**: cover art (`artwork_url`, thin fallback when absent),
   title, who it went to (`Friend.name` when the link carries `friend_id`, else the link `label`),
   ben's words — the link's `gift_note` (the card on the present) and the per-game tag
   `curated_notes[game_id]` (the sticker on the item) when either exists — the friend's
-  `thank_note` + `thanked_at` when it came back, and the **postmark span**: "bought 2014 ·
-  opened 2023 — waited 9 years" (reusing `web/src/postmark.ts`, not re-deriving).
-- **"chosen and waiting"** — the deferred feeling, finally on the page it belongs to: games
-  curated on **live** links (not revoked, not expired, claims remaining) that nobody has claimed
-  yet, grouped by link with the friend/label named. On the friend surface this would be pressure
-  (shop grammar); on ben's own page it is anticipation, and the shelf review already ruled it his.
+  `thank_note` + `thanked_at` when it came back, and the **postmark span**:
+  **"bought aug 2014 · opened mar 2023 — waited 9 years"** — month + year, exactly what
+  `postmark()` produces (Lilith: the v1 example "bought 2014" was a string the reused function
+  cannot emit; adopting the function's own format is both honest and warmer).
+  The card deep-links to its owning links-tab row, which already shows revoked state — a warm
+  memory must not click into an unexplained dead link (OMBB Q4 rider).
+- **Thank-you rendering** (Lilith #5): by domain contract `thanked_at` is `Some` iff
+  `thank_note` is `Some` (`set_link_thanks` writes both in one update — domain doc). The card
+  renders them as one unit. Defensively: if a corrupt record ever carries only one, render what
+  exists and invent nothing.
+- **"chosen and waiting"** — the deferred feeling, finally on the page it belongs to:
+  **curated ∧ `is_listable()` ∧ no `Fulfilled`/`Pending` claim ∧ live link**, the listability
+  test applied **server-side** during composition (OMBB B1+B2 — this is a listability test, NOT
+  a claim-absence test, and an implementer must not build the latter):
+  - `Failed` games retire forever (`is_listable` excludes `Expired`) — without this filter a
+    dead-key game reads as "chosen and waiting" *permanently*, a promise the fulfillment path
+    has already decided can never be kept.
+  - `hidden` and non-`giftable` games are things ben deliberately took off the shelf — the
+    filter keeps them from being called *chosen*.
+  - A curated-but-never-claimed game on a **revoked** link deliberately leaves this section —
+    stated so a future reader doesn't file the vanish as a bug (OMBB Q4 rider).
+- **"doors left open"** — its own small heading, visually separate from "chosen and waiting"
+  (Q3, settled between both reviewers): uncurated live links are *"ben left the door open,"* not
+  *"ben picked THIS for YOU,"* and the word **chosen** stays off them. One line per link,
+  **recipient named** ("the door ben left open for sam · 2 claims left") — never a count in the
+  summary sentence, because *a count erases the person* and naming who is the page's thesis
+  (Lilith, conceded by OMBB).
 - **One prose summary line**, not stat tiles (PRODUCT.md anti-reference: no metric-card grids):
-  "N gifts opened by M friends across Y years · K thank-yous ♡" — a sentence in lowercase, the
-  numbers computed from the same payload the page already has.
+  "N gifts opened by M people across Y years · K thank-yous ♡" — **"people," not "friends"**:
+  recipients fall back to link labels when `friend_id` is absent, so the honest count is
+  distinct recipients (OMBB, unasked #1). Computed **client-side from the same payload the
+  cards render from — a correctness property, not a convenience: the numbers cannot disagree
+  with the cards because they share a derivation.** Stated so nobody "optimises" it server-side
+  into a second source of truth (Lilith #7).
+
+### claim states on the page
+
+- **`Fulfilled`** — a keepsake card. "Opened."
+- **`Pending`** — **the "transient" premise was checked and is FALSE** (Lilith Q2: answer the
+  empirical question first). Measured in prod 2026-09-14: the oldest Pending claim is
+  **70 days old** (`2026-07-06`, a `LINK#SELF` self-claim — excluded from this page, but proof
+  the mechanism has no reaper). So: a Pending claim **≤ 48h old** renders as a keepsake card
+  with a soft "unwrapping…" badge — mid-flight is a gift, a dead key is not (the
+  principle-4 inconsistency accepted out loud, per OMBB Q2). A Pending **older than 48h** is a
+  fulfillment defect owned by the ops surface: the scrapbook renders it **neither** as a card
+  (it is not live) **nor** as waiting (its game sits in `pending` status, `is_listable` false) —
+  the page must not wallpaper over a stuck claim with a live-looking badge. 48h is provisional
+  and layout-invariant.
+- **`Compensated` / `Failed`** — excluded from entries. A `Compensated` game re-lists
+  (`pending → available`) and so returns to "chosen and waiting" naturally; a `Failed` game
+  retires as `Expired` and **does not** (OMBB B1 — the v1 sentence gave these two states one
+  truth value, and they have two). Exclusion decided, not defaulted: a failed unwrap is
+  machinery, and machinery stays invisible (PRODUCT.md principle 4).
 
 ### non-goals (decided, not omitted)
 
 - **No friend-surface exposure.** Admin-auth only; nothing here changes what any friend can see.
 - **No self-claims.** `LINK#SELF` claims are ben gifting himself; they have their own surface
-  (`/admin/api/claims/self`) and their presence here would dilute the giving story. Excluded at
-  the composition layer, stated in a test.
-- **No edits from the scrapbook.** The workbench tabs own every write; this page owns none. A
-  keepsake card may *link* to the owning links-tab row, nothing more.
+  (`/admin/api/claims/self`). Excluded structurally at the join (see architecture), not merely
+  unrendered.
+- **No edits from the scrapbook.** The workbench tabs own every write; this page owns none.
 - **No new write path at all.** Read-only composition; zero WCU by construction.
 - **No pagination.** Bounded by the same argument as the shelf ("dozens, not thousands"), stated
   so the future knows it was considered.
@@ -59,56 +107,115 @@ in the brand voice:
 ## architecture
 
 **Store (`crates/dynamo`)** — one new method:
-- `list_claims()` — paginated Scan, `FilterExpression = begins_with(sk, "CLAIM#")`, the exact
-  completeness pattern `list_links` / `list_all_games` already use (claims are scattered under
-  `LINK#<token>` partitions; no GSI exists that covers all claims, and pending-only gsi2 cannot —
-  fulfilled claims leave it). Returns every claim with its parent link token recoverable from
-  `pk` (`LINK#<token>`), so the composition can join claims → links without N+1 per-link queries.
+- `list_claims()` — paginated Scan, `FilterExpression = begins_with(pk, "LINK#") AND
+  begins_with(sk, "CLAIM#")` (both halves constrained — OMBB M1: nothing in the schema forbids
+  a future non-`LINK#` partition growing a `CLAIM#` sort key). This is the **same completeness
+  loop** as `list_links` / `list_all_games` (`last_evaluated_key` until exhausted) with a
+  **deliberately wider filter — it spans partitions on purpose, which is exactly why
+  `LINK#SELF` arrives in the result set and must be excluded downstream** (Lilith's wording; the
+  v1 "exact pattern" claim was doing reassurance work the code does not support). A Scan is the
+  only complete read: `gsi2pk = "PENDINGCLAIM"` is written only while pending and consumed on
+  transition, so no GSI can enumerate fulfilled claims (verified by both reviewers).
+
+**Storage-doctrine contract (stated, not implied — OMBB's crossfire find):** the scrapbook
+introduces **zero new body-field dependencies**. Links are read ONLY through
+`link_from_item`-backed methods (`list_links`), so every editable/authoritative field the page
+shows (`gift_note`, `thank_note`, `curated_notes`, enforcer fields) comes from its top-level
+attribute, never out of the `body` blob — a later `SET body = :b` writer cannot silently erase
+what the page depends on. Claims are read through the same `parse_body` path every existing
+claim reader uses (`get_claim` / `claims_for_link`), which is correct *for claims* because claim
+transitions are whole-item `PutItem` rewrites (`claim_item(&claim)`, measured at
+`fulfill_claim`) — claim `body` IS the authoritative record; there is no top-level twin to
+diverge from. `list_claims()` reuses that parse function verbatim.
+
+**The claims→links join (OMBB B3 + Lilith's invariant declaration):** the composition joins
+*claims whose parent link META is present*. `LINK#SELF` claims are dropped **by pk, before the
+join** (`pk == "LINK#SELF"` — no META item ever exists for that partition, so "drop before
+join" and "structural exclusion" are the same act). Any **other** claim with no matching link
+META is an orphan: **counted in the payload (`orphan_claim_count`) and logged server-side**,
+never silently skipped — an orphan that is not SELF is a data fact, and this is the only
+surface that would ever see it (the page renders a quiet footnote only when the count is
+nonzero). **Declared invariant:** the join assumes every non-`SELF` claim has a live parent
+LINK META — true today because links are never deleted (`lib.rs:1064` documents that invariant
+and its revisit-list); **a link-deletion feature must revisit this join** and is hereby the
+second member of that list.
 
 **admin-api** — one new route:
 - `GET /admin/api/scrapbook` → server-side composition: `list_claims()` + `list_links()` +
-  `list_friends()` + `batch_get_games(claimed ∪ waiting ids)`. Response:
+  `list_friends()` + `batch_get_games(entry ∪ waiting ids)`. Response:
   ```json
   {
     "entries": [ { "claimed_at", "state", "game": {"id","title","artwork_url","acquired_at"},
                    "recipient", "gift_note", "tag", "thank_note", "thanked_at",
                    "link_token", "link_label" } ],
     "waiting": [ { "link_token", "link_label", "recipient",
-                   "games": [ {"id","title","artwork_url","acquired_at"} ] } ]
+                   "games": [ {"id","title","artwork_url","acquired_at"} ] } ],
+    "doors_open": [ { "link_token", "link_label", "recipient", "claims_left" } ],
+    "orphan_claim_count": 0
   }
   ```
-  `recipient` is resolved server-side (friend name > link label). The summary sentence is
-  computed client-side from the payload — no server-side stat fields to drift.
-- **Claim states**: `Fulfilled` entries are "opened". `Pending` is transient (fulfillment in
-  flight) and renders as an opened card with a soft "unwrapping…" badge rather than vanishing —
-  a gift mid-open is still a gift. `Compensated` and `Failed` are **excluded from entries** (the
-  slot came back / the key was dead; the game returns to waiting naturally if still curated on a
-  live link). Exclusion decided, not defaulted — a failed unwrap is machinery, and machinery
-  stays invisible (PRODUCT.md principle 4).
+  The payload stays thin **because every filter is server-side**: `is_listable()` is applied
+  during composition (OMBB B2 — the client never receives `status`/`giftable`/`hidden` and so
+  can never mis-apply them), stale-Pending is dropped during composition, `recipient` is
+  resolved server-side (friend name > link label).
+- **`claimed_at` is the claim's `created_at`, renamed once at the API boundary and used
+  everywhere** — grouping, sorting, the postmark span (OMBB M3). For a `Pending` card it is
+  when the gift was picked up, which is what "opened" means mid-flight.
 
-**web** — `web/src/admin/Scrapbook.tsx` + the nav link + `api.ts` fetcher. Reuses `postmark.ts`
-for the span line and the existing thin-fallback art pattern. Reduced-motion: the page is
-static; no ceremony animation is planned, so nothing to gate.
+**web** — `web/src/admin/Scrapbook.tsx` + the nav link + `api.ts` fetcher.
+
+**The postmark span's two call sites (Lilith's BLOCKER — spec'd exactly because the reuse is
+where the bug lives):** `waitedYears(iso, now = Date.now())` measures **to now** by default.
+The default is correct for exactly one of this page's two calls:
+- **keepsake card**: `waitedYears(game.acquired_at, Date.parse(entry.claimed_at))` — the span
+  **ended at the unwrap**. Called with the default it renders "waited 12 years" today and 13
+  next January: well-formatted, plausible, drifting.
+- **waiting / doors sections**: `waitedYears(game.acquired_at)` — still waiting, the span
+  genuinely runs to now; the default is right here.
+A **frozen-clock test pins the divergence** (both call shapes, one fixture, different expected
+years). And `postmark.ts:39`'s doc comment "`now` is injectable for tests" gets amended in the
+same edit — the keepsake card is a *production* caller that must inject, and a comment labeling
+the parameter as test scaffolding points the next reader away from the bug (OMBB's rider).
+**Fallbacks (OMBB M4):** `postmark()`/`waitedYears()` return null on missing/junk
+`acquired_at` → the span line is simply omitted (the card still shows "opened <postmark of
+claimed_at>"). If `acquired_at` postdates `claimed_at` (bad data), the "waited" clause is
+omitted — never a negative year. Guard at the call site in `Scrapbook.tsx`, not inside
+`waitedYears` (whose calendar semantics are shared and correct).
 
 **infra** — none. Same lambda, same table, same auth, one new route + one new page in the
 existing SPA bundle. Deploy is the standing CI-zips runbook.
 
 ### cost note
 
-One admin page-load = 2 Scans (links, claims) + 1 Query (friends) + 1 BatchGet (games).
-Catalog-scale is single-digit MB (measured claim in `list_all_games`' own doc comment); at
-admin-visit frequency (Ben, occasionally) this is noise. No caching layer — correctness over
-cleverness at this traffic.
+One admin page-load = **two full-table Scans** (links, claims) + 1 Query (friends) + 1 BatchGet
+(games). A Scan is billed on every item **read, before the `FilterExpression` applies** — the
+filter bounds the wire, not the RCU (OMBB M2, Lilith). The honest denominator is the **table**,
+not the catalog: measured 2026-09-14 via `DescribeTable`, the prod table is **4.31 MB / 2,043
+items across its eleven partition types** — so a full Scan is ~½ MB of RCU-eligible read at
+eventual consistency, twice per page-load, at Ben-occasionally frequency. Genuinely noise, now
+at table scale rather than catalog scale. Watch-item, not blocker: `WHISPER#` is an append-only
+log with no TTL or prune path (Lilith) — if the table's shape ever changes character, this note's
+number is dated and re-derivable, not a law.
 
-## open questions (for family crossfire)
+### tests owed by this spec (beyond per-task TDD)
 
-1. **Order within a year**: chronological by `claimed_at` (proposed) — any case for grouping by
-   friend inside a year instead?
-2. **`Pending` rendering**: "unwrapping…" badge on the card (proposed) vs excluding until
-   fulfilled. The badge keeps the page truthful mid-flight; is the transient state worth a UI
-   string?
-3. **Waiting-section scope**: curated games only (proposed), or should an uncurated live link
-   (whole-catalog invite) appear as "an open invitation, N claims left"? Lean yes-as-one-line —
-   it IS chosen-and-waiting, just coarser.
-4. **Anything the composition should refuse to show**: revoked links' historical claims stay
-   (the gift happened; revocation is about the future) — confirm.
+- **Revoked-link two-half fixture** (Lilith Q4): one revoked link carrying one `Fulfilled` claim
+  and one curated-unclaimed game → the claim **appears in `entries`**, the game **does not
+  appear in `waiting`**. Two assertions, one fixture — so a future filter change cannot silently
+  take the gift with it.
+- **Frozen-clock postmark divergence** (Lilith blocker): entry-shaped call vs waiting-shaped
+  call on the same `acquired_at`, distinct expected years.
+- **Waiting-is-listability** (OMBB B1/B2): a `Failed`-retired game, a `hidden` game, and a
+  non-`giftable` game each curated on a live link → none in `waiting`.
+- **SELF-drop + orphan count** (OMBB B3): a `LINK#SELF` claim → absent everywhere,
+  `orphan_claim_count` 0; a synthetic non-SELF orphan → counted.
+
+## crossfire record (Q1–Q4 as resolved)
+
+1. **Order within a year** → ascending chronological, tiebreak `(claimed_at, game_id)`.
+2. **Pending** → badge ≤ 48h, dropped after (premise "transient" measured false: 70-day Pending
+   exists in prod; the stuck specimen is SELF, but the mechanism has no reaper).
+3. **Uncurated live links** → own "doors left open" heading, recipient named, one line each;
+   never under "chosen", never a scalar in the summary (both reviewers, synthesized).
+4. **Revoked links keep historical claims** → confirmed; vanish-from-waiting stated; deep-link
+   rider; two-half fixture owed.
