@@ -39,7 +39,7 @@ in the brand voice:
   ben's words — the link's `gift_note` (the card on the present) and the per-game tag
   `curated_notes[game_id]` (the sticker on the item) when either exists — the friend's
   `thank_note` + `thanked_at` when it came back, and the **postmark span**:
-  **"bought aug 2014 · opened mar 2023 — waited 9 years"** — month + year, exactly what
+  **"bought aug 2014 · opened sep 2023 — waited 9 years"** — month + year, exactly what
   `postmark()` produces (Lilith: the v1 example "bought 2014" was a string the reused function
   cannot emit; adopting the function's own format is both honest and warmer).
   The card deep-links to its owning links-tab row, which already shows revoked state — a warm
@@ -205,8 +205,16 @@ number is dated and re-derivable, not a law.
   take the gift with it.
 - **Frozen-clock postmark divergence** (Lilith blocker): entry-shaped call vs waiting-shaped
   call on the same `acquired_at`, distinct expected years.
-- **Waiting-is-listability** (OMBB B1/B2): a `Failed`-retired game, a `hidden` game, and a
-  non-`giftable` game each curated on a live link → none in `waiting`.
+- **Waiting-is-listability** (OMBB B1/B2): a `Failed`-retired game, a `hidden` game, a
+  non-`giftable` game, **and a stale-Pending game** each curated on a live link → none in
+  `waiting`. The stale-Pending arm is there because that Q2 behaviour is *derived from* this
+  filter (the game sits in `pending` status), and an untested derivation goes invisible the day
+  someone edits the filter (OMBB round 2, ①).
+- **48h boundary, frozen clock** (OMBB round 2 — a time-relative rule reuses the frozen clock or
+  it reintroduces the class it fixed): the composition takes `now: OffsetDateTime` as a
+  parameter (the handler passes `now_utc()`); fixtures sit ON the boundary — one Pending aged
+  47h renders as a badged card, one aged 49h is dropped. A fixture aged 3h asserts nothing
+  about a 48h rule.
 - **SELF-drop + orphan count** (OMBB B3): a `LINK#SELF` claim → absent everywhere,
   `orphan_claim_count` 0; a synthetic non-SELF orphan → counted.
 
