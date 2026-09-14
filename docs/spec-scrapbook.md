@@ -59,6 +59,18 @@ in the brand voice:
     filter keeps them from being called *chosen*.
   - A curated-but-never-claimed game on a **revoked** link deliberately leaves this section —
     stated so a future reader doesn't file the vanish as a bug (OMBB Q4 rider).
+  - A curated **sealed** link's games **stay in this section and SAY SO** — "wrapped until
+    ⟨date⟩" on the group (payload: `sealed_until`). Not merely admissible: the purest instance
+    of the section, and the only waiting on the page with a known end — `unlock_at` is the one
+    field here that points forward, the giver's side of anticipation *with a date* (Lilith's
+    tense ruling on OMBB's step-5 Q1; by omission it would have silently discarded the most
+    on-thesis item the page could carry). Waiting's predicate forgives exactly the `Sealed`
+    refusal of `can_claim`; the doors predicate forgives nothing.
+  - A sealed **uncurated** link appears **nowhere in v1** — it is not an open door ("a door
+    that hasn't opened is not open"), and a fourth section for a rare state is chrome, not
+    warmth. Stated so the omission is a decision; revisit if one exists in practice.
+    (Measured 2026-09-14: 1 of 2,043 prod items carries `unlock_at` — the seal feature is
+    live, not latent.)
 - **"doors left open"** — its own small heading, visually separate from "chosen and waiting"
   (Q3, settled between both reviewers): uncurated live links are *"ben left the door open,"* not
   *"ben picked THIS for YOU,"* and the word **chosen** stays off them. One line per link,
@@ -148,7 +160,7 @@ second member of that list.
     "entries": [ { "claimed_at", "state", "game": {"id","title","artwork_url","acquired_at"},
                    "recipient", "gift_note", "tag", "thank_note", "thanked_at",
                    "link_token", "link_label" } ],
-    "waiting": [ { "link_token", "link_label", "recipient",
+    "waiting": [ { "link_token", "link_label", "recipient", "sealed_until",
                    "games": [ {"id","title","artwork_url","acquired_at"} ] } ],
     "doors_open": [ { "link_token", "link_label", "recipient", "claims_left", "created_at" } ],
     "orphan_claim_count": 0,

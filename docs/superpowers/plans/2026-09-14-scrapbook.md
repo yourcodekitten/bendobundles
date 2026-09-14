@@ -176,11 +176,13 @@ git commit -S -m "📖 dynamo: list_claims() — all claims across LINK# partiti
 
 - [ ] **Step 1: Write the failing composition tests** (`crates/admin-api/src/scrapbook.rs`, bottom, `#[cfg(test)] mod tests`)
 
-Fixture helpers first — every test builds from these three, with a fixed
-`NOW: datetime!(2026-09-14 12:00 UTC)`:
+Fixture helpers first — every test builds from these, with a fixed
+`NOW: datetime!(2026-09-14 12:00 UTC)`. The test module imports `domain::GameStatus` (the
+production module does not need it — `can_claim`/`is_listable` hide it there):
 
 ```rust
-    fn fx_game(id: &str) -> Game { /* Available, giftable, !hidden, artwork Some, acquired_at Some(datetime!(2014-08-15 0:00 UTC)) — copy the full literal shape from store_test.rs's game() helper, every field explicit */ }
+    fn fx_game_with(id: &str, status: GameStatus, giftable: bool, hidden: bool) -> Game { /* every field explicit; artwork Some, acquired_at Some(datetime!(2014-08-15 0:00 UTC)). SHAPE-only reference: store_test.rs's game() helper shows a full Game literal — different signature (game(n: u32, listable: bool)), different crate, cannot be imported; copy the field list, not the arity */ }
+    fn fx_game(id: &str) -> Game { fx_game_with(id, GameStatus::Available, true, false) }
     fn fx_link(token: &str) -> Link { /* claims_allowed 2, claims_used 0, revoked false, no expiry/unlock, no friend, no curation, created_at datetime!(2024-09-01 0:00 UTC) */ }
     fn fx_claim(id: &str, token: &str, gid: &str, state: ClaimState, at: OffsetDateTime) -> Claim { /* every field explicit, gift_url None */ }
 ```
@@ -230,6 +232,16 @@ The test set — one test per spec-owed contract, names fixed (the review gate g
     fn doors_are_uncurated_live_links_with_created_at() {
         // uncurated live link → doors_open row {claims_left = allowed-used, created_at rfc3339};
         // uncurated REVOKED link → absent; curated link → absent from doors.
+    }
+    #[test]
+    fn sealed_two_half_waits_labeled_never_doors() {
+        // ONE fixture, two assertions (the revoked two-half's sibling — step-5 B1):
+        // a SEALED curated link (unlock_at = NOW + 10 days, one listable curated game)
+        // IS in waiting with sealed_until == Some(rfc3339 of that unlock);
+        // a SEALED uncurated link is NOT in doors_open (and nowhere else).
+        // Control: an unsealed curated link's waiting row has sealed_until == None,
+        // and a PAST unlock_at (NOW - 1 day) also yields None — the filter is
+        // sealed-AT-now, not attribute-present.
     }
     #[test]
     fn tag_read_only_for_entry_games() {
@@ -289,6 +301,9 @@ pub struct ScrapbookWaitingLink {
     pub link_token: String,
     pub link_label: String,
     pub recipient: String,
+    /// RFC3339 unlock moment, Some iff the link is sealed AT `now` — the one
+    /// forward-pointing field on the page ("wrapped until ⟨date⟩", spec Q1 ruling).
+    pub sealed_until: Option<String>,
     pub games: Vec<ScrapbookGame>,
 }
 
@@ -332,10 +347,19 @@ fn scrapbook_game(id: &str, games: &HashMap<String, Game>) -> ScrapbookGame {
     }
 }
 
-fn link_is_live(l: &Link, now: OffsetDateTime) -> bool {
-    !l.revoked
-        && l.expires_at.is_none_or(|e| e > now)
-        && l.claims_used < l.claims_allowed
+/// TWO predicates, deliberately — the seal splits them (step-5 B1, decided in spec):
+/// a curated sealed link's games are chosen-and-waiting (the friend just can't open
+/// yet); a sealed uncurated link is NOT an open door — it is wrapped. Both call the
+/// canonical `Link::can_claim` (domain:372) rather than restating a subset of its
+/// four arms — a hand-rolled copy that drops one arm is the drift class this fixes.
+fn link_waits(l: &Link, now: OffsetDateTime) -> bool {
+    // tolerates the seal AND NOTHING ELSE — a future fifth refusal lands
+    // excluded-by-default and must be NAMED to be tolerated (Lilith's form;
+    // the exhaustiveness argument Notify::resolve's own doc makes one crate over)
+    matches!(l.can_claim(now), Ok(()) | Err(domain::ClaimRefusal::Sealed))
+}
+fn link_is_open_door(l: &Link, now: OffsetDateTime) -> bool {
+    l.can_claim(now).is_ok()
 }
 
 fn recipient(l: &Link, friends: &HashMap<String, String>) -> String {
@@ -405,11 +429,14 @@ pub fn compose_scrapbook(
 
     let mut waiting = Vec::new();
     let mut doors_open = Vec::new();
-    let mut live_links: Vec<&&Link> = links_by_token.values().filter(|l| link_is_live(l, now)).collect();
-    live_links.sort_by(|a, b| (a.created_at, &a.token).cmp(&(b.created_at, &b.token)));
-    for link in live_links {
+    let mut sorted_links: Vec<&&Link> = links_by_token.values().collect();
+    sorted_links.sort_by(|a, b| (a.created_at, &a.token).cmp(&(b.created_at, &b.token)));
+    for link in sorted_links {
         let curated = link.curated_game_ids.as_deref().unwrap_or(&[]);
         if curated.is_empty() {
+            if !link_is_open_door(link, now) {
+                continue; // revoked, expired, exhausted — or SEALED: wrapped is not open
+            }
             doors_open.push(ScrapbookDoor {
                 link_token: link.token.clone(),
                 link_label: link.label.clone(),
@@ -418,6 +445,9 @@ pub fn compose_scrapbook(
                 created_at: rfc3339(link.created_at),
             });
             continue;
+        }
+        if !link_waits(link, now) {
+            continue; // dead links leave waiting; a SEAL alone does not
         }
         // THE LISTABILITY TEST, not a claim-absence test (spec B1/B2): Failed
         // retires, hidden/non-giftable were taken off the shelf, a claimed or
@@ -432,6 +462,7 @@ pub fn compose_scrapbook(
                 link_token: link.token.clone(),
                 link_label: link.label.clone(),
                 recipient: recipient(link, &friend_names),
+                sealed_until: link.unlock_at.filter(|u| *u > now).map(rfc3339),
                 games: games_waiting,
             });
         }
@@ -533,7 +564,7 @@ git commit -S -m "📖 admin-api: GET /admin/api/scrapbook — pure clock-inject
 - Produces (Tasks 4–5 import these exact names from `../api` / `../postmark`):
   - `export type ScrapbookGame = { id: string; title: string; artwork_url: string | null; acquired_at: string | null }`
   - `export type ScrapbookEntry = { claimed_at: string; state: 'pending' | 'fulfilled' | 'compensated' | 'failed'; game: ScrapbookGame; recipient: string; gift_note: string | null; tag: string | null; thank_note: string | null; thanked_at: string | null; link_token: string; link_label: string }`
-  - `export type ScrapbookWaitingLink = { link_token: string; link_label: string; recipient: string; games: ScrapbookGame[] }`
+  - `export type ScrapbookWaitingLink = { link_token: string; link_label: string; recipient: string; sealed_until: string | null; games: ScrapbookGame[] }`
   - `export type ScrapbookDoor = { link_token: string; link_label: string; recipient: string; claims_left: number; created_at: string }`
   - `export type ScrapbookView = { entries: ScrapbookEntry[]; waiting: ScrapbookWaitingLink[]; doors_open: ScrapbookDoor[]; orphan_claim_count: number; stale_pending_count: number }`
   - `export async function adminScrapbook(): Promise<ScrapbookView>`
@@ -582,7 +613,10 @@ export async function adminScrapbook(): Promise<ScrapbookView> {
 }
 ```
 
-- [ ] **Step 4: Failing postmark tests** (append to `postmark.test.ts`):
+- [ ] **Step 4: Pin the existing `waitedYears` semantics** (characterization — these tests
+**PASS immediately**, they pin behavior the scrapbook relies on, not new code. ⚠️ If any FAILS,
+STOP: the plan's understanding of `waitedYears` is wrong — re-read `postmark.ts` and reconcile
+before continuing). Append to `postmark.test.ts`:
 
 ```ts
 describe('waitedYears — the two scrapbook call shapes (frozen clock)', () => {
@@ -600,7 +634,7 @@ describe('waitedYears — the two scrapbook call shapes (frozen clock)', () => {
 });
 ```
 
-- [ ] **Step 5: Run** — the three tests must PASS against the existing implementation (they pin semantics, not new code). If any fails, STOP: the plan's understanding of `waitedYears` is wrong — re-read `postmark.ts` and reconcile before continuing.
+- [ ] **Step 5: Run** — `npx vitest run src/postmark.test.ts` → all three PASS (see Step 4's characterization note; a FAIL here is a STOP, not a fix-forward).
 
 - [ ] **Step 6: Amend the doc comment** in `postmark.ts` — replace the line
 `` *  `now` is injectable for tests. `` with:
@@ -633,7 +667,7 @@ git commit -S -m "📖 web: adminScrapbook() + waitedYears call-site contract pi
 **Files:**
 - Create: `web/src/admin/Scrapbook.tsx`
 - Modify: `web/src/App.tsx` (route, in the `/admin` children ~line 29), `web/src/admin/AdminApp.tsx` (fifth NavLink after `friends` ~line 70; **fix the comment at line 16 to `// One place for the nav active/inactive style — every NavLink shares it.` — drop the number, don't increment it**), `web/src/admin/Links.tsx` (row anchors + hash-scroll, for the card deep-link — spec: "the card deep-links to its owning links-tab row")
-- Test: `web/src/admin/Scrapbook.test.tsx`
+- Test: `web/src/admin/Scrapbook.test.tsx`, `web/src/admin/Links.test.tsx` (consuming-side deep-link arm — step-5 B2)
 
 **Interfaces:**
 - Consumes: `adminScrapbook`, `ScrapbookView`, `ScrapbookEntry` from `../api`; `postmark`, `waitedYears` from `../postmark`.
@@ -705,8 +739,25 @@ useEffect(() => {
 }, [hash, links]);   // re-run when rows land — the anchor doesn't exist until data loads
 ```
 
-— because react-router does not scroll to hashes on its own. Test (in `Scrapbook.test.tsx`):
-the card link's `href` ends with `/admin/links#link-<token>`.
+— because react-router does not scroll to hashes on its own. Tests, BOTH sides (step-5 B2 —
+the producing-side href test alone lets a subagent skip `Links.tsx` entirely with every suite
+green; *a fix that cannot go red is the same shape as the gap it closed*):
+- Producing side (`Scrapbook.test.tsx`): the card link's `href` ends with
+  `/admin/links#link-<token>`.
+- Consuming side (append to `web/src/admin/Links.test.tsx`, which already mocks the api —
+  follow its existing render idiom):
+
+```tsx
+it('deep-link hash scrolls to the owning row', async () => {
+  const scrollSpy = vi.fn();
+  HTMLElement.prototype.scrollIntoView = scrollSpy; // jsdom doesn't implement it — unstubbed it throws, which is the honest red
+  // render Links inside <MemoryRouter initialEntries={['/admin/links#link-tok-a']}>
+  // with adminLinks resolving two links (tokens 'tok-a', 'tok-b');
+  await waitFor(() => expect(screen.getByText(/tok-a-label/)).toBeInTheDocument());
+  expect(document.getElementById('link-tok-a')).not.toBeNull();  // the row carries the anchor id
+  expect(scrollSpy).toHaveBeenCalled();                           // and the effect actually scrolled
+});
+```
 
 - [ ] **Step 4: Route + nav.** `App.tsx`: `<Route path="scrapbook" element={<Scrapbook />} />` with the other admin children. `AdminApp.tsx`: NavLink `scrapbook` after `friends`, plus the line-16 comment fix (Global note: **drop the number**).
 
@@ -734,6 +785,9 @@ git commit -S -m "📖 web: /admin/scrapbook — years, jump-list, keepsake card
 
 ```tsx
 it('chosen and waiting: recipient-grouped, listable games only arrive (server filtered)', ...);
+it('a sealed waiting group says "wrapped until ⟨date⟩"; unsealed groups do not', ...);
+   // fixture: one group sealed_until '2026-12-25T15:00:00Z' → heading carries
+   // "wrapped until dec 25"; one group sealed_until null → string absent
 it('doors left open is its own heading — recipient named, never under chosen', ...);
    // asserts "the door ben left open for sam · open 2 years · 2 claims left"
    // shape, with the open-clause omitted for a door younger than a year
@@ -751,7 +805,11 @@ it('quiet footnotes render ONLY when counts are nonzero', ...);
 {recipient}", game rows with `postmark(g.acquired_at ?? undefined)` + default-now
 `waitedYears(g.acquired_at ?? undefined)` ("waiting N years" clause omitted when null) —
 the `?? undefined` coercion is required: API types are `string | null`, the postmark helpers
-take `string | undefined`. Doors: own `<section>` headed `doors left open`,
+take `string | undefined`. A group with `sealed_until` non-null renders "wrapped until
+{sealDate(sealed_until)}" in its heading — `sealDate` is a tiny local helper in
+`Scrapbook.tsx` (`const d = new Date(Date.parse(iso));` → `` `${MONTHS_SHORT[d.getUTCMonth()]} ${d.getUTCDate()}` `` with a lowercase
+month list matching postmark's style — day-level because a seal has a *date*, unlike the
+month-grain postmark; null/junk → omit the clause). Doors: own `<section>` headed `doors left open`,
 one line per door — `the door ben left open for {recipient}` + (waitedYears(created_at) ?
 ` · open {n} years` : ``) + ` · {claims_left} claims left` (singular "claim" when 1). Summary
 sentence above everything, derived client-side from `view` (distinct `recipient` strings ⇒
@@ -839,3 +897,24 @@ execute.** Findings, all fixed above:
 - Interface table: T1→T2 (`list_claims`), T2→T3 (JSON contract), T3→T4/T5
   (`adminScrapbook` + types), T4→T5 (single-fetch component) — all matched, no forward
   references, no orphan Produces.
+
+## Step-5 record (OMBB sign-off pass @ `4086645`, integrated 2026-09-14)
+
+Verdict was **ready after fixes** — five edits (his four + the payload field his Q1-consequence
+note and Lilith's tense ruling made necessary), all in:
+- **B1**: `link_is_live` dropped `can_claim`'s Sealed arm (a live feature — 1 of 2,043 prod
+  items carries `unlock_at`, measured). Fix: TWO predicates, both through the canonical
+  `can_claim` — `link_waits` tolerates exactly `Sealed` (`matches!`, excluded-by-default for
+  any future refusal), `link_is_open_door` forgives nothing. Ruling in spec: curated+sealed
+  stays in waiting AND says so ("wrapped until ⟨date⟩", the page's only forward-pointing
+  item); uncurated+sealed appears nowhere in v1, stated. New payload field `sealed_until`
+  (Some iff sealed at `now`) + `sealed_two_half_waits_labeled_never_doors` test + T5 render
+  arm + `sealDate` helper.
+- **B2**: the deep-link fix could not go red — consuming-side `Links.test.tsx` arm added
+  (row `id` + `scrollIntoView` spy; jsdom's missing impl is the honest red), file added to
+  T4's Files and run command.
+- **M1**: T3 Step 4 retitled characterization, STOP moved into it. **M2/m1/m2**:
+  `fx_game_with(id, status, giftable, hidden)` named, `GameStatus` into the test-mod imports,
+  "shape only, not signature" on the cross-crate reference.
+- His refuted-hunt is on the record too: the T1 scan-count flake he went looking for is
+  already prevented by per-test tables (`store_or_skip`'s own comment).
