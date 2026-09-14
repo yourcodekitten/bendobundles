@@ -4308,3 +4308,51 @@ async fn friend_id_survives_a_claim() {
         "and gsi3 still resolves the link to the friend"
     );
 }
+
+#[tokio::test]
+async fn list_claims_spans_links_and_includes_self() {
+    let Some(store) = store_or_skip("list-claims-spans").await else {
+        return;
+    };
+    // two ordinary links, one claim each
+    for (tok, gid) in [("tok-a", "gk1:game_a"), ("tok-b", "gk1:game_b")] {
+        let mut l = link(tok);
+        l.claims_allowed = 2;
+        store.create_link(&l).await.unwrap();
+        let c = Claim {
+            id: format!("c-{tok}"),
+            link_token: tok.into(),
+            game_id: gid.into(),
+            state: ClaimState::Pending,
+            gift_url: None,
+            revealed_key: None,
+            created_at: datetime!(2026-09-01 12:00 UTC),
+            choice_pre_tpks: None,
+            failure_reason: None,
+        };
+        store.put_claim(&c).await.unwrap();
+    }
+    // one SELF claim — must ALSO be returned (the scan is wide on purpose;
+    // exclusion is the composition's job, not the store's)
+    let self_claim = Claim {
+        id: "c-self".into(),
+        link_token: SELF_LINK_TOKEN.into(),
+        game_id: "gk1:game_c".into(),
+        state: ClaimState::Pending,
+        gift_url: None,
+        revealed_key: None,
+        created_at: datetime!(2026-09-02 12:00 UTC),
+        choice_pre_tpks: None,
+        failure_reason: None,
+    };
+    store.put_claim(&self_claim).await.unwrap();
+
+    let mut got = store.list_claims().await.unwrap();
+    got.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(got.len(), 3, "all claims across all LINK# partitions");
+    assert_eq!(got[0].link_token, SELF_LINK_TOKEN);
+    assert_eq!(got[1].link_token, "tok-a");
+    assert_eq!(got[2].link_token, "tok-b");
+    // link META items must NOT leak in as claims (the sk filter's job)
+    assert!(got.iter().all(|c| !c.id.is_empty()));
+}

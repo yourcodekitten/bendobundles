@@ -2894,6 +2894,51 @@ impl Store {
         Ok(links)
     }
 
+    /// Every CLAIM item across all `LINK#` partitions — the scrapbook's read
+    /// (docs/spec-scrapbook.md). Same completeness loop as `list_links` /
+    /// `list_all_games` (`last_evaluated_key` until exhausted) with a
+    /// deliberately WIDER filter: it spans partitions on purpose, which is why
+    /// `LINK#SELF` claims arrive in the result and must be excluded downstream
+    /// by the composition. Both key halves are constrained (`pk` begins_with
+    /// "LINK#" AND `sk` begins_with "CLAIM#") — nothing in the schema forbids
+    /// a future non-LINK partition growing a CLAIM# sort key, and this filter
+    /// must not be the thing that discovers it. No GSI can answer this query:
+    /// `gsi2pk = "PENDINGCLAIM"` is written only while pending and consumed on
+    /// transition, so fulfilled claims leave that index. Claim body is the
+    /// authoritative record (whole-item PutItem transitions) — `parse_body` is
+    /// the same parse `get_claim` / `claims_for_link` use.
+    pub async fn list_claims(&self) -> Result<Vec<Claim>, StoreError> {
+        let mut claims: Vec<Claim> = Vec::new();
+        let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .filter_expression("begins_with(pk, :lpfx) AND begins_with(sk, :cpfx)")
+                .expression_attribute_values(
+                    ":lpfx",
+                    aws_sdk_dynamodb::types::AttributeValue::S("LINK#".into()),
+                )
+                .expression_attribute_values(
+                    ":cpfx",
+                    aws_sdk_dynamodb::types::AttributeValue::S("CLAIM#".into()),
+                )
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await
+                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
+            for item in out.items() {
+                claims.push(parse_body(item)?);
+            }
+            match out.last_evaluated_key() {
+                None => break,
+                Some(k) => last_key = Some(k.clone()),
+            }
+        }
+        Ok(claims)
+    }
+
     /// Record the whisper for one SLOT (ISO week) — the idempotence gate of the attic whispers.
     /// PutItem conditioned `attribute_not_exists(pk)`: exactly ONE whisper per slot, and only the
     /// winner of this write may send. `Ok(false)` = the slot already has a whisper (a same-slot
