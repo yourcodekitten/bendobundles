@@ -1,5 +1,5 @@
 import { render, screen, within } from '@testing-library/react';
-import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 import { Scrapbook } from './Scrapbook';
 import type { ScrapbookEntry, ScrapbookView } from '../api';
@@ -179,5 +179,130 @@ describe('Scrapbook — the story', () => {
     vi.mocked(adminScrapbook).mockResolvedValue(emptyView);
     renderPage();
     expect(await screen.findByText(/no gifts opened yet/)).toBeInTheDocument();
+  });
+});
+
+describe('Scrapbook — waiting, doors, summary, footnotes', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-14T12:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const richView: ScrapbookView = {
+    entries: [
+      entry({ claimed_at: '2023-04-01T10:00:00Z', recipient: 'sam' }),
+      entry({
+        claimed_at: '2023-05-01T10:00:00Z',
+        recipient: 'sam',
+        game: { id: 'g-2', title: 'second', artwork_url: null, acquired_at: null },
+      }),
+      entry({
+        claimed_at: '2023-06-01T10:00:00Z',
+        recipient: 'sarah bday',
+        thank_note: 'ty!',
+        thanked_at: '2023-06-02T10:00:00Z',
+        game: { id: 'g-3', title: 'third', artwork_url: null, acquired_at: null },
+      }),
+    ],
+    waiting: [
+      {
+        link_token: 'tok-w',
+        link_label: 'label-w',
+        recipient: 'sam',
+        sealed_until: '2026-12-25T15:00:00Z',
+        games: [
+          {
+            id: 'g-wait',
+            title: 'patient treasure',
+            artwork_url: null,
+            acquired_at: '2020-03-01T00:00:00Z',
+          },
+        ],
+      },
+      {
+        link_token: 'tok-w2',
+        link_label: 'label-w2',
+        recipient: 'alex',
+        sealed_until: null,
+        games: [
+          { id: 'g-w2', title: 'quiet wait', artwork_url: null, acquired_at: null },
+        ],
+      },
+    ],
+    doors_open: [
+      {
+        link_token: 'tok-d',
+        link_label: 'label-d',
+        recipient: 'sam',
+        claims_left: 2,
+        created_at: '2024-09-01T00:00:00Z',
+      },
+      {
+        link_token: 'tok-d2',
+        link_label: 'label-d2',
+        recipient: 'jo',
+        claims_left: 1,
+        created_at: '2026-09-01T00:00:00Z', // under a year — clause omitted
+      },
+    ],
+    orphan_claim_count: 0,
+    stale_pending_count: 0,
+  };
+
+  it('chosen and waiting: recipient named, sealed group says wrapped until', async () => {
+    vi.mocked(adminScrapbook).mockResolvedValue(richView);
+    renderPage();
+    await screen.findByText('patient treasure');
+    expect(screen.getByText(/chosen and waiting/)).toBeInTheDocument();
+    const sealedGroup = screen.getByText(/for sam.*wrapped until dec 25/);
+    expect(sealedGroup).toBeInTheDocument();
+    // unsealed group carries no wrapped-until
+    expect(screen.getByText(/^for alex$/)).toBeInTheDocument();
+    // waiting span runs to now (frozen): bought mar 2020, waiting 6 years
+    expect(screen.getByText(/waiting 6 years/)).toBeInTheDocument();
+  });
+
+  it('doors left open is its own heading — recipient named, one line each', async () => {
+    vi.mocked(adminScrapbook).mockResolvedValue(richView);
+    renderPage();
+    await screen.findByText(/doors left open/);
+    expect(
+      screen.getByText('the door ben left open for sam · open 2 years · 2 claims left'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('the door ben left open for jo · 1 claim left'),
+    ).toBeInTheDocument();
+  });
+
+  it('summary sentence counts distinct recipients as people', async () => {
+    vi.mocked(adminScrapbook).mockResolvedValue(richView);
+    renderPage();
+    expect(
+      await screen.findByText('3 gifts opened by 2 people · 1 thank-you ♡'),
+    ).toBeInTheDocument();
+  });
+
+  it('quiet footnotes render ONLY when counts are nonzero', async () => {
+    vi.mocked(adminScrapbook).mockResolvedValue(richView);
+    const first = renderPage();
+    await first.findByText('patient treasure');
+    expect(screen.queryByText(/can't find/)).toBeNull();
+    expect(screen.queryByText(/stuck mid-unwrap/)).toBeNull();
+    first.unmount();
+    vi.mocked(adminScrapbook).mockResolvedValue({
+      ...richView,
+      orphan_claim_count: 1,
+      stale_pending_count: 2,
+    });
+    renderPage();
+    expect(
+      await screen.findByText('1 claim references a link this page can\'t find'),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText('2 gifts are stuck mid-unwrap — see ops'),
+    ).toBeInTheDocument();
   });
 });
