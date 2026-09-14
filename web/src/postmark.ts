@@ -35,7 +35,11 @@ export function postmark(iso: string | undefined): string | null {
  *  years" — D6) and on unknown/junk. Calendar comparison, not 365.25-day division:
  *  the average-year floor reads a gift's exact first anniversary as 0.9993 → 0 →
  *  silence on the one day the line is most deserved (step-5 review, OMBB).
- *  `now` is injectable for tests. */
+ *  `now` is injectable — for tests AND for production callers measuring a span
+ *  that ended in the past: the scrapbook keepsake card MUST pass the claim's
+ *  claimed_at (a default-now call there drifts +1 every January). The waiting
+ *  and doors sections correctly take the default; the door span feeds
+ *  link.created_at, a different field (docs/spec-scrapbook.md). */
 export function waitedYears(
   iso: string | undefined,
   now: number = Date.now(),

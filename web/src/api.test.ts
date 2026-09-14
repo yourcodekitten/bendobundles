@@ -20,6 +20,7 @@ import {
   adminClearSteamIdentity,
   adminSetAppId,
   adminFriends,
+  adminScrapbook,
   adminCreateFriend,
   adminReissueFriendToken,
   adminRevokeFriendToken,
@@ -1112,5 +1113,31 @@ describe('adminSetLinkFriend', () => {
     });
 
     await expect(adminSetLinkFriend('tok', 'f1')).rejects.toThrow(/assign/);
+  });
+});
+
+describe('adminScrapbook', () => {
+  it('fetches and returns the view', async () => {
+    const view = {
+      entries: [],
+      waiting: [],
+      doors_open: [],
+      orphan_claim_count: 0,
+      stale_pending_count: 0,
+    };
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue(view),
+    };
+    mockFetch.mockResolvedValueOnce(mockResponse);
+    const result = await adminScrapbook();
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/scrapbook');
+    expect(result.stale_pending_count).toBe(0);
+  });
+
+  it('throws Unauthorized on 401', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 401, json: vi.fn() });
+    await expect(adminScrapbook()).rejects.toBeInstanceOf(Unauthorized);
   });
 });
