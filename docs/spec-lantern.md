@@ -1,8 +1,9 @@
 # the lantern 🏮 — spec
 
-*2026-09-16, kitten. Status: v3 — OMBB round 1 (B1, B2a, B2b, major, Q①–Q⑤) + Lilith round 1
-(closing looks forward, backlog line, chimney names its action, bell markdown finding) + OMBB's
-round 2 corrections integrated. Where narrative and **decisions** disagree, the decisions win.*
+*2026-09-16, kitten. Status: v4 — OMBB round 1 (B1, B2a, B2b, major, Q①–Q⑤) + Lilith round 1
+(closing looks forward, backlog line, chimney names its action, bell markdown finding) + OMBB
+round 2 (closing on k+1) + round 3 (F1: quiet writes a row) integrated; **go-to-plan given at
+`3d56bbb`**. Where narrative and **decisions** disagree, the decisions win.*
 
 ## why this exists
 
@@ -180,8 +181,9 @@ aws_scheduler_schedule "lantern"  cron(0 17 ? * SUN *)  America/New_York
   └─ fulfillment lambda, input {"op":"lantern"} → FulfillRequest::Lantern
        ├─ GATE  whisper register resolves Webhook?  else loud no-op, ZERO writes (dark-deploy rule)
        ├─ READ  list_links · list_pending_claims · games for the mentioned ids · friends
-       ├─ COMPOSE  lantern::compose(links, claims, games, friends, now) -> Option<Lantern>
-       │      None ⇒ log outcome=lantern_quiet (nothing to say) — no write, no send
+       ├─ COMPOSE  lantern::compose(links, claims, games, friends, slot, now) -> Option<Lantern>
+       │      None ⇒ log outcome=lantern_quiet (nothing to say) — RECORD a `quiet` slot row
+       │             (one write, zero sends; decision F1) and exit
        ├─ RECORD  LANTERN#<iso-week> conditional put (idempotence: one lantern per week)
        ├─ SEND    whisper_send_body(http, url, body)  — the ONE webhook POST function
        └─ MARK    delivered
@@ -216,9 +218,17 @@ aws_scheduler_schedule "lantern"  cron(0 17 ? * SUN *)  America/New_York
   ② **the Wednesday tick is `{"op":"lantern_heartbeat"}` — a distinct op that reads the slot
   row and does exactly one of three things:** row absent ⇒ the Sunday tick never RAN (schedule
   fault, or read-failed before RECORD) ⇒ run the full lantern for that slot (the retry day the
-  whisper's heartbeat also is); row present + `delivered` ⇒ exit, metric touched, nothing else;
-  row present + **undelivered** ⇒ **RESEND the same slot and mark** — this is the answer to the
-  major below. It never composes a different week's lantern: `tick_slot` pins it to Sunday's.
+  whisper's heartbeat also is); row present + (`delivered` OR `quiet`) ⇒ exit, metric touched,
+  nothing else; row present + **undelivered and not quiet** ⇒ **RESEND the same slot and mark**
+  — this is the answer to the major below.
+  🛑 **Decision F1 (OMBB, round 3): a QUIET Sunday must leave a row.** With "quiet ⇒ zero
+  writes", Wednesday reads *absent* and runs the full lantern — and the chimney check uses
+  `now`, so a claim that started Monday is ≥24h Pending by Wednesday and ben gets a Wednesday
+  lantern. *Absent* meant both "never ran" and "ran, said nothing" and the heartbeat could not
+  tell them apart. ⇒ quiet RECORDs `LANTERN#<sunday>` with `quiet = true, delivered = false`
+  (one write a week, zero sends); the heartbeat treats `quiet` like `delivered`. A quiet row is
+  NOT a delivered row, so it never consumes the backlog line (which cannot coincide with a quiet
+  week anyway — a non-zero backlog makes the doors room non-empty). It never composes a different week's lantern: `tick_slot` pins it to Sunday's.
   (OMBB proposed a metric-only op; this is that op plus the one branch that makes a failed
   Sunday recoverable without a second alarm on a room nobody reads. If the family prefers the
   pure metric-only form, the undelivered branch is one `if` to delete and the major reopens.)
@@ -243,7 +253,8 @@ pending read — so a predicate bug reads as "0 of 18" and not as peace; Q① de
 `lantern_slot_taken` (a second tick lost the put — by design) · `lantern_read_failed` (store
 error — the Wednesday heartbeat retries the slot; the pending sweep's rule) · `lantern_send_failed`
 (POST failed after RECORD — the row exists undelivered; **the Wednesday heartbeat resends it**;
-a second failure pings ops and the row stays as the audit trail).
+a second failure pings ops and the row stays as the audit trail). **`lantern_quiet` writes its
+row (F1)** — the only outcome besides a send that leaves one.
 **A quiet lantern sends nothing to ben** (Q① decided: the alarm proves the tick ran, the
 per-room log proves compose judged the real population; a monthly "all quiet" to a human is the
 nag the whisper spec forbade).
@@ -269,11 +280,12 @@ handler must not inherit that branch from the whisper's skeleton.
   `dynamo` (copies of the whisper trio with the new prefix and a `delivered` read for the
   heartbeat's three-way branch).
 - Tests pin: LANTERN_DISABLED darkens only the lantern (bell + whisper unaffected, and vice
-  versa); dark register ⇒ zero store writes; quiet ⇒ zero writes + per-room counts logged;
-  slot-taken ⇒ no send; heartbeat: absent ⇒ full run · delivered ⇒ no read of links/claims, no
-  send · undelivered ⇒ resend + mark, same slot; backlog line present iff no delivered row, and
-  a preview (zero writes) leaves it present; `escape_md` on masked link + backtick; the bell's
-  thanks card escapes.
+  versa); dark register ⇒ zero store writes; **quiet ⇒ exactly one row (`quiet = true`), zero
+  sends** + per-room counts logged; slot-taken ⇒ no send; heartbeat: absent ⇒ full run ·
+  delivered ⇒ no send · **quiet ⇒ no send (F1)** · undelivered ⇒ resend + mark, same slot;
+  backlog line present iff no delivered row (a quiet row does not count), and a preview (zero
+  writes) leaves it present; `escape_md` on masked link + backtick; the bell's thanks card
+  escapes.
 
 ## non-goals (decided, not omitted)
 
@@ -320,3 +332,9 @@ handler must not inherit that branch from the whisper's skeleton.
   reveal.
 - **Bell Markdown finding (Lilith; OMBB confirmed) — not a lantern blocker; FIXED IN THIS PR** via
   the shared `escape_md` the lantern needs anyway. Code span rejected (backtick breakout).
+
+### round 3 (OMBB, 2026-09-16T07:13, read at `3d56bbb`) — go-to-plan, with F1 as a decision
+- **F1 — quiet writes no row ⇒ the heartbeat re-runs a quiet Sunday on Wednesday → accepted.**
+  Quiet records a `quiet = true` slot row; heartbeat treats it like delivered; the quiet test
+  becomes "exactly one row, zero sends".
+- The Sunday-date key + 21:00Z boundary refinement of B2: **taken**.
