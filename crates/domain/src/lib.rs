@@ -384,6 +384,20 @@ impl Link {
         self.can_claim_if_unsealed(now)
     }
 
+    /// A live door a friend could walk through RIGHT NOW: `can_claim` succeeds. Relocated from
+    /// admin-api's scrapbook (its `link_is_open_door`) when the lantern became the second
+    /// caller — two copies of a predicate is where review attention goes to die.
+    pub fn is_open_door(&self, now: OffsetDateTime) -> bool {
+        self.can_claim(now).is_ok()
+    }
+
+    /// "Would be claimable if it weren't wrapped": `can_claim_if_unsealed` succeeds — see that
+    /// method for why the seal's masking must not be re-derived by a consumer. A sealed EXHAUSTED
+    /// link is NOT waiting. Relocated from the scrapbook's `link_waits`.
+    pub fn waits(&self, now: OffsetDateTime) -> bool {
+        self.can_claim_if_unsealed(now).is_ok()
+    }
+
     /// "Would this link be claimable if it weren't wrapped?" — every refusal
     /// EXCEPT the seal, in `can_claim`'s own order. `Sealed` outranks Expired
     /// AND Exhausted there ("a sealed link reports sealed whatever else is
@@ -753,6 +767,25 @@ mod tests {
         );
         let back: Link = serde_json::from_str(&json).unwrap();
         assert_eq!(back.friend_id, None);
+    }
+
+    #[test]
+    fn is_open_door_is_can_claim_and_waits_ignores_the_seal() {
+        let mut l = link();
+        let now = datetime!(2026-07-02 12:00 UTC);
+        l.unlock_at = Some(now + time::Duration::days(1));
+        assert!(!l.is_open_door(now), "sealed is not an open door");
+        assert!(l.waits(now), "sealed still waits");
+        l.unlock_at = None;
+        assert!(l.is_open_door(now));
+        l.claims_used = l.claims_allowed;
+        l.unlock_at = Some(now + time::Duration::days(1));
+        assert!(!l.waits(now), "a sealed EXHAUSTED link is not waiting");
+        l.unlock_at = None;
+        l.claims_used = 0;
+        l.revoked = true;
+        assert!(!l.is_open_door(now));
+        assert!(!l.waits(now), "revoked waits for nobody");
     }
 
     #[test]
