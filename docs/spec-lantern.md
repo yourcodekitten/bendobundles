@@ -1,9 +1,11 @@
 # the lantern 🏮 — spec
 
-*2026-09-16, kitten. Status: v4 — OMBB round 1 (B1, B2a, B2b, major, Q①–Q⑤) + Lilith round 1
-(closing looks forward, backlog line, chimney names its action, bell markdown finding) + OMBB
-round 2 (closing on k+1) + round 3 (F1: quiet writes a row) integrated; **go-to-plan given at
-`3d56bbb`; OMBB plan SIGN-OFF at plan `f204d13` / spec `6d0d34f` (07:48), scoped to D1+D2**. Where narrative and **decisions** disagree, the decisions win.*
+*2026-09-16, kitten. Status: BUILT — plan `docs/superpowers/plans/2026-09-16-the-lantern.md`
+(OMBB plan sign-off at plan `f204d13` / spec `6d0d34f`, 07:48, scoped to D1+D2; both applied).
+History: v1 draft → OMBB round 1 (B1, B2a, B2b, major, Q①–Q⑤) + Lilith round 1 (closing looks
+forward, backlog line, chimney names its action, bell markdown finding) + OMBB round 2 (closing
+on k+1) + round 3 (F1: quiet writes a row) + plan gate (17:05 ticks, real split mute, no-history
+heartbeat arm, quiet-settle). Where narrative and **decisions** disagree, the decisions win.*
 
 ## why this exists
 
@@ -357,3 +359,18 @@ handler must not inherit that branch from the whisper's skeleton.
   Quiet records a `quiet = true` slot row; heartbeat treats it like delivered; the quiet test
   becomes "exactly one row, zero sends".
 - The Sunday-date key + 21:00Z boundary refinement of B2: **taken**.
+
+## deploy checklist (Task 8; the tfvars flip is a deploy step because the file is gitignored)
+
+1. `lantern_enabled = true` added to the LOCAL, gitignored `terraform/production.tfvars`.
+2. `terraform plan` shows exactly: 1 schedule group · 2 schedules · 1 IAM role + 1 inline policy
+   · 2 alarms — and NOTHING else (the lambda's env is untouched: `LANTERN_DISABLED` is not
+   plumbed, by design). Any other resource in the plan is a stop.
+3. Apply (kitten-deploy).
+4. `aws lambda invoke --payload '{"op":"lantern_preview"}'` ⇒ `preview_sent`; the message lands
+   in ben's channel with the `(preview — nothing recorded)` header; the preview's own log line
+   reads `rows=0`. The message IS the reveal — step 14 follows within minutes.
+5. **OWED on the checkpoint: watch the first real tick, Sun 2026-09-20 17:05 ET** — expect one
+   message and one `delivered` row. Until then the heartbeat's no-history arm makes a dead Sunday
+   schedule invisible (stated residual). The Wed 09-23 17:05 heartbeat should log
+   `slot settled — metric touched`.
