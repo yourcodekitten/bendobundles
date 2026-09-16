@@ -146,6 +146,10 @@ pub struct Lantern {
     pub rooms: Vec<Room>,
     /// doors, chimney, wrapped, closing — what compose JUDGED (logged on quiet too).
     pub counts: [u32; 4],
+    /// Doors past their 60d birthday summarised by the backlog line (only before the first
+    /// delivery). Separate from `counts[0]` so the first lantern's log does not read "doors=0"
+    /// on the one week it carries nine of them (pass-1 review, minor 5).
+    pub backlog: u32,
 }
 
 fn is_shelf(l: &Link) -> bool {
@@ -291,10 +295,16 @@ pub fn compose(input: &Input) -> Option<Lantern> {
         .map(|l| {
             let e = l.expires_at.expect("filtered");
             let left = l.claims_allowed - l.claims_used;
+            // BUCKET(k+1) holds both tonight (after the tick) and next Sunday before 21:00Z;
+            // "closes sunday" would be ambiguous, so the tick's own date says "tonight"
+            let when = if eastern_date(e) == eastern_date(now) {
+                "tonight".to_string()
+            } else {
+                weekday_name(e).to_string()
+            };
             format!(
-                "· the door for {} closes {} with {left} claim{} left",
+                "· the door for {} closes {when} with {left} claim{} left",
                 recipient(l, friends),
-                weekday_name(e),
                 if left == 1 { "" } else { "s" }
             )
         })
@@ -324,7 +334,11 @@ pub fn compose(input: &Input) -> Option<Lantern> {
     if rooms.is_empty() {
         None
     } else {
-        Some(Lantern { rooms, counts })
+        Some(Lantern {
+            rooms,
+            counts,
+            backlog,
+        })
     }
 }
 
@@ -499,7 +513,9 @@ mod tests {
         ] {
             let slots = [tick_slot(a), tick_slot(b), tick_slot(b).next()];
             assert_eq!(slots[0].next(), slots[1]);
-            let mut t = a;
+            // start INSIDE slots[0] (the tick at `a` is already past its own bucket's end) so all
+            // three buckets and both boundaries are sampled (pass-1 review, nit 6)
+            let mut t = slots[0].end() - time::Duration::hours(3);
             while t < b + time::Duration::hours(3) {
                 let n = slots.iter().filter(|s| s.contains(t)).count();
                 assert_eq!(n, 1, "{t} in {n} buckets");
@@ -686,7 +702,7 @@ mod tests {
             "{:?}",
             r.lines
         );
-        assert!(r.lines[0].contains("label-tonight") && r.lines[0].contains("closes sunday"));
+        assert!(r.lines[0].contains("label-tonight") && r.lines[0].contains("closes tonight"));
         assert!(r.lines[1].contains("label-nextthu") && r.lines[1].contains("closes thursday"));
     }
 
@@ -760,6 +776,22 @@ mod tests {
         assert!(v["embeds"].as_array().unwrap().is_empty());
         let p = render(&l, &slot, "https://s", true);
         assert!(p["content"].as_str().unwrap().contains("(preview"));
+    }
+
+    #[test]
+    fn eastern_offset_transitions_at_the_us_rule_instants() {
+        // 2026: 2nd Sunday of March = 03-08 (March 1 IS a Sunday ⇒ to_sun == 0 exercised);
+        // 1st Sunday of November = 11-01. 2027: 03-14 / 11-07.
+        let est = UtcOffset::from_hms(-5, 0, 0).unwrap();
+        let edt = UtcOffset::from_hms(-4, 0, 0).unwrap();
+        assert_eq!(eastern_offset(datetime!(2026-03-08 06:59:59 UTC)), est);
+        assert_eq!(eastern_offset(datetime!(2026-03-08 07:00:00 UTC)), edt);
+        assert_eq!(eastern_offset(datetime!(2026-11-01 05:59:59 UTC)), edt);
+        assert_eq!(eastern_offset(datetime!(2026-11-01 06:00:00 UTC)), est);
+        assert_eq!(eastern_offset(datetime!(2027-03-14 06:59:59 UTC)), est);
+        assert_eq!(eastern_offset(datetime!(2027-03-14 07:00:00 UTC)), edt);
+        assert_eq!(eastern_offset(datetime!(2027-11-07 05:59:59 UTC)), edt);
+        assert_eq!(eastern_offset(datetime!(2027-11-07 06:00:00 UTC)), est);
     }
 
     #[test]

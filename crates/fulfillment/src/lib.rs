@@ -230,6 +230,9 @@ pub enum FulfillResponse {
     PreviewBlocked,
     /// whisper_preview: the card was built and the POST failed.
     PreviewSendFailed,
+    /// lantern_preview: this week would be QUIET — a healthy state, not a blocked one (the
+    /// deploy checklist's named alternative to `PreviewSent`).
+    PreviewQuiet,
     CookieStatus {
         ok: bool,
     },
@@ -5129,9 +5132,18 @@ async fn lantern_reads(deps: &Deps) -> Option<LanternReads> {
         .ok()?;
     let mut games = std::collections::HashMap::new();
     for c in &pending {
-        // an unreadable/missing game renders as its id — counted, never skipped
-        if let Ok(Some(g)) = deps.store.get_game(&c.game_id).await {
-            games.insert(c.game_id.clone(), g);
+        match deps.store.get_game(&c.game_id).await {
+            Ok(Some(g)) => {
+                games.insert(c.game_id.clone(), g);
+            }
+            // a MISSING game renders as its id — counted, never skipped (a true orphan)
+            Ok(None) => {}
+            // a store ERROR is not an orphan: shipping a raw id and then marking the slot
+            // delivered would put it beyond the heartbeat's repair (pass-1 review, minor 1)
+            Err(e) => {
+                tracing::error!(error = ?e, game = %c.game_id, outcome = "lantern_read_failed", "lantern: cannot read a pending claim's game");
+                return None;
+            }
         }
     }
     let friends = friends.into_iter().map(|f| (f.id, f.name)).collect();
@@ -5224,7 +5236,7 @@ async fn run_lantern(deps: &Deps, slot: &lantern::Slot) -> bool {
                 "quiet, and the slot was already taken"
             ),
             Err(e) => {
-                tracing::error!(error = ?e, slot = %slot.key(), "lantern: quiet record failed")
+                tracing::error!(error = ?e, slot = %slot.key(), outcome = "lantern_record_failed", "lantern: quiet record failed")
             }
         }
         return false;
@@ -5249,7 +5261,7 @@ async fn run_lantern(deps: &Deps, slot: &lantern::Slot) -> bool {
             return false;
         }
     }
-    tracing::info!(slot = %slot.key(), doors = d, chimney = c, wrapped = w, closing = x, "lantern composed");
+    tracing::info!(slot = %slot.key(), doors = d, chimney = c, wrapped = w, closing = x, backlog = card.backlog, "lantern composed");
     send_and_mark(deps, &url, slot, &card).await
 }
 
@@ -5264,7 +5276,7 @@ async fn send_and_mark(
     let body = lantern::render(card, slot, &deps.whisper_site_url, false);
     if whisper_send_body(&deps.http, url, &body).await {
         if let Err(e) = deps.store.mark_lantern_delivered(&slot.key()).await {
-            tracing::error!(error = ?e, slot = %slot.key(), "lantern sent but mark failed — heartbeat will resend (at-least-once)");
+            tracing::error!(error = ?e, slot = %slot.key(), outcome = "lantern_mark_failed", "lantern sent but mark failed — heartbeat will resend (at-least-once)");
         }
         true
     } else {
@@ -5394,8 +5406,17 @@ async fn handle_lantern_preview(deps: &Deps) -> FulfillResponse {
             outcome = "lantern_preview_quiet",
             "lantern_preview: this week would be quiet — nothing to show"
         );
-        return FulfillResponse::PreviewBlocked;
+        return FulfillResponse::PreviewQuiet;
     };
+    let [d, c, w, x] = card.counts;
+    tracing::info!(
+        doors = d,
+        chimney = c,
+        wrapped = w,
+        closing = x,
+        backlog = card.backlog,
+        "lantern_preview: composed"
+    );
     let body = lantern::render(&card, &input.slot, &deps.whisper_site_url, true);
     if whisper_send_body(&deps.http, &url, &body).await {
         FulfillResponse::PreviewSent

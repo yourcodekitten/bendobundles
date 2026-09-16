@@ -9627,7 +9627,10 @@ async fn lantern_quiet_writes_exactly_one_row_and_sends_nothing() {
     };
     let humble = MockServer::start().await;
     let discord = discord_ok().await;
-    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    let ops = discord_ok().await;
+    // an OPS webhook is wired so "quiet must not page ops" is an assertion, not an accident
+    let mut d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    d.notify = fulfillment::Notify::Webhook(ops.uri());
     assert_eq!(
         handle(&d, FulfillRequest::Lantern).await,
         FulfillResponse::Lanterned
@@ -9636,6 +9639,51 @@ async fn lantern_quiet_writes_exactly_one_row_and_sends_nothing() {
     assert_eq!(rows.len(), 1);
     assert!(rows[0].quiet && !rows[0].delivered);
     assert_eq!(discord.received_requests().await.unwrap().len(), 0);
+    assert_eq!(
+        ops.received_requests().await.unwrap().len(),
+        0,
+        "a quiet week is healthy — it must NOT page ops (unlike the whisper's empty pool)"
+    );
+}
+
+#[tokio::test]
+async fn lantern_send_failure_leaves_an_undelivered_row_pings_ops_and_the_heartbeat_resends() {
+    let Some(store) = store_or_skip("lantern_send_failed").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let ops = discord_ok().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&discord)
+        .await;
+    seed_stuck_pending(&store, 3).await;
+    let mut d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    d.notify = fulfillment::Notify::Webhook(ops.uri());
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    // Sunday: POST fails ⇒ recorded, undelivered, ops told
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    let r = store.get_lantern(&slot).await.unwrap().unwrap();
+    assert!(!r.delivered && !r.quiet, "row stays undelivered");
+    let ops_reqs = ops.received_requests().await.unwrap();
+    assert_eq!(ops_reqs.len(), 1);
+    assert!(String::from_utf8_lossy(&ops_reqs[0].body).contains("SEND FAILED"));
+    // Wednesday: the webhook is healthy again ⇒ the heartbeat resends the SAME slot and marks it
+    discord.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1);
+    assert!(store.get_lantern(&slot).await.unwrap().unwrap().delivered);
 }
 
 #[tokio::test]

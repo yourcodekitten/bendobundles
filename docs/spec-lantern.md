@@ -50,7 +50,8 @@ something to say.** Four rooms, each a section; empty rooms are omitted; all emp
    · the door for jo closes thursday with 2 claims left  ↗ links
 ```
 
-Every line deep-links to the **admin** page that acts on it (`/admin/links`, `/admin/ops`),
+Every ROOM heading deep-links to the **admin** page that acts on it (`/admin/links`,
+`/admin/ops`) — one link per room, not per line (built: five identical URLs per room is noise) —
 never to the friend-facing invite. **No bearer capability rides the message** — the link token IS
 the claim capability, and a Discord channel is not a vault (the whisper's deep-link rule, kept).
 
@@ -160,7 +161,7 @@ line names the action AND the gap; the reveal puts the #234 disposition to ben a
 
 - `content` = header line + rooms as plain text (the whisper v1 shape, not v2 embeds: this is a
   list, not a card; embeds would fight the one-screen rule). `allowed_mentions: {"parse": []}`.
-- **Per-room cap 5 lines + "· and N more ↗"**; total content capped at 2000 (Discord's hard
+- **Per-room cap 5 lines + "· and N more"**; total content capped at 2000 (Discord's hard
   limit) with the same `cap()` helper the bell uses. Ordering inside a room: oldest first.
 - Recipient naming reuses the scrapbook's rule: `Friend.name` via `friend_id`, else the link
   `label`. (Measured: no link carries `friend_id` yet; labels it is.)
@@ -173,8 +174,9 @@ line names the action AND the gap; the reveal puts the #234 disposition to ben a
   link with made-up text. `allowed_mentions` stops pings, not links. The lantern interpolates
   **labels (admin-written), friend names (admin-written) and game TITLES (Humble/Steam-sourced,
   third-party text)** — a title with `*`, `_` or brackets renders wrong at best. ⇒ **one helper,
-  `discord::escape_md(&str)`, escaping `\ * _ ~ \` | > [ ] ( )`, in the shared send module; the
-  lantern uses it on every field and the bell's `thanks_card` adopts it in the same PR** (the
+  `domain::text::escape_md(&str)`, escaping `\ * _ ~ \` | > [ ] ( )`, beside the one
+  `sanitize_line`; the lantern uses it on every field via `bell::field` (sanitise → cap → escape)
+  and the bell's `thanks_card` adopts it in the same PR** (the
   repo's one-copy rule; a code span was rejected — a backtick in the note breaks out of it).
   Tests: a masked link + a stray backtick render inert; the escape is idempotent on plain text.
 - Dates in the message are **America/New_York** (ben reads local; the tick is tz-aware).
@@ -189,7 +191,7 @@ aws_scheduler_schedule "lantern"  cron(5 17 ? * SUN *)  America/New_York   (hear
        ├─ COMPOSE  lantern::compose(links, claims, games, friends, slot, now) -> Option<Lantern>
        │      None ⇒ log outcome=lantern_quiet (nothing to say) — RECORD a `quiet` slot row
        │             (one write, zero sends; decision F1) and exit
-       ├─ RECORD  LANTERN#<iso-week> conditional put (idempotence: one lantern per week)
+       ├─ RECORD  LANTERN#<sunday-date> conditional put (idempotence: one lantern per week)
        ├─ SEND    whisper_send_body(http, url, body)  — the ONE webhook POST function
        └─ MARK    delivered
 ```
@@ -367,7 +369,8 @@ handler must not inherit that branch from the whisper's skeleton.
    · 2 alarms — and NOTHING else (the lambda's env is untouched: `LANTERN_DISABLED` is not
    plumbed, by design). Any other resource in the plan is a stop.
 3. Apply (kitten-deploy).
-4. `aws lambda invoke --payload '{"op":"lantern_preview"}'` ⇒ `preview_sent`; the message lands
+4. `aws lambda invoke --payload '{"op":"lantern_preview"}'` ⇒ `preview_sent` (a healthy quiet
+   week answers `preview_quiet`, never `preview_blocked`); the message lands
    in ben's channel with the `(preview — nothing recorded)` header; the preview's own log line
    reads `rows=0`. The message IS the reveal — step 14 follows within minutes.
 5. **OWED on the checkpoint: watch the first real tick, Sun 2026-09-20 17:05 ET** — expect one

@@ -51,6 +51,9 @@ pub(crate) fn field(raw: &str, max: usize) -> String {
 /// Final-content cap that never strands a trailing backslash (a `\` at the cut would escape the
 /// character after it in the template). Applied to the FINISHED string, after every field's own
 /// escape — so the 2000 bound is on what Discord receives.
+/// INVARIANT for template authors: every card's `content` must END in literal text or the site
+/// URL, never in a foreign field — this pops EVERY trailing backslash, so a sub-cap content ending
+/// in an escaped backslash would lose a legitimate character. Unreachable today; stated so it stays so.
 pub(crate) fn cap_content(s: &str) -> String {
     let mut out = cap(s, BELL_CONTENT_MAX);
     while out.ends_with('\\') {
