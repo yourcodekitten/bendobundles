@@ -246,10 +246,12 @@ aws_scheduler_schedule "lantern"  cron(0 17 ? * SUN *)  America/New_York
   POST that lands whose MARK then fails (timeout) leaves the row undelivered and Wednesday sends
   a duplicate — a duplicate beats lost mentions, written down here so nobody "fixes" it into
   at-most-once and reopens the major.
-- **Terraform:** `lantern_enabled` (default false → dark deploy), `lantern_schedule_expression`,
-  schedule group + schedule + scheduler role (copies of the whisper trio), alarm clone,
-  `LANTERN_DISABLED` env plumbed. No new IAM beyond invoking the existing lambda and the
-  existing SSM read (the register already exists).
+- **Terraform:** `lantern_enabled` (default false → dark deploy), `lantern_schedule_expression`
+  + `lantern_heartbeat_schedule_expression`, schedule group + two schedules + scheduler role
+  (copies of the whisper trio), alarm clones. **`LANTERN_DISABLED` is NOT terraform-plumbed** —
+  parity with `BELL_DISABLED` (no `*_DISABLED` is; plan review Q①): an operator mute is a manual
+  env edit on the lambda. No new IAM beyond invoking the existing lambda and the existing SSM
+  read (the register already exists).
 
 ### silence is a state, not an absence
 

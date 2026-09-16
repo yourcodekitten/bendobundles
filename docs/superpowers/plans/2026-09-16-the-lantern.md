@@ -8,7 +8,11 @@
 
 **Tech Stack:** Rust 2024 (workspace), `time 0.3`, `serde_json`, `aws-sdk-dynamodb`, wiremock + dynamodb-local for handler tests, Terraform (EventBridge Scheduler, CloudWatch, SSM), the existing `bendoerr-terraform-modules/*`.
 
-**Spec:** `docs/spec-lantern.md` (v4 at `1a782d7`; decisions section wins over narrative).
+**Spec:** `docs/spec-lantern.md` (v5 at `290f41b`; decisions section wins over narrative).
+
+**Branch:** `lantern` already exists on origin (spec + this plan live on it). Every task commits to it; no task creates a branch.
+
+**Review:** cold implementation-plan-review 2026-09-16T07:2x (3 blockers, 8 majors) integrated — see the tail of this file.
 
 ## Global Constraints
 
@@ -23,6 +27,7 @@
 - **No bearer capability in any message.** Deep links are `{site}/admin/links` and `{site}/admin/ops` only.
 - **Empty lantern is HEALTHY** — it must not page ops (the whisper's empty-pool ping is NOT inherited).
 - **Commits:** GPG-signed, authored `code kitten <yourcodekitten@gmail.com>`; message style: lowercase, no conventional-commit prefix (repo convention: see `git log`).
+- **`LANTERN_DISABLED` is NOT terraform-plumbed** — parity with `BELL_DISABLED` (measured: no `*_DISABLED` is in `aws-lambda.tf`); it is a manual env edit on the lambda for an operator mute. The spec's "plumbed" wording is corrected here.
 - **Tests:** unit tests run with `cargo test -p <crate> --lib`; handler tests in `crates/fulfillment/tests/handler_test.rs` need dynamodb-local (`store_or_skip` skips locally, CI runs them for real). **CI is the authoritative run** — if the local link OOMs, push and read CI, never "assume green".
 
 ---
@@ -32,7 +37,7 @@
 | File | Responsibility |
 |---|---|
 | `crates/domain/src/lib.rs` | `Link::is_open_door(now)`, `Link::waits(now)` (relocated from admin-api scrapbook); `LanternRecord` |
-| `crates/domain/src/text.rs` (new) | `sanitize_line`, `is_spoofing_format_char`, `escape_md` — ONE copy |
+| `crates/domain/src/text.rs` (new) | `sanitize_line`, `escape_md` — ONE copy (`is_spoofing_format_char` ALREADY lives in `domain/src/lib.rs:654`, public-api imports it; admin-api's private copy is deleted) |
 | `crates/public-api/src/lib.rs`, `crates/admin-api/src/lib.rs` | adopt `domain::text::sanitize_line` (delete private copies) |
 | `crates/admin-api/src/scrapbook.rs` | adopt `Link::is_open_door` / `Link::waits` |
 | `crates/fulfillment/src/bell.rs` | cards use sanitize→cap→escape via `domain::text` |
@@ -41,7 +46,7 @@
 | `crates/fulfillment/src/lib.rs` | `FulfillRequest::{Lantern, LanternHeartbeat, LanternPreview}`, `FulfillResponse::Lanterned`, `Deps.lantern_disabled`, handlers |
 | `crates/fulfillment/src/main.rs` | `lantern_suppressed`, env wiring |
 | `crates/fulfillment/tests/handler_test.rs` | lantern handler arms |
-| `terraform/aws-eventbridge.tf`, `aws-cloudwatch-alarms.tf`, `aws-lambda.tf`, `tf-variables.tf`, `production.tfvars` | schedules, alarms, env, flag |
+| `terraform/aws-eventbridge.tf`, `aws-cloudwatch-alarms.tf`, `tf-variables.tf`, `production.tfvars` | schedules, alarms, flag (no lambda env change — see Global Constraints) |
 
 ---
 
@@ -141,12 +146,13 @@ git commit -S -m "domain: Link::is_open_door + Link::waits — the scrapbook's d
 **Files:**
 - Create: `crates/domain/src/text.rs`
 - Modify: `crates/domain/src/lib.rs` (add `pub mod text;` near the top)
-- Modify: `crates/public-api/src/lib.rs:~1090-1122` (delete private `is_spoofing_format_char` + `sanitize_note`; adopt)
-- Modify: `crates/admin-api/src/lib.rs:~1085-1118` (delete private `is_spoofing_format_char` + `sanitize_friend_name`; adopt)
+- Modify: `crates/public-api/src/lib.rs:1103-1122` (delete private `sanitize_note`; KEEP `use domain::is_spoofing_format_char;` at :21)
+- Modify: `crates/admin-api/src/lib.rs:1073-1118` (delete private `is_spoofing_format_char` AND `sanitize_friend_name`; adopt)
 - Test: `crates/domain/src/text.rs` tests module
 
 **Interfaces:**
-- Produces: `domain::text::sanitize_line(raw: &str) -> String`, `domain::text::is_spoofing_format_char(c: char) -> bool`, `domain::text::escape_md(s: &str) -> String`, `domain::text::MD_META: &[char]`
+- Consumes: `domain::is_spoofing_format_char(c: char) -> bool` — EXISTING at `crates/domain/src/lib.rs:654` ("MOVED VERBATIM from public-api"); do NOT write another.
+- Produces: `domain::text::sanitize_line(raw: &str) -> String`, `domain::text::escape_md(s: &str) -> String`, `domain::text::MD_META: &[char]`
 
 - [ ] **Step 1: write the failing tests**
 
@@ -204,20 +210,7 @@ Prepend to `crates/domain/src/text.rs` (above the tests):
 /// rejected because a backtick in the field breaks out of it). Order is irrelevant; membership is.
 pub const MD_META: &[char] = &['\\', '*', '_', '~', '`', '|', '>', '[', ']', '(', ')'];
 
-/// Unicode format characters that can spoof text direction/joining. Copied verbatim from the two
-/// former private copies (public-api + admin-api) — the range list is the contract, do not trim.
-pub fn is_spoofing_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{200B}'..='\u{200F}'   // ZW space/non-joiner/joiner, LRM, RLM
-        | '\u{202A}'..='\u{202E}' // LRE/RLE/PDF/LRO/RLO
-        | '\u{2060}'..='\u{2064}' // word joiner … invisible plus
-        | '\u{2066}'..='\u{2069}' // LRI/RLI/FSI/PDI
-        | '\u{FEFF}'              // BOM / ZWNBSP
-        | '\u{FE00}'..='\u{FE0F}' // variation selectors
-        | '\u{E0100}'..='\u{E01EF}'
-    )
-}
+use crate::is_spoofing_format_char;
 
 /// Line/segment separators (newline, CR, tab, VT, FF, NEL, U+2028/U+2029) become one space so a
 /// multiline paste keeps its word boundaries; every other control char and every spoofing format
@@ -252,7 +245,7 @@ pub fn escape_md(s: &str) -> String {
 }
 ```
 
-⚠️ **Before committing, diff `is_spoofing_format_char` against the ORIGINAL in `crates/public-api/src/lib.rs`** (the ranges above were transcribed from a partial read — the file is the truth): `grep -n 'fn is_spoofing_format_char' -A 14 crates/public-api/src/lib.rs`. Copy that body verbatim over the one above if they differ in any range.
+`is_spoofing_format_char` is `domain`'s existing `pub fn` (`lib.rs:654`, 20 ranges incl. `00AD`, `2060–206F`, `FFF9–FFFB`, `E0000–E007F`; it deliberately does NOT strip variation selectors, so `❤️` keeps its `FE0F`). The plan's first draft re-transcribed a narrower list — the review caught it. Use the existing fn; never re-declare it.
 
 - [ ] **Step 4: run to verify it passes**
 
@@ -261,19 +254,19 @@ Expected: PASS (3 tests)
 
 - [ ] **Step 5: adopt in public-api and admin-api**
 
-In `crates/public-api/src/lib.rs`: delete the private `fn is_spoofing_format_char` and `fn sanitize_note`; add `use domain::text::sanitize_line;` and replace every `sanitize_note(` call with `sanitize_line(` (`grep -n 'sanitize_note\|is_spoofing_format_char' crates/public-api/src/lib.rs`). If any test in that crate calls `sanitize_note` directly, redirect it the same way — the test bodies are the behavioural pin.
-In `crates/admin-api/src/lib.rs`: same for `sanitize_friend_name` → `sanitize_line`, delete its private `is_spoofing_format_char`.
+In `crates/public-api/src/lib.rs`: delete ONLY the private `fn sanitize_note` (:1112-1122) and its doc comment; KEEP `use domain::is_spoofing_format_char;` (:21) if anything else in the file still uses it, else drop the now-unused import (clippy `-D warnings` fails on unused imports). Add `use domain::text::sanitize_line;` and replace every `sanitize_note(` call with `sanitize_line(` (`grep -n 'sanitize_note' crates/public-api/src/lib.rs`). If any test calls `sanitize_note` directly, redirect it — the test bodies are the behavioural pin.
+In `crates/admin-api/src/lib.rs`: delete BOTH the private `fn is_spoofing_format_char` (:1073, the "deliberate second copy") and `fn sanitize_friend_name` (:1105); add `use domain::text::sanitize_line;`; replace every `sanitize_friend_name(` call with `sanitize_line(`. Update `domain/src/lib.rs:652-653`'s comment ("keeps the count at two") to say the count is now ONE.
 
 - [ ] **Step 6: run the three crates**
 
 Run: `cargo test -p domain --lib && cargo test -p public-api --lib && cargo test -p admin-api --lib`
-Expected: PASS, and `grep -rn 'fn sanitize_note\|fn sanitize_friend_name\|fn is_spoofing_format_char' crates/` prints exactly ONE hit, in `crates/domain/src/text.rs`.
+Expected: PASS; `grep -rn 'fn is_spoofing_format_char' crates/` prints exactly ONE hit (`crates/domain/src/lib.rs`), and `grep -rn 'fn sanitize_note\|fn sanitize_friend_name' crates/` prints ZERO.
 
 - [ ] **Step 7: commit**
 
 ```bash
 git add crates/domain/src/text.rs crates/domain/src/lib.rs crates/public-api/src/lib.rs crates/admin-api/src/lib.rs
-git commit -S -m "domain::text — sanitize_line + escape_md, one copy (public-api/admin-api adopt; the lantern is the third caller)"
+git commit -S -m "domain::text — sanitize_line + escape_md, one copy (public-api/admin-api adopt; admin-api's second is_spoofing_format_char deleted)"
 ```
 
 ---
@@ -309,12 +302,16 @@ git commit -S -m "domain::text — sanitize_line + escape_md, one copy (public-a
     }
 
     #[test]
-    fn cards_apply_the_2000_cap_to_the_final_escaped_content() {
-        let note = "*".repeat(500);
-        let v = thanks_card(&"_".repeat(120), &note, "https://s");
+    fn cap_content_cuts_at_2000_and_never_strands_a_backslash() {
+        // thanks_card cannot reach 2000 (≈240+1000+50), so test the cap DIRECTLY where the cut
+        // lands on an escape: 1998 'y' + "\\x" → the 2000th char is the backslash → popped.
+        let s = format!("{}\\x", "y".repeat(1998));
+        assert_eq!(cap_content(&s), "y".repeat(1998));
+        assert_eq!(cap_content("short").as_str(), "short");
+        // a card path that DOES reach the cap: a 6000-char site_url on unwrap_card
+        let v = unwrap_card("sam", "Celeste", None, &"u".repeat(6000), false);
         let c = v["content"].as_str().unwrap();
-        assert!(c.chars().count() <= 2000, "{}", c.chars().count());
-        assert!(!c.ends_with('\\'), "cap must not leave a dangling backslash");
+        assert!(c.chars().count() <= 2000 && !c.ends_with('\\'));
     }
 
     #[test]
@@ -333,11 +330,9 @@ Expected: FAIL — `cannot find function field`, and `thanks_card_escapes_markdo
 
 - [ ] **Step 3: implement**
 
-In `bell.rs`, below `fn cap`:
+In `bell.rs`: add `use domain::text::{escape_md, sanitize_line};` at the TOP of the file (beside the existing `use crate::Deps;` block — move that block up too if it sits mid-file), then below `fn cap`:
 
 ```rust
-use domain::text::{escape_md, sanitize_line};
-
 /// The ONE way a foreign string enters `content`: sanitise (fold line breaks, strip controls —
 /// a Steam title with `\n# ` must not become a heading), cap by CHARS, THEN escape exactly once
 /// (escaping first lets the cap cut between `\` and `*`). Shared with the lantern via
@@ -365,7 +360,7 @@ Then:
 - [ ] **Step 4: run**
 
 Run: `cargo test -p fulfillment --lib bell::`
-Expected: PASS (existing 4 + new 4). `thanks_card_quotes_the_note_and_denies_mentions` still passes — `@everyone` has no metacharacter.
+Expected: PASS (existing 4 + new 4). `thanks_card_quotes_the_note_and_denies_mentions` still passes — `@everyone` has no metacharacter. `field_caps_before_escaping_so_no_dangling_backslash` is a real red first: `field` does not exist.
 
 - [ ] **Step 5: commit**
 
@@ -391,7 +386,7 @@ git commit -S -m "bell: sanitise → cap → escape_md on every foreign field �
   - `Store::get_lantern(&self, slot: &str) -> Result<Option<LanternRecord>, StoreError>`
   - `Store::list_lanterns(&self) -> Result<Vec<LanternRecord>, StoreError>`
 
-- [ ] **Step 1: the failing store test** (append to `crates/dynamo/tests/store_test.rs`, copying the file's `store_or_skip`/table-setup idiom from its whisper test — `grep -n 'record_whisper' crates/dynamo/tests/store_test.rs` to find it)
+- [ ] **Step 1: the failing store test** (append to `crates/dynamo/tests/store_test.rs`, copying the file's `store_or_skip`/table-setup idiom from its whisper test — `grep -n 'record_whisper' crates/dynamo/tests/store_test.rs` to find it). **Add `StoreError` to the file's `use dynamo::{…}` list at :6-10** — it is not imported today and the last assertion needs it.
 
 ```rust
 #[tokio::test]
@@ -504,12 +499,18 @@ pub struct LanternRecord {
         let slot = item.get("pk").and_then(|v| v.as_s().ok())
             .and_then(|s| s.strip_prefix("LANTERN#"))
             .ok_or(StoreError::Corrupt("lantern row without LANTERN# pk"))?.to_string();
-        let b = |k: &str| item.get(k).and_then(|v| v.as_bool().ok()).copied().unwrap_or(false);
+        // `delivered`/`quiet` are the row's MEANING — absent is Corrupt, like list_whispers' fields.
+        // The four counts are diagnostics — absent/garbage reads 0 (a row written before a count
+        // existed must still load). Asymmetry is deliberate and this comment is why.
+        let b = |k: &str| -> Result<bool, StoreError> {
+            item.get(k).and_then(|v| v.as_bool().ok()).copied()
+                .ok_or(StoreError::Corrupt("lantern row missing a bool field"))
+        };
         let n = |k: &str| -> u32 {
             item.get(k).and_then(|v| v.as_n().ok()).and_then(|s| s.parse().ok()).unwrap_or(0)
         };
         Ok(domain::LanternRecord {
-            slot, delivered: b("delivered"), quiet: b("quiet"),
+            slot, delivered: b("delivered")?, quiet: b("quiet")?,
             doors: n("doors"), chimney: n("chimney"), wrapped: n("wrapped"), closing: n("closing"),
         })
     }
@@ -572,7 +573,7 @@ git commit -S -m "dynamo: LANTERN#<sunday> slot rows — record (once per slot, 
 - Modify: `crates/fulfillment/src/lib.rs:14-17` (`pub mod lantern;`)
 
 **Interfaces:**
-- Consumes: `domain::{Link, Claim, ClaimState, Game, LanternRecord}`, `Link::is_open_door`, `crate::bell::{field, cap_content}`, `crate::RECONCILE_STUCK_ALERT_AGE` (existing const; if it is private, make it `pub(crate)`).
+- Consumes: `domain::{Link, Claim, ClaimState, Game}`, `Link::is_open_door` (Task 1), `crate::bell::{field, cap_content}` (Task 3, `pub(crate)`), `crate::RECONCILE_STUCK_ALERT_AGE: time::Duration` (existing private const at `lib.rs:113` — a child module reads it via `crate::`, no visibility change).
 - Produces:
   - `pub struct Slot { pub sunday: time::Date }` with `key() -> String` (`YYYY-MM-DD`), `start()`, `end()`, `next()`, `contains(t)`
   - `pub fn tick_slot(now: OffsetDateTime) -> Slot`
@@ -599,19 +600,21 @@ mod tests {
             created_at: created,
         }
     }
+    // `Game` and `Claim` do NOT impl Default (measured) — every field is listed.
     fn game(id: &str, title: &str) -> Game {
         Game {
             id: id.into(), title: title.into(), bundle: "b".into(), gamekey: "gk".into(),
             machine_name: id.into(), key_type: "steam".into(), giftable: true, hidden: false,
             status: GameStatus::Available, claim_id: None, artwork_url: None, keyindex: 0,
-            ..Default::default()
+            requires_choice: false, steam_app_id: None, appid_source: None, owned_by_ben: false,
+            hidden_source: None, acquired_at: None,
         }
     }
     fn claim(id: &str, gid: &str, at: OffsetDateTime) -> Claim {
         Claim {
             id: id.into(), link_token: "SELF".into(), game_id: gid.into(), state: ClaimState::Pending,
             gift_url: None, revealed_key: None, created_at: at, choice_pre_tpks: None,
-            ..Default::default()
+            failure_reason: None,
         }
     }
     fn input<'a>(links: &'a [Link], pending: &'a [Claim], games: &'a HashMap<String, Game>,
@@ -634,20 +637,29 @@ mod tests {
     }
 
     #[test]
-    fn dst_weeks_put_every_instant_in_exactly_one_bucket() {
-        // fall-back: 2026-11-01 02:00 ET; spring-forward: 2027-03-14 02:00 ET
+    fn weekly_buckets_partition_time_exactly_including_the_dst_change_weeks() {
+        // Buckets are fixed 21:00Z boundaries, so nothing here is DST-dependent BY CONSTRUCTION —
+        // that is the point (B2b): the 169h/167h tick-to-tick weeks around the fall-back
+        // (2026-11-01) and spring-forward (2027-03-14) still map every instant to ONE bucket.
+        // Three consecutive slots cover [a−7d, b+7d); the walk stays inside [a, b+3h).
         for (a, b) in [
             (datetime!(2026-10-25 21:00 UTC), datetime!(2026-11-01 21:00 UTC)),
             (datetime!(2027-03-07 21:00 UTC), datetime!(2027-03-14 21:00 UTC)),
         ] {
+            let slots = [tick_slot(a), tick_slot(b), tick_slot(b).next()];
+            assert_eq!(slots[0].next(), slots[1]);
             let mut t = a;
             while t < b + time::Duration::hours(3) {
-                let n = [tick_slot(a).next(), tick_slot(b).next(), tick_slot(a), tick_slot(b)]
-                    .iter().filter(|s| s.contains(t)).count();
+                let n = slots.iter().filter(|s| s.contains(t)).count();
                 assert_eq!(n, 1, "{t} in {n} buckets");
                 t += time::Duration::minutes(17);
             }
         }
+    }
+
+    #[test]
+    fn chimney_bar_matches_the_sweep() {
+        assert_eq!(CHIMNEY_BAR, crate::RECONCILE_STUCK_ALERT_AGE);
     }
 
     #[test]
@@ -663,8 +675,9 @@ mod tests {
         let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).unwrap();
         let doors = &l.rooms[0];
         assert_eq!(doors.lines.len(), 2, "{:?}", doors.lines);
-        assert!(doors.lines[0].contains("label\\-in") || doors.lines[0].contains("label-in"));
-        assert!(doors.lines.iter().any(|x| x.contains("shall it stay open")));
+        // oldest first: `sixty` (created ~60d ago) precedes `in` (~14d ago)
+        assert!(doors.lines[0].contains("label\\-sixty") && doors.lines[0].contains("shall it stay open"), "{:?}", doors.lines);
+        assert!(doors.lines[1].contains("label\\-in") && doors.lines[1].contains("two weeks"), "{:?}", doors.lines);
         assert_eq!(l.counts, [2, 0, 0, 0]);
     }
 
@@ -777,7 +790,7 @@ mod tests {
 }
 ```
 
-If `Game`/`Claim` do not implement `Default`, replace `..Default::default()` by listing the remaining fields — copy the fixture from `crates/fulfillment/src/whisper.rs` tests (`fn game(...)`) and `crates/admin-api/src/scrapbook.rs` tests (`fn fx_claim(...)`).
+The fixtures list every field because neither struct implements `Default` (verified 2026-09-16 at `290f41b`); if a field has been added since, the compiler names it — add it with the neutral value.
 
 - [ ] **Step 2: register + run to verify it fails**
 
@@ -1036,13 +1049,14 @@ pub fn render(l: &Lantern, slot: &Slot, site_url: &str, preview: bool) -> serde_
 Notes for the implementer:
 - `Link`'s `is_open_door` comes from Task 1. `bell::field`/`cap_content` from Task 3 (make both `pub(crate)`).
 - `let … && …` chains are edition-2024 and already used in `domain` — fine.
-- Add a tiny test `chimney_bar_matches_the_sweep` asserting `CHIMNEY_BAR == crate::RECONCILE_STUCK_ALERT_AGE` (convert types as needed) so the two bars cannot drift.
+- `chimney_bar_matches_the_sweep` (in step 1) pins `CHIMNEY_BAR == crate::RECONCILE_STUCK_ALERT_AGE` — both `time::Duration`, no conversion.
+- Deep links: ONE per room heading, not per line as the spec's mock-up shows — a deliberate deviation (five identical URLs per room is noise); the spec's mock-up is illustrative, the decisions section does not fix per-line links.
 - Lines are already escaped by `field`; `render` only joins — this is the "exactly once" discipline the tests pin (single backslash).
 
 - [ ] **Step 4: run**
 
 Run: `cargo test -p fulfillment --lib lantern:: && cargo clippy -p fulfillment -- -D warnings`
-Expected: PASS (12 tests), clippy clean.
+Expected: PASS (13 tests), clippy clean.
 
 - [ ] **Step 5: commit**
 
@@ -1056,13 +1070,13 @@ git commit -S -m "lantern: slot buckets (sunday-date key, 21:00Z boundary), comp
 ### Task 6: the handlers — lantern, heartbeat, preview — and the env wiring
 
 **Files:**
-- Modify: `crates/fulfillment/src/lib.rs` (`FulfillRequest` ~line 161-175, `FulfillResponse` ~line 204, `Deps` ~line 527, dispatch ~line 740, handlers after `handle_whisper`)
+- Modify: `crates/fulfillment/src/lib.rs` (`FulfillRequest` :117-172, `FulfillResponse` :177-222, `Deps` :508-555 with `bell_disabled` at :527, dispatch ~:740, handlers after `handle_whisper` ~:4922)
 - Modify: `crates/fulfillment/src/main.rs` (~line 65 `lantern_suppressed`, ~line 296 Deps build)
 - Test: `crates/fulfillment/tests/handler_test.rs` (append; `deps()` builders at lines 135 and 534 gain the new field)
 
 **Interfaces:**
 - Consumes: Task 4 store quartet, Task 5 `lantern::{tick_slot, compose, render, Input, Slot}`, `resolve_whisper_url`, `whisper_send_body`, `ping_msg`.
-- Produces: `FulfillRequest::{Lantern, LanternHeartbeat, LanternPreview}` (serde `snake_case` ⇒ `{"op":"lantern"}`, `{"op":"lantern_heartbeat"}`, `{"op":"lantern_preview"}`), `FulfillResponse::Lanterned`, `Deps.lantern_disabled: bool`.
+- Produces: `FulfillRequest::{Lantern, LanternHeartbeat, LanternPreview}` (serde `snake_case` ⇒ `{"op":"lantern"}`, `{"op":"lantern_heartbeat"}`, `{"op":"lantern_preview"}`), `FulfillResponse::Lanterned`, `Deps.lantern_disabled: bool`. No test seam is exported — every heartbeat arm is reachable through `handle` by forging the current slot's row.
 
 - [ ] **Step 1: the failing handler tests** — append to `crates/fulfillment/tests/handler_test.rs`, next to the whisper arms (`deps_whisper` at ~9127):
 
@@ -1071,20 +1085,13 @@ fn deps_lantern(store: Store, humble_uri: &str, whisper_webhook: Option<String>)
     deps_whisper(store, humble_uri, None, whisper_webhook)
 }
 
+/// A Pending claim `days` old on game "gk:stuck" (title "Stardew Valley" — the helper's own
+/// fixture), via the file's existing `seed_aged_pending(store, gid, token, claim_id, created)`
+/// at ~line 969: it puts the game, creates link `token` (claims_used becomes 1 — NOT a door),
+/// and claims it Pending at `created`. Friend-claim or self-claim is irrelevant to the chimney.
 async fn seed_stuck_pending(store: &Store, days: i64) {
-    // an Available game + a Pending self-claim `days` old — the #234 shape
-    let g = available_game("gk:stuck", "Stuck Game");
-    store.put_game(&g).await.unwrap();
-    let mut c = domain::Claim {
-        id: "c-stuck".into(), link_token: domain::SELF_LINK_TOKEN.into(), game_id: g.id.clone(),
-        state: domain::ClaimState::Pending, gift_url: None, revealed_key: None,
-        created_at: OffsetDateTime::now_utc() - time::Duration::days(days), choice_pre_tpks: None,
-        ..Default::default()
-    };
-    // use whichever seeding helper the whisper/reconcile tests use for a pending claim
-    // (`seed_aged_pending` at ~969 seeds via the store's claim path); copy that idiom here.
-    let _ = &mut c;
-    seed_aged_pending(store, "gk", "stuck", days * 24).await;
+    seed_aged_pending(store, "gk:stuck", "stuck-link", "c-stuck",
+        OffsetDateTime::now_utc() - time::Duration::days(days)).await;
 }
 
 #[tokio::test]
@@ -1125,41 +1132,59 @@ async fn lantern_sends_records_and_marks_and_slot_is_once() {
     assert_eq!(reqs.len(), 1);
     let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
     let c = body["content"].as_str().unwrap();
-    assert!(c.contains("stuck in the chimney") && c.contains("Stuck Game") && c.contains("#234"));
-    assert!(!c.contains("Stuck Game\\") , "no stray escapes: {c}");
+    assert!(c.contains("stuck in the chimney") && c.contains("Stardew Valley") && c.contains("#234"));
+    assert!(!c.contains("Stardew Valley\\"), "no stray escapes: {c}");
     // same slot again ⇒ loser, no second send
     assert_eq!(handle(&d, FulfillRequest::Lantern).await, FulfillResponse::Lanterned);
     assert_eq!(discord.received_requests().await.unwrap().len(), 1);
 }
 
+// The heartbeat reads the CURRENT slot (tick_slot(now)), so every arm is driven through `handle`
+// by forging that slot's row first — no test seam in the lib.
 #[tokio::test]
-async fn lantern_heartbeat_three_way_branch() {
-    let Some(store) = store_or_skip("lantern_heartbeat").await else { return };
+async fn lantern_heartbeat_absent_runs_then_delivered_does_nothing() {
+    let Some(store) = store_or_skip("lantern_hb_absent").await else { return };
     let humble = MockServer::start().await;
     let discord = discord_ok().await;
     seed_stuck_pending(&store, 3).await;
     let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
     let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
-    // (a) absent ⇒ full run
     assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
-    assert_eq!(discord.received_requests().await.unwrap().len(), 1);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1, "absent ⇒ full run");
     assert!(store.get_lantern(&slot).await.unwrap().unwrap().delivered);
-    // (b) delivered ⇒ nothing
     assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
-    assert_eq!(discord.received_requests().await.unwrap().len(), 1);
-    // (c) undelivered ⇒ resend + mark: forge an undelivered row for a fresh slot by recording
-    //     without marking, then point the heartbeat at it via the store state
-    let store2 = store.clone();
-    store2.record_lantern("1999-01-03", false, [0, 1, 0, 0]).await.unwrap();
-    // the heartbeat only looks at the CURRENT slot, so exercise the resend path through the
-    // lib seam: fulfillment::lantern_resend_for_test(&d, "1999-01-03")
-    assert!(fulfillment::lantern_resend_for_test(&d, "1999-01-03").await);
-    assert_eq!(discord.received_requests().await.unwrap().len(), 2);
-    assert!(store.get_lantern("1999-01-03").await.unwrap().unwrap().delivered);
-    // (d) quiet ⇒ nothing (F1)
-    store.record_lantern("1999-01-10", true, [0, 0, 0, 0]).await.unwrap();
-    assert!(!fulfillment::lantern_resend_for_test(&d, "1999-01-10").await, "quiet is not resent");
-    assert_eq!(discord.received_requests().await.unwrap().len(), 2);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1, "delivered ⇒ nothing");
+}
+
+#[tokio::test]
+async fn lantern_heartbeat_resends_an_undelivered_slot_and_marks_it() {
+    let Some(store) = store_or_skip("lantern_hb_undelivered").await else { return };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await;
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    // forge Sunday's "sent-but-mark-failed" (or POST-failed) state: recorded, undelivered
+    assert!(store.record_lantern(&slot, false, [0, 1, 0, 0]).await.unwrap());
+    assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1, "undelivered ⇒ resend");
+    assert!(store.get_lantern(&slot).await.unwrap().unwrap().delivered, "…and mark");
+    assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1, "now settled");
+}
+
+#[tokio::test]
+async fn lantern_heartbeat_leaves_a_quiet_slot_alone() {
+    let Some(store) = store_or_skip("lantern_hb_quiet").await else { return };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await; // there IS something to say — the quiet row must still win
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    assert!(store.record_lantern(&slot, true, [0, 0, 0, 0]).await.unwrap());
+    assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 0, "quiet ⇒ nothing (F1)");
+    assert!(!store.get_lantern(&slot).await.unwrap().unwrap().delivered);
 }
 
 #[tokio::test]
@@ -1170,7 +1195,7 @@ async fn lantern_preview_writes_nothing_and_keeps_the_backlog_line() {
     // an old open door ⇒ backlog line while nothing delivered
     let mut l = link("old-door");
     l.created_at = OffsetDateTime::now_utc() - time::Duration::days(90);
-    store.put_link(&l).await.unwrap();
+    store.create_link(&l).await.unwrap();
     let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
     assert_eq!(handle(&d, FulfillRequest::LanternPreview).await, FulfillResponse::PreviewSent);
     assert!(store.list_lanterns().await.unwrap().is_empty(), "preview ⇒ zero writes");
@@ -1195,12 +1220,16 @@ async fn lantern_disabled_darkens_only_the_lantern() {
     assert_eq!(handle(&d, FulfillRequest::Lantern).await, FulfillResponse::Lanterned);
     assert!(store.list_lanterns().await.unwrap().is_empty());
     assert_eq!(discord.received_requests().await.unwrap().len(), 0);
-    // the whisper register is untouched by the lantern flag: a bell still rings
-    assert!(!d.bell_disabled);
+    // vice-versa: the BELL's mute must not dark the lantern (shared credential, split mutes)
+    d.lantern_disabled = false;
+    d.bell_disabled = true;
+    assert_eq!(handle(&d, FulfillRequest::Lantern).await, FulfillResponse::Lanterned);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1);
+    assert_eq!(store.list_lanterns().await.unwrap().len(), 1);
 }
 ```
 
-Use the file's existing helpers (`link`, `available_game`, `seed_aged_pending`, `discord_ok`, `store.put_game`/`put_link` — check their exact names with `grep -n 'pub async fn put_link\|pub async fn put_game' crates/dynamo/src/lib.rs` and the test file's `fn link(`). Where `seed_stuck_pending` above hedges, resolve it to ONE idiom before running.
+Helpers used are the file's own, verified at `290f41b`: `link(token)` (~116, label "dave", 1 slot, created now), `seed_aged_pending(store, gid, token, claim_id, created)` (~969), `discord_ok()` (~1009), `deps_whisper(...)` (~9127); store methods `create_link(&Link)` (dynamo ~831), `put_game(&Game)` (~679), `list_lanterns`/`get_lantern`/`record_lantern` from Task 4.
 
 - [ ] **Step 2: run to verify it fails**
 
@@ -1346,17 +1375,6 @@ async fn resend_undelivered(deps: &Deps, slot: &lantern::Slot) -> bool {
     }
 }
 
-/// Test seam for the heartbeat's undelivered branch on an arbitrary slot key.
-#[doc(hidden)]
-pub async fn lantern_resend_for_test(deps: &Deps, slot_key: &str) -> bool {
-    let sunday = time::Date::parse(slot_key, &time::format_description::well_known::Iso8601::DATE).expect("slot key");
-    let slot = lantern::Slot { sunday };
-    match deps.store.get_lantern(slot_key).await {
-        Ok(Some(r)) if !r.delivered && !r.quiet => resend_undelivered(deps, &slot).await,
-        _ => false,
-    }
-}
-
 /// Zero writes: compose against live data, POST with the preview header.
 async fn handle_lantern_preview(deps: &Deps) -> FulfillResponse {
     let Some(url) = resolve_lantern_url(deps).await else { return FulfillResponse::PreviewBlocked };
@@ -1376,7 +1394,7 @@ async fn handle_lantern_preview(deps: &Deps) -> FulfillResponse {
 }
 ```
 
-Imports: `Link`, `Claim`, `Game` from `domain` are likely already imported at the top of lib.rs; add what is missing. `time::Date::parse` with `Iso8601::DATE` needs the `parsing` feature (workspace has it).
+Imports: `Link`, `Claim`, `Game` from `domain` are likely already imported at the top of lib.rs; add what is missing.
 
 - [ ] **Step 5: main.rs**
 
@@ -1388,7 +1406,7 @@ fn lantern_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
     env("LANTERN_DISABLED").as_deref() == Some("1")
 }
 ```
-In the `Deps { … }` build: `lantern_disabled: lantern_suppressed(|k| std::env::var(k).ok()),` after `bell_disabled`. If main.rs has a test pinning `whisper_suppressed`/`bell_suppressed` flag names, add the same shape for `lantern_suppressed` (grep `fn bell_suppressed_reads_only` or similar).
+In the `Deps { … }` build (:289-304): `lantern_disabled: lantern_suppressed(|k| std::env::var(k).ok()),` after `bell_disabled`. main.rs pins the flag NAMES by test for `whisper_suppressed`/`bell_suppressed` (`grep -n 'suppressed' crates/fulfillment/src/main.rs` for the test names) — add the same two-arm shape for `lantern_suppressed`: `LANTERN_DISABLED=1` ⇒ true; `BELL_DISABLED=1`/`WHISPER_DISABLED=1`/`NOTIFY_DISABLED=1` ⇒ false.
 
 Add `lantern_disabled: false,` to BOTH `Deps` builders in `handler_test.rs` (lines ~150 and ~558) and to any other `Deps {` literal in `crates/fulfillment` (`grep -rn 'bell_disabled:' crates/fulfillment/`).
 
@@ -1544,11 +1562,11 @@ git commit -S -m "terraform: the lantern — sunday + wednesday schedules in the
 
 **Files:**
 - Modify: `docs/spec-lantern.md` (status line → BUILT, plan path)
-- Modify: `README.md` (one line under status if the repo lists features there — check; else skip)
+- (README has no feature list — measured; nothing to do there.)
 
 - [ ] **Step 1: spec status**
 
-Change the status line to: `Status: BUILT — plan docs/superpowers/plans/2026-09-16-the-lantern.md; family sign-off at <sha>`.
+Change the status line to: `Status: BUILT — plan docs/superpowers/plans/2026-09-16-the-lantern.md; OMBB plan sign-off at the sha his sign-off message names` (fill the sha from the room message; it is recorded in the PR body too). Also correct the spec's mechanism bullet that says `LANTERN_DISABLED` is "plumbed" — it is a manual env edit, parity with `BELL_DISABLED`.
 
 - [ ] **Step 2: file the follow-up issue** (the button the chimney line names)
 
@@ -1582,5 +1600,13 @@ ops/report-pr-status.sh yourcodekitten/bendobundles <pr>   # from ~/code-kitten 
 ## Self-review (run after writing; findings fixed inline)
 
 1. **Spec coverage** — four rooms + predicates (T5) · bucket function + DST + closing-forward fixtures (T5) · backlog line keyed on delivered, preview cannot consume (T5 compose flag + T6 preview test) · chimney week N + action + #234 (T5) · shelf voice (T5) · no bearer capability (T5 render test) · escape_md exactly once, cap-then-escape, 2000 on final, title newline flatten (T2/T3/T5) · register + LANTERN_DISABLED decoupled (T6) · idempotence LANTERN#<sunday> (T4/T6) · heartbeat 3-way + F1 (T6) · at-least-once (T6 send_and_mark) · preview zero writes (T6) · never-ran alarm own group + heartbeat cadence (T7) · UTC cliff margin on the variable (T7) · quiet logs population sizes (T6 `run_lantern`) · empty does NOT page ops (T6: no ping on quiet) · Link predicates relocated (T1) · follow-up issue (T8). **Gap found and closed:** eastern-date rendering had no task — added to T5 (`eastern_offset`, `eastern_date`, pinned across DST).
-2. **Placeholder scan** — `seed_stuck_pending` in T6 hedges between two idioms; the step says to resolve to one before running (the file's `seed_aged_pending` is the known-good). `..Default::default()` in fixtures is conditional on `Default` impls; T5 step 1 names the fallback fixture sources. No TBD/TODO.
-3. **Type consistency** — `record_lantern(slot: &str, quiet: bool, counts: [u32; 4])` used identically in T4/T6; `Lantern.counts: [u32; 4]` in T5 feeds it; `Slot::key()` returns the `YYYY-MM-DD` string used as the store key everywhere; `bell::field`/`cap_content` are `pub(crate)` for `lantern.rs`; `FulfillResponse::Lanterned` used in T6 tests and handlers; `lantern_resend_for_test` is `pub` + `#[doc(hidden)]` for the integration test.
+2. **Placeholder scan** — fixtures list every struct field (no `Default` impls exist); `seed_stuck_pending` delegates to the file's `seed_aged_pending` with its real 5-arg signature. No TBD/TODO.
+3. **Type consistency** — `record_lantern(slot: &str, quiet: bool, counts: [u32; 4])` used identically in T4/T6; `Lantern.counts: [u32; 4]` in T5 feeds it; `Slot::key()` returns the `YYYY-MM-DD` string used as the store key everywhere; `bell::field`/`cap_content` are `pub(crate)` for `lantern.rs`; `FulfillResponse::Lanterned` used in T6 tests and handlers; no test seam exported.
+
+## Cold review 2026-09-16T07:2x — integrated (verdict was "not ready"; all blockers + majors fixed here)
+
+- **B1** T2 re-declared `is_spoofing_format_char` with a NARROWER transcribed range list; the real one is `domain::is_spoofing_format_char` (`lib.rs:654`, 20 ranges, keeps variation selectors) and public-api already imports it. Fixed: text.rs consumes it; admin-api's deliberate second copy is deleted (count 2 → 1).
+- **B2** the DST bucket test listed `Slot(11-01)` twice (`tick_slot(a).next() == tick_slot(b)`) so every instant counted 2. Fixed: three distinct consecutive slots; renamed to say the partition is UTC-fixed by construction.
+- **B3** `seed_stuck_pending` called `seed_aged_pending` with a 4-arg signature that does not exist and asserted a title the helper never writes. Fixed: real 5-arg call, "Stardew Valley", `create_link`.
+- **M1** doors test asserted `lines[0]` = the 14d door; compose sorts oldest-first so it is the 60d one. Fixed: order asserted explicitly. **M2** `chimney_bar_matches_the_sweep` had no code. Fixed. **M3** `..Default::default()` on structs with no `Default`. Fixed: full field lists. **M4** the 2000-cap card test could not reach 2000 (fake). Fixed: `cap_content` tested directly at the cut-on-backslash case + a card path that does reach it. **M5** the heartbeat's undelivered arm ran only through a `pub` test seam on a 1999 slot. Fixed: three tests through `handle` by forging the CURRENT slot's row; seam deleted. **M6** the disabled test asserted a struct literal. Fixed: vice-versa arm through `handle`. **M7** no task created the branch — it already exists (stated in the header). **M8** `StoreError` not imported in store_test — stated.
+- **Open questions answered:** ① `LANTERN_DISABLED` is NOT tf-plumbed — bell parity, now in Global Constraints and the spec. ② EST 21–22Z closing drop is ratified by OMBB round 2 ("harmless — the door is already closed"); the tick stays 17:00 ET. ③ `lantern_from_item`: bools Corrupt-on-absent (meaning), counts 0-on-absent (diagnostics) — asymmetry made deliberate and commented.
