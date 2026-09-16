@@ -1,7 +1,8 @@
 # the lantern 🏮 — spec
 
-*2026-09-16, kitten. Status: v2 — OMBB's round 1 integrated (B1, B2a, B2b, 1 major, Q①–Q⑤);
-Lilith's round pending. Where narrative and **decisions** disagree, the decisions win.*
+*2026-09-16, kitten. Status: v3 — OMBB round 1 (B1, B2a, B2b, major, Q①–Q⑤) + Lilith round 1
+(closing looks forward, backlog line, chimney names its action, bell markdown finding) + OMBB's
+round 2 corrections integrated. Where narrative and **decisions** disagree, the decisions win.*
 
 ## why this exists
 
@@ -59,7 +60,7 @@ Let `now` be the tick time (UTC), `age(x) = now − x`. Ages in whole days.
 | 🚪 **doors** | links where `can_claim(now).is_ok()` (live: unrevoked, unexpired, unsealed, claims remain — domain's own gate, the scrapbook's `link_is_open_door`) **and `claims_used == 0`** | **birthdays, stateless, bucketed by SLOT (decision B2):** mentioned in the tick whose bucket contains the instant `created_at + 14d`, and again the one containing `created_at + 60d`. Once at two weeks ("nobody's come through yet"), once at two months ("still inside — shall it stay open?"). Never otherwise. **Voice keys on shape (Q⑤):** `claims_allowed > 1 && friend_id.is_none() && curated_game_ids.is_none()` ⇒ *shelf* voice ("the shelf for the d&d table — 15 slots, nobody's taken one in 2 months"); else *door* voice ("the door for sam"). Fixtures on both sides. |
 | 🕯️ **chimney** | claims with `state == Pending` and `age(created_at) ≥ RECONCILE_STUCK_ALERT_AGE` (24h — the sweep's own bar, `fulfillment/src/lib.rs:4201`) | **every tick while stuck, with a stateless `week N` counter** (`N = age.whole_days() / 7`, Q② = (a)+(c)). Ops truth on a warm register: the 2026-07-29 family ruling — *a once-ever alert that scrolls away IS the silent-loop bug* — applies; backoff rebuilds the silent loop. The daily ops ping is untouched (#162 stays its own decision). |
 | 🎁 **wrapped** | links with `unlock_at` set, `unlock_at ≤ now`, `claims_used == 0`, otherwise live | **once:** the tick whose bucket contains `unlock_at + 7d`. |
-| ⏳ **closing** | links live with claims remaining and `expires_at` set | **once:** the tick whose bucket contains `expires_at`, evaluated at the tick BEFORE it (i.e. the bucket is the coming week's — see the bucket function; "closes thursday with 2 claims left"). |
+| ⏳ **closing** | links live with claims remaining and `expires_at` set | **once, LOOKING FORWARD (Lilith):** mentioned at tick *k* iff `expires_at ∈ BUCKET(k+1)` — the coming week, `[BOUNDARY(k), BOUNDARY(k+1))`. Doors and wrapped look BACK (their instant is a past birthday, bucket *k*); closing is the one room whose instant is in the future. An expiry earlier in the tick's own bucket is already closed and must NOT appear (fixture). An expiry in the hours right after Sunday's tick is in BUCKET(k+1) and is named by tick *k* ("closes tonight"), still exactly once. |
 
 ### the bucket function — decision B2 (OMBB, 2026-09-16, blockers B2a + B2b)
 
@@ -75,7 +76,8 @@ BOUNDARY(k)  = the k-th Sunday at 21:00Z              (fixed in UTC, never in lo
 BUCKET(k)    = [BOUNDARY(k-1), BOUNDARY(k))           half-open, exactly one bucket per instant
 SLOT(k)      = the date of BOUNDARY(k)'s Sunday, e.g. "2026-09-20"   → LANTERN#2026-09-20
 tick_slot(now) = SLOT of the latest BOUNDARY ≤ now
-mention(instant, k) ⇔ instant ∈ BUCKET(k)
+mention(instant, k) ⇔ instant ∈ BUCKET(k)      — doors (created_at+14d, +60d), wrapped (unlock_at+7d)
+mention(instant, k) ⇔ instant ∈ BUCKET(k+1)    — closing (expires_at): the coming week
 ```
 
 - The Sunday 17:00 ET tick is **21:00Z under EDT and 22:00Z under EST** — always **≥** its own
@@ -91,7 +93,10 @@ mention(instant, k) ⇔ instant ∈ BUCKET(k)
   pure function every tick agrees on.
 - **Fixtures pinned:** each room at boundary −1s / +0s / +7d−1s / +7d; the fall-back week
   (Sun 2026-11-01 tick, 169h) and spring-forward week (Sun 2027-03-14 tick, 167h) each show every
-  instant in exactly one bucket; a Wednesday `now` maps to the previous Sunday's slot.
+  instant in exactly one bucket; a Wednesday `now` maps to the previous Sunday's slot; **closing:
+  an expiry on the Thursday BEFORE the tick does not appear, one on the Thursday AFTER does, one
+  at BOUNDARY(k)+1s appears at tick k and not k+1** (Lilith's in-week-expiry fixture beside
+  OMBB's DST one).
 
 **Launch state under B2 (re-derived):** 07-28 door → `+60d` = 09-26T18:43Z ∈ BUCKET ending
 09-27 ⇒ mentioned **09-27**; 08-05 door → `+60d` = 10-04T14:09Z ⇒ mentioned **10-04**. First
@@ -121,6 +126,30 @@ his call, which the lantern's first line is precisely the mechanism for raising;
 reveal with the two options, compensate or leave). One honest line, until he acts, is the
 feature working — not the feature nagging.
 
+### the backlog line — decision (Lilith): "lights forward" does not carry over from the bell
+
+The bell is about events; a missed event is gone. The lantern is about **state that is still
+standing** — 9 of the 11 open doors are past both birthdays at launch and would never be
+mentioned, which is the exact forgetting the first paragraph describes, left in place. **Fix, with
+no new state:** while **no lantern has ever been DELIVERED** (`list_lanterns` has no row with
+`delivered == true`), the doors room carries one extra summary line — *"and N doors older than
+two months nobody has walked through ↗ links"* — counting every open zero-claim link whose 60d
+birthday is already past. One line, once. **Keyed on a DELIVERED row, not any row**, so a failed
+first send (row present, undelivered) does not use it up — the heartbeat's resend recomposes it.
+**`lantern_preview` writes nothing, so it cannot consume the line — pinned by a test** (OMBB):
+preview → zero writes → a following real tick still carries the backlog line.
+
+### the chimney line names the action that clears it — decision (Lilith, OMBB)
+
+A number that only grows is the repeating alert with a nicer font — the exact message ben has
+told us he learns to ignore. Each chimney line says what the state IS and what CLEARS it:
+*"soulcalibur vi — a claim started jul 6 never finished (week 10). it clears when the claim is
+compensated (slot returned, game re-listed) or fulfilled — no admin button for that yet, see
+#234 ↗ ops"*. Honest about the missing button: `compensate_self_claim` exists in fulfillment and
+nothing in the admin can invoke it (measured 2026-09-16). **Follow-up issue filed with the PR:**
+*admin ops — compensate a stuck Pending claim* (the button the line names). Until it exists the
+line names the action AND the gap; the reveal puts the #234 disposition to ben as two options.
+
 ## the message
 
 - `content` = header line + rooms as plain text (the whisper v1 shape, not v2 embeds: this is a
@@ -131,6 +160,17 @@ feature working — not the feature nagging.
   `label`. (Measured: no link carries `friend_id` yet; labels it is.)
 - Game titles come from `Game.title` via `game_id`; a missing game renders as the id, never
   drops the line (the scrapbook's "orphans are COUNTED, never skipped").
+- **Every interpolated string is Discord-Markdown-escaped** — decision from Lilith's bell finding
+  (OMBB confirmed at `65b9c78`): `bell.rs:205` puts the friend-written `thank_note` raw into
+  `content`, sanitised for control/bidi and capped, but Markdown is not escaped and Discord
+  renders masked links in webhook content — `[open your gift](https://…)` becomes a clickable
+  link with made-up text. `allowed_mentions` stops pings, not links. The lantern interpolates
+  **labels (admin-written), friend names (admin-written) and game TITLES (Humble/Steam-sourced,
+  third-party text)** — a title with `*`, `_` or brackets renders wrong at best. ⇒ **one helper,
+  `discord::escape_md(&str)`, escaping `\ * _ ~ \` | > [ ] ( )`, in the shared send module; the
+  lantern uses it on every field and the bell's `thanks_card` adopts it in the same PR** (the
+  repo's one-copy rule; a code span was rejected — a backtick in the note breaks out of it).
+  Tests: a masked link + a stray backtick render inert; the escape is idempotent on plain text.
 - Dates in the message are **America/New_York** (ben reads local; the tick is tz-aware).
 
 ## mechanism — reuses, deliberately, the whisper's skeleton
@@ -231,7 +271,9 @@ handler must not inherit that branch from the whisper's skeleton.
 - Tests pin: LANTERN_DISABLED darkens only the lantern (bell + whisper unaffected, and vice
   versa); dark register ⇒ zero store writes; quiet ⇒ zero writes + per-room counts logged;
   slot-taken ⇒ no send; heartbeat: absent ⇒ full run · delivered ⇒ no read of links/claims, no
-  send · undelivered ⇒ resend + mark, same slot.
+  send · undelivered ⇒ resend + mark, same slot; backlog line present iff no delivered row, and
+  a preview (zero writes) leaves it present; `escape_md` on masked link + backtick; the bell's
+  thanks card escapes.
 
 ## non-goals (decided, not omitted)
 
@@ -268,3 +310,13 @@ handler must not inherit that branch from the whisper's skeleton.
   the same forgetting. Voice predicate `claims_allowed > 1 && friend_id.is_none() &&
   curated_game_ids.is_none()`, fixtures on both sides.
 - **UTC cliff margin stated as the lantern's own: 3h EDT / 2h EST**, on the tf variable.
+
+### round 2 (Lilith + OMBB, 2026-09-16T07:1x)
+- **Closing looks FORWARD → BLOCKER on B2's first form, accepted by all three.** `expires_at ∈
+  BUCKET(k+1)`; doors/wrapped stay on BUCKET(k). In-week-expiry fixture beside the DST fixture.
+- **Backlog line, once, keyed on a DELIVERED row; preview cannot consume it — accepted.**
+- **Chimney lines name the clearing action — accepted**, honestly including that the button does
+  not exist yet; follow-up issue for the admin compensate action; #234's disposition rides the
+  reveal.
+- **Bell Markdown finding (Lilith; OMBB confirmed) — not a lantern blocker; FIXED IN THIS PR** via
+  the shared `escape_md` the lantern needs anyway. Code span rejected (backtick breakout).
