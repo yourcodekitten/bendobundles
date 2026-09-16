@@ -115,3 +115,48 @@ resource "aws_cloudwatch_metric_alarm" "whisper_target_errors" {
   alarm_actions       = [aws_sns_topic.ops_alarms.arn]
   tags                = module.label_whisper.tags
 }
+
+# ── the lantern: the run that never happened (spec: docs/spec-lantern.md) ────────────────────
+# Same instrument as the whisper's: AWS/Scheduler's OWN metrics on the lantern's OWN group, so the
+# alarm cannot inherit the failure it watches for. The Wednesday heartbeat keeps the metric
+# present at <=4-day gaps, so a healthy week can never show 7 empty daily buckets.
+resource "aws_cloudwatch_metric_alarm" "lantern_never_ran" {
+  count             = var.lantern_enabled ? 1 : 0
+  alarm_name        = "${module.label_lantern.id}-never-ran"
+  alarm_description = "The lantern schedule group has not fired in over a week — the run that never happened cannot announce itself."
+  namespace         = "AWS/Scheduler"
+  metric_name       = "InvocationAttemptCount"
+  # ScheduleGroup is the ONLY dimension AWS/Scheduler emits; the lantern has its own group.
+  dimensions = {
+    ScheduleGroup = aws_scheduler_schedule_group.lantern[0].name
+  }
+  statistic           = "Sum"
+  period              = 86400 # 7 daily buckets — AWS's hard cap (see whisper_never_ran)
+  evaluation_periods  = 7
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "breaching" # silence from the metric IS the alarm condition
+  datapoints_to_alarm = 7           # ALL seven must breach; the Wednesday heartbeat guarantees <=4-day gaps
+  alarm_actions       = [aws_sns_topic.ops_alarms.arn]
+  ok_actions          = [aws_sns_topic.ops_alarms.arn]
+  tags                = module.label_lantern.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "lantern_target_errors" {
+  count             = var.lantern_enabled ? 1 : 0
+  alarm_name        = "${module.label_lantern.id}-target-errors"
+  alarm_description = "A lantern schedule fired but its lambda target errored — the invoke path is broken."
+  namespace         = "AWS/Scheduler"
+  metric_name       = "TargetErrorCount"
+  dimensions = {
+    ScheduleGroup = aws_scheduler_schedule_group.lantern[0].name
+  }
+  statistic           = "Sum"
+  period              = 86400
+  evaluation_periods  = 1
+  threshold           = 0
+  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.ops_alarms.arn]
+  tags                = module.label_lantern.tags
+}

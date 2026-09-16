@@ -84,3 +84,25 @@ variable "whisper_schedule_expression" {
   default     = "cron(0 10 ? * SAT,SUN *)"
   description = "Whisper cadence in America/New_York. The SUNDAY tick is a HEARTBEAT, not a second whisper: Saturday always wins the ISO-week slot, Sunday exits as the designed conditional-put loser — it keeps InvocationAttemptCount present at ≤6-day gaps (the never-ran alarm lives under AWS's hard 7-day evaluation cap, measured 2026-08-28 when the API refused 8 daily buckets), and doubles as the retry day if a Saturday tick outright fails. ⚠️ TIME-OF-DAY IS PART OF THE INVARIANT TOO (gate review, #211): the slot is computed in UTC, so a late Sunday tick lands MONDAY UTC — the NEXT ISO week — and Sunday wins its own slot and double-sends. The cliff is SEASONAL: >=20:00 ET under EDT, but >=19:00 ET under EST, because the offset changes and the UTC boundary does not. THE CONFIGURED 10:00 TICK IS SAFE IN BOTH SEASONS — ~10h of margin under EDT, ~9h under EST — so this is not a clock deadline; it is a guard against a FUTURE EDIT. A tick moved to 19:30 would work until November and double-send after the clocks go back, which is the failure that gets shipped by someone reading only the summer figure; do not move the tick later in the day without re-deriving the boundary distance. Cadence in America/New_York (EventBridge Scheduler is timezone-aware; classic rules are UTC-only and drift an hour across DST, which is why this rides aws_scheduler_schedule). ⚠️ The whisper-log slot key is the ISO WEEK — grain coupled to a weekly cadence; a sub-weekly schedule must change the slot derivation in fulfillment in the same commit."
 }
+
+variable "lantern_enabled" {
+  type        = bool
+  default     = false # flipped in the (gitignored) production.tfvars; default-off so plan-only environments stay silent
+  description = "The lantern (spec: docs/spec-lantern.md): Sunday-evening stalled-intentions message on the WHISPER register. Creates the schedule group, the Sunday + Wednesday schedules, the scheduler role, and the never-ran/target-error alarms. REQUIRES whisper_enabled — the lantern rides the whisper webhook param; with the whisper off the lantern runs DARK (loud no-op, zero writes)."
+  validation {
+    condition     = !var.lantern_enabled || var.whisper_enabled
+    error_message = "lantern_enabled requires whisper_enabled: the lantern has no register of its own."
+  }
+}
+
+variable "lantern_schedule_expression" {
+  type        = string
+  default     = "cron(5 17 ? * SUN *)"
+  description = "Lantern tick, America/New_York. 17:05 ET = 21:05Z under EDT / 22:05Z under EST. The slot key is the SUNDAY DATE and the bucket boundary is Sunday 21:00Z (fulfillment::lantern::tick_slot): the tick must fire AFTER 21:00Z on its own Sunday, and 17:00 sharp would sit ON the boundary with zero margin against clock skew (a 20:59:59.9 reading maps to LAST week's slot and exits slot_taken, which reads healthy) — hence :05. Margin to the UTC-midnight cliff: 2h55 under EDT, 1h55 under EST. A tick moved past 19:00 ET lands on MONDAY UTC under EST and maps to the NEXT Sunday's slot (a week early, then double). Do not move the tick without re-deriving both edges."
+}
+
+variable "lantern_heartbeat_schedule_expression" {
+  type        = string
+  default     = "cron(5 17 ? * WED *)"
+  description = "Wednesday heartbeat: keeps AWS/Scheduler InvocationAttemptCount present at <=4-day gaps for the never-ran alarm (7-daily-bucket hard cap), and retries an un-run or undelivered Sunday for the SAME slot (tick_slot maps Wednesday to the previous Sunday). It cannot send a delivered or quiet slot again, and with zero lantern history it only touches the metric (spec decisions B1 + F1 + the no-history arm)."
+}
