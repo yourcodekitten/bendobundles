@@ -22,13 +22,17 @@
 - **Dark-deploy rule:** register unresolved/disabled ⇒ loud no-op, ZERO writes.
 - **Slot key = the Sunday DATE (`YYYY-MM-DD`), boundary = Sunday 21:00Z**, buckets `[Sun 21:00Z − 7d, Sun 21:00Z)`. Doors/wrapped mention on BUCKET(k); closing on BUCKET(k+1).
 - **Quiet writes exactly one row (`quiet = true`) and zero sends (F1).**
-- **Heartbeat: row absent ⇒ full run · delivered OR quiet ⇒ metric only · undelivered ⇒ resend + mark (at-least-once: a landed POST whose MARK fails resends on Wednesday — a duplicate beats a lost bucket).**
+- **Heartbeat: row absent AND at least one lantern row exists ⇒ full run · absent AND ZERO rows ⇒ metric only + `outcome=lantern_heartbeat_no_history` warn (enablement on Mon–Wed must not send a lantern for the Sunday before it existed) · delivered OR quiet ⇒ metric only · undelivered ⇒ resend + mark (at-least-once: a landed POST whose MARK fails resends on Wednesday — a duplicate beats a lost bucket) · undelivered that now composes EMPTY ⇒ mark quiet, never delivered.**
 - **Text safety order per field: `sanitize_line` → cap → `escape_md`, exactly once; the 2000-char Discord cap applies to the FINAL escaped content.**
 - **No bearer capability in any message.** Deep links are `{site}/admin/links` and `{site}/admin/ops` only.
 - **Empty lantern is HEALTHY** — it must not page ops (the whisper's empty-pool ping is NOT inherited).
 - **Commits:** GPG-signed, authored `code kitten <yourcodekitten@gmail.com>`; message style: lowercase, no conventional-commit prefix (repo convention: see `git log`).
 - **`LANTERN_DISABLED` is NOT terraform-plumbed** — parity with `BELL_DISABLED` (measured: no `*_DISABLED` is in `aws-lambda.tf`); it is a manual env edit on the lambda for an operator mute. The spec's "plumbed" wording is corrected here.
-- **Tests:** unit tests run with `cargo test -p <crate> --lib`; handler tests in `crates/fulfillment/tests/handler_test.rs` need dynamodb-local (`store_or_skip` skips locally, CI runs them for real). **CI is the authoritative run** — if the local link OOMs, push and read CI, never "assume green".
+- **Lint, CI's exact two commands, run in EVERY task's verify step:** `cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings` (`.github/workflows/ci.yml:43-44`). Run `cargo fmt` before them; never put several statements on one line in shipped code (the plan's own snippets are compressed for reading — `cargo fmt` expands them).
+- **Store-backed tests (handler_test, store_test, iam_capture) run LOCALLY against moto:** `uvx --from 'moto[server]' moto_server -p 8000 &` then `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test …` (`store_or_skip` panics rather than skips when the URL is set — a forged green is impossible). CI runs the same against `amazon/dynamodb-local:2.5.2`; **CI is the authoritative run** — if the local link OOMs, push and read CI, never "assume green".
+- **`terraform/production.tfvars` is gitignored** (`.gitignore:18`) — the `lantern_enabled = true` flip is a DEPLOY-checklist step, never a commit.
+- **Mutes are split for real:** `lantern_notify` is resolved from the whisper's `SecretRead` with `LANTERN_DISABLED` only — `WHISPER_DISABLED` must not dark the lantern (review found the first draft coupled them through `resolve_whisper_url`). (The bell has the same coupling today — `bell::ring` calls `resolve_whisper_url` — noted in the follow-up issue, not fixed here.)
+- **Ticks are 17:05 ET** (`cron(5 17 ? * SUN *)`, heartbeat `cron(5 17 ? * WED *)`): the bucket boundary is 21:00Z and a tick exactly ON the boundary has zero margin against clock skew (a 20:59:59.9 reading maps to LAST week's slot and exits `slot_taken`, which reads healthy). Margin to the UTC-midnight cliff: **2h55 EDT / 1h55 EST**.
 
 ---
 
@@ -41,9 +45,10 @@
 | `crates/public-api/src/lib.rs`, `crates/admin-api/src/lib.rs` | adopt `domain::text::sanitize_line` (delete private copies) |
 | `crates/admin-api/src/scrapbook.rs` | adopt `Link::is_open_door` / `Link::waits` |
 | `crates/fulfillment/src/bell.rs` | cards use sanitize→cap→escape via `domain::text` |
-| `crates/dynamo/src/lib.rs` | `record_lantern`, `mark_lantern_delivered`, `get_lantern`, `list_lanterns` |
+| `crates/dynamo/src/lib.rs` | `record_lantern`, `mark_lantern_delivered`, `mark_lantern_quiet`, `get_lantern`, `list_lanterns` |
+| `crates/dynamo/tests/iam_capture.rs` | captures the five lantern calls; corpus + policy templates regenerated (the harness DERIVES the IAM policies from traffic) |
 | `crates/fulfillment/src/lantern.rs` (new) | `Slot`, `tick_slot`, `compose`, `render`, eastern-date formatting — pure |
-| `crates/fulfillment/src/lib.rs` | `FulfillRequest::{Lantern, LanternHeartbeat, LanternPreview}`, `FulfillResponse::Lanterned`, `Deps.lantern_disabled`, handlers |
+| `crates/fulfillment/src/lib.rs` | `FulfillRequest::{Lantern, LanternHeartbeat, LanternPreview}`, `FulfillResponse::Lanterned`, `Deps.lantern_notify`, `LanternReads`, handlers |
 | `crates/fulfillment/src/main.rs` | `lantern_suppressed`, env wiring |
 | `crates/fulfillment/tests/handler_test.rs` | lantern handler arms |
 | `terraform/aws-eventbridge.tf`, `aws-cloudwatch-alarms.tf`, `tf-variables.tf`, `production.tfvars` | schedules, alarms, flag (no lambda env change — see Global Constraints) |
@@ -129,7 +134,7 @@ and replace every call `link_waits(l, now)` → `l.waits(now)`, `link_is_open_do
 
 - [ ] **Step 5: run both crates' tests**
 
-Run: `cargo test -p domain --lib && cargo test -p admin-api --lib scrapbook`
+Run: `cargo fmt && cargo test -p domain --lib && cargo test -p admin-api --lib scrapbook && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings`
 Expected: PASS, all scrapbook tests unchanged and green (they are the behavioural pin across the move).
 
 - [ ] **Step 6: commit**
@@ -259,7 +264,7 @@ In `crates/admin-api/src/lib.rs`: delete BOTH the private `fn is_spoofing_format
 
 - [ ] **Step 6: run the three crates**
 
-Run: `cargo test -p domain --lib && cargo test -p public-api --lib && cargo test -p admin-api --lib`
+Run: `cargo fmt && cargo test -p domain --lib && cargo test -p public-api --lib && cargo test -p admin-api --lib && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings`
 Expected: PASS; `grep -rn 'fn is_spoofing_format_char' crates/` prints exactly ONE hit (`crates/domain/src/lib.rs`), and `grep -rn 'fn sanitize_note\|fn sanitize_friend_name' crates/` prints ZERO.
 
 - [ ] **Step 7: commit**
@@ -304,9 +309,9 @@ git commit -S -m "domain::text — sanitize_line + escape_md, one copy (public-a
     #[test]
     fn cap_content_cuts_at_2000_and_never_strands_a_backslash() {
         // thanks_card cannot reach 2000 (≈240+1000+50), so test the cap DIRECTLY where the cut
-        // lands on an escape: 1998 'y' + "\\x" → the 2000th char is the backslash → popped.
-        let s = format!("{}\\x", "y".repeat(1998));
-        assert_eq!(cap_content(&s), "y".repeat(1998));
+        // lands on an escape: 1999 'y' + "\\x" is 2001 chars → cap keeps 1999 'y' + '\\' → popped.
+        let s = format!("{}\\x", "y".repeat(1999));
+        assert_eq!(cap_content(&s), "y".repeat(1999));
         assert_eq!(cap_content("short").as_str(), "short");
         // a card path that DOES reach the cap: a 6000-char site_url on unwrap_card
         let v = unwrap_card("sam", "Celeste", None, &"u".repeat(6000), false);
@@ -359,7 +364,7 @@ Then:
 
 - [ ] **Step 4: run**
 
-Run: `cargo test -p fulfillment --lib bell::`
+Run: `cargo fmt && cargo test -p fulfillment --lib bell:: && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings`
 Expected: PASS (existing 4 + new 4). `thanks_card_quotes_the_note_and_denies_mentions` still passes — `@everyone` has no metacharacter. `field_caps_before_escaping_so_no_dangling_backslash` is a real red first: `field` does not exist.
 
 - [ ] **Step 5: commit**
@@ -371,11 +376,13 @@ git commit -S -m "bell: sanitise → cap → escape_md on every foreign field �
 
 ---
 
-### Task 4: `LanternRecord` + the dynamo quartet
+### Task 4: `LanternRecord` + the dynamo quintet + the IAM capture corpus
 
 **Files:**
 - Modify: `crates/domain/src/lib.rs` (beside `WhisperRecord`)
 - Modify: `crates/dynamo/src/lib.rs` (after `list_whispers`, ~line 3075)
+- Modify: `crates/dynamo/tests/iam_capture.rs` (~line 999-1025, the whisper's fulfillment captures — add the lantern's five beside them)
+- Regenerate: `terraform/iam-request-corpus.json`, `terraform/policies/dynamo-rw-fulfillment.json.tpl` (write mode, see step 6)
 - Test: `crates/dynamo/tests/store_test.rs`
 
 **Interfaces:**
@@ -383,6 +390,7 @@ git commit -S -m "bell: sanitise → cap → escape_md on every foreign field �
   - `domain::LanternRecord { pub slot: String, pub delivered: bool, pub quiet: bool, pub doors: u32, pub chimney: u32, pub wrapped: u32, pub closing: u32 }`
   - `Store::record_lantern(&self, slot: &str, quiet: bool, counts: [u32; 4]) -> Result<bool, StoreError>` (Ok(false) = slot taken)
   - `Store::mark_lantern_delivered(&self, slot: &str) -> Result<(), StoreError>`
+  - `Store::mark_lantern_quiet(&self, slot: &str) -> Result<(), StoreError>` (an undelivered row whose resend composes empty is settled as quiet — `delivered` must keep meaning delivered, it keys the backlog line)
   - `Store::get_lantern(&self, slot: &str) -> Result<Option<LanternRecord>, StoreError>`
   - `Store::list_lanterns(&self) -> Result<Vec<LanternRecord>, StoreError>`
 
@@ -401,10 +409,15 @@ async fn lantern_record_is_once_per_slot_and_quiet_rows_are_not_delivered() {
     assert!(store.get_lantern("2026-09-20").await.unwrap().unwrap().delivered);
     let q = store.get_lantern("2026-09-27").await.unwrap().unwrap();
     assert!(q.quiet && !q.delivered);
+    assert!(store.record_lantern("2026-10-11", false, [1, 0, 0, 0]).await.unwrap());
+    store.mark_lantern_quiet("2026-10-11").await.unwrap();
+    let settled = store.get_lantern("2026-10-11").await.unwrap().unwrap();
+    assert!(settled.quiet && !settled.delivered, "settled-as-quiet is not delivered");
     assert!(store.get_lantern("2026-10-04").await.unwrap().is_none());
     let all = store.list_lanterns().await.unwrap();
-    assert_eq!(all.len(), 2);
+    assert_eq!(all.len(), 3);
     assert!(matches!(store.mark_lantern_delivered("2026-10-04").await, Err(StoreError::Corrupt(_))));
+    assert!(matches!(store.mark_lantern_quiet("2026-10-04").await, Err(StoreError::Corrupt(_))));
 }
 ```
 
@@ -493,6 +506,25 @@ pub struct LanternRecord {
         }
     }
 
+    /// Settle an undelivered row as QUIET (the heartbeat's resend composed empty — nothing was
+    /// ever sent, so `delivered` stays false). Same condition as the delivered mark.
+    pub async fn mark_lantern_quiet(&self, slot: &str) -> Result<(), StoreError> {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let res = self.client.update_item().table_name(&self.table)
+            .key("pk", A::S(format!("LANTERN#{slot}"))).key("sk", A::S("META".into()))
+            .update_expression("SET quiet = :t")
+            .expression_attribute_values(":t", A::Bool(true))
+            .condition_expression("attribute_exists(pk)").send().await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                if is_ccf_update(&sdk_err) {
+                    Err(StoreError::Corrupt("mark_lantern_quiet on a slot never recorded"))
+                } else { Err(StoreError::Aws(AwsFault::from_sdk_error("update_item", &sdk_err))) }
+            }
+        }
+    }
+
     fn lantern_from_item(
         item: &HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
     ) -> Result<domain::LanternRecord, StoreError> {
@@ -554,14 +586,53 @@ pub struct LanternRecord {
 
 - [ ] **Step 5: run**
 
-Run: `cargo test -p dynamo --test store_test lantern_record` (CI if no local dynamodb) and `cargo build -p dynamo`
-Expected: PASS / builds clean, `cargo clippy -p dynamo -p domain -- -D warnings` clean.
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p dynamo --test store_test lantern_record` (moto up per Global Constraints) then `cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings`
+Expected: PASS, lint clean.
 
-- [ ] **Step 6: commit**
+- [ ] **Step 6: capture the five calls in the IAM harness and regenerate the corpus**
+
+`crates/dynamo/tests/iam_capture.rs` is a hand-written driver whose OUTPUT is the generated IAM policy; a store call it does not drive silently stops being described (the whisper shipped with exactly this gap, #210 review pass 1). In the fulfillment section, right after the `mark_whisper_delivered` capture (~:1023), add:
+
+```rust
+    // the lantern (handle_lantern / heartbeat / preview, fulfillment/src/lib.rs): FIVE calls on
+    // LANTERN# rows — record (conditional put), mark delivered / mark quiet (conditional
+    // updates), get (point read), list (filtered scan). spec: docs/spec-lantern.md
+    capture(cap, &mut m, "list_lanterns", async {
+        s.list_lanterns().await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "record_lantern", async {
+        s.record_lantern("2026-09-20", false, [0, 1, 0, 0]).await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "get_lantern", async {
+        s.get_lantern("2026-09-20").await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "mark_lantern_delivered", async {
+        s.mark_lantern_delivered("2026-09-20").await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "mark_lantern_quiet", async {
+        s.mark_lantern_quiet("2026-09-20").await.unwrap();
+    })
+    .await;
+```
+
+(Match the exact `capture(cap, &mut m, "<name>", async { … }).await;` shape of the whisper block above it — copy one and edit.) Then, with moto up:
 
 ```bash
-git add crates/domain/src/lib.rs crates/dynamo/src/lib.rs crates/dynamo/tests/store_test.rs
-git commit -S -m "dynamo: LANTERN#<sunday> slot rows — record (once per slot, quiet-aware), mark, get, list"
+DYNAMODB_LOCAL_URL=http://localhost:8000 IAM_CORPUS_WRITE=1 cargo test -p dynamo --test iam_capture
+git diff --stat terraform/iam-request-corpus.json terraform/policies/
+```
+
+Expected: the corpus gains five `fulfillment` entries whose `leading_keys` are `["LANTERN#"]` (scan: `[]`) and whose `attributes` are `pk, sk, delivered, quiet, doors, chimney, wrapped, closing, created_at` (put) / `delivered` or `quiet` (updates); the fulfillment policy template diff is EMPTY or attribute-only — **it must not change the deny prefixes** (`SESSION#*`, `OIDCSTATE#*`). Read the diff like the IAM change it is. Then the drift gate (default mode) must be green: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p dynamo --test iam_capture`.
+
+- [ ] **Step 7: commit**
+
+```bash
+git add crates/domain/src/lib.rs crates/dynamo/src/lib.rs crates/dynamo/tests/store_test.rs crates/dynamo/tests/iam_capture.rs terraform/iam-request-corpus.json terraform/policies/
+git commit -S -m "dynamo: LANTERN#<sunday> slot rows — record (once per slot, quiet-aware), mark delivered/quiet, get, list; IAM corpus captures the five calls"
 ```
 
 ---
@@ -626,9 +697,12 @@ mod tests {
     #[test]
     fn tick_slot_maps_every_instant_to_the_sunday_whose_2100z_boundary_it_follows() {
         assert_eq!(tick_slot(datetime!(2026-09-20 21:00 UTC)).key(), "2026-09-20");
-        assert_eq!(tick_slot(datetime!(2026-09-20 20:59:59 UTC)).key(), "2026-09-13");
-        assert_eq!(tick_slot(datetime!(2026-09-23 21:00 UTC)).key(), "2026-09-20", "wednesday → previous sunday");
-        assert_eq!(tick_slot(datetime!(2026-09-27 22:00 UTC)).key(), "2026-09-27", "EST-shaped late tick still its own sunday");
+        assert_eq!(tick_slot(datetime!(2026-09-20 21:05 UTC)).key(), "2026-09-20", "the real EDT tick");
+        assert_eq!(tick_slot(datetime!(2026-09-20 20:59:59 UTC)).key(), "2026-09-13", "before the boundary is LAST week — why the tick is 17:05 not 17:00");
+        assert_eq!(tick_slot(datetime!(2026-09-23 21:05 UTC)).key(), "2026-09-20", "wednesday → previous sunday");
+        assert_eq!(tick_slot(datetime!(2026-11-01 22:05 UTC)).key(), "2026-11-01", "the real EST tick, first Sunday after fall-back");
+        assert_eq!(tick_slot(datetime!(2026-10-25 21:05 UTC)).next().key(), "2026-11-01", "EDT tick's next IS the EST tick's slot");
+        assert_eq!(tick_slot(datetime!(2027-03-14 21:05 UTC)).key(), "2027-03-14", "first EDT tick after spring-forward");
         let s = tick_slot(SUN_TICK);
         assert_eq!(s.start(), datetime!(2026-09-13 21:00 UTC));
         assert_eq!(s.end(), datetime!(2026-09-20 21:00 UTC));
@@ -676,8 +750,9 @@ mod tests {
         let doors = &l.rooms[0];
         assert_eq!(doors.lines.len(), 2, "{:?}", doors.lines);
         // oldest first: `sixty` (created ~60d ago) precedes `in` (~14d ago)
-        assert!(doors.lines[0].contains("label\\-sixty") && doors.lines[0].contains("shall it stay open"), "{:?}", doors.lines);
-        assert!(doors.lines[1].contains("label\\-in") && doors.lines[1].contains("two weeks"), "{:?}", doors.lines);
+        // `-` is not a Markdown metacharacter, so labels render unescaped
+        assert!(doors.lines[0].contains("label-sixty") && doors.lines[0].contains("shall it stay open"), "{:?}", doors.lines);
+        assert!(doors.lines[1].contains("label-in") && doors.lines[1].contains("two weeks"), "{:?}", doors.lines);
         assert_eq!(l.counts, [2, 0, 0, 0]);
     }
 
@@ -702,7 +777,7 @@ mod tests {
         let links = vec![link("old1", SUN_TICK - time::Duration::days(70)), link("old2", SUN_TICK - time::Duration::days(200)),
                          link("young", SUN_TICK - time::Duration::days(40))];
         let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, false)).unwrap();
-        assert!(l.rooms[0].lines.iter().any(|x| x.contains("2 doors older than two months")), "{:?}", l.rooms[0].lines);
+        assert!(l.rooms[0].lines[0].contains("2 doors older than two months"), "backlog line is FIRST: {:?}", l.rooms[0].lines);
         assert!(compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).is_none(), "delivered once ⇒ backlog gone ⇒ quiet");
     }
 
@@ -737,13 +812,15 @@ mod tests {
     fn closing_looks_forward_into_the_next_bucket_only() {
         let games = HashMap::new(); let friends = HashMap::new(); let none: Vec<Claim> = vec![];
         let slot = tick_slot(SUN_TICK);
-        let mut last_thu = link("lastthu", SUN_TICK - time::Duration::days(100));
+        // each via link() so LABELS differ too (a clone keeps `label-lastthu`; the review caught it)
+        let old = SUN_TICK - time::Duration::days(100);
+        let mut last_thu = link("lastthu", old);
         last_thu.expires_at = Some(datetime!(2026-09-17 12:00 UTC)); // already closed at the tick
-        let mut next_thu = last_thu.clone(); next_thu.token = "nextthu".into();
+        let mut next_thu = link("nextthu", old);
         next_thu.expires_at = Some(datetime!(2026-09-24 12:00 UTC));
-        let mut tonight = last_thu.clone(); tonight.token = "tonight".into();
+        let mut tonight = link("tonight", old);
         tonight.expires_at = Some(slot.end() + time::Duration::seconds(1));
-        let mut far = last_thu.clone(); far.token = "far".into();
+        let mut far = link("far", old);
         far.expires_at = Some(slot.next().end());
         let links = vec![last_thu, next_thu, tonight, far];
         let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).unwrap();
@@ -765,16 +842,23 @@ mod tests {
 
     #[test]
     fn render_carries_one_deep_link_per_room_no_mentions_and_the_final_cap() {
-        let games = HashMap::new(); let friends = HashMap::new(); let none: Vec<Claim> = vec![];
+        // five chimney titles of 240 '*' each → 480 escaped chars per line → ~2,600 raw: the
+        // 2000 cap is REACHED here (the review found the first draft of this test topped out ~1,550)
+        let mut games = HashMap::new();
+        for i in 0..5 { games.insert(format!("g{i}"), game(&format!("g{i}"), &"*".repeat(240))); }
+        let friends = HashMap::new(); let links: Vec<Link> = vec![];
+        let pending: Vec<Claim> = (0..5).map(|i| claim(&format!("c{i}"), &format!("g{i}"), SUN_TICK - time::Duration::days(3 + i))).collect();
         let slot = tick_slot(SUN_TICK);
-        let links: Vec<Link> = (0..5).map(|i| { let mut l = link(&"*".repeat(120), slot.start() - time::Duration::days(14) + time::Duration::minutes(i)); l.token = format!("t{i}"); l }).collect();
-        let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).unwrap();
+        let l = compose(&input(&links, &pending, &games, &friends, SUN_TICK, true)).unwrap();
+        let raw: usize = l.rooms.iter().map(|r| r.lines.iter().map(|x| x.chars().count()).sum::<usize>()).sum();
+        assert!(raw > 2000, "fixture must overflow the cap to test it: {raw}");
         let v = render(&l, &slot, "https://s", false);
         let c = v["content"].as_str().unwrap();
-        assert!(c.starts_with("🏮 the lantern"));
-        assert!(c.contains("https://s/admin/links"));
+        assert!(c.starts_with("🏮 the lantern · week of sep 13"));
+        assert!(c.contains("https://s/admin/ops"));
         assert!(!c.contains("token=") && !c.contains("/l/"), "no bearer capability: {c}");
-        assert!(c.chars().count() <= 2000 && !c.ends_with('\\'));
+        assert_eq!(c.chars().count(), 2000);
+        assert!(!c.ends_with('\\'));
         assert_eq!(v["allowed_mentions"]["parse"].as_array().unwrap().len(), 0);
         assert!(v["embeds"].as_array().unwrap().is_empty());
         let p = render(&l, &slot, "https://s", true);
@@ -981,7 +1065,8 @@ pub fn compose(input: &Input) -> Option<Lantern> {
     }
     let door_count = doors.len() as u32;
     if backlog > 0 {
-        doors.push(format!("· and {backlog} doors older than two months nobody has walked through"));
+        // FIRST, so the room cap can never push it into "and N more" on the one tick that has it
+        doors.insert(0, format!("· and {backlog} doors older than two months nobody has walked through"));
     }
 
     // 🕯️ chimney — Pending past the bar, every week, with a week counter and the clearing action
@@ -1051,12 +1136,13 @@ Notes for the implementer:
 - `let … && …` chains are edition-2024 and already used in `domain` — fine.
 - `chimney_bar_matches_the_sweep` (in step 1) pins `CHIMNEY_BAR == crate::RECONCILE_STUCK_ALERT_AGE` — both `time::Duration`, no conversion.
 - Deep links: ONE per room heading, not per line as the spec's mock-up shows — a deliberate deviation (five identical URLs per room is noise); the spec's mock-up is illustrative, the decisions section does not fix per-line links.
+- Header reads "week of ⟨eastern date of slot.start()⟩" — the SUNDAY the bucket opened (sep 13 for the 09-20 tick), not the Monday; the spec mock-up's "sep 14" is corrected to match.
 - Lines are already escaped by `field`; `render` only joins — this is the "exactly once" discipline the tests pin (single backslash).
 
 - [ ] **Step 4: run**
 
-Run: `cargo test -p fulfillment --lib lantern:: && cargo clippy -p fulfillment -- -D warnings`
-Expected: PASS (13 tests), clippy clean.
+Run: `cargo fmt && cargo test -p fulfillment --lib lantern:: && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings`
+Expected: PASS (14 tests), lint clean.
 
 - [ ] **Step 5: commit**
 
@@ -1076,13 +1162,18 @@ git commit -S -m "lantern: slot buckets (sunday-date key, 21:00Z boundary), comp
 
 **Interfaces:**
 - Consumes: Task 4 store quartet, Task 5 `lantern::{tick_slot, compose, render, Input, Slot}`, `resolve_whisper_url`, `whisper_send_body`, `ping_msg`.
-- Produces: `FulfillRequest::{Lantern, LanternHeartbeat, LanternPreview}` (serde `snake_case` ⇒ `{"op":"lantern"}`, `{"op":"lantern_heartbeat"}`, `{"op":"lantern_preview"}`), `FulfillResponse::Lanterned`, `Deps.lantern_disabled: bool`. No test seam is exported — every heartbeat arm is reachable through `handle` by forging the current slot's row.
+- Produces: `FulfillRequest::{Lantern, LanternHeartbeat, LanternPreview}` (serde `snake_case` ⇒ `{"op":"lantern"}`, `{"op":"lantern_heartbeat"}`, `{"op":"lantern_preview"}`), `FulfillResponse::Lanterned`, `Deps.lantern_notify: Notify` (resolved in main.rs from the whisper's `SecretRead` + `LANTERN_DISABLED` only), `struct LanternReads`. No test seam is exported — every heartbeat arm is reachable through `handle` by forging the current slot's row.
 
 - [ ] **Step 1: the failing handler tests** — append to `crates/fulfillment/tests/handler_test.rs`, next to the whisper arms (`deps_whisper` at ~9127):
 
 ```rust
-fn deps_lantern(store: Store, humble_uri: &str, whisper_webhook: Option<String>) -> Deps {
-    deps_whisper(store, humble_uri, None, whisper_webhook)
+fn deps_lantern(store: Store, humble_uri: &str, webhook: Option<String>) -> Deps {
+    let mut d = deps_whisper(store, humble_uri, None, webhook.clone());
+    d.lantern_notify = match webhook {
+        Some(u) => fulfillment::Notify::Webhook(u),
+        None => fulfillment::Notify::Disabled,
+    };
+    d
 }
 
 /// A Pending claim `days` old on game "gk:stuck" (title "Stardew Valley" — the helper's own
@@ -1149,8 +1240,10 @@ async fn lantern_heartbeat_absent_runs_then_delivered_does_nothing() {
     seed_stuck_pending(&store, 3).await;
     let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
     let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    // history exists ⇒ "absent" means Sunday FAILED, not "didn't exist yet"
+    store.record_lantern("2000-01-02", true, [0, 0, 0, 0]).await.unwrap();
     assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
-    assert_eq!(discord.received_requests().await.unwrap().len(), 1, "absent ⇒ full run");
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1, "absent (with history) ⇒ full run");
     assert!(store.get_lantern(&slot).await.unwrap().unwrap().delivered);
     assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
     assert_eq!(discord.received_requests().await.unwrap().len(), 1, "delivered ⇒ nothing");
@@ -1171,6 +1264,37 @@ async fn lantern_heartbeat_resends_an_undelivered_slot_and_marks_it() {
     assert!(store.get_lantern(&slot).await.unwrap().unwrap().delivered, "…and mark");
     assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
     assert_eq!(discord.received_requests().await.unwrap().len(), 1, "now settled");
+}
+
+#[tokio::test]
+async fn lantern_heartbeat_with_no_history_sends_nothing() {
+    // enabled on a Monday–Wednesday: the first heartbeat finds no row for the Sunday BEFORE the
+    // lantern existed. "Absent" means "didn't exist yet", not "failed" — metric only.
+    let Some(store) = store_or_skip("lantern_hb_nohistory").await else { return };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await; // there IS something it could say
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 0);
+    assert!(store.list_lanterns().await.unwrap().is_empty(), "no history ⇒ zero writes");
+}
+
+#[tokio::test]
+async fn lantern_heartbeat_settles_an_undelivered_slot_that_composes_empty_as_quiet() {
+    let Some(store) = store_or_skip("lantern_hb_empty_resend").await else { return };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    // history exists (a delivered old slot) so the no-history arm is not the one firing
+    store.record_lantern("2000-01-02", false, [0, 1, 0, 0]).await.unwrap();
+    store.mark_lantern_delivered("2000-01-02").await.unwrap();
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    store.record_lantern(&slot, false, [0, 1, 0, 0]).await.unwrap(); // undelivered, but nothing stuck now
+    assert_eq!(handle(&d, FulfillRequest::LanternHeartbeat).await, FulfillResponse::Lanterned);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 0);
+    let r = store.get_lantern(&slot).await.unwrap().unwrap();
+    assert!(r.quiet && !r.delivered, "settled as quiet, never as delivered");
 }
 
 #[tokio::test]
@@ -1210,18 +1334,21 @@ async fn lantern_preview_writes_nothing_and_keeps_the_backlog_line() {
 }
 
 #[tokio::test]
-async fn lantern_disabled_darkens_only_the_lantern() {
+async fn lantern_mute_is_its_own_and_the_whisper_mute_does_not_reach_it() {
     let Some(store) = store_or_skip("lantern_disabled").await else { return };
     let humble = MockServer::start().await;
     let discord = discord_ok().await;
     seed_stuck_pending(&store, 3).await;
     let mut d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
-    d.lantern_disabled = true;
+    // lantern muted ⇒ dark: zero writes, zero sends
+    d.lantern_notify = fulfillment::Notify::Disabled;
     assert_eq!(handle(&d, FulfillRequest::Lantern).await, FulfillResponse::Lanterned);
     assert!(store.list_lanterns().await.unwrap().is_empty());
     assert_eq!(discord.received_requests().await.unwrap().len(), 0);
-    // vice-versa: the BELL's mute must not dark the lantern (shared credential, split mutes)
-    d.lantern_disabled = false;
+    // WHISPER muted, lantern not ⇒ the lantern still lights (the review found the first draft
+    // routed the lantern through resolve_whisper_url, which made WHISPER_DISABLED dark it too)
+    d.lantern_notify = fulfillment::Notify::Webhook(discord.uri());
+    d.whisper_notify = fulfillment::Notify::Disabled;
     d.bell_disabled = true;
     assert_eq!(handle(&d, FulfillRequest::Lantern).await, FulfillResponse::Lanterned);
     assert_eq!(discord.received_requests().await.unwrap().len(), 1);
@@ -1234,7 +1361,7 @@ Helpers used are the file's own, verified at `290f41b`: `link(token)` (~116, lab
 - [ ] **Step 2: run to verify it fails**
 
 Run: `cargo test -p fulfillment --test handler_test lantern_`
-Expected: FAIL to compile — `FulfillRequest::Lantern` does not exist, `Deps` has no `lantern_disabled`.
+Expected: FAIL to compile — `FulfillRequest::Lantern` does not exist, `Deps` has no `lantern_notify`.
 
 - [ ] **Step 3: request/response/Deps**
 
@@ -1260,9 +1387,12 @@ In `crates/fulfillment/src/lib.rs`:
 ```
 - `Deps`, after `bell_disabled`:
 ```rust
-    /// The lantern's OWN off-switch (`LANTERN_DISABLED`), decoupled like the bell's: shared
-    /// credential, split mute.
-    pub lantern_disabled: bool,
+    /// The LANTERN register: the whisper's CREDENTIAL (same SecretRead, one rotation event)
+    /// resolved with the lantern's OWN flag, `LANTERN_DISABLED` — so `WHISPER_DISABLED` cannot
+    /// dark the lantern and vice versa. A split `bool` beside `whisper_notify` (the bell's shape)
+    /// is NOT enough: `resolve_whisper_url` reads a Notify that was resolved with the whisper's
+    /// flag, so routing through it re-couples the mutes (plan review 2026-09-16).
+    pub lantern_notify: Notify,
 ```
 - dispatch (`handle`): add
 ```rust
@@ -1274,8 +1404,18 @@ In `crates/fulfillment/src/lib.rs`:
 - [ ] **Step 4: the handlers** — after `handle_whisper`:
 
 ```rust
-/// Reads everything compose needs. `Err` ⇒ already logged; caller exits (next tick retries).
-async fn lantern_reads(deps: &Deps) -> Option<(Vec<Link>, Vec<Claim>, std::collections::HashMap<String, Game>, std::collections::HashMap<String, String>, Vec<domain::LanternRecord>)> {
+/// Everything compose needs, read in one place. A named struct, not a tuple — clippy's
+/// `type_complexity` and the next reader both prefer it.
+struct LanternReads {
+    links: Vec<Link>,
+    pending: Vec<Claim>,
+    games: std::collections::HashMap<String, Game>,
+    friends: std::collections::HashMap<String, String>,
+    lanterns: Vec<domain::LanternRecord>,
+}
+
+/// `None` ⇒ already logged; caller exits (next tick retries).
+async fn lantern_reads(deps: &Deps) -> Option<LanternReads> {
     let links = deps.store.list_links().await.map_err(|e| tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list links")).ok()?;
     let pending = deps.store.list_pending_claims().await.map_err(|e| tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list pending")).ok()?;
     let friends = deps.store.list_friends().await.map_err(|e| tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list friends")).ok()?;
@@ -1286,17 +1426,32 @@ async fn lantern_reads(deps: &Deps) -> Option<(Vec<Link>, Vec<Claim>, std::colle
         // an unreadable/missing game renders as its id — counted, never skipped
     }
     let friends = friends.into_iter().map(|f| (f.id, f.name)).collect();
-    Some((links, pending, games, friends, lanterns))
+    Some(LanternReads { links, pending, games, friends, lanterns })
 }
 
-/// The lantern gate: the lantern's own flag first, then the shared register (whose dark faces
-/// already announce themselves naming the param to light — the same param lights the lantern).
+/// The lantern gate on ITS OWN Notify (never `resolve_whisper_url` — that one carries the
+/// whisper's mute). Same three faces as the whisper's gate; the dark advice names the whisper
+/// param because that IS the credential the lantern rides. Match all three; never let-else.
 async fn resolve_lantern_url(deps: &Deps) -> Option<String> {
-    if deps.lantern_disabled {
-        tracing::warn!(outcome = "lantern_dark", "LANTERN_DISABLED set — not lighting, by choice; zero writes");
-        return None;
+    match &deps.lantern_notify {
+        Notify::Webhook(u) => Some(u.clone()),
+        Notify::Disabled => {
+            tracing::warn!(outcome = "lantern_dark", "lantern register unconfigured or LANTERN_DISABLED — no-op, zero writes");
+            ping_msg(deps, &OperatorMessage::fmt(
+                "the lantern is DARK — it rides the whisper webhook ({}); light that param, or unset LANTERN_DISABLED",
+                &[Part::Id(&deps.whisper_param_name)],
+            )).await;
+            None
+        }
+        Notify::Unresolved => {
+            tracing::error!(outcome = "lantern_unresolved", "lantern register configured but UNREADABLE — no-op, zero writes");
+            ping_msg(deps, &OperatorMessage::fmt(
+                "the lantern's webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value.",
+                &[Part::Id(&deps.whisper_param_name)],
+            )).await;
+            None
+        }
     }
-    resolve_whisper_url(deps).await
 }
 
 async fn handle_lantern(deps: &Deps) -> FulfillResponse {
@@ -1308,12 +1463,12 @@ async fn handle_lantern(deps: &Deps) -> FulfillResponse {
 /// RECORD → SEND → MARK for one slot. Returns whether a message was sent.
 async fn run_lantern(deps: &Deps, slot: &lantern::Slot) -> bool {
     let Some(url) = resolve_lantern_url(deps).await else { return false };
-    let Some((links, pending, games, friends, lanterns)) = lantern_reads(deps).await else { return false };
+    let Some(r) = lantern_reads(deps).await else { return false };
     let now = OffsetDateTime::now_utc();
-    let any_delivered = lanterns.iter().any(|r| r.delivered);
-    let input = lantern::Input { links: &links, pending: &pending, games: &games, friends: &friends, slot: slot.clone(), now, any_delivered };
+    let any_delivered = r.lanterns.iter().any(|x| x.delivered);
+    let input = lantern::Input { links: &r.links, pending: &r.pending, games: &r.games, friends: &r.friends, slot: slot.clone(), now, any_delivered };
     let Some(card) = lantern::compose(&input) else {
-        tracing::info!(outcome = "lantern_quiet", slot = %slot.key(), links = links.len(), pending = pending.len(),
+        tracing::info!(outcome = "lantern_quiet", slot = %slot.key(), links = r.links.len(), pending = r.pending.len(),
             "lantern: nothing to say this week — quiet row recorded (F1)");
         match deps.store.record_lantern(&slot.key(), true, [0, 0, 0, 0]).await {
             Ok(true) => {}
@@ -1351,11 +1506,27 @@ async fn send_and_mark(deps: &Deps, url: &str, slot: &lantern::Slot, card: &lant
     }
 }
 
-/// Wednesday: absent ⇒ full run · delivered|quiet ⇒ exit · undelivered ⇒ resend + mark.
+/// Wednesday: absent+history ⇒ full run · absent+NO history ⇒ metric only (the lantern did not
+/// exist last Sunday — enabling on Mon–Wed must not send for a Sunday before enablement) ·
+/// delivered|quiet ⇒ exit · undelivered ⇒ resend + mark.
+/// ⚠️ Residual, stated: with ZERO history a Sunday schedule that never fires is masked by its
+/// own heartbeat (the metric stays present). The warn outcome below is the only tell, plus the
+/// deploy checklist's "watch the first real Sunday tick".
 async fn handle_lantern_heartbeat(deps: &Deps) -> FulfillResponse {
     let slot = lantern::tick_slot(OffsetDateTime::now_utc());
     match deps.store.get_lantern(&slot.key()).await {
-        Ok(None) => { tracing::warn!(slot = %slot.key(), "heartbeat: Sunday never recorded — running the lantern for its slot"); run_lantern(deps, &slot).await; }
+        Ok(None) => {
+            let history = match deps.store.list_lanterns().await {
+                Ok(v) => !v.is_empty(),
+                Err(e) => { tracing::error!(error = ?e, outcome = "lantern_read_failed", "heartbeat: cannot list lantern log"); return FulfillResponse::Lanterned; }
+            };
+            if history {
+                tracing::warn!(slot = %slot.key(), "heartbeat: Sunday never recorded — running the lantern for its slot");
+                run_lantern(deps, &slot).await;
+            } else {
+                tracing::warn!(outcome = "lantern_heartbeat_no_history", slot = %slot.key(), "heartbeat: no lantern has ever run — not running one for a Sunday before enablement; metric touched only");
+            }
+        }
         Ok(Some(r)) if r.delivered || r.quiet => tracing::info!(slot = %slot.key(), quiet = r.quiet, "heartbeat: slot settled — metric touched, nothing to do"),
         Ok(Some(_)) => { resend_undelivered(deps, &slot).await; }
         Err(e) => tracing::error!(error = ?e, outcome = "lantern_read_failed", "heartbeat: cannot read slot row"),
@@ -1366,25 +1537,30 @@ async fn handle_lantern_heartbeat(deps: &Deps) -> FulfillResponse {
 /// Recompose the SAME slot (same buckets, current liveness) and send; no RECORD (the row exists).
 async fn resend_undelivered(deps: &Deps, slot: &lantern::Slot) -> bool {
     let Some(url) = resolve_lantern_url(deps).await else { return false };
-    let Some((links, pending, games, friends, lanterns)) = lantern_reads(deps).await else { return false };
-    let any_delivered = lanterns.iter().any(|r| r.delivered);
-    let input = lantern::Input { links: &links, pending: &pending, games: &games, friends: &friends, slot: slot.clone(), now: OffsetDateTime::now_utc(), any_delivered };
+    let Some(r) = lantern_reads(deps).await else { return false };
+    let any_delivered = r.lanterns.iter().any(|x| x.delivered);
+    let input = lantern::Input { links: &r.links, pending: &r.pending, games: &r.games, friends: &r.friends, slot: slot.clone(), now: OffsetDateTime::now_utc(), any_delivered };
     match lantern::compose(&input) {
         Some(card) => { tracing::warn!(slot = %slot.key(), "heartbeat: resending an undelivered lantern (at-least-once)"); send_and_mark(deps, &url, slot, &card).await }
-        None => { tracing::info!(slot = %slot.key(), "heartbeat: undelivered slot now composes empty — marking delivered to settle it"); let _ = deps.store.mark_lantern_delivered(&slot.key()).await; false }
+        None => {
+            // nothing was ever sent for this slot ⇒ settle it as QUIET; `delivered` keeps meaning delivered
+            tracing::info!(outcome = "lantern_quiet", slot = %slot.key(), "heartbeat: undelivered slot now composes empty — settled as quiet");
+            if let Err(e) = deps.store.mark_lantern_quiet(&slot.key()).await { tracing::error!(error = ?e, slot = %slot.key(), "heartbeat: mark quiet failed"); }
+            false
+        }
     }
 }
 
 /// Zero writes: compose against live data, POST with the preview header.
 async fn handle_lantern_preview(deps: &Deps) -> FulfillResponse {
     let Some(url) = resolve_lantern_url(deps).await else { return FulfillResponse::PreviewBlocked };
-    let Some((links, pending, games, friends, lanterns)) = lantern_reads(deps).await else { return FulfillResponse::PreviewBlocked };
+    let Some(r) = lantern_reads(deps).await else { return FulfillResponse::PreviewBlocked };
     let now = OffsetDateTime::now_utc();
     let slot = lantern::tick_slot(now);
-    let any_delivered = lanterns.iter().any(|r| r.delivered);
-    let undelivered = lanterns.iter().filter(|r| !r.delivered && !r.quiet).count();
-    tracing::info!(slot = %slot.key(), rows = lanterns.len(), undelivered, "lantern_preview: log state");
-    let input = lantern::Input { links: &links, pending: &pending, games: &games, friends: &friends, slot, now, any_delivered };
+    let any_delivered = r.lanterns.iter().any(|x| x.delivered);
+    let undelivered = r.lanterns.iter().filter(|x| !x.delivered && !x.quiet).count();
+    tracing::info!(slot = %slot.key(), rows = r.lanterns.len(), undelivered, "lantern_preview: log state");
+    let input = lantern::Input { links: &r.links, pending: &r.pending, games: &r.games, friends: &r.friends, slot, now, any_delivered };
     let Some(card) = lantern::compose(&input) else {
         tracing::warn!(outcome = "lantern_preview_quiet", "lantern_preview: this week would be quiet — nothing to show");
         return FulfillResponse::PreviewBlocked;
@@ -1406,14 +1582,21 @@ fn lantern_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
     env("LANTERN_DISABLED").as_deref() == Some("1")
 }
 ```
-In the `Deps { … }` build (:289-304): `lantern_disabled: lantern_suppressed(|k| std::env::var(k).ok()),` after `bell_disabled`. main.rs pins the flag NAMES by test for `whisper_suppressed`/`bell_suppressed` (`grep -n 'suppressed' crates/fulfillment/src/main.rs` for the test names) — add the same two-arm shape for `lantern_suppressed`: `LANTERN_DISABLED=1` ⇒ true; `BELL_DISABLED=1`/`WHISPER_DISABLED=1`/`NOTIFY_DISABLED=1` ⇒ false.
+After `let whisper_notify = Notify::resolve(whisper_read, whisper_disabled);` (:148) — `SecretRead` is `Clone` (`lib.rs:429`), so clone the read BEFORE it is moved: change that line to `Notify::resolve(whisper_read.clone(), whisper_disabled)` and add
+```rust
+    // The LANTERN register: the SAME credential read, its OWN flag. Resolving a second Notify
+    // (rather than a bool beside whisper_notify) is what keeps WHISPER_DISABLED from reaching it.
+    let lantern_disabled = lantern_suppressed(|k| std::env::var(k).ok());
+    let lantern_notify = Notify::resolve(whisper_read, lantern_disabled);
+```
+then clone it into the closure like `whisper_notify` (:178) and put `lantern_notify,` in the `Deps { … }` build (:289-304) after `bell_disabled`. main.rs pins the flag NAMES by test for `whisper_suppressed`/`bell_suppressed` (`grep -n 'suppressed' crates/fulfillment/src/main.rs` for the test names) — add the same two-arm shape for `lantern_suppressed`: `LANTERN_DISABLED=1` ⇒ true; `BELL_DISABLED=1`/`WHISPER_DISABLED=1`/`NOTIFY_DISABLED=1` ⇒ false.
 
-Add `lantern_disabled: false,` to BOTH `Deps` builders in `handler_test.rs` (lines ~150 and ~558) and to any other `Deps {` literal in `crates/fulfillment` (`grep -rn 'bell_disabled:' crates/fulfillment/`).
+Add `lantern_notify: fulfillment::Notify::Disabled,` to BOTH `Deps` builders in `handler_test.rs` (lines ~150 and ~558) and to any other `Deps {` literal in `crates/fulfillment` (`grep -rn 'bell_disabled:' crates/fulfillment/`).
 
 - [ ] **Step 6: run**
 
-Run: `cargo test -p fulfillment --lib && cargo test -p fulfillment --test handler_test lantern_ && cargo clippy --workspace -- -D warnings`
-Expected: PASS locally where dynamodb-local exists; otherwise the lib tests pass and the handler tests SKIP — **push and read CI before claiming green.**
+Run: `cargo fmt && cargo test -p fulfillment --lib && DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test lantern_ && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings`
+Expected: PASS against moto; **push and read CI before claiming green** (the full workspace link may OOM locally).
 
 - [ ] **Step 7: commit**
 
@@ -1450,13 +1633,13 @@ variable "lantern_enabled" {
 
 variable "lantern_schedule_expression" {
   type        = string
-  default     = "cron(0 17 ? * SUN *)"
-  description = "Lantern tick, America/New_York. 17:00 ET = 21:00Z under EDT / 22:00Z under EST. The slot key is the SUNDAY DATE and the bucket boundary is Sunday 21:00Z (fulfillment::lantern::tick_slot) — the tick must fire AT OR AFTER 21:00Z on its own Sunday, so the margin to the cliff is the distance to MIDNIGHT UTC: ~3h under EDT, ~2h under EST. A tick moved past 19:00 ET would land on MONDAY UTC under EST and map to the NEXT Sunday's slot (a week early, then double). Do not move the tick later without re-deriving; earlier than 17:00 ET is unsafe the other way (before 21:00Z the tick maps to the PREVIOUS Sunday)."
+  default     = "cron(5 17 ? * SUN *)"
+  description = "Lantern tick, America/New_York. 17:05 ET = 21:05Z under EDT / 22:05Z under EST. The slot key is the SUNDAY DATE and the bucket boundary is Sunday 21:00Z (fulfillment::lantern::tick_slot): the tick must fire AFTER 21:00Z on its own Sunday, and 17:00 sharp would sit ON the boundary with zero margin against clock skew (a 20:59:59.9 reading maps to LAST week's slot and exits slot_taken, which reads healthy) — hence :05. Margin to the UTC-midnight cliff: 2h55 under EDT, 1h55 under EST. A tick moved past 19:00 ET lands on MONDAY UTC under EST and maps to the NEXT Sunday's slot (a week early, then double). Do not move the tick without re-deriving both edges."
 }
 
 variable "lantern_heartbeat_schedule_expression" {
   type        = string
-  default     = "cron(0 17 ? * WED *)"
+  default     = "cron(5 17 ? * WED *)"
   description = "Wednesday heartbeat: keeps AWS/Scheduler InvocationAttemptCount present at ≤4-day gaps for the never-ran alarm (7-daily-bucket hard cap), and retries an un-run or undelivered Sunday for the SAME slot (tick_slot maps Wednesday to the previous Sunday). It cannot send a delivered or quiet slot again (spec decisions B1 + F1)."
 }
 ```
@@ -1543,17 +1726,17 @@ resource "aws_scheduler_schedule" "lantern_heartbeat" {
 
 - [ ] **Step 3: alarms** (append) — copies of `whisper_never_ran` / `whisper_target_errors` with `lantern` substituted: `count = var.lantern_enabled ? 1 : 0`, `alarm_name = "${module.label_lantern.id}-never-ran"` / `-target-errors`, `dimensions = { ScheduleGroup = aws_scheduler_schedule_group.lantern[0].name }`, same period/evaluation/threshold/treat_missing_data/datapoints_to_alarm values, `tags = module.label_lantern.tags`. Update the never-ran comment: "the Wednesday heartbeat keeps the metric present at ≤4-day gaps".
 
-- [ ] **Step 4: tfvars + fmt + validate**
+- [ ] **Step 4: fmt + validate (NO tfvars commit)**
 
-Add `lantern_enabled = true` to `terraform/production.tfvars` under `whisper_enabled`.
+`terraform/production.tfvars` is gitignored (`.gitignore:18`) — a `lantern_enabled = true` line there is a DEPLOY step (Task 8's checklist), not a commit; adding it now and `git add`-ing would silently drop it.
 Run: `terraform -chdir=terraform fmt -check && terraform -chdir=terraform validate` (init with `-backend=false` if the backend needs creds: `terraform -chdir=terraform init -backend=false`).
 Expected: fmt clean, validate OK.
 
 - [ ] **Step 5: commit**
 
 ```bash
-git add terraform/
-git commit -S -m "terraform: the lantern — sunday + wednesday schedules in their own group, never-ran/target-error alarms, lantern_enabled (requires whisper)"
+git add terraform/tf-variables.tf terraform/aws-eventbridge.tf terraform/aws-cloudwatch-alarms.tf
+git commit -S -m "terraform: the lantern — sunday 17:05 + wednesday 17:05 schedules in their own group, never-ran/target-error alarms, lantern_enabled (requires whisper)"
 ```
 
 ---
@@ -1568,15 +1751,19 @@ git commit -S -m "terraform: the lantern — sunday + wednesday schedules in the
 
 Change the status line to: `Status: BUILT — plan docs/superpowers/plans/2026-09-16-the-lantern.md; OMBB plan sign-off at the sha his sign-off message names` (fill the sha from the room message; it is recorded in the PR body too). Also correct the spec's mechanism bullet that says `LANTERN_DISABLED` is "plumbed" — it is a manual env edit, parity with `BELL_DISABLED`.
 
-- [ ] **Step 2: file the follow-up issue** (the button the chimney line names)
+- [ ] **Step 2: write the deploy checklist into the spec** (a section `## deploy checklist`): ① `lantern_enabled = true` added to the LOCAL, gitignored `terraform/production.tfvars` ② `terraform plan` shows exactly: 1 schedule group, 2 schedules, 1 role + 1 policy, 2 alarms — nothing else ③ apply ④ `aws lambda invoke --payload '{"op":"lantern_preview"}'` ⇒ `preview_sent`, message in the channel with the `(preview` header, `list_lanterns` still empty (read via the preview's own log line `rows=0`) ⑤ OWED on the checkpoint: watch the first real tick Sun 2026-09-20 17:05 ET — expect one message + one delivered row; the heartbeat's no-history arm makes a dead Sunday schedule invisible until then.
+
+- [ ] **Step 3: file the follow-up issue** (the button the chimney line names — and the bell's shared mute)
 
 ```bash
 gh issue create -R yourcodekitten/bendobundles \
   --title "admin ops: compensate a stuck Pending claim (the action the lantern's chimney line names)" \
-  --body "The lantern (docs/spec-lantern.md) tells ben a Pending claim past the 24h bar 'clears when compensated or fulfilled — no admin button for that yet'. compensate_self_claim exists in fulfillment; nothing in admin-api/web can invoke it (measured 2026-09-16). Shape: an admin-api op that invokes fulfillment with a Compensate request for a claim id, a confirm-step button on /admin/ops beside the stuck row, tests for the self-claim vs friend-claim arms. Disposition of the current #234 specimen is ben's call and is raised at the lantern's reveal."
+  --body "The lantern (docs/spec-lantern.md) tells ben a Pending claim past the 24h bar 'clears when compensated or fulfilled — no admin button for that yet'. compensate_self_claim exists in fulfillment; nothing in admin-api/web can invoke it (measured 2026-09-16). Shape: an admin-api op that invokes fulfillment with a Compensate request for a claim id, a confirm-step button on /admin/ops beside the stuck row, tests for the self-claim vs friend-claim arms. Disposition of the current #234 specimen is ben's call and is raised at the lantern's reveal.
+
+Also from the lantern's plan review, same register, different bug: bell::ring gates on bell_disabled and then calls resolve_whisper_url, whose Notify was resolved with WHISPER_DISABLED — so WHISPER_DISABLED darks the bell too, contrary to spec-attic-bell Q①. The lantern resolves its own Notify from the same SecretRead with its own flag; the bell should adopt that shape (bell_notify) in its own PR."
 ```
 
-- [ ] **Step 3: push, open the PR, watch CI**
+- [ ] **Step 4: push, open the PR, watch CI**
 
 ```bash
 git push -u origin lantern
@@ -1609,4 +1796,5 @@ ops/report-pr-status.sh yourcodekitten/bendobundles <pr>   # from ~/code-kitten 
 - **B2** the DST bucket test listed `Slot(11-01)` twice (`tick_slot(a).next() == tick_slot(b)`) so every instant counted 2. Fixed: three distinct consecutive slots; renamed to say the partition is UTC-fixed by construction.
 - **B3** `seed_stuck_pending` called `seed_aged_pending` with a 4-arg signature that does not exist and asserted a title the helper never writes. Fixed: real 5-arg call, "Stardew Valley", `create_link`.
 - **M1** doors test asserted `lines[0]` = the 14d door; compose sorts oldest-first so it is the 60d one. Fixed: order asserted explicitly. **M2** `chimney_bar_matches_the_sweep` had no code. Fixed. **M3** `..Default::default()` on structs with no `Default`. Fixed: full field lists. **M4** the 2000-cap card test could not reach 2000 (fake). Fixed: `cap_content` tested directly at the cut-on-backslash case + a card path that does reach it. **M5** the heartbeat's undelivered arm ran only through a `pub` test seam on a 1999 slot. Fixed: three tests through `handle` by forging the CURRENT slot's row; seam deleted. **M6** the disabled test asserted a struct literal. Fixed: vice-versa arm through `handle`. **M7** no task created the branch — it already exists (stated in the header). **M8** `StoreError` not imported in store_test — stated.
+- **OMBB plan gate round 1 (07:42, 4 parts) — integrated:** P1 `-` is not escaped (asserts were wrong) · P2 closing clones kept `label-lastthu` (each link built via `link()`) · P3 the cap test string was exactly 2000 (1999 now) · CI's exact fmt/clippy lines in every verify step · `LanternReads` struct (type_complexity) · tfvars gitignored → deploy checklist · render cap test now overflows (five 240-`*` chimney titles) · heartbeat no-history arm (+test, residual stated) · empty resend settles QUIET via new `mark_lantern_quiet` (+test) · ticks 17:05 (margins 2h55/1h55) · real EST 22:05Z tick asserted · **split mute made real: `lantern_notify` resolved from the shared SecretRead with `LANTERN_DISABLED` only** (bell's identical coupling → follow-up issue) · backlog line FIRST · header = the Sunday the bucket opened · iam_capture captures the five calls + corpus regenerated against moto.
 - **Open questions answered:** ① `LANTERN_DISABLED` is NOT tf-plumbed — bell parity, now in Global Constraints and the spec. ② EST 21–22Z closing drop is ratified by OMBB round 2 ("harmless — the door is already closed"); the tick stays 17:00 ET. ③ `lantern_from_item`: bools Corrupt-on-absent (meaning), counts 0-on-absent (diagnostics) — asymmetry made deliberate and commented.
