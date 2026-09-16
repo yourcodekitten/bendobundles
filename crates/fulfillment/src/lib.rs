@@ -13,11 +13,12 @@
 /// test suite runs it; only the `delete_game` call in the bin is `heal`-feature-gated.
 pub mod bell;
 pub mod heal_pairs;
+pub mod lantern;
 pub mod operator_message;
 pub mod whisper;
 
 use crate::operator_message::{ErrorSummary, OperatorMessage, Part};
-use domain::{AppidSource, Claim, Game, GameStatus};
+use domain::{AppidSource, Claim, Game, GameStatus, Link};
 use dynamo::{OwnedWrite, Store, StoreError, SyncBegin, SyncState, SyncWrite};
 use humble_client::{
     GiftUrl, HumbleClient, HumbleError, KeyEntry, OfferedGame, Order, RevealedKey,
@@ -164,6 +165,16 @@ pub enum FulfillRequest {
     /// recording), marked 🔍 in footer + content, so card changes are visible without spending a
     /// weekly slot. Manual-invoke-only, like ValidateCookie.
     WhisperPreview,
+    /// The lantern 🏮 (spec: docs/spec-lantern.md): Sunday's walk through the attic — stalled
+    /// intentions, on the whisper register. Scheduler input `{"op":"lantern"}`.
+    Lantern,
+    /// Wednesday's heartbeat: keeps the never-ran metric alive and retries an un-run or
+    /// undelivered Sunday for the SAME slot (`tick_slot` maps Wednesday to the previous Sunday).
+    /// Never sends a delivered or quiet slot again. Scheduler input `{"op":"lantern_heartbeat"}`.
+    LanternHeartbeat,
+    /// Zero-write preview: compose against live data and POST with a preview header. Manual
+    /// invoke only. The deploy-verification instrument.
+    LanternPreview,
     /// The attic bell (spec: docs/spec-attic-bell.md): one warm webhook message for a durable
     /// friend-side moment. Fired by public-api as InvocationType::Event — NEVER RequestResponse,
     /// NEVER from a schedule. Shares the whisper transport, never WHISPER# slot state.
@@ -202,6 +213,9 @@ pub enum FulfillResponse {
     /// same reason: Scheduler invokes async and the payload is discarded; the run's truth lives
     /// in the whisper log and the ops/whisper channels.
     Whispered,
+    /// The lantern/heartbeat ran (sent, quiet, dark, slot-taken, or a logged failure) — fieldless
+    /// like [`Self::Whispered`], for the same reason.
+    Lanterned,
     /// whisper_preview: the card went out. Which shape it showed is in the card's own footer.
     PreviewSent,
     /// The bell ran (sent, dark no-op, or swallowed failure): every outcome is this variant BY
@@ -216,6 +230,9 @@ pub enum FulfillResponse {
     PreviewBlocked,
     /// whisper_preview: the card was built and the POST failed.
     PreviewSendFailed,
+    /// lantern_preview: this week would be QUIET — a healthy state, not a blocked one (the
+    /// deploy checklist's named alternative to `PreviewSent`).
+    PreviewQuiet,
     CookieStatus {
         ok: bool,
     },
@@ -525,6 +542,12 @@ pub struct Deps {
     /// muting per-event bells must not dark the weekly whisper, and vice versa. Resolved in
     /// main.rs from `BELL_DISABLED`, mirroring `WHISPER_DISABLED`'s register-decoupling rule.
     pub bell_disabled: bool,
+    /// The LANTERN register: the whisper's CREDENTIAL (same SecretRead, one rotation event)
+    /// resolved with the lantern's OWN flag, `LANTERN_DISABLED` — so `WHISPER_DISABLED` cannot
+    /// dark the lantern and vice versa. A split `bool` beside `whisper_notify` (the bell's shape)
+    /// is NOT enough: `resolve_whisper_url` reads a Notify that was resolved with the whisper's
+    /// flag, so routing through it re-couples the mutes (plan review 2026-09-16).
+    pub lantern_notify: Notify,
     pub http: reqwest::Client,
     /// SSM client + the humble-cookie parameter name, so the app can self-heal its own session:
     /// on a dead session it logs in (via `humble.login()`) and persists the fresh cookie here,
@@ -739,6 +762,9 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
         FulfillRequest::ValidateCookie => handle_validate_cookie(deps).await,
         FulfillRequest::Whisper => handle_whisper(deps).await,
         FulfillRequest::WhisperPreview => handle_whisper_preview(deps).await,
+        FulfillRequest::Lantern => handle_lantern(deps).await,
+        FulfillRequest::LanternHeartbeat => handle_lantern_heartbeat(deps).await,
+        FulfillRequest::LanternPreview => handle_lantern_preview(deps).await,
     }
 }
 
@@ -5056,6 +5082,359 @@ async fn handle_whisper(deps: &Deps) -> FulfillResponse {
         .await;
     }
     FulfillResponse::Whispered
+}
+
+// ── the lantern 🏮 (spec: docs/spec-lantern.md) ──────────────────────────────────────────────
+
+/// Everything compose needs, read in one place. A named struct, not a tuple — clippy's
+/// `type_complexity` and the next reader both prefer it.
+struct LanternReads {
+    links: Vec<Link>,
+    pending: Vec<Claim>,
+    games: std::collections::HashMap<String, Game>,
+    friends: std::collections::HashMap<String, String>,
+    lanterns: Vec<domain::LanternRecord>,
+}
+
+/// `None` ⇒ already logged; caller exits (next tick retries).
+async fn lantern_reads(deps: &Deps) -> Option<LanternReads> {
+    let links = deps
+        .store
+        .list_links()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list links")
+        })
+        .ok()?;
+    let pending = deps
+        .store
+        .list_pending_claims()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list pending")
+        })
+        .ok()?;
+    let friends = deps
+        .store
+        .list_friends()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list friends")
+        })
+        .ok()?;
+    let lanterns = deps
+        .store
+        .list_lanterns()
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list lantern log")
+        })
+        .ok()?;
+    let mut games = std::collections::HashMap::new();
+    for c in &pending {
+        match deps.store.get_game(&c.game_id).await {
+            Ok(Some(g)) => {
+                games.insert(c.game_id.clone(), g);
+            }
+            // a MISSING game renders as its id — counted, never skipped (a true orphan)
+            Ok(None) => {}
+            // a store ERROR is not an orphan: shipping a raw id and then marking the slot
+            // delivered would put it beyond the heartbeat's repair (pass-1 review, minor 1)
+            Err(e) => {
+                tracing::error!(error = ?e, game = %c.game_id, outcome = "lantern_read_failed", "lantern: cannot read a pending claim's game");
+                return None;
+            }
+        }
+    }
+    let friends = friends.into_iter().map(|f| (f.id, f.name)).collect();
+    Some(LanternReads {
+        links,
+        pending,
+        games,
+        friends,
+        lanterns,
+    })
+}
+
+/// The lantern gate on ITS OWN Notify (never `resolve_whisper_url` — that one carries the
+/// whisper's mute). Same three faces as the whisper's gate; the dark advice names the whisper
+/// param because that IS the credential the lantern rides. Match all three; never let-else.
+async fn resolve_lantern_url(deps: &Deps) -> Option<String> {
+    match &deps.lantern_notify {
+        Notify::Webhook(u) => Some(u.clone()),
+        Notify::Disabled => {
+            tracing::warn!(
+                outcome = "lantern_dark",
+                "lantern register unconfigured or LANTERN_DISABLED — no-op, zero writes"
+            );
+            ping_msg(deps, &OperatorMessage::fmt(
+                "the lantern is DARK — it rides the whisper webhook ({}); light that param, or unset LANTERN_DISABLED",
+                &[Part::Id(&deps.whisper_param_name)],
+            ))
+            .await;
+            None
+        }
+        Notify::Unresolved => {
+            tracing::error!(
+                outcome = "lantern_unresolved",
+                "lantern register configured but UNREADABLE — no-op, zero writes"
+            );
+            ping_msg(deps, &OperatorMessage::fmt(
+                "the lantern's webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value.",
+                &[Part::Id(&deps.whisper_param_name)],
+            ))
+            .await;
+            None
+        }
+    }
+}
+
+async fn handle_lantern(deps: &Deps) -> FulfillResponse {
+    let slot = lantern::tick_slot(OffsetDateTime::now_utc());
+    run_lantern(deps, &slot).await;
+    FulfillResponse::Lanterned
+}
+
+/// RECORD → SEND → MARK for one slot. Returns whether a message was sent. A quiet week RECORDs a
+/// `quiet` row (decision F1) so the heartbeat never re-runs it — and, unlike the whisper's empty
+/// pool, quiet is HEALTHY here: it must not page ops.
+async fn run_lantern(deps: &Deps, slot: &lantern::Slot) -> bool {
+    let Some(url) = resolve_lantern_url(deps).await else {
+        return false;
+    };
+    let Some(r) = lantern_reads(deps).await else {
+        return false;
+    };
+    let now = OffsetDateTime::now_utc();
+    let any_delivered = r.lanterns.iter().any(|x| x.delivered);
+    let input = lantern::Input {
+        links: &r.links,
+        pending: &r.pending,
+        games: &r.games,
+        friends: &r.friends,
+        slot: slot.clone(),
+        now,
+        any_delivered,
+    };
+    let Some(card) = lantern::compose(&input) else {
+        tracing::info!(
+            outcome = "lantern_quiet",
+            slot = %slot.key(),
+            links = r.links.len(),
+            pending = r.pending.len(),
+            "lantern: nothing to say this week — quiet row recorded (F1)"
+        );
+        match deps
+            .store
+            .record_lantern(&slot.key(), true, [0, 0, 0, 0])
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => tracing::info!(
+                outcome = "lantern_slot_taken",
+                slot = %slot.key(),
+                "quiet, and the slot was already taken"
+            ),
+            Err(e) => {
+                tracing::error!(error = ?e, slot = %slot.key(), outcome = "lantern_record_failed", "lantern: quiet record failed");
+                ping_msg(deps, &OperatorMessage::fmt(
+                    "the lantern could not RECORD its quiet row for slot {} — the Wednesday heartbeat may re-run the week. Check dynamo.",
+                    &[Part::Id(&slot.key())],
+                ))
+                .await;
+            }
+        }
+        return false;
+    };
+    let [d, c, w, x] = card.counts;
+    match deps
+        .store
+        .record_lantern(&slot.key(), false, card.counts)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                outcome = "lantern_slot_taken",
+                slot = %slot.key(),
+                "this slot already has a lantern — loser exits"
+            );
+            return false;
+        }
+        Err(e) => {
+            // The first Sunday's record failing would be eaten by the heartbeat's no-history
+            // arm (no row ⇒ "did not exist yet"), so this one pages ops (OMBB, PR gate).
+            tracing::error!(error = ?e, slot = %slot.key(), outcome = "lantern_record_failed", "lantern: record failed — NOT sending (record precedes act)");
+            ping_msg(deps, &OperatorMessage::fmt(
+                "the lantern could not RECORD slot {} — nothing sent; if this is the first slot the Wednesday heartbeat will NOT retry it (no history). Check dynamo.",
+                &[Part::Id(&slot.key())],
+            ))
+            .await;
+            return false;
+        }
+    }
+    tracing::info!(slot = %slot.key(), doors = d, chimney = c, wrapped = w, closing = x, backlog = card.backlog, "lantern composed");
+    send_and_mark(deps, &url, slot, &card).await
+}
+
+/// SEND then MARK. At-least-once by design: a landed POST whose MARK fails leaves the row
+/// undelivered, and Wednesday's heartbeat resends it — a duplicate beats a lost bucket (OMBB).
+async fn send_and_mark(
+    deps: &Deps,
+    url: &str,
+    slot: &lantern::Slot,
+    card: &lantern::Lantern,
+) -> bool {
+    let body = lantern::render(card, slot, &deps.whisper_site_url, false);
+    if whisper_send_body(&deps.http, url, &body).await {
+        if let Err(e) = deps.store.mark_lantern_delivered(&slot.key()).await {
+            tracing::error!(error = ?e, slot = %slot.key(), outcome = "lantern_mark_failed", "lantern sent but mark failed — heartbeat will resend (at-least-once)");
+        }
+        true
+    } else {
+        tracing::error!(
+            outcome = "lantern_send_failed",
+            slot = %slot.key(),
+            "lantern POST failed — row stays undelivered; heartbeat resends"
+        );
+        ping_msg(deps, &OperatorMessage::fmt(
+            "the lantern's SEND FAILED for slot {} — recorded, undelivered; Wednesday's heartbeat will resend. Check the whisper webhook URL / Discord status.",
+            &[Part::Id(&slot.key())],
+        ))
+        .await;
+        false
+    }
+}
+
+/// Wednesday: absent+history ⇒ full run · absent+NO history ⇒ metric only (the lantern did not
+/// exist last Sunday — enabling on Mon–Wed must not send for a Sunday before enablement) ·
+/// delivered|quiet ⇒ exit · undelivered ⇒ resend + mark.
+/// ⚠️ Residual, stated: with ZERO history a Sunday schedule that never fires is masked by its
+/// own heartbeat (the metric stays present). The warn outcome below is the only tell, plus the
+/// deploy checklist's "watch the first real Sunday tick".
+async fn handle_lantern_heartbeat(deps: &Deps) -> FulfillResponse {
+    let slot = lantern::tick_slot(OffsetDateTime::now_utc());
+    match deps.store.get_lantern(&slot.key()).await {
+        Ok(None) => {
+            let history = match deps.store.list_lanterns().await {
+                Ok(v) => !v.is_empty(),
+                Err(e) => {
+                    tracing::error!(error = ?e, outcome = "lantern_read_failed", "heartbeat: cannot list lantern log");
+                    return FulfillResponse::Lanterned;
+                }
+            };
+            if history {
+                tracing::warn!(slot = %slot.key(), "heartbeat: Sunday never recorded — running the lantern for its slot");
+                run_lantern(deps, &slot).await;
+            } else {
+                tracing::warn!(
+                    outcome = "lantern_heartbeat_no_history",
+                    slot = %slot.key(),
+                    "heartbeat: no lantern has ever run — not running one for a Sunday before enablement; metric touched only"
+                );
+            }
+        }
+        Ok(Some(r)) if r.delivered || r.quiet => tracing::info!(
+            slot = %slot.key(),
+            quiet = r.quiet,
+            "heartbeat: slot settled — metric touched, nothing to do"
+        ),
+        Ok(Some(_)) => {
+            resend_undelivered(deps, &slot).await;
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, outcome = "lantern_read_failed", "heartbeat: cannot read slot row")
+        }
+    }
+    FulfillResponse::Lanterned
+}
+
+/// Recompose the SAME slot (same buckets, current liveness) and send; no RECORD (the row exists).
+async fn resend_undelivered(deps: &Deps, slot: &lantern::Slot) -> bool {
+    let Some(url) = resolve_lantern_url(deps).await else {
+        return false;
+    };
+    let Some(r) = lantern_reads(deps).await else {
+        return false;
+    };
+    let any_delivered = r.lanterns.iter().any(|x| x.delivered);
+    let input = lantern::Input {
+        links: &r.links,
+        pending: &r.pending,
+        games: &r.games,
+        friends: &r.friends,
+        slot: slot.clone(),
+        now: OffsetDateTime::now_utc(),
+        any_delivered,
+    };
+    match lantern::compose(&input) {
+        Some(card) => {
+            tracing::warn!(slot = %slot.key(), "heartbeat: resending an undelivered lantern (at-least-once)");
+            send_and_mark(deps, &url, slot, &card).await
+        }
+        None => {
+            // nothing was ever sent for this slot ⇒ settle it as QUIET; `delivered` keeps meaning delivered
+            tracing::info!(
+                outcome = "lantern_quiet",
+                slot = %slot.key(),
+                "heartbeat: undelivered slot now composes empty — settled as quiet"
+            );
+            if let Err(e) = deps.store.mark_lantern_quiet(&slot.key()).await {
+                tracing::error!(error = ?e, slot = %slot.key(), "heartbeat: mark quiet failed");
+            }
+            false
+        }
+    }
+}
+
+/// Zero writes: compose against live data, POST with the preview header.
+async fn handle_lantern_preview(deps: &Deps) -> FulfillResponse {
+    let Some(url) = resolve_lantern_url(deps).await else {
+        return FulfillResponse::PreviewBlocked;
+    };
+    let Some(r) = lantern_reads(deps).await else {
+        return FulfillResponse::PreviewBlocked;
+    };
+    let now = OffsetDateTime::now_utc();
+    let slot = lantern::tick_slot(now);
+    let any_delivered = r.lanterns.iter().any(|x| x.delivered);
+    let undelivered = r
+        .lanterns
+        .iter()
+        .filter(|x| !x.delivered && !x.quiet)
+        .count();
+    tracing::info!(slot = %slot.key(), rows = r.lanterns.len(), undelivered, "lantern_preview: log state");
+    let input = lantern::Input {
+        links: &r.links,
+        pending: &r.pending,
+        games: &r.games,
+        friends: &r.friends,
+        slot,
+        now,
+        any_delivered,
+    };
+    let Some(card) = lantern::compose(&input) else {
+        tracing::warn!(
+            outcome = "lantern_preview_quiet",
+            "lantern_preview: this week would be quiet — nothing to show"
+        );
+        return FulfillResponse::PreviewQuiet;
+    };
+    let [d, c, w, x] = card.counts;
+    tracing::info!(
+        doors = d,
+        chimney = c,
+        wrapped = w,
+        closing = x,
+        backlog = card.backlog,
+        "lantern_preview: composed"
+    );
+    let body = lantern::render(&card, &input.slot, &deps.whisper_site_url, true);
+    if whisper_send_body(&deps.http, &url, &body).await {
+        FulfillResponse::PreviewSent
+    } else {
+        FulfillResponse::PreviewSendFailed
+    }
 }
 
 /// Test seam: drive the REAL `ping_msg` — `Notify` gate, chunking, delivery, failure record — from

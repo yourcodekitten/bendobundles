@@ -3101,6 +3101,199 @@ impl Store {
         Ok(out_rows)
     }
 
+    // ── the lantern (spec: docs/spec-lantern.md) — LANTERN#<sunday-date> slot rows ────────────
+
+    /// Record the lantern for one SLOT (Sunday date) — the idempotence gate. PutItem conditioned
+    /// `attribute_not_exists(pk)`: exactly ONE lantern per slot. `Ok(false)` = slot taken (a
+    /// heartbeat or double-fire lost the race) — the designed quiet-loser signal. `quiet = true`
+    /// rows are born AND stay `delivered = false`: a quiet week is not a delivered week (the
+    /// backlog line keys on delivered).
+    pub async fn record_lantern(
+        &self,
+        slot: &str,
+        quiet: bool,
+        counts: [u32; 4],
+    ) -> Result<bool, StoreError> {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let mut item: HashMap<String, A> = HashMap::new();
+        item.insert("pk".into(), A::S(format!("LANTERN#{slot}")));
+        item.insert("sk".into(), A::S("META".into()));
+        item.insert("delivered".into(), A::Bool(false));
+        item.insert("quiet".into(), A::Bool(quiet));
+        for (k, v) in ["doors", "chimney", "wrapped", "closing"]
+            .iter()
+            .zip(counts)
+        {
+            item.insert((*k).into(), A::N(v.to_string()));
+        }
+        item.insert(
+            "created_at".into(),
+            A::S(
+                time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+            ),
+        );
+        let res = self
+            .client
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(true),
+            Err(sdk_err) => {
+                if is_ccf_put(&sdk_err) {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "put_item", &sdk_err,
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Flip one slot's lantern to delivered — the third write of record → send → mark.
+    /// Conditioned `attribute_exists(pk)`: marking a never-recorded slot is a caller bug.
+    pub async fn mark_lantern_delivered(&self, slot: &str) -> Result<(), StoreError> {
+        self.lantern_set_flag(
+            slot,
+            "delivered",
+            "mark_lantern_delivered on a slot never recorded",
+        )
+        .await
+    }
+
+    /// Settle an undelivered row as QUIET (the heartbeat's resend composed empty — nothing was
+    /// ever sent, so `delivered` stays false). Same condition as the delivered mark.
+    pub async fn mark_lantern_quiet(&self, slot: &str) -> Result<(), StoreError> {
+        self.lantern_set_flag(slot, "quiet", "mark_lantern_quiet on a slot never recorded")
+            .await
+    }
+
+    /// `SET <flag> = true` on one lantern row, conditioned on the row existing. The two public
+    /// marks differ only in the flag; one implementation so they cannot drift.
+    async fn lantern_set_flag(
+        &self,
+        slot: &str,
+        flag: &str,
+        corrupt: &'static str,
+    ) -> Result<(), StoreError> {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let res = self
+            .client
+            .update_item()
+            .table_name(&self.table)
+            .key("pk", A::S(format!("LANTERN#{slot}")))
+            .key("sk", A::S("META".into()))
+            .update_expression("SET #f = :t")
+            .expression_attribute_names("#f", flag)
+            .expression_attribute_values(":t", A::Bool(true))
+            .condition_expression("attribute_exists(pk)")
+            .send()
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(sdk_err) => {
+                if is_ccf_update(&sdk_err) {
+                    Err(StoreError::Corrupt(corrupt))
+                } else {
+                    Err(StoreError::Aws(AwsFault::from_sdk_error(
+                        "update_item",
+                        &sdk_err,
+                    )))
+                }
+            }
+        }
+    }
+
+    fn lantern_from_item(
+        item: &HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+    ) -> Result<domain::LanternRecord, StoreError> {
+        let slot = item
+            .get("pk")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| s.strip_prefix("LANTERN#"))
+            .ok_or(StoreError::Corrupt("lantern row without LANTERN# pk"))?
+            .to_string();
+        // `delivered`/`quiet` are the row's MEANING — absent is Corrupt, like list_whispers'
+        // fields. The four counts are diagnostics — absent/garbage reads 0 (a row written before
+        // a count existed must still load). The asymmetry is deliberate and this comment is why.
+        let flag = |k: &str| -> Result<bool, StoreError> {
+            item.get(k)
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .ok_or(StoreError::Corrupt("lantern row missing a bool field"))
+        };
+        let count = |k: &str| -> u32 {
+            item.get(k)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
+        Ok(domain::LanternRecord {
+            slot,
+            delivered: flag("delivered")?,
+            quiet: flag("quiet")?,
+            doors: count("doors"),
+            chimney: count("chimney"),
+            wrapped: count("wrapped"),
+            closing: count("closing"),
+        })
+    }
+
+    /// One slot's row, or None — the heartbeat's three-way branch reads this.
+    pub async fn get_lantern(
+        &self,
+        slot: &str,
+    ) -> Result<Option<domain::LanternRecord>, StoreError> {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let out = self
+            .client
+            .get_item()
+            .table_name(&self.table)
+            .key("pk", A::S(format!("LANTERN#{slot}")))
+            .key("sk", A::S("META".into()))
+            .send()
+            .await
+            .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("get_item", &e)))?;
+        match out.item() {
+            None => Ok(None),
+            Some(item) => Ok(Some(Self::lantern_from_item(item)?)),
+        }
+    }
+
+    /// Every lantern row. Filtered scan like `list_whispers` — one row per week, no GSI spent.
+    pub async fn list_lanterns(&self) -> Result<Vec<domain::LanternRecord>, StoreError> {
+        use aws_sdk_dynamodb::types::AttributeValue as A;
+        let mut rows = Vec::new();
+        let mut last_key: Option<HashMap<String, A>> = None;
+        loop {
+            let out = self
+                .client
+                .scan()
+                .table_name(&self.table)
+                .filter_expression("begins_with(pk, :pfx) AND sk = :meta")
+                .expression_attribute_values(":pfx", A::S("LANTERN#".into()))
+                .expression_attribute_values(":meta", A::S("META".into()))
+                .set_exclusive_start_key(last_key.take())
+                .send()
+                .await
+                .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("scan", &e)))?;
+            for item in out.items() {
+                rows.push(Self::lantern_from_item(item)?);
+            }
+            match out.last_evaluated_key() {
+                Some(k) if !k.is_empty() => last_key = Some(k.clone()),
+                _ => break,
+            }
+        }
+        Ok(rows)
+    }
+
     /// Persist a catalog-sync run summary. Unconditional upsert — only one SYNC#STATE item exists.
     pub async fn put_sync_state(&self, state: &SyncState) -> Result<(), StoreError> {
         self.client

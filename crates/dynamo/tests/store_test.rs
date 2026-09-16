@@ -5,8 +5,8 @@ use domain::{
 };
 use dynamo::{
     AppidWrite, AutoHideWrite, BellCounter, ClaimTxError, GuardedWrite, HiddenWrite, OwnedWrite,
-    SYNC_RUN_STALE_SECS, SteamAppCache, SteamAppPutError, SteamAppPutGuard, Store, SyncBegin,
-    SyncState, SyncWrite, sync_run_is_live,
+    SYNC_RUN_STALE_SECS, SteamAppCache, SteamAppPutError, SteamAppPutGuard, Store, StoreError,
+    SyncBegin, SyncState, SyncWrite, sync_run_is_live,
 };
 use std::collections::HashMap;
 use time::macros::datetime;
@@ -4355,4 +4355,68 @@ async fn list_claims_spans_links_and_includes_self() {
     assert_eq!(got[2].link_token, "tok-b");
     // link META items must NOT leak in as claims (the sk filter's job)
     assert!(got.iter().all(|c| !c.id.is_empty()));
+}
+
+// ── the lantern (spec: docs/spec-lantern.md) — LANTERN#<sunday> slot rows ────────────────────
+
+#[tokio::test]
+async fn lantern_record_is_once_per_slot_and_quiet_rows_are_not_delivered() {
+    let Some(store) = store_or_skip("lantern_record").await else {
+        return;
+    };
+    assert!(
+        store
+            .record_lantern("2026-09-20", false, [0, 1, 0, 0])
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .record_lantern("2026-09-20", false, [0, 1, 0, 0])
+            .await
+            .unwrap(),
+        "slot taken"
+    );
+    assert!(
+        store
+            .record_lantern("2026-09-27", true, [0, 0, 0, 0])
+            .await
+            .unwrap()
+    );
+    let r = store.get_lantern("2026-09-20").await.unwrap().unwrap();
+    assert!(!r.delivered && !r.quiet && r.chimney == 1);
+    store.mark_lantern_delivered("2026-09-20").await.unwrap();
+    assert!(
+        store
+            .get_lantern("2026-09-20")
+            .await
+            .unwrap()
+            .unwrap()
+            .delivered
+    );
+    let q = store.get_lantern("2026-09-27").await.unwrap().unwrap();
+    assert!(q.quiet && !q.delivered);
+    assert!(
+        store
+            .record_lantern("2026-10-11", false, [1, 0, 0, 0])
+            .await
+            .unwrap()
+    );
+    store.mark_lantern_quiet("2026-10-11").await.unwrap();
+    let settled = store.get_lantern("2026-10-11").await.unwrap().unwrap();
+    assert!(
+        settled.quiet && !settled.delivered,
+        "settled-as-quiet is not delivered"
+    );
+    assert!(store.get_lantern("2026-10-04").await.unwrap().is_none());
+    let all = store.list_lanterns().await.unwrap();
+    assert_eq!(all.len(), 3);
+    assert!(matches!(
+        store.mark_lantern_delivered("2026-10-04").await,
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(matches!(
+        store.mark_lantern_quiet("2026-10-04").await,
+        Err(StoreError::Corrupt(_))
+    ));
 }

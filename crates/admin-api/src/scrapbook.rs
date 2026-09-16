@@ -87,23 +87,8 @@ fn scrapbook_game(id: &str, games: &HashMap<String, Game>) -> ScrapbookGame {
     }
 }
 
-/// TWO predicates, deliberately — the seal splits them (spec Q1 ruling, four
-/// rounds of crossfire convergence): a curated sealed link's games are
-/// chosen-and-waiting (the friend just can't open yet); a sealed uncurated
-/// link is NOT an open door — it is wrapped. NO precedence knowledge lives
-/// here: `Sealed` outranks Expired AND Exhausted inside `can_claim`, so any
-/// consumer hand-tolerating `Err(Sealed)` re-derives an ordering documented
-/// three crates away (a sealed EXHAUSTED link — reachable, the unlock edit
-/// never checks claims remaining — would render as a wrapped gift nobody can
-/// ever open). The tolerance lives in domain instead: `can_claim_if_unsealed`
-/// asks "claimable if it weren't wrapped?", and a future refusal variant is
-/// handled at its definition site.
-fn link_waits(l: &Link, now: OffsetDateTime) -> bool {
-    l.can_claim_if_unsealed(now).is_ok()
-}
-fn link_is_open_door(l: &Link, now: OffsetDateTime) -> bool {
-    l.can_claim(now).is_ok()
-}
+// `Link::waits` / `Link::is_open_door` (domain) — relocated there when the lantern became the
+// second caller; the sealed-exhausted tolerance rationale lives on `can_claim_if_unsealed` now.
 
 fn recipient(l: &Link, friends: &HashMap<String, String>) -> String {
     l.friend_id
@@ -178,7 +163,7 @@ pub fn compose_scrapbook(
     for link in sorted_links {
         let curated = link.curated_game_ids.as_deref().unwrap_or(&[]);
         if curated.is_empty() {
-            if !link_is_open_door(link, now) {
+            if !link.is_open_door(now) {
                 continue; // revoked, expired, exhausted — or SEALED: wrapped is not open
             }
             doors_open.push(ScrapbookDoor {
@@ -190,7 +175,7 @@ pub fn compose_scrapbook(
             });
             continue;
         }
-        if !link_waits(link, now) {
+        if !link.waits(now) {
             continue; // dead links leave waiting; a SEAL alone does not
         }
         // THE LISTABILITY TEST, not a claim-absence test (spec B1/B2): Failed

@@ -101,3 +101,86 @@ resource "aws_scheduler_schedule" "whisper" {
     input    = jsonencode({ op = "whisper" })
   }
 }
+
+# ── the lantern (spec: docs/spec-lantern.md) ─────────────────────────────────────────────────
+# Its OWN schedule group (AWS/Scheduler metrics carry exactly one dimension, ScheduleGroup — a
+# group shared with the whisper would mask either one's silence). Two schedules in the group:
+# Sunday = the lantern, Wednesday = the heartbeat; both keep the group's metric present.
+module "label_lantern" {
+  source  = "bendoerr-terraform-modules/label/null"
+  version = "1.0.1"
+  context = module.context.shared
+  name    = "lantern"
+}
+
+resource "aws_iam_role" "lantern_scheduler" {
+  count = var.lantern_enabled ? 1 : 0
+  name  = "${module.label_lantern.id}-scheduler"
+  # REQUIRED, not tidy — IamAppRolesSetBoundary (see whisper_scheduler above).
+  permissions_boundary = var.lambda_permissions_boundary_arn
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "scheduler.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+  tags = module.label_lantern.tags
+}
+
+resource "aws_iam_role_policy" "lantern_scheduler_invoke" {
+  count = var.lantern_enabled ? 1 : 0
+  name  = "invoke-fulfillment"
+  role  = aws_iam_role.lantern_scheduler[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunction"
+      Resource = module.lambda_fulfillment.lambda_function_arn
+    }]
+  })
+}
+
+resource "aws_scheduler_schedule_group" "lantern" {
+  count = var.lantern_enabled ? 1 : 0
+  name  = module.label_lantern.id
+  tags  = module.label_lantern.tags
+}
+
+resource "aws_scheduler_schedule" "lantern" {
+  count                        = var.lantern_enabled ? 1 : 0
+  name                         = module.label_lantern.id
+  group_name                   = aws_scheduler_schedule_group.lantern[0].name
+  schedule_expression          = var.lantern_schedule_expression
+  schedule_expression_timezone = "America/New_York"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = module.lambda_fulfillment.lambda_function_arn
+    role_arn = aws_iam_role.lantern_scheduler[0].arn
+    input    = jsonencode({ op = "lantern" })
+  }
+}
+
+resource "aws_scheduler_schedule" "lantern_heartbeat" {
+  count                        = var.lantern_enabled ? 1 : 0
+  name                         = "${module.label_lantern.id}-heartbeat"
+  group_name                   = aws_scheduler_schedule_group.lantern[0].name
+  schedule_expression          = var.lantern_heartbeat_schedule_expression
+  schedule_expression_timezone = "America/New_York"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = module.lambda_fulfillment.lambda_function_arn
+    role_arn = aws_iam_role.lantern_scheduler[0].arn
+    input    = jsonencode({ op = "lantern_heartbeat" })
+  }
+}

@@ -148,6 +148,7 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         whisper_site_url: String::new(),
         whisper_param_name: String::new(),
         bell_disabled: false,
+        lantern_notify: fulfillment::Notify::Disabled,
         http: reqwest::Client::new(),
         // No self-login in these handler tests — a dead session keeps the flag-and-ping path.
         session_store: None,
@@ -556,6 +557,7 @@ async fn deps_with_selfheal(
         whisper_site_url: String::new(),
         whisper_param_name: String::new(),
         bell_disabled: false,
+        lantern_notify: fulfillment::Notify::Disabled,
         http: reqwest::Client::new(),
         session_store: Some(SessionStore {
             ssm: ssm_at(ssm_uri).await,
@@ -9572,4 +9574,379 @@ async fn whisper_empty_pool_pings_ops_distinctly() {
     let body = String::from_utf8(ops.received_requests().await.unwrap()[0].body.clone()).unwrap();
     assert!(body.contains("NOTHING to say")); // cause ② wording, distinct from ①'s DARK/UNREADABLE
     assert!(body.contains("0 listable")); // per-stage pool sizes, so a vacuous predicate shows its work
+}
+
+// ── the lantern (spec: docs/spec-lantern.md) ─────────────────────────────────────────────────
+
+fn deps_lantern(store: Store, humble_uri: &str, webhook: Option<String>) -> Deps {
+    let mut d = deps_whisper(store, humble_uri, None, webhook.clone());
+    d.lantern_notify = match webhook {
+        Some(u) => fulfillment::Notify::Webhook(u),
+        None => fulfillment::Notify::Disabled,
+    };
+    d
+}
+
+/// A Pending claim `days` old on game "gk:stuck" (title "Stardew Valley" — the helper's own
+/// fixture), via the file's existing `seed_aged_pending(store, gid, token, claim_id, created)`:
+/// it puts the game, creates link `token` (claims_used becomes 1 — NOT a door), and claims it
+/// Pending at `created`. Friend-claim or self-claim is irrelevant to the chimney.
+async fn seed_stuck_pending(store: &Store, days: i64) {
+    seed_aged_pending(
+        store,
+        "gk:stuck",
+        "stuck-link",
+        "c-stuck",
+        OffsetDateTime::now_utc() - time::Duration::days(days),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lantern_dark_register_writes_nothing() {
+    let Some(store) = store_or_skip("lantern_dark").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_stuck_pending(&store, 3).await;
+    let d = deps_lantern(store.clone(), &humble.uri(), None);
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    assert!(
+        store.list_lanterns().await.unwrap().is_empty(),
+        "dark ⇒ zero writes"
+    );
+}
+
+#[tokio::test]
+async fn lantern_quiet_writes_exactly_one_row_and_sends_nothing() {
+    let Some(store) = store_or_skip("lantern_quiet").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    let ops = discord_ok().await;
+    // an OPS webhook is wired so "quiet must not page ops" is an assertion, not an accident
+    let mut d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    d.notify = fulfillment::Notify::Webhook(ops.uri());
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    let rows = store.list_lanterns().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].quiet && !rows[0].delivered);
+    assert_eq!(discord.received_requests().await.unwrap().len(), 0);
+    assert_eq!(
+        ops.received_requests().await.unwrap().len(),
+        0,
+        "a quiet week is healthy — it must NOT page ops (unlike the whisper's empty pool)"
+    );
+}
+
+#[tokio::test]
+async fn lantern_send_failure_leaves_an_undelivered_row_pings_ops_and_the_heartbeat_resends() {
+    let Some(store) = store_or_skip("lantern_send_failed").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let ops = discord_ok().await;
+    let discord = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&discord)
+        .await;
+    seed_stuck_pending(&store, 3).await;
+    let mut d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    d.notify = fulfillment::Notify::Webhook(ops.uri());
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    // Sunday: POST fails ⇒ recorded, undelivered, ops told
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    let r = store.get_lantern(&slot).await.unwrap().unwrap();
+    assert!(!r.delivered && !r.quiet, "row stays undelivered");
+    let ops_reqs = ops.received_requests().await.unwrap();
+    assert_eq!(ops_reqs.len(), 1);
+    assert!(String::from_utf8_lossy(&ops_reqs[0].body).contains("SEND FAILED"));
+    // Wednesday: the webhook is healthy again ⇒ the heartbeat resends the SAME slot and marks it
+    discord.reset().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&discord)
+        .await;
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1);
+    assert!(store.get_lantern(&slot).await.unwrap().unwrap().delivered);
+}
+
+#[tokio::test]
+async fn lantern_sends_records_and_marks_and_slot_is_once() {
+    let Some(store) = store_or_skip("lantern_send").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await;
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    let rows = store.list_lanterns().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].delivered && !rows[0].quiet && rows[0].chimney == 1);
+    let reqs = discord.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+    let c = body["content"].as_str().unwrap();
+    assert!(
+        c.contains("stuck in the chimney") && c.contains("Stardew Valley") && c.contains("#234"),
+        "{c}"
+    );
+    assert!(!c.contains("Stardew Valley\\"), "no stray escapes: {c}");
+    // same slot again ⇒ loser, no second send
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1);
+}
+
+// The heartbeat reads the CURRENT slot (tick_slot(now)), so every arm is driven through `handle`
+// by forging that slot's row first — no test seam in the lib.
+#[tokio::test]
+async fn lantern_heartbeat_absent_runs_then_delivered_does_nothing() {
+    let Some(store) = store_or_skip("lantern_hb_absent").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await;
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    // history exists ⇒ "absent" means Sunday FAILED, not "didn't exist yet"
+    store
+        .record_lantern("2000-01-02", true, [0, 0, 0, 0])
+        .await
+        .unwrap();
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        1,
+        "absent (with history) ⇒ full run"
+    );
+    assert!(store.get_lantern(&slot).await.unwrap().unwrap().delivered);
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        1,
+        "delivered ⇒ nothing"
+    );
+}
+
+#[tokio::test]
+async fn lantern_heartbeat_resends_an_undelivered_slot_and_marks_it() {
+    let Some(store) = store_or_skip("lantern_hb_undelivered").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await;
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    // forge Sunday's "sent-but-mark-failed" (or POST-failed) state: recorded, undelivered
+    assert!(
+        store
+            .record_lantern(&slot, false, [0, 1, 0, 0])
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        1,
+        "undelivered ⇒ resend"
+    );
+    assert!(
+        store.get_lantern(&slot).await.unwrap().unwrap().delivered,
+        "…and mark"
+    );
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        1,
+        "now settled"
+    );
+}
+
+#[tokio::test]
+async fn lantern_heartbeat_with_no_history_sends_nothing() {
+    // enabled on a Monday–Wednesday: the first heartbeat finds no row for the Sunday BEFORE the
+    // lantern existed. "Absent" means "didn't exist yet", not "failed" — metric only.
+    let Some(store) = store_or_skip("lantern_hb_nohistory").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await; // there IS something it could say
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(discord.received_requests().await.unwrap().len(), 0);
+    assert!(
+        store.list_lanterns().await.unwrap().is_empty(),
+        "no history ⇒ zero writes"
+    );
+}
+
+#[tokio::test]
+async fn lantern_heartbeat_settles_an_undelivered_slot_that_composes_empty_as_quiet() {
+    let Some(store) = store_or_skip("lantern_hb_empty_resend").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    // history exists (a delivered old slot) so the no-history arm is not the one firing
+    store
+        .record_lantern("2000-01-02", false, [0, 1, 0, 0])
+        .await
+        .unwrap();
+    store.mark_lantern_delivered("2000-01-02").await.unwrap();
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    store
+        .record_lantern(&slot, false, [0, 1, 0, 0])
+        .await
+        .unwrap(); // undelivered, but nothing stuck now
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(discord.received_requests().await.unwrap().len(), 0);
+    let r = store.get_lantern(&slot).await.unwrap().unwrap();
+    assert!(
+        r.quiet && !r.delivered,
+        "settled as quiet, never as delivered"
+    );
+}
+
+#[tokio::test]
+async fn lantern_heartbeat_leaves_a_quiet_slot_alone() {
+    let Some(store) = store_or_skip("lantern_hb_quiet").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await; // there IS something to say — the quiet row must still win
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
+    assert!(
+        store
+            .record_lantern(&slot, true, [0, 0, 0, 0])
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternHeartbeat).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(
+        discord.received_requests().await.unwrap().len(),
+        0,
+        "quiet ⇒ nothing (F1)"
+    );
+    assert!(!store.get_lantern(&slot).await.unwrap().unwrap().delivered);
+}
+
+#[tokio::test]
+async fn lantern_preview_writes_nothing_and_keeps_the_backlog_line() {
+    let Some(store) = store_or_skip("lantern_preview").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    // an old open door ⇒ backlog line while nothing delivered
+    let mut l = link("old-door");
+    l.created_at = OffsetDateTime::now_utc() - time::Duration::days(90);
+    store.create_link(&l).await.unwrap();
+    let d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    assert_eq!(
+        handle(&d, FulfillRequest::LanternPreview).await,
+        FulfillResponse::PreviewSent
+    );
+    assert!(
+        store.list_lanterns().await.unwrap().is_empty(),
+        "preview ⇒ zero writes"
+    );
+    let reqs = discord.received_requests().await.unwrap();
+    let c = serde_json::from_slice::<serde_json::Value>(&reqs[0].body).unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        c.contains("(preview") && c.contains("1 doors older than two months"),
+        "{c}"
+    );
+    // a real tick afterwards STILL carries the backlog line
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    let reqs = discord.received_requests().await.unwrap();
+    let c2 = serde_json::from_slice::<serde_json::Value>(&reqs[1].body).unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(c2.contains("1 doors older than two months"), "{c2}");
+}
+
+#[tokio::test]
+async fn lantern_mute_is_its_own_and_the_whisper_mute_does_not_reach_it() {
+    let Some(store) = store_or_skip("lantern_disabled").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let discord = discord_ok().await;
+    seed_stuck_pending(&store, 3).await;
+    let mut d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
+    // lantern muted ⇒ dark: zero writes, zero sends
+    d.lantern_notify = fulfillment::Notify::Disabled;
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    assert!(store.list_lanterns().await.unwrap().is_empty());
+    assert_eq!(discord.received_requests().await.unwrap().len(), 0);
+    // WHISPER muted, lantern not ⇒ the lantern still lights (the review found the first draft
+    // routed the lantern through resolve_whisper_url, which made WHISPER_DISABLED dark it too)
+    d.lantern_notify = fulfillment::Notify::Webhook(discord.uri());
+    d.whisper_notify = fulfillment::Notify::Disabled;
+    d.bell_disabled = true;
+    assert_eq!(
+        handle(&d, FulfillRequest::Lantern).await,
+        FulfillResponse::Lanterned
+    );
+    assert_eq!(discord.received_requests().await.unwrap().len(), 1);
+    assert_eq!(store.list_lanterns().await.unwrap().len(), 1);
 }

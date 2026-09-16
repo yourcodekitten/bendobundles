@@ -69,6 +69,13 @@ fn bell_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
     env("BELL_DISABLED").as_deref() == Some("1")
 }
 
+/// Is the LANTERN suppressed? Reads `LANTERN_DISABLED` and ONLY that — same register-decoupling
+/// rule as the bell: shared credential, split mute. Unlike the bell's bool, this flag resolves a
+/// SECOND `Notify` from the whisper's SecretRead, so the whisper's own mute cannot reach it.
+fn lantern_suppressed(env: impl Fn(&str) -> Option<String>) -> bool {
+    env("LANTERN_DISABLED").as_deref() == Some("1")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), lambda_runtime::Error> {
     tracing_subscriber::fmt()
@@ -145,7 +152,11 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         SecretRead::DeliberatelyOff
     };
     let whisper_disabled = whisper_suppressed(|k| std::env::var(k).ok());
-    let whisper_notify = Notify::resolve(whisper_read, whisper_disabled);
+    let whisper_notify = Notify::resolve(whisper_read.clone(), whisper_disabled);
+    // The LANTERN register: the SAME credential read, its OWN flag. Resolving a second Notify
+    // (rather than a bool beside whisper_notify) is what keeps WHISPER_DISABLED from reaching it.
+    let lantern_disabled = lantern_suppressed(|k| std::env::var(k).ok());
+    let lantern_notify = Notify::resolve(whisper_read, lantern_disabled);
     // Carried for the DARK announcement's one-liner: the message must always name something
     // actionable, so an unwired env gets a literal saying exactly that.
     let whisper_param_name =
@@ -176,6 +187,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let cookie_param = cookie_param.clone();
         let notify = notify.clone();
         let whisper_notify = whisper_notify.clone();
+        let lantern_notify = lantern_notify.clone();
         let whisper_param_name = whisper_param_name.clone();
         let whisper_site_url = whisper_site_url.clone();
         let base_url = base_url.clone();
@@ -294,6 +306,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     whisper_site_url,
                     whisper_param_name,
                     bell_disabled: bell_suppressed(|k| std::env::var(k).ok()),
+                    lantern_notify,
                     http: http_client,
                     session_store,
                     steam: steam.clone(),
@@ -338,5 +351,22 @@ mod tests {
         assert!(!whisper_suppressed(bell));
         let whisper = |k: &str| (k == "WHISPER_DISABLED").then(|| "1".to_string());
         assert!(!super::bell_suppressed(whisper));
+    }
+
+    #[test]
+    fn lantern_flag_is_its_own_switch_in_every_direction() {
+        // shared credential, split mute: LANTERN_DISABLED mutes only the lantern, and none of the
+        // whisper, bell or global flags reach it.
+        let lantern = |k: &str| (k == "LANTERN_DISABLED").then(|| "1".to_string());
+        assert!(super::lantern_suppressed(lantern));
+        assert!(!whisper_suppressed(lantern));
+        assert!(!super::bell_suppressed(lantern));
+        for other in ["WHISPER_DISABLED", "BELL_DISABLED", "NOTIFY_DISABLED"] {
+            let env = |k: &str| (k == other).then(|| "1".to_string());
+            assert!(
+                !super::lantern_suppressed(env),
+                "{other} must not reach the lantern"
+            );
+        }
     }
 }

@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+pub mod text;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GameStatus {
@@ -348,6 +350,21 @@ pub struct WhisperRecord {
     pub delivered: bool,
 }
 
+/// One row per lantern slot (`LANTERN#<sunday-date>`; spec: docs/spec-lantern.md). `quiet` = the
+/// tick ran and had nothing to say (decision F1: a quiet week must leave a row or the heartbeat
+/// re-runs it); `delivered` = the POST landed and MARK succeeded. The four counts are what compose
+/// judged — the preview reports them so a predicate bug reads as "0 of N", not as peace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanternRecord {
+    pub slot: String,
+    pub delivered: bool,
+    pub quiet: bool,
+    pub doors: u32,
+    pub chimney: u32,
+    pub wrapped: u32,
+    pub closing: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ClaimRefusal {
     #[error("link revoked")]
@@ -382,6 +399,20 @@ impl Link {
             return Err(ClaimRefusal::Sealed);
         }
         self.can_claim_if_unsealed(now)
+    }
+
+    /// A live door a friend could walk through RIGHT NOW: `can_claim` succeeds. Relocated from
+    /// admin-api's scrapbook (its `link_is_open_door`) when the lantern became the second
+    /// caller — two copies of a predicate is where review attention goes to die.
+    pub fn is_open_door(&self, now: OffsetDateTime) -> bool {
+        self.can_claim(now).is_ok()
+    }
+
+    /// "Would be claimable if it weren't wrapped": `can_claim_if_unsealed` succeeds — see that
+    /// method for why the seal's masking must not be re-derived by a consumer. A sealed EXHAUSTED
+    /// link is NOT waiting. Relocated from the scrapbook's `link_waits`.
+    pub fn waits(&self, now: OffsetDateTime) -> bool {
+        self.can_claim_if_unsealed(now).is_ok()
     }
 
     /// "Would this link be claimable if it weren't wrapped?" — every refusal
@@ -753,6 +784,25 @@ mod tests {
         );
         let back: Link = serde_json::from_str(&json).unwrap();
         assert_eq!(back.friend_id, None);
+    }
+
+    #[test]
+    fn is_open_door_is_can_claim_and_waits_ignores_the_seal() {
+        let mut l = link();
+        let now = datetime!(2026-07-02 12:00 UTC);
+        l.unlock_at = Some(now + time::Duration::days(1));
+        assert!(!l.is_open_door(now), "sealed is not an open door");
+        assert!(l.waits(now), "sealed still waits");
+        l.unlock_at = None;
+        assert!(l.is_open_door(now));
+        l.claims_used = l.claims_allowed;
+        l.unlock_at = Some(now + time::Duration::days(1));
+        assert!(!l.waits(now), "a sealed EXHAUSTED link is not waiting");
+        l.unlock_at = None;
+        l.claims_used = 0;
+        l.revoked = true;
+        assert!(!l.is_open_door(now));
+        assert!(!l.waits(now), "revoked waits for nobody");
     }
 
     #[test]
