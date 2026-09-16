@@ -5236,7 +5236,12 @@ async fn run_lantern(deps: &Deps, slot: &lantern::Slot) -> bool {
                 "quiet, and the slot was already taken"
             ),
             Err(e) => {
-                tracing::error!(error = ?e, slot = %slot.key(), outcome = "lantern_record_failed", "lantern: quiet record failed")
+                tracing::error!(error = ?e, slot = %slot.key(), outcome = "lantern_record_failed", "lantern: quiet record failed");
+                ping_msg(deps, &OperatorMessage::fmt(
+                    "the lantern could not RECORD its quiet row for slot {} — the Wednesday heartbeat may re-run the week. Check dynamo.",
+                    &[Part::Id(&slot.key())],
+                ))
+                .await;
             }
         }
         return false;
@@ -5257,7 +5262,14 @@ async fn run_lantern(deps: &Deps, slot: &lantern::Slot) -> bool {
             return false;
         }
         Err(e) => {
-            tracing::error!(error = ?e, slot = %slot.key(), "lantern: record failed — NOT sending (record precedes act)");
+            // The first Sunday's record failing would be eaten by the heartbeat's no-history
+            // arm (no row ⇒ "did not exist yet"), so this one pages ops (OMBB, PR gate).
+            tracing::error!(error = ?e, slot = %slot.key(), outcome = "lantern_record_failed", "lantern: record failed — NOT sending (record precedes act)");
+            ping_msg(deps, &OperatorMessage::fmt(
+                "the lantern could not RECORD slot {} — nothing sent; if this is the first slot the Wednesday heartbeat will NOT retry it (no history). Check dynamo.",
+                &[Part::Id(&slot.key())],
+            ))
+            .await;
             return false;
         }
     }

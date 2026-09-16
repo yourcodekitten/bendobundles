@@ -7,8 +7,10 @@
 use crate::is_spoofing_format_char;
 
 /// Discord Markdown metacharacters (the set the family settled on 2026-09-16; a code span was
-/// rejected because a backtick in the field breaks out of it). Membership is the contract.
-pub const MD_META: &[char] = &['\\', '*', '_', '~', '`', '|', '>', '[', ']', '(', ')'];
+/// rejected because a backtick in the field breaks out of it). `<` is in because `<@id>`,
+/// `<#chan>` and `<t:0:R>` RENDER as pills/timestamps even when `allowed_mentions` mutes the
+/// ping (OMBB, PR gate). Membership is the contract.
+pub const MD_META: &[char] = &['\\', '*', '_', '~', '`', '|', '>', '<', '[', ']', '(', ')'];
 
 /// Line/segment separators (newline, CR, tab, VT, FF, NEL, U+2028/U+2029) become one space so a
 /// multiline paste keeps its word boundaries; every other control char and every spoofing
@@ -60,11 +62,12 @@ mod tests {
 
     #[test]
     fn escape_md_neutralises_every_metacharacter_exactly_once() {
-        let hostile = r"[open your gift](https://evil) `tick` *b* _i_ ~s~ |sp| > q \ back";
+        let hostile =
+            r"[open your gift](https://evil) `tick` *b* _i_ ~s~ |sp| > q \ back <@1> <t:0:R>";
         let once = escape_md(hostile);
         assert_eq!(
             once,
-            r"\[open your gift\]\(https://evil\) \`tick\` \*b\* \_i\_ \~s\~ \|sp\| \> q \\ back"
+            r"\[open your gift\]\(https://evil\) \`tick\` \*b\* \_i\_ \~s\~ \|sp\| \> q \\ back \<@1\> \<t:0:R\>"
         );
         // NOT idempotent by design: escaping the escaped string doubles the backslashes.
         // Call sites escape exactly once (pinned at the render tests).
