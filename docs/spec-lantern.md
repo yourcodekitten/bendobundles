@@ -32,7 +32,7 @@ something to say.** Four rooms, each a section; empty rooms are omitted; all emp
 (and a logged no-send cause, see §silence). In the attic voice, ≤ one screen.
 
 ```
-🏮 the lantern · week of sep 14
+🏮 the lantern · week of sep 13
 
 🚪 doors nobody has walked through
    · the door for sam — open 2 weeks, nobody's come through yet  ↗ links
@@ -180,7 +180,7 @@ line names the action AND the gap; the reveal puts the #234 disposition to ben a
 ## mechanism — reuses, deliberately, the whisper's skeleton
 
 ```
-aws_scheduler_schedule "lantern"  cron(0 17 ? * SUN *)  America/New_York
+aws_scheduler_schedule "lantern"  cron(5 17 ? * SUN *)  America/New_York   (heartbeat: WED, same time)
   └─ fulfillment lambda, input {"op":"lantern"} → FulfillRequest::Lantern
        ├─ GATE  whisper register resolves Webhook?  else loud no-op, ZERO writes (dark-deploy rule)
        ├─ READ  list_links · list_pending_claims · games for the mentioned ids · friends
@@ -195,13 +195,17 @@ aws_scheduler_schedule "lantern"  cron(0 17 ? * SUN *)  America/New_York
 - **Register:** the WHISPER webhook (`WHISPER_WEBHOOK_PARAM`), same credential, same room —
   it is ben's channel and this is for ben. **Off-switch:** `LANTERN_DISABLED=1`, read ONLY by
   the lantern (the bell/whisper register-decoupling rule: one room, one rotation event, separate
-  mutes). Never `NOTIFY_DISABLED`.
+  mutes). Never `NOTIFY_DISABLED`. **Made real (plan gate, OMBB): the lantern resolves ITS OWN
+  `Notify` from the whisper's `SecretRead` with its own flag** — a `bool` beside `whisper_notify`
+  routed through `resolve_whisper_url` would inherit `WHISPER_DISABLED` (the bell has exactly that
+  coupling today; follow-up issue).
 - **Idempotence** = the whisper's `WHISPER#<slot>` pattern with its own key prefix
   `LANTERN#<sunday-date>` (decision B1/B2: the key is `tick_slot(now)`, NOT an ISO week); never
-  touches `WHISPER#` state. **17:00 ET is 21:00Z (EDT) / 22:00Z (EST) — 3h / 2h of margin inside
-  the same UTC Sunday, stated on the tf variable as the real margin** (the lantern ticks later
-  than the whisper, so the whisper's 10h/9h figure does not transfer). *Do not move the tick past
-  19:00 ET without re-deriving; under EST the cliff is an hour earlier.*
+  touches `WHISPER#` state. **The tick is 17:05 ET = 21:05Z (EDT) / 22:05Z (EST): five minutes
+  AFTER the 21:00Z boundary (a tick ON the boundary has zero margin against clock skew — a
+  20:59:59.9 reading maps to LAST week's slot and exits `slot_taken`, which reads healthy), and
+  2h55 / 1h55 of margin to the UTC-midnight cliff, stated on the tf variable** (the whisper's
+  10h/9h figure does not transfer). *Do not move the tick without re-deriving both edges.*
 - **Preview op** `{"op":"lantern_preview"}` (manual invoke only, like `whisper_preview`):
   composes against live data, POSTs with a `(preview)` header, **zero writes**. This is the
   deploy-verification instrument — and, since the message IS the reveal, step 12 and step 14 of
@@ -219,11 +223,17 @@ aws_scheduler_schedule "lantern"  cron(0 17 ? * SUN *)  America/New_York
   `now` maps to the previous Sunday's slot, so the heartbeat is a loser BY CONSTRUCTION, on
   every calendar, and
   ② **the Wednesday tick is `{"op":"lantern_heartbeat"}` — a distinct op that reads the slot
-  row and does exactly one of three things:** row absent ⇒ the Sunday tick never RAN (schedule
-  fault, or read-failed before RECORD) ⇒ run the full lantern for that slot (the retry day the
-  whisper's heartbeat also is); row present + (`delivered` OR `quiet`) ⇒ exit, metric touched,
-  nothing else; row present + **undelivered and not quiet** ⇒ **RESEND the same slot and mark**
-  — this is the answer to the major below.
+  row and does exactly one of these:** row absent AND some lantern row exists ⇒ the Sunday tick
+  never RAN (schedule fault, or read-failed before RECORD) ⇒ run the full lantern for that slot
+  (the retry day the whisper's heartbeat also is); **row absent AND ZERO rows ⇒ metric only +
+  `outcome=lantern_heartbeat_no_history`** (OMBB, plan gate: enabling on Mon–Wed must not send a
+  lantern for the Sunday before the lantern existed — *absent* there means "did not exist yet";
+  residual stated: with zero history a Sunday schedule that never fires is masked by its own
+  heartbeat until the first real Sunday, which the deploy checklist watches); row present +
+  (`delivered` OR `quiet`) ⇒ exit, metric touched, nothing else; row present + **undelivered and
+  not quiet** ⇒ **RESEND the same slot and mark delivered** — the answer to the major below —
+  **or, if it now composes EMPTY, settle it as `quiet`** (never `delivered`: nothing was sent, and
+  `delivered` keys the backlog line).
   🛑 **Decision F1 (OMBB, round 3): a QUIET Sunday must leave a row.** With "quiet ⇒ zero
   writes", Wednesday reads *absent* and runs the full lantern — and the chimney check uses
   `now`, so a claim that started Monday is ≥24h Pending by Wednesday and ben gets a Wednesday
