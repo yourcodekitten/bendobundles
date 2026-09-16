@@ -2,6 +2,10 @@
 //! Pure card builders + best-effort ring. Shares the whisper TRANSPORT (webhook + POST helper),
 //! never its SLOT state: nothing in this module may name WHISPER#, record_whisper, or a slot.
 
+use crate::Deps;
+use crate::operator_message::{OperatorMessage, Part};
+use domain::text::{escape_md, sanitize_line};
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BellEvent {
@@ -25,6 +29,8 @@ pub enum BellEvent {
 const BELL_CONTENT_MAX: usize = 2000;
 const BELL_LABEL_MAX: usize = 120;
 const BELL_TITLE_MAX: usize = 240;
+/// Mirrors public-api's private `THANK_NOTE_MAX_CHARS` (the stored note's write-time budget).
+const BELL_NOTE_MAX: usize = 500;
 
 fn cap(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -32,6 +38,25 @@ fn cap(s: &str, n: usize) -> String {
     } else {
         s.chars().take(n).collect()
     }
+}
+
+/// The ONE way a foreign string enters `content`: sanitise (fold line breaks, strip controls —
+/// a Steam title with `\n# ` must not become a heading), cap by CHARS, THEN escape exactly once
+/// (escaping first lets the cap cut between `\` and `*`). Shared with the lantern via
+/// `crate::bell::field`; do not re-implement.
+pub(crate) fn field(raw: &str, max: usize) -> String {
+    escape_md(&cap(&sanitize_line(raw), max))
+}
+
+/// Final-content cap that never strands a trailing backslash (a `\` at the cut would escape the
+/// character after it in the template). Applied to the FINISHED string, after every field's own
+/// escape — so the 2000 bound is on what Discord receives.
+pub(crate) fn cap_content(s: &str) -> String {
+    let mut out = cap(s, BELL_CONTENT_MAX);
+    while out.ends_with('\\') {
+        out.pop();
+    }
+    out
 }
 
 pub fn unwrap_card(
@@ -48,8 +73,8 @@ pub fn unwrap_card(
     };
     let content = format!(
         "🔔 *the attic rings…*\n**{label}** just unwrapped **{title}**{spent} ♡\n{site}/admin/links",
-        label = cap(label, BELL_LABEL_MAX),
-        title = cap(game_title, BELL_TITLE_MAX),
+        label = field(label, BELL_LABEL_MAX),
+        title = field(game_title, BELL_TITLE_MAX),
         site = site_url,
     );
     // artless ⇒ NO embed at all: an embed object with no renderable field is a Discord 400,
@@ -63,14 +88,11 @@ pub fn unwrap_card(
         None => serde_json::json!([]),
     };
     serde_json::json!({
-        "content": cap(&content, BELL_CONTENT_MAX),
+        "content": cap_content(&content),
         "embeds": embeds,
         "allowed_mentions": { "parse": [] },
     })
 }
-
-use crate::Deps;
-use crate::operator_message::{OperatorMessage, Part};
 
 /// The bell ledger's week key — ONE implementation (the whisper's slot derivation is a different
 /// meaning: tick identity, schedule-coupled; this is just "which week does this count in").
@@ -200,15 +222,17 @@ pub fn thanks_card(label: &str, note: &str, site_url: &str) -> serde_json::Value
     // THANK_NOTE_MAX_CHARS. Mentions are denied structurally, never by scrubbing — all
     // friend-influenced text rides `content`, where allowed_mentions is DOCUMENTED to apply
     // (embed behaviour is observed-not-contract, so this card carries zero embeds and the
-    // question does not arise).
+    // question does not arise). Markdown, however, is NOT denied by `allowed_mentions`: Discord
+    // renders masked links in webhook content, so a note of `[open your gift](https://…)` became
+    // a clickable link with made-up text (Lilith, lantern review 2026-09-16). `field` escapes it.
     let content = format!(
         "💌 *a note came back…*\n**{label}** says: “{note}”\n{site}/admin/links",
-        label = cap(label, BELL_LABEL_MAX),
-        note = note,
+        label = field(label, BELL_LABEL_MAX),
+        note = field(note, BELL_NOTE_MAX),
         site = site_url,
     );
     serde_json::json!({
-        "content": cap(&content, BELL_CONTENT_MAX),
+        "content": cap_content(&content),
         "embeds": [],
         "allowed_mentions": { "parse": [] },
     })
@@ -271,5 +295,54 @@ mod tests {
         ] {
             assert!(v["content"].as_str().unwrap().chars().count() <= 2000);
         }
+    }
+
+    #[test]
+    fn thanks_card_escapes_markdown_exactly_once() {
+        let v = thanks_card(
+            "sam",
+            "[open your gift](https://evil) and a `tick",
+            "https://s",
+        );
+        let c = v["content"].as_str().unwrap();
+        assert!(
+            c.contains(r"\[open your gift\]\(https://evil\) and a \`tick"),
+            "{c}"
+        );
+        assert!(!c.contains(r"\\["), "escaped twice: {c}");
+        assert!(
+            c.contains("**sam** says"),
+            "template bold must survive: {c}"
+        );
+    }
+
+    #[test]
+    fn field_caps_before_escaping_so_no_dangling_backslash() {
+        // cap of 3 lands right before the `*`: "ab*" → "ab\*" (3 chars kept, THEN escaped)
+        assert_eq!(field("ab*cd", 3), "ab\\*");
+        // a max-length note of nothing but metacharacters doubles in length after escaping
+        let note = "*".repeat(500);
+        assert_eq!(field(&note, 500).chars().count(), 1000);
+    }
+
+    #[test]
+    fn cap_content_cuts_at_2000_and_never_strands_a_backslash() {
+        // thanks_card cannot reach 2000 (≈240+1000+50), so test the cap DIRECTLY where the cut
+        // lands on an escape: 1999 'y' + "\x" is 2001 chars → cap keeps 1999 'y' + '\' → popped.
+        let s = format!("{}\\x", "y".repeat(1999));
+        assert_eq!(cap_content(&s), "y".repeat(1999));
+        assert_eq!(cap_content("short").as_str(), "short");
+        // a card path that DOES reach the cap: a 6000-char site_url on unwrap_card
+        let v = unwrap_card("sam", "Celeste", None, &"u".repeat(6000), false);
+        let c = v["content"].as_str().unwrap();
+        assert!(c.chars().count() <= 2000 && !c.ends_with('\\'));
+    }
+
+    #[test]
+    fn unwrap_card_title_with_newline_heading_is_flattened() {
+        let v = unwrap_card("sam", "Bad\n# Title", None, "https://s", false);
+        let c = v["content"].as_str().unwrap();
+        assert!(!c.contains("\n# "), "{c}");
+        assert!(c.contains("Bad # Title"), "{c}");
     }
 }
