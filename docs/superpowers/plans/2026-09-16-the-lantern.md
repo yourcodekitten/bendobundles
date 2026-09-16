@@ -857,8 +857,14 @@ mod tests {
         assert!(c.starts_with("🏮 the lantern · week of sep 13"));
         assert!(c.contains("https://s/admin/ops"));
         assert!(!c.contains("token=") && !c.contains("/l/"), "no bearer capability: {c}");
-        assert_eq!(c.chars().count(), 2000);
-        assert!(!c.ends_with('\\'));
+        // parity: runs of `\*` mean char 2000 is either `\` (popped ⇒ 1999) or `*` (stays 2000),
+        // and the header length decides which — so assert the RANGE, and pin the pop case below.
+        let n = c.chars().count();
+        assert!((1999..=2000).contains(&n) && !c.ends_with('\\'), "{n}");
+        // the cut-on-backslash case, pinned by construction: content that is exactly 2001 chars
+        // with the backslash at position 2000 (cap_content is what render calls last)
+        let exact = format!("{}\\*", "y".repeat(1999));
+        assert_eq!(crate::bell::cap_content(&exact), "y".repeat(1999));
         assert_eq!(v["allowed_mentions"]["parse"].as_array().unwrap().len(), 0);
         assert!(v["embeds"].as_array().unwrap().is_empty());
         let p = render(&l, &slot, "https://s", true);
@@ -1797,4 +1803,4 @@ ops/report-pr-status.sh yourcodekitten/bendobundles <pr>   # from ~/code-kitten 
 - **B3** `seed_stuck_pending` called `seed_aged_pending` with a 4-arg signature that does not exist and asserted a title the helper never writes. Fixed: real 5-arg call, "Stardew Valley", `create_link`.
 - **M1** doors test asserted `lines[0]` = the 14d door; compose sorts oldest-first so it is the 60d one. Fixed: order asserted explicitly. **M2** `chimney_bar_matches_the_sweep` had no code. Fixed. **M3** `..Default::default()` on structs with no `Default`. Fixed: full field lists. **M4** the 2000-cap card test could not reach 2000 (fake). Fixed: `cap_content` tested directly at the cut-on-backslash case + a card path that does reach it. **M5** the heartbeat's undelivered arm ran only through a `pub` test seam on a 1999 slot. Fixed: three tests through `handle` by forging the CURRENT slot's row; seam deleted. **M6** the disabled test asserted a struct literal. Fixed: vice-versa arm through `handle`. **M7** no task created the branch — it already exists (stated in the header). **M8** `StoreError` not imported in store_test — stated.
 - **OMBB plan gate round 1 (07:42, 4 parts) — integrated:** P1 `-` is not escaped (asserts were wrong) · P2 closing clones kept `label-lastthu` (each link built via `link()`) · P3 the cap test string was exactly 2000 (1999 now) · CI's exact fmt/clippy lines in every verify step · `LanternReads` struct (type_complexity) · tfvars gitignored → deploy checklist · render cap test now overflows (five 240-`*` chimney titles) · heartbeat no-history arm (+test, residual stated) · empty resend settles QUIET via new `mark_lantern_quiet` (+test) · ticks 17:05 (margins 2h55/1h55) · real EST 22:05Z tick asserted · **split mute made real: `lantern_notify` resolved from the shared SecretRead with `LANTERN_DISABLED` only** (bell's identical coupling → follow-up issue) · backlog line FIRST · header = the Sunday the bucket opened · iam_capture captures the five calls + corpus regenerated against moto.
-- **Open questions answered:** ① `LANTERN_DISABLED` is NOT tf-plumbed — bell parity, now in Global Constraints and the spec. ② EST 21–22Z closing drop is ratified by OMBB round 2 ("harmless — the door is already closed"); the tick stays 17:00 ET. ③ `lantern_from_item`: bools Corrupt-on-absent (meaning), counts 0-on-absent (diagnostics) — asymmetry made deliberate and commented.
+- **Open questions answered:** ① `LANTERN_DISABLED` is NOT tf-plumbed — bell parity, now in Global Constraints and the spec. ② the EST closing drop (an expiry between 21:00Z and the 22:05Z tick is already past at the tick) is ratified by OMBB round 2 ("harmless — the door is already closed"); the tick is 17:05 ET. ③ `lantern_from_item`: bools Corrupt-on-absent (meaning), counts 0-on-absent (diagnostics) — asymmetry made deliberate and commented.

@@ -3,7 +3,7 @@
 *2026-09-16, kitten. Status: v4 — OMBB round 1 (B1, B2a, B2b, major, Q①–Q⑤) + Lilith round 1
 (closing looks forward, backlog line, chimney names its action, bell markdown finding) + OMBB
 round 2 (closing on k+1) + round 3 (F1: quiet writes a row) integrated; **go-to-plan given at
-`3d56bbb`**. Where narrative and **decisions** disagree, the decisions win.*
+`3d56bbb`; OMBB plan SIGN-OFF at plan `f204d13` / spec `6d0d34f` (07:48), scoped to D1+D2**. Where narrative and **decisions** disagree, the decisions win.*
 
 ## why this exists
 
@@ -81,11 +81,11 @@ mention(instant, k) ⇔ instant ∈ BUCKET(k)      — doors (created_at+14d, +6
 mention(instant, k) ⇔ instant ∈ BUCKET(k+1)    — closing (expires_at): the coming week
 ```
 
-- The Sunday 17:00 ET tick is **21:00Z under EDT and 22:00Z under EST** — always **≥** its own
-  boundary, so every instant in the bucket is in the past at the tick. Under EST the hour
-  21:00Z–22:00Z belongs to the *next* bucket: for **doors and wrapped** that means mentioned a
+- The Sunday 17:05 ET tick is **21:05Z under EDT and 22:05Z under EST** — always **>** its own
+  boundary, so every instant in the bucket is in the past at the tick. Under EST the span
+  21:00Z–22:05Z belongs to the *next* bucket: for **doors and wrapped** that means mentioned a
   week later, never dropped, never doubled. (**Closing is the exception, harmlessly:** an expiry
-  in that hour is in BUCKET(k+1) but already past at the 22:00Z tick, so liveness drops it —
+  in that span is in BUCKET(k+1) but already past at the 22:05Z tick, so liveness drops it —
   mentioned never, and the door is already closed. "Never dropped" is a doors/wrapped property.)
   Jitter and retries evaluate the same `tick_slot`, so they see the same bucket.
 - ⚠️ Why NOT "ISO week of the birthday instant == tick's ISO week": the Sunday tick is the LAST
