@@ -1024,6 +1024,38 @@ async fn drive_fulfillment(rig: &Rig) -> MethodOps {
         s.mark_whisper_delivered("2026-W35").await.unwrap();
     })
     .await;
+    // the lantern (handle_lantern / heartbeat / preview, fulfillment/src/lib.rs; spec
+    // docs/spec-lantern.md): FIVE calls on LANTERN# rows — record (conditional put), mark
+    // delivered / mark quiet (conditional updates on one row), get (point read), list (filtered
+    // scan) — plus list_friends, which fulfillment had never called before (the scrapbook's
+    // friend-name join, now the lantern's too; the whisper's roster lesson, applied at write
+    // time instead of at review).
+    capture(cap, &mut m, "list_friends", async {
+        s.list_friends().await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "list_lanterns", async {
+        s.list_lanterns().await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "record_lantern", async {
+        s.record_lantern("2026-09-20", false, [0, 1, 0, 0])
+            .await
+            .unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "get_lantern", async {
+        s.get_lantern("2026-09-20").await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "mark_lantern_delivered", async {
+        s.mark_lantern_delivered("2026-09-20").await.unwrap();
+    })
+    .await;
+    capture(cap, &mut m, "mark_lantern_quiet", async {
+        s.mark_lantern_quiet("2026-09-20").await.unwrap();
+    })
+    .await;
     m
 }
 
@@ -1199,8 +1231,31 @@ fn public_policy(methods: &MethodOps) -> String {
 // the test
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn iam_corpus_and_policies_match_code() {
+/// Each drive fn is ONE enormous future (every capture is an inline await). The default 2 MiB
+/// test-thread stack overflowed the moment the lantern's six captures joined fulfillment's
+/// (measured 2026-09-16: HEAD passed at the default stack, +6 captures aborted with "has
+/// overflowed its stack"; `Box::pin` at the call sites did NOT help — a debug-build future is
+/// built on the stack before it is moved into the box). So the body runs on its own thread
+/// with a 64 MiB stack and a current-thread runtime. Preferred over `RUST_MIN_STACK`, which
+/// CI does not set and a reader would not find.
+#[test]
+fn iam_corpus_and_policies_match_code() {
+    std::thread::Builder::new()
+        .name("iam-capture".into())
+        .stack_size(64 << 20)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(iam_corpus_and_policies_match_code_body());
+        })
+        .expect("spawn")
+        .join()
+        .expect("the harness panicked — see the message above");
+}
+
+async fn iam_corpus_and_policies_match_code_body() {
     let Some(rig) = rig_or_skip("iam-capture").await else {
         return;
     };

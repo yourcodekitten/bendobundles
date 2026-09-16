@@ -350,6 +350,21 @@ pub struct WhisperRecord {
     pub delivered: bool,
 }
 
+/// One row per lantern slot (`LANTERN#<sunday-date>`; spec: docs/spec-lantern.md). `quiet` = the
+/// tick ran and had nothing to say (decision F1: a quiet week must leave a row or the heartbeat
+/// re-runs it); `delivered` = the POST landed and MARK succeeded. The four counts are what compose
+/// judged — the preview reports them so a predicate bug reads as "0 of N", not as peace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LanternRecord {
+    pub slot: String,
+    pub delivered: bool,
+    pub quiet: bool,
+    pub doors: u32,
+    pub chimney: u32,
+    pub wrapped: u32,
+    pub closing: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ClaimRefusal {
     #[error("link revoked")]

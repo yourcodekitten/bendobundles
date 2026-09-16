@@ -1040,6 +1040,18 @@
         ]
       }
     ],
+    "get_lantern": [
+      {
+        "action": "dynamodb:GetItem",
+        "leading_keys": [
+          "LANTERN#"
+        ],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
     "get_steam_app": [
       {
         "action": "dynamodb:GetItem",
@@ -1126,6 +1138,28 @@
         ]
       }
     ],
+    "list_friends": [
+      {
+        "action": "dynamodb:Query",
+        "index": "listable",
+        "leading_keys": [
+          "FRIEND"
+        ],
+        "attributes": [
+          "gsi1pk"
+        ]
+      }
+    ],
+    "list_lanterns": [
+      {
+        "action": "dynamodb:Scan",
+        "leading_keys": [],
+        "attributes": [
+          "pk",
+          "sk"
+        ]
+      }
+    ],
     "list_links": [
       {
         "action": "dynamodb:Scan",
@@ -1167,6 +1201,38 @@
         "attributes": [
           "pk",
           "sk"
+        ]
+      }
+    ],
+    "mark_lantern_delivered": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "LANTERN#"
+        ],
+        "attributes": [
+          "delivered",
+          "pk",
+          "sk"
+        ],
+        "update_attributes": [
+          "delivered"
+        ]
+      }
+    ],
+    "mark_lantern_quiet": [
+      {
+        "action": "dynamodb:UpdateItem",
+        "leading_keys": [
+          "LANTERN#"
+        ],
+        "attributes": [
+          "pk",
+          "quiet",
+          "sk"
+        ],
+        "update_attributes": [
+          "quiet"
         ]
       }
     ],
@@ -1249,6 +1315,25 @@
           "gsi2sk",
           "pk",
           "sk"
+        ]
+      }
+    ],
+    "record_lantern": [
+      {
+        "action": "dynamodb:PutItem",
+        "leading_keys": [
+          "LANTERN#"
+        ],
+        "attributes": [
+          "chimney",
+          "closing",
+          "created_at",
+          "delivered",
+          "doors",
+          "pk",
+          "quiet",
+          "sk",
+          "wrapped"
         ]
       }
     ],
