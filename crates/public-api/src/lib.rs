@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use domain::is_spoofing_format_char;
+use domain::text::sanitize_line;
 use dynamo::{ClaimTxError, OwnedProxyOutcome, Store, StoreError};
 use fulfillment::{FulfillRequest, FulfillResponse};
 use serde::{Deserialize, Serialize};
@@ -1101,26 +1101,6 @@ fn is_invisible_standalone(c: char) -> bool {
     )
 }
 
-/// Normalize a raw note before validation: line/segment separators (newline, CR,
-/// tab, VT, FF, NEL, U+2028/U+2029 — everything that breaks lines in some text
-/// lineage; a PDF-paste's form feeds are word boundaries too, review pass 2)
-/// become plain spaces so a multiline paste keeps its word boundaries, and every
-/// other control character or spoofing format char is stripped. Runs BEFORE the
-/// emptiness/length checks, so a note of nothing but invisibles is refused as
-/// empty, and stripped characters can't smuggle a 501st visible char past the
-/// budget.
-fn sanitize_note(raw: &str) -> String {
-    raw.chars()
-        .filter_map(|c| match c {
-            '\n' | '\r' | '\t' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
-                Some(' ')
-            }
-            c if c.is_control() || is_spoofing_format_char(c) => None,
-            c => Some(c),
-        })
-        .collect()
-}
-
 #[derive(Deserialize)]
 struct ThanksBody {
     note: String,
@@ -1138,7 +1118,7 @@ async fn handle_post_thanks(
     // 1. Validate before any read. Unlike the admin's gift-note parser, empty is
     //    an error rather than "clear" — there is no clearing a thank-you.
     //    Sanitize first: control/bidi strip precedes emptiness and budget checks.
-    let sanitized = sanitize_note(&body.note);
+    let sanitized = sanitize_line(&body.note);
     let note = sanitized.trim();
     // "Empty" means no visible ink, not just no characters: the sanitizer keeps
     // ZWJ/ZWNJ/MVS/variation-selectors/Hangul-fillers because they're legitimate

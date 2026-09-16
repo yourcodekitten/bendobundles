@@ -27,6 +27,7 @@
 //! State-changing routes (POST/DELETE/…) additionally require the `X-Admin-Request` header —
 //! CSRF defense-in-depth, an independent second layer under `SameSite=Strict` (#83).
 //! All `/admin/api/steam/*` routes additionally require a configured steam client; absent → 503.
+use domain::text::sanitize_line;
 use std::sync::Arc;
 
 mod scrapbook;
@@ -1062,58 +1063,6 @@ async fn handle_set_link_friend(
 
 const FRIEND_NAME_MAX_CHARS: usize = 64;
 
-/// Same category public-api's `sanitize_note` strips from a thank-you note (Unicode Cf
-/// format chars minus the ZWJ/ZWNJ/MVS carve-outs — bidi overrides/embeddings/isolates,
-/// zero-width space, word joiner, BOM, the tag block, etc.) — duplicated here rather than
-/// imported because admin-api does not depend on public-api (review finding: the friend
-/// `name` renders on the UNAUTHENTICATED `/s/{token}` shelf header just like the note
-/// renders beside ben's trusted chrome, so it carries the same U+202E spoofing risk and
-/// needs the same treatment at write time). Keep in sync with
-/// `public-api::is_spoofing_format_char` if that category ever changes.
-fn is_spoofing_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{0600}'..='\u{0605}'
-            | '\u{061C}'
-            | '\u{06DD}'
-            | '\u{070F}'
-            | '\u{0890}'..='\u{0891}'
-            | '\u{08E2}'
-            | '\u{200B}'
-            | '\u{200E}'
-            | '\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{110BD}'
-            | '\u{110CD}'
-            | '\u{13430}'..='\u{1343F}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E007F}'
-    )
-}
-
-/// Same treatment `sanitize_note` gives a thank-you note, applied to a friend name at
-/// write time (create + rename): line/segment separators fold to a space, every other
-/// control or spoofing-format char is dropped — strip, not reject, matching the note
-/// path's behavior exactly. Runs BEFORE the length/emptiness check below so a name that
-/// sanitizes down to nothing is refused as empty, and stripped chars can't smuggle extra
-/// visible length past `FRIEND_NAME_MAX_CHARS`.
-fn sanitize_friend_name(raw: &str) -> String {
-    raw.chars()
-        .filter_map(|c| match c {
-            '\n' | '\r' | '\t' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
-                Some(' ')
-            }
-            c if c.is_control() || is_spoofing_format_char(c) => None,
-            c => Some(c),
-        })
-        .collect()
-}
-
 #[derive(Deserialize)]
 struct CreateFriendBody {
     name: String,
@@ -1126,7 +1075,7 @@ async fn handle_create_friend(
     State(s): State<AppState>,
     Json(body): Json<CreateFriendBody>,
 ) -> Response {
-    let name = sanitize_friend_name(&body.name);
+    let name = sanitize_line(&body.name);
     let name = name.trim();
     // chars().count(), not len(): the constant and the 422 message both promise
     // CHARACTERS, and a byte count refuses multibyte names far short of the cap
@@ -1200,7 +1149,7 @@ async fn handle_patch_friend(
     }
 
     if let Some(name) = body.name.as_deref() {
-        let name = sanitize_friend_name(name);
+        let name = sanitize_line(name);
         let name = name.trim();
         // chars().count(), not len() — same character-cap contract as create
         if name.is_empty() || name.chars().count() > FRIEND_NAME_MAX_CHARS {
@@ -1607,28 +1556,28 @@ mod friend_name_sanitize_tests {
     #[test]
     fn strips_bidi_override_and_other_spoofing_format_chars() {
         assert_eq!(
-            sanitize_friend_name("sarah\u{202E}"),
+            sanitize_line("sarah\u{202E}"),
             "sarah",
             "a trailing bidi override must be stripped, not stored"
         );
         assert_eq!(
-            sanitize_friend_name("\u{202E}sarah\u{200B}"),
+            sanitize_line("\u{202E}sarah\u{200B}"),
             "sarah",
             "leading override + zero-width space both stripped"
         );
         // ordinary names are untouched
-        assert_eq!(sanitize_friend_name("Sarah O'Brien"), "Sarah O'Brien");
+        assert_eq!(sanitize_line("Sarah O'Brien"), "Sarah O'Brien");
     }
 
     #[test]
     fn folds_line_separators_to_a_space_like_sanitize_note_does() {
-        assert_eq!(sanitize_friend_name("sarah\nsmith"), "sarah smith");
+        assert_eq!(sanitize_line("sarah\nsmith"), "sarah smith");
     }
 
     #[test]
     fn a_name_that_sanitizes_to_nothing_is_empty_after_trim() {
         // mirrors sanitize_note's ordering: sanitize runs BEFORE the emptiness check
         // in the handlers, so an all-invisible name is refused as empty, not stored.
-        assert_eq!(sanitize_friend_name("\u{202E}\u{200B}").trim(), "");
+        assert_eq!(sanitize_line("\u{202E}\u{200B}").trim(), "");
     }
 }

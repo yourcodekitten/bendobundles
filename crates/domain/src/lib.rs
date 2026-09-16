@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+pub mod text;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GameStatus {
