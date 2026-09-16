@@ -365,9 +365,11 @@ handler must not inherit that branch from the whisper's skeleton.
 ## deploy checklist (Task 8; the tfvars flip is a deploy step because the file is gitignored)
 
 1. `lantern_enabled = true` added to the LOCAL, gitignored `terraform/production.tfvars`.
-2. `terraform plan` shows exactly: 1 schedule group · 2 schedules · 1 IAM role + 1 inline policy
-   · 2 alarms — and NOTHING else (the lambda's env is untouched: `LANTERN_DISABLED` is not
-   plumbed, by design). Any other resource in the plan is a stop.
+2. `terraform plan` shows exactly **7 to add** — 1 schedule group · 2 schedules · 1 IAM role +
+   1 inline policy · 2 alarms — and **3 to change in place**: the three lambdas' code
+   (`source_code_hash`/`last_modified`; every crate links `domain::text` now, so all three zips
+   differ). Nothing destroyed, no env change (`LANTERN_DISABLED` is not plumbed, by design), no
+   IAM/boundary/SSM/`admin_password_hash` line. Any other line in the plan is a stop.
 3. Apply (kitten-deploy).
 4. `aws lambda invoke --payload '{"op":"lantern_preview"}'` ⇒ `preview_sent` (a healthy quiet
    week answers `preview_quiet`, never `preview_blocked`); the message lands
