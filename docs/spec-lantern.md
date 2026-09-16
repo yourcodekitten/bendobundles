@@ -83,8 +83,11 @@ mention(instant, k) ⇔ instant ∈ BUCKET(k+1)    — closing (expires_at): the
 
 - The Sunday 17:00 ET tick is **21:00Z under EDT and 22:00Z under EST** — always **≥** its own
   boundary, so every instant in the bucket is in the past at the tick. Under EST the hour
-  21:00Z–22:00Z belongs to the *next* bucket: mentioned a week later, never dropped, never
-  doubled. Jitter and retries evaluate the same `tick_slot`, so they see the same bucket.
+  21:00Z–22:00Z belongs to the *next* bucket: for **doors and wrapped** that means mentioned a
+  week later, never dropped, never doubled. (**Closing is the exception, harmlessly:** an expiry
+  in that hour is in BUCKET(k+1) but already past at the 22:00Z tick, so liveness drops it —
+  mentioned never, and the door is already closed. "Never dropped" is a doors/wrapped property.)
+  Jitter and retries evaluate the same `tick_slot`, so they see the same bucket.
 - ⚠️ Why NOT "ISO week of the birthday instant == tick's ISO week": the Sunday tick is the LAST
   day of its ISO week, so the 3h tail Sun 21:00Z–24:00Z is in the tick's week but after the
   tick — a birthday there would be mentioned never. The 21:00Z boundary is chosen so the tick
@@ -235,10 +238,14 @@ aws_scheduler_schedule "lantern"  cron(0 17 ? * SUN *)  America/New_York
 - **Major (OMBB): a failed POST silently eats a bucket's birthdays.** Stateless means the
   door/wrapped/closing lines of that slot exist in no other tick. The never-ran alarm cannot see
   it — the tick ran. Closed by: the heartbeat's undelivered-resend branch (above) gives every
-  slot a second delivery attempt 3 days later, with the SAME bucket so the same lines; both
-  failures log `outcome=lantern_send_failed` with the slot AND ping ops (whisper parity); and
-  the undelivered row is durable — `list_lanterns` in the preview op reports "newest
-  undelivered" so an operator can see it from the admin-invoke path.
+  slot a second delivery attempt 3 days later — **same bucket, current liveness** (the buckets
+  are fixed by the slot; `can_claim(now)`, the chimney's age and every liveness check are
+  re-evaluated on Wednesday, so a door claimed on Tuesday is rightly gone); both failures log
+  `outcome=lantern_send_failed` with the slot AND ping ops (whisper parity); the undelivered row
+  is durable and the preview op logs the undelivered count. **Delivery is AT-LEAST-ONCE:** a
+  POST that lands whose MARK then fails (timeout) leaves the row undelivered and Wednesday sends
+  a duplicate — a duplicate beats lost mentions, written down here so nobody "fixes" it into
+  at-most-once and reopens the major.
 - **Terraform:** `lantern_enabled` (default false → dark deploy), `lantern_schedule_expression`,
   schedule group + schedule + scheduler role (copies of the whisper trio), alarm clone,
   `LANTERN_DISABLED` env plumbed. No new IAM beyond invoking the existing lambda and the
