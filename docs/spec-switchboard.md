@@ -75,6 +75,19 @@ direction its own example sentence named.
 `Deps` already carries `lantern_notify` (`:550`) resolved under its own flag — the correct shape
 exists in this file. The bell simply never got one.
 
+🔑 **AND THE REPO ALREADY CONTAINS THE DIAGNOSIS, WRITTEN WHILE FIXING THIS EXACT BUG FOR A
+DIFFERENT REGISTER.** `main.rs:159` resolves the lantern from the **same** `whisper_read` under a
+**different** flag — and `:157`, one line above it, says why that shape was chosen:
+
+> *a separate `Notify` (rather than a bool beside `whisper_notify`) is what keeps `WHISPER_DISABLED`
+> from reaching it.*
+
+**The bell is precisely "a bool beside `whisper_notify`"**: `bell_disabled: bool` (`lib.rs:544`)
+plus a call to `resolve_whisper_url`. The lantern arc (2026-09-16, same author) identified the
+anti-pattern by name, avoided it for the new register, and left the existing one standing in it.
+⇒ *The class was understood and fixed narrowly, because the bell was already "done" — a premise
+inherited from one's own prior work is the least-audited thing in the file.*
+
 ### 1.3 What makes the next one inevitable
 
 Three registers exist (`notify`, `whisper_notify`, `lantern_notify`); two resolve correctly and one
@@ -170,6 +183,10 @@ the **`BELL_DISABLED`** flag. Exactly `lantern_notify`'s shape.
 `Notify::resolve(read, true)` ⇒ `Disabled` ⇒ `sendable()` returns `None` and says so. Keeping both
 would be two switches for one lamp, and the existing early-return's `outcome="bell_disabled"`
 record is preserved by the gate's `register_dark reason="disabled" register="bell"`.
+**Measured dependents of the bool (all in-repo, none external):** `lib.rs:544` (the field),
+`bell.rs:111` (the read), `main.rs:308` (the wiring, via `bell_suppressed`), and **three test
+sites** — `handler_test.rs:150`, `:559`, `:9945`. The env var `BELL_DISABLED` and its reader
+`bell_suppressed` (`main.rs:65`) are UNCHANGED; only the bool's destination moves.
 
 ---
 
@@ -228,7 +245,12 @@ cannot report that register.**
 - **Blast radius is the notification path only.** `ping_msg` returns `()` by design and no call site
   can propagate; that guarantee is preserved unchanged.
 - **The newtype touches every `Notify` construction site.** Compile-enforced; the census is
-  `Notify::Webhook` (6 hits today, `:178 :513 :4740 :4819 :5164 :5591`).
+  `Notify::Webhook` = **13 hits** workspace-wide (`--include=*.rs`, excluding `target/`).
+  🔴 **This number was 6 in this spec's first draft and that was a WINDOW, not a census** — the
+  first grep was scoped to `crates/fulfillment/src/*.rs`, one crate's `src/`, and published as
+  the population. The missing 7 are mostly test-side constructions. *Corrected at spec self-review;
+  recorded rather than silently fixed, because understating one's own blast radius by half is the
+  failure this spec is about.*
 - **A newly-loud `Unresolved` could page repeatedly.** By construction it can only page through the
   log (§4.5), never through `ping_msg`, so there is no amplification loop — the alarm debounces on
   the CloudWatch side.
