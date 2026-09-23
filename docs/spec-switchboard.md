@@ -51,7 +51,10 @@ The composition is the real cost. Every dark-gate in the app escalates *through*
 
 - whisper dark → `tracing::warn!(outcome="whisper_dark")` → `ping_msg(...)` → **silently dropped**
 - lantern dark → `tracing::warn!(outcome="lantern_dark")` → `ping_msg(...)` → **silently dropped**
-- `pending_age_sweep` stuck-claim warn (#234's 70-day prod specimen) → `ping_msg(...)` → **dropped**
+- `pending_age_sweep` stuck-claim warn (#234's prod specimen — **70 days when that issue measured
+  it on 2026-09-14; 78 as of 2026-09-23**, and it is the CLAIM's age, never the defect's: the
+  let-else dates to `525dc10` on 08-07 = **47 days**, the same shape to 07-02 = **83**. Three axes,
+  and an earlier draft of this spec quoted one figure for all of them) → `ping_msg(...)` → **dropped**
 - lantern record/send failure → `ping_msg(...)` → **dropped**
 
 ⇒ **The system's entire escalation path has a single point of silent failure, and it is the one
@@ -193,9 +196,21 @@ per event, and the plan implements neither.** Two changes, both against my recom
   `lib.rs:4754` and `bell.rs:115` already ship. *§3.4's "two records for one event is deliberate"
   is RETIRED.*
 
-`Disabled` is `warn` (deliberate, operator-initiated silence); `Unresolved` is `error`
-(misconfiguration — the state `Notify`'s doc already calls out as distinct, now distinct at SEND
-and not only at init).
+`Disabled` is `info` (deliberate, operator-initiated silence — the level `bell.rs:115` already
+used for this exact state); `Unresolved` is `error` (misconfiguration — the state `Notify`'s doc
+already calls out as distinct, now distinct at SEND and not only at init).
+
+🔴 **THIS SENTENCE SAID `warn` UNTIL 07:3x, TWO LINES BELOW THE NOTE THAT CORRECTS IT — and that
+makes it the FOURTH distance datum, the shortest and the worst.** The amendment above landed on the
+table and on its own explanation and **walked past the next paragraph.** The series now reads:
+4,282 lines (prohibition → violation) · 4 lines (an active reviewer's gate comment → the defect) ·
+4 lines *in the reviewer's own terminal, printed by him, for another purpose* · **2 lines, same
+section, immediately after its own correction, written by the person making the correction.**
+⇒ ***Nobody gets to call this carelessness. It is the thesis.*** (OMBB found it; he declined to
+count it against the sign-off, which is the right call and does not make it less true.)
+⚠️ **A half-applied correction is worse than none: the section now carries the authority of having
+been reviewed.** When you amend a claim, grep the document for every spelling of it — the copy you
+will miss is the one nearest your cursor.
 
 ### 3.3 The structural half — a silent drop stops compiling
 
