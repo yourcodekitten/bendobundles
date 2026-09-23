@@ -10027,3 +10027,58 @@ fn sendable_returns_url_only_for_webhook_and_logs_every_dark_face() {
         "the needle is on the wrong face — a deliberate mute would page: {logs}"
     );
 }
+
+/// A `Store` that is VALID but never reachable. The port is closed ON PURPOSE: a test whose path
+/// touches the store fails LOUDLY here instead of skipping green or panicking on the dynamo guard.
+/// Sound only for tests whose path provably never touches it — measured per test, see the plan's
+/// run-matrix. Do not "fix" this later by pointing it at something that answers.
+async fn unreachable_store() -> Store {
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url("http://127.0.0.1:1")
+        .region("us-east-1")
+        .test_credentials()
+        .load()
+        .await;
+    Store::new(aws_sdk_dynamodb::Client::new(&config), "sw-unused".to_string())
+}
+
+#[tokio::test]
+async fn unreachable_store_is_actually_unreachable() {
+    // Every LOCAL row of the run-matrix rests on this endpoint being closed: a test whose path
+    // touches the store must go RED here rather than skip green. That is a property of the WORLD
+    // (port 1 refuses), not of this repo — so it is asserted on every run, not assumed.
+    let store = unreachable_store().await;
+    assert!(
+        store.get_link("sw-enforcement-control").await.is_err(),
+        "unreachable_store() ANSWERED a query — the endpoint is live, and every LOCAL row of the \
+         run-matrix is back to being an unenforced claim"
+    );
+}
+
+#[tokio::test]
+async fn ping_msg_on_a_dark_ops_register_says_so() {
+    // "emits nothing" IS the bug. A test asserting only "does not panic" would have passed every
+    // one of the 78 days the prod alarm was being swallowed.
+    let (log_buf, _capture) = capture_logs();
+    let mut d = deps(unreachable_store().await, "http://humble.invalid", None);
+
+    for (notify, want_reason) in [
+        (fulfillment::Notify::Disabled, "disabled"),
+        (fulfillment::Notify::Unresolved, "unresolved"),
+    ] {
+        d.notify = notify;
+        // 🔴 `ping_msg_for_test`, NOT a widened `ping_msg`. An earlier draft of this task made
+        // the real function `pub`; its neighbour's doc says why not, in the repo's own words:
+        // *"`ping_msg` is private and stays private: it takes `&Deps`, and exposing it would make
+        // the notification path callable from anywhere."* The seam already existed and the plan
+        // said to look for one. I widened the API before looking.
+        fulfillment::ping_msg_for_test(&d, "knock knock").await;
+
+        let logs = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains(r#"register="ops""#)
+                && logs.contains(&format!(r#"reason="{want_reason}""#)),
+            "a dark ops register returned in silence ({want_reason}): {logs}"
+        );
+    }
+}
