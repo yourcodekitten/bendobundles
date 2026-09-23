@@ -9962,14 +9962,22 @@ fn sendable_returns_url_only_for_webhook_and_logs_every_dark_face() {
     // 🔴 ALL FOUR REGISTERS x ALL THREE STATES = the 3x4 matrix spec §5 promises. An earlier draft
     // asserted THREE CELLS (Ops/Whisper/Lantern, one state each) and never mentioned `Bell` — the
     // register Task 4 exists for. A gate that worked for Ops and broke the bell would have passed.
-    const REGISTERS: [Register; 4] =
-        [Register::Ops, Register::Whisper, Register::Lantern, Register::Bell];
+    const REGISTERS: [Register; 4] = [
+        Register::Ops,
+        Register::Whisper,
+        Register::Lantern,
+        Register::Bell,
+    ];
 
     // ── the sendable face, on every register ──────────────────────────────────
     for reg in REGISTERS {
         let (buf, _g) = capture_logs();
         let hook = Notify::Webhook(WebhookUrl::new(URL.to_string()));
-        assert_eq!(hook.sendable(reg), Some(URL), "{reg:?} cannot send a configured webhook");
+        assert_eq!(
+            hook.sendable(reg),
+            Some(URL),
+            "{reg:?} cannot send a configured webhook"
+        );
         // The healthy path must emit NOTHING — a gate that narrates success is furniture.
         let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
@@ -9988,7 +9996,11 @@ fn sendable_returns_url_only_for_webhook_and_logs_every_dark_face() {
             (Notify::Unresolved, DarkFace::Unresolved, "ERROR"),
         ] {
             let (buf, _g) = capture_logs();
-            assert_eq!(notify.sendable(reg), None, "{reg:?}/{face:?} handed out a URL");
+            assert_eq!(
+                notify.sendable(reg),
+                None,
+                "{reg:?}/{face:?} handed out a URL"
+            );
             let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
 
             let line = logs
@@ -9996,8 +10008,14 @@ fn sendable_returns_url_only_for_webhook_and_logs_every_dark_face() {
                 .find(|l| l.contains(&format!(r#"register="{}""#, reg.as_str())))
                 .unwrap_or_else(|| panic!("{reg:?}/{face:?} emitted no record at all: {logs}"));
 
-            assert!(line.contains(r#"outcome="register_dark""#), "{reg:?}/{face:?}: {line}");
-            assert!(line.contains(want_level), "{reg:?}/{face:?} is not {want_level}: {line}");
+            assert!(
+                line.contains(r#"outcome="register_dark""#),
+                "{reg:?}/{face:?}: {line}"
+            );
+            assert!(
+                line.contains(want_level),
+                "{reg:?}/{face:?} is not {want_level}: {line}"
+            );
             // 🔴 ALL EIGHT NOTE CELLS ASSERTED. `Register::note` is `pub` precisely so this can
             // read the table instead of a hand-typed copy of it; an earlier draft paid for the
             // public accessor and then asserted ONE cell (Whisper/Disabled).
@@ -10039,7 +10057,10 @@ async fn unreachable_store() -> Store {
         .test_credentials()
         .load()
         .await;
-    Store::new(aws_sdk_dynamodb::Client::new(&config), "sw-unused".to_string())
+    Store::new(
+        aws_sdk_dynamodb::Client::new(&config),
+        "sw-unused".to_string(),
+    )
 }
 
 #[tokio::test]
@@ -10109,16 +10130,23 @@ async fn a_dark_whisper_emits_one_record_carrying_both_lifetimes() {
     let logs = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
 
     // The machine contract: stable keys, what the filter reads. Must never churn.
-    assert!(logs.contains(r#"outcome="register_dark""#), "lost the countable record: {logs}");
-    assert!(logs.contains(r#"register="whisper""#), "the record does not say WHICH register: {logs}");
-    assert!(logs.contains(r#"reason="disabled""#), "the record does not say WHICH face: {logs}");
+    assert!(
+        logs.contains(r#"outcome="register_dark""#),
+        "lost the countable record: {logs}"
+    );
+    assert!(
+        logs.contains(r#"register="whisper""#),
+        "the record does not say WHICH register: {logs}"
+    );
+    assert!(
+        logs.contains(r#"reason="disabled""#),
+        "the record does not say WHICH face: {logs}"
+    );
 
     // The human half rides the SAME event as a message field, so improving the wording can never
     // kill the alarm. Asserted against the note table, never a hand-typed copy of it.
     assert!(
-        logs.contains(
-            fulfillment::Register::Whisper.note(fulfillment::DarkFace::Disabled)
-        ),
+        logs.contains(fulfillment::Register::Whisper.note(fulfillment::DarkFace::Disabled)),
         "the record lost this register's own sentence: {logs}"
     );
 
@@ -10136,8 +10164,14 @@ async fn a_dark_whisper_emits_one_record_carrying_both_lifetimes() {
     let reqs = ops.received_requests().await.unwrap();
     assert_eq!(reqs.len(), 1, "the dark gate stopped pinging ops");
     let body = String::from_utf8(reqs[0].body.clone()).unwrap();
-    assert!(body.contains("DARK"), "the ping lost its cause wording: {body}");
-    assert!(body.contains("put-parameter"), "the ping lost its actionable one-liner: {body}");
+    assert!(
+        body.contains("DARK"),
+        "the ping lost its cause wording: {body}"
+    );
+    assert!(
+        body.contains("put-parameter"),
+        "the ping lost its actionable one-liner: {body}"
+    );
 }
 
 #[test]
@@ -10182,7 +10216,8 @@ fn the_bool_and_the_gate_cannot_disagree() {
     assert_eq!(Notify::Disabled.sendable(Register::Bell), None);
     let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(
-        logs.contains(Register::Bell.note(DarkFace::Disabled)) && logs.contains(r#"register="bell""#),
+        logs.contains(Register::Bell.note(DarkFace::Disabled))
+            && logs.contains(r#"register="bell""#),
         "the bell's dark face lost its own sentence: {logs}"
     );
 }
@@ -10214,7 +10249,10 @@ async fn the_bell_and_the_whisper_cannot_dark_each_other() {
         },
     )
     .await;
-    assert!(matches!(resp, FulfillResponse::Belled), "the bell must always come home as Belled");
+    assert!(
+        matches!(resp, FulfillResponse::Belled),
+        "the bell must always come home as Belled"
+    );
 
     let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
     assert!(
@@ -10232,7 +10270,9 @@ async fn the_bell_and_the_whisper_cannot_dark_each_other() {
     d.whisper_notify = hook();
     d.bell_notify = Notify::Disabled;
     assert!(
-        fulfillment::Register::Bell.note(fulfillment::DarkFace::Disabled).contains("BELL_DISABLED"),
+        fulfillment::Register::Bell
+            .note(fulfillment::DarkFace::Disabled)
+            .contains("BELL_DISABLED"),
         "the bell's disabled sentence stopped naming its own flag"
     );
     assert_eq!(
@@ -10241,5 +10281,69 @@ async fn the_bell_and_the_whisper_cannot_dark_each_other() {
         "BELL_DISABLED reached the whisper"
     );
     let logs2 = String::from_utf8(buf2.lock().unwrap().clone()).unwrap();
-    assert!(!logs2.contains("register_dark"), "the live whisper emitted a dark record: {logs2}");
+    assert!(
+        !logs2.contains("register_dark"),
+        "the live whisper emitted a dark record: {logs2}"
+    );
+}
+
+#[test]
+fn the_alarm_and_the_code_agree_on_the_string() {
+    // The alarm is a STRING MATCH against log content. Nothing in Rust's type system knows the
+    // metric filter exists, so a rename of the needle would leave a green build, a green suite,
+    // and an alarm that has quietly stopped counting — the exact defect the switchboard was built
+    // to remove, reintroduced by its own remedy. This test IS the coupling.
+    let tf = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../terraform/aws-cloudwatch-alarms.tf"
+    ))
+    .expect("cannot read the alarms terraform — if that file moved, fix the path, do not delete this test");
+
+    // Positive control: prove we are reading the right file before trusting any absence below.
+    // Without it, a wrong path yields an empty string and every assertion becomes vacuous.
+    assert!(
+        tf.contains("aws_cloudwatch_log_metric_filter"),
+        "read a terraform file with no metric filter in it — the path is wrong and everything \
+         below would be vacuously true"
+    );
+
+    // Take the needle from the EMITTED OUTPUT, not from memory: the const is one source of truth
+    // and this asserts the code still puts it on the wire.
+    let (buf, _g) = capture_logs();
+    assert_eq!(
+        fulfillment::Notify::Unresolved.sendable(fulfillment::Register::Ops),
+        None
+    );
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let needle = fulfillment::REGISTER_UNRESOLVED_NEEDLE;
+
+    assert!(
+        logs.contains(needle),
+        "the gate no longer emits its own needle {needle:?}: {logs}"
+    );
+    assert!(
+        tf.contains(needle),
+        "the gate emits {needle:?} but the metric filter pattern does not contain it — the alarm \
+         has stopped counting"
+    );
+
+    // The pattern is a plain-text match, so the token must survive as a CONTIGUOUS substring of a
+    // single rendered line. A structured rendering that split or escaped it would satisfy a naive
+    // `contains` over the whole buffer and still never match in CloudWatch.
+    assert!(
+        logs.lines().any(|l| l.contains(needle)),
+        "the needle does not appear contiguously on any single rendered line: {logs}"
+    );
+
+    // And it must NOT ride the `disabled` face: an operator who asked for silence must not page.
+    let (buf2, _g2) = capture_logs();
+    assert_eq!(
+        fulfillment::Notify::Disabled.sendable(fulfillment::Register::Ops),
+        None
+    );
+    let dis = String::from_utf8(buf2.lock().unwrap().clone()).unwrap();
+    assert!(
+        !dis.contains(needle),
+        "the DISABLED face carries the alarm's needle — a deliberate mute would page: {dis}"
+    );
 }

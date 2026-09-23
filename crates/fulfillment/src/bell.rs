@@ -180,7 +180,7 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
             thanks_card(&link.label, note, &deps.whisper_site_url)
         }
     };
-    if crate::whisper_send_body(&deps.http, &url, &body).await {
+    if crate::whisper_send_body(&deps.http, url, &body).await {
         // ledger of rings, best-effort like everything here: the count exists so the weekly
         // whisper can contradict a silent bell; a failed increment is a WARN, never a failed
         // ring. UNWRAP RINGS ONLY — `rings` must be a true pair with `unwraps` (same population,
