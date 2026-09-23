@@ -452,6 +452,206 @@ pub enum SecretRead {
     ReadFailed,
 }
 
+/// WHO is speaking. A log field, so one metric filter selects every dark face and a dashboard can
+/// split by register. Four registers exist and each resolves its own `Notify`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Register {
+    Ops,
+    Whisper,
+    Lantern,
+    Bell,
+}
+
+/// Which way a register is dark. A TYPE, not a string, so the note table below cannot silently
+/// return a neighbour's sentence when a name drifts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DarkFace {
+    Disabled,
+    Unresolved,
+}
+
+impl Register {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Register::Ops => "ops",
+            Register::Whisper => "whisper",
+            Register::Lantern => "lantern",
+            Register::Bell => "bell",
+        }
+    }
+
+    /// The human sentence for one (register x face). **All eight cells written out, no wildcard** —
+    /// the discipline `Notify::resolve`'s six-cell matrix already uses, for the same reason: adding
+    /// a register or a face must fail to compile here rather than silently reuse a neighbour's
+    /// wording.
+    ///
+    /// PROSE LIVES HERE; THE MACHINE KEY LIVES IN `sendable`. Two FIELDS on one event, not two
+    /// records: the separation of lifetimes (a stable key a filter reads, prose a human reads and
+    /// should improve) is what was wanted, and fields buy it at half the volume on a per-send path.
+    /// This is not a new shape — `ping_msg` ships it at the `operator_notification_failed` record,
+    /// and `bell::ring` shipped it for `bell_disabled`. Generalised, not invented.
+    pub fn note(&self, face: DarkFace) -> &'static str {
+        match (self, face) {
+            (Register::Ops, DarkFace::Disabled) => "operator notifications are off by request",
+            (Register::Ops, DarkFace::Unresolved) => {
+                "operator notifications are configured but UNREADABLE — running blind"
+            }
+            (Register::Whisper, DarkFace::Disabled) => {
+                "whisper webhook unconfigured — no-op, zero writes"
+            }
+            (Register::Whisper, DarkFace::Unresolved) => {
+                "whisper webhook configured but UNREADABLE — no-op, zero writes"
+            }
+            (Register::Lantern, DarkFace::Disabled) => {
+                "lantern register unconfigured or LANTERN_DISABLED — no-op, zero writes"
+            }
+            (Register::Lantern, DarkFace::Unresolved) => {
+                "lantern register configured but UNREADABLE — no-op, zero writes"
+            }
+            (Register::Bell, DarkFace::Disabled) => {
+                "bell: BELL_DISABLED set — not ringing, by choice"
+            }
+            (Register::Bell, DarkFace::Unresolved) => {
+                "bell register configured but UNREADABLE — not ringing"
+            }
+        }
+    }
+}
+
+/// The ONE literal the CloudWatch metric filter matches, and the only machine contract in this
+/// module. **Fixed forever; never reword it.** The prose around it is for humans and SHOULD churn —
+/// which is exactly why the two are separated.
+///
+/// It is a single token rather than a structured field because **these logs are not JSON**
+/// (`main.rs` installs `tracing_subscriber::fmt()` in text mode and the crate's `json` feature is
+/// off), and a CloudWatch `{ $.outcome = ... }` pattern matches **nothing** against text —
+/// silently, forever, with the alarm sitting in INSUFFICIENT_DATA wearing green.
+pub const REGISTER_UNRESOLVED_NEEDLE: &str = "register_dark_unresolved";
+
+/// A webhook URL that **cannot be sent to without passing the gate**.
+///
+/// The field is private and there is deliberately NO `as_str`, NO `Deref`, NO `Into<String>`.
+/// `let Notify::Webhook(u) = &deps.notify else { return; }` still *matches* — it simply yields a
+/// `&WebhookUrl` that nothing in `deliver()`'s signature accepts. The only path to a `&str` is
+/// [`Notify::sendable`], which logs every dark face on the way past.
+///
+/// ⚠️ **Adding an accessor here re-opens the bug this type exists to close.** The silent drop
+/// became impossible to WRITE; an accessor makes it merely discouraged again.
+///
+/// # Why a TYPE and not a rule — measured, 2026-09-23
+///
+/// Commit `525dc10` (#171, 2026-08-07) added, in ONE diff, both the prohibition four lines below
+/// this — *"A use-time `else { return; }` can never distinguish deliberately off from someone
+/// dropped the env var — that collapse IS the defect"* — and, in `ping_msg`, that exact collapse.
+/// **The rule and its violation shipped together.**
+///
+/// Four distances, all measured that morning:
+/// - prohibition -> violation: **4,282 lines**. Too far to hold in mind.
+/// - an active reviewer's own gate comment -> the defect: **4 lines**, while raising a major about
+///   a neighbouring field.
+/// - the same reviewer, an hour later: the line refuting his claim was **in output he had printed
+///   40 seconds earlier**, read past because he was looking for something else.
+/// - a correction in the spec -> the sentence contradicting it: **2 lines**, same section, written
+///   by the person making the correction.
+/// - and **zero**: a peer produced a wrong clock while the rule *"when in doubt, run `date`"* was
+///   injected at the top of that very turn.
+///
+/// ⇒ ***Distance was never the mechanism. Prose does not fail because it is far away; it fails
+/// because READING IS NOT EXECUTING.*** A rule at distance zero is still one you must choose to
+/// apply, and choosing is the step that fails. **That is why this guarantee is a private field and
+/// not a sentence** — and why *a rule written inside the artifact it governs is not enforcement,
+/// it is decoration with good intentions.*
+///
+/// # The gate is the only door — asserted, not merely documented
+///
+/// Going through `sendable()` compiles:
+///
+/// ```
+/// use fulfillment::{Notify, Register, WebhookUrl};
+/// let n = Notify::Webhook(WebhookUrl::new("https://example.invalid/h".to_string()));
+/// let url: Option<&str> = n.sendable(Register::Ops);
+/// assert_eq!(url, Some("https://example.invalid/h"));
+/// ```
+///
+/// Reaching around it does **not** — the field is private (E0616), so the silent-drop shape cannot
+/// be written even though the pattern still matches:
+///
+/// ```compile_fail,E0616
+/// use fulfillment::{Notify, WebhookUrl};
+/// let n = Notify::Webhook(WebhookUrl::new("https://example.invalid/h".to_string()));
+/// let Notify::Webhook(u) = &n else { unreachable!() };
+/// let _leaked: &str = &u.0;   // E0616: field `0` of struct `WebhookUrl` is private
+/// ```
+pub use gate::WebhookUrl;
+
+/// 🔴 ITS OWN MODULE, AND THAT IS THE WHOLE POINT — MEASURED, NOT ASSUMED.
+///
+/// A private field is private to its **module**, not to the file. With `WebhookUrl` declared at
+/// the crate root, every function in `lib.rs` — **including `ping_msg`, the exact site this spec
+/// exists to fix** — could still write `let Notify::Webhook(u) = … else { return; }` and reach
+/// `u.0`. Probed during execution 2026-09-23 by planting `Some(u.0.clone())` at a root-module
+/// call site: it compiled, **zero E0616**.
+///
+/// ⚠️ And the `compile_fail` doctest would have stayed GREEN throughout, because doctests compile
+/// as an EXTERNAL crate — the one vantage from which the field was already private. ⇒ ***the
+/// assertion covered every caller except the one the bug was in, and would have reported success.***
+/// Same family as every finding this morning: a guard that passes without reaching its subject.
+mod gate {
+    /// The field is private to `gate`. `lib.rs`'s root module — where `ping_msg` and both
+    /// dark-gates live — cannot construct, destructure or read it. The ONLY door is
+    /// [`super::Notify::sendable`], which is defined in here for exactly that reason.
+    #[derive(Clone, Debug)]
+    pub struct WebhookUrl(String);
+
+    impl WebhookUrl {
+        pub fn new(url: String) -> Self {
+            WebhookUrl(url)
+        }
+    }
+
+    impl super::Notify {
+        /// The ONLY way to obtain a sendable URL. Every dark face logs itself, tagged with the
+        /// register that went dark, before returning `None`.
+        ///
+        /// `Disabled` is `info!` — deliberate, operator-initiated silence, and the level
+        /// `bell::ring` already used for this exact state (*"Loud, so a muted bell never reads as
+        /// broken"*). A deliberate mute re-announced at WARN on every event is furniture.
+        /// `Unresolved` is `error!` — misconfiguration, a fault, an edge.
+        ///
+        /// Until this gate existed that distinction was observable only at INIT: a container that
+        /// cold-started with an unreadable secret announced itself exactly once and then swallowed
+        /// every operator page for its whole life. **Loud at birth, mute forever after.**
+        ///
+        /// Three arms, no wildcard: adding a `Notify` variant must fail to compile here.
+        pub fn sendable(&self, reg: super::Register) -> Option<&str> {
+            match self {
+                super::Notify::Webhook(WebhookUrl(u)) => Some(u.as_str()),
+                super::Notify::Disabled => {
+                    tracing::info!(
+                        outcome = "register_dark",
+                        register = reg.as_str(),
+                        reason = "disabled",
+                        "{}",
+                        reg.note(super::DarkFace::Disabled)
+                    );
+                    None
+                }
+                super::Notify::Unresolved => {
+                    tracing::error!(
+                        outcome = "register_dark",
+                        register = reg.as_str(),
+                        reason = "unresolved",
+                        "{}: {}",
+                        super::REGISTER_UNRESOLVED_NEEDLE,
+                        reg.note(super::DarkFace::Unresolved)
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// How this process reaches the operator. Resolved ONCE at init, so a missing webhook is one loud
 /// event per cold start instead of twenty silent no-ops a day.
 ///
@@ -464,7 +664,7 @@ pub enum SecretRead {
 /// **fail LOUD, never CLOSED.** Do not change this to return `Result`.
 #[derive(Clone, Debug)]
 pub enum Notify {
-    Webhook(String),
+    Webhook(WebhookUrl),
     /// Deliberately off. Silent by request; suppresses the alarm.
     Disabled,
     /// Misconfigured or unreadable. Behaves like `Disabled` at runtime, but is LOUD at init and
@@ -510,7 +710,7 @@ impl Notify {
             // Suppression beats a working webhook. *** THIS IS THE CELL THE BUG LIVED IN *** — and
             // it is the one a future reader will be most tempted to collapse back into a wildcard.
             (SecretRead::Resolved(_), true) => Notify::Disabled,
-            (SecretRead::Resolved(u), false) => Notify::Webhook(u),
+            (SecretRead::Resolved(u), false) => Notify::Webhook(WebhookUrl::new(u)),
             (SecretRead::DeliberatelyOff, true) => Notify::Disabled,
             (SecretRead::DeliberatelyOff, false) => Notify::Disabled,
             // Suppression is the job: do not page someone about the quiet they asked for.
@@ -538,10 +738,21 @@ pub struct Deps {
     /// operator an actionable one-liner. When the env isn't even wired, main.rs passes a literal
     /// that says so — the message must always name something actionable.
     pub whisper_param_name: String,
-    /// The bell's OWN off-switch (spec-attic-bell Q①: shared secret, SPLIT disable flag) —
-    /// muting per-event bells must not dark the weekly whisper, and vice versa. Resolved in
-    /// main.rs from `BELL_DISABLED`, mirroring `WHISPER_DISABLED`'s register-decoupling rule.
-    pub bell_disabled: bool,
+    /// The BELL register: the whisper's CREDENTIAL (same `SecretRead`, one rotation event)
+    /// resolved with the bell's OWN flag, `BELL_DISABLED` — so `WHISPER_DISABLED` cannot dark the
+    /// bell and vice versa.
+    ///
+    /// 🔴 This used to be `bell_disabled: bool` PLUS a call to `resolve_whisper_url`, which is the
+    /// exact anti-pattern `lantern_notify`'s own doc names four lines down: *"A split `bool` beside
+    /// `whisper_notify` (the bell's shape) is NOT enough … routing through it re-couples the
+    /// mutes."* The lantern arc identified the anti-pattern BY NAME, avoided it for the new
+    /// register, and left the existing one standing in it — a premise inherited from one's own
+    /// prior work being the least-audited thing in the file.
+    ///
+    /// The env var `BELL_DISABLED` and its reader `bell_suppressed` are UNCHANGED; only the bool's
+    /// destination moved. Deleting it is pure subsumption, licensed by a constructed test
+    /// (`the_bool_and_the_gate_cannot_disagree`) rather than by argument.
+    pub bell_notify: Notify,
     /// The LANTERN register: the whisper's CREDENTIAL (same SecretRead, one rotation event)
     /// resolved with the lantern's OWN flag, `LANTERN_DISABLED` — so `WHISPER_DISABLED` cannot
     /// dark the lantern and vice versa. A split `bool` beside `whisper_notify` (the bell's shape)
@@ -4737,7 +4948,12 @@ fn logged<E: std::error::Error>(e: &E, what: &'static str) -> ErrorSummary {
 /// durable queue would be storage with no consumer. **No retry** — a chunked send is not atomic
 /// (`1 of 2 chunk(s) sent` is a real observed outcome), so a naive retry double-posts.
 pub(crate) async fn ping_msg(deps: &Deps, msg: &OperatorMessage) {
-    let Notify::Webhook(url) = &deps.notify else {
+    // 🔴 THIS FUNCTION USED TO OPEN WITH `let Notify::Webhook(url) = &deps.notify else { return; }`
+    // — no log, no metric, no row. Every dark-gate in this app escalates THROUGH here, so the whole
+    // escalation path had a single point of SILENT failure, and it was the one function the two
+    // correct gates document as "the only shape a call site should use".
+    // *You cannot notify that notification is broken.* `sendable` announces every dark face.
+    let Some(url) = deps.notify.sendable(Register::Ops) else {
         return;
     };
     let chunks = msg.chunks(PING_PREFIX);
@@ -4813,15 +5029,32 @@ pub async fn whisper_send_body_for_test(url: &str, body: &serde_json::Value) -> 
 /// announce themselves distinctly and return None (①a advises the put-parameter; ①b never
 /// advises overwrite — the stored value may be right and the fault the read path). Extracted
 /// UNCHANGED from handle_whisper — the two faces' wording is family-reviewed, do not edit in
-/// passing. Match all three states; never flatten with a let-else.
+/// passing.
+///
+/// 🔴 THIS LINE USED TO READ *"Match all three states; never flatten with a let-else."* Correct
+/// about the old world, and now the opposite of the rule: **the URL comes from
+/// [`Notify::sendable`] and nowhere else, so a let-else OVER `sendable()` is the correct shape** —
+/// the gate announces the dark face before returning `None`. What stays forbidden is a let-else
+/// over the **variant** (`let Notify::Webhook(u) = … else`), which is why `WebhookUrl`'s field is
+/// private to `mod gate`. Match all three arms below for the bespoke advice; no wildcard.
+/// *Left standing, this sentence would have had the repo's two exemplary gates forbidding by name
+/// the thing the repo's own gate now does.*
 pub(crate) async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
+    // `sendable` FIRST: the healthy path returns here, and each dark face emits THE record on the
+    // way past — machine keys (`outcome`/`register`/`reason`) plus this register's own sentence
+    // from the note table. ONE event, two lifetimes. The match below adds only the actionable
+    // PING, which is a webhook payload and not a log line.
+    if let Some(u) = deps.whisper_notify.sendable(Register::Whisper) {
+        return Some(u.to_owned());
+    }
     match &deps.whisper_notify {
-        Notify::Webhook(u) => Some(u.clone()),
+        // NOT `unreachable!()`. `sendable` returns Some for Webhook, so this arm is dead today —
+        // but this is the notification path, whose whole contract is that it returns () and cannot
+        // break fulfilment. A panic here would trade a silent drop for a louder outage. Written
+        // out rather than wildcarded so a new `Notify` variant still fails to compile, and
+        // returning None fails CLOSED if `sendable`'s behaviour ever changes underneath it.
+        Notify::Webhook(_) => None,
         Notify::Disabled => {
-            tracing::warn!(
-                outcome = "whisper_dark",
-                "whisper webhook unconfigured — no-op, zero writes"
-            );
             ping_msg(deps, &OperatorMessage::fmt(
                 "whisper is DARK — the attic has a voice and no throat. Light it: aws ssm put-parameter --name {} --type SecureString --overwrite --value <discord webhook url>",
                 &[Part::Id(&deps.whisper_param_name)],
@@ -4830,10 +5063,6 @@ pub(crate) async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
             None
         }
         Notify::Unresolved => {
-            tracing::error!(
-                outcome = "whisper_unresolved",
-                "whisper webhook configured but UNREADABLE — no-op, zero writes"
-            );
             ping_msg(deps, &OperatorMessage::fmt(
                 "whisper webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value; the stored secret may be fine and the fault is the read path.",
                 &[Part::Id(&deps.whisper_param_name)],
@@ -5158,15 +5387,21 @@ async fn lantern_reads(deps: &Deps) -> Option<LanternReads> {
 
 /// The lantern gate on ITS OWN Notify (never `resolve_whisper_url` — that one carries the
 /// whisper's mute). Same three faces as the whisper's gate; the dark advice names the whisper
-/// param because that IS the credential the lantern rides. Match all three; never let-else.
+/// param because that IS the credential the lantern rides.
+///
+/// 🔴 THIS LINE USED TO READ *"Match all three; never let-else."* — see the same correction on
+/// [`resolve_whisper_url`]. The URL comes from [`Notify::sendable`]; a let-else over the VARIANT
+/// is what the private field now prevents.
 async fn resolve_lantern_url(deps: &Deps) -> Option<String> {
+    // Same shape as the whisper's gate: `sendable` first, emitting the one record; the match adds
+    // only the actionable ping.
+    if let Some(u) = deps.lantern_notify.sendable(Register::Lantern) {
+        return Some(u.to_owned());
+    }
     match &deps.lantern_notify {
-        Notify::Webhook(u) => Some(u.clone()),
+        // Dead-but-honest, and fails CLOSED — see the identical arm in `resolve_whisper_url`.
+        Notify::Webhook(_) => None,
         Notify::Disabled => {
-            tracing::warn!(
-                outcome = "lantern_dark",
-                "lantern register unconfigured or LANTERN_DISABLED — no-op, zero writes"
-            );
             ping_msg(deps, &OperatorMessage::fmt(
                 "the lantern is DARK — it rides the whisper webhook ({}); light that param, or unset LANTERN_DISABLED",
                 &[Part::Id(&deps.whisper_param_name)],
@@ -5175,10 +5410,6 @@ async fn resolve_lantern_url(deps: &Deps) -> Option<String> {
             None
         }
         Notify::Unresolved => {
-            tracing::error!(
-                outcome = "lantern_unresolved",
-                "lantern register configured but UNREADABLE — no-op, zero writes"
-            );
             ping_msg(deps, &OperatorMessage::fmt(
                 "the lantern's webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value.",
                 &[Part::Id(&deps.whisper_param_name)],

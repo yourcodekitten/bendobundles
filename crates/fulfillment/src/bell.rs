@@ -108,17 +108,37 @@ pub fn current_week() -> String {
 /// return — an Event-invoked lambda retries on function error, and a double ring is worse than a
 /// missed one. The gift may never miss; the bell may.
 pub async fn ring(deps: &Deps, event: &BellEvent) {
-    if deps.bell_disabled {
-        // the bell's OWN off-switch (shared secret, split disable flag): muting bells must not
-        // dark the weekly whisper, and vice versa. Loud, so a muted bell never reads as broken.
-        tracing::info!(
-            outcome = "bell_disabled",
-            "bell: BELL_DISABLED set — not ringing, by choice"
-        );
-        return;
-    }
-    let Some(url) = crate::resolve_whisper_url(deps).await else {
-        // dark deploy: same loud no-op face as the whisper — the resolve fn already logged it.
+    // ONE switch, ONE lamp. This used to be TWO returns: `deps.bell_disabled` (the bell's own
+    // flag) and then `crate::resolve_whisper_url`, whose Notify was resolved under
+    // `WHISPER_DISABLED` — so muting the WHISPER darked the BELL, contrary to the
+    // register-decoupling rule spec-attic-bell states and illustrates in only one direction.
+    //
+    // `bell_notify` is resolved in main.rs from the same credential under `BELL_DISABLED`, so the
+    // gate below subsumes both returns and announces which face went dark. The retired
+    // `outcome="bell_disabled"` record is carried by `register_dark register="bell"
+    // reason="disabled"`, at the same `info` level it always used.
+    //
+    // 🔴 AND THE BELL DELIBERATELY DOES NOT PING OPS WHEN IT IS DARK, unlike the whisper and the
+    // lantern. That asymmetry is CHOSEN, not a side effect of deleting a call — review pass 1
+    // caught it as an unstated change and this is the decision.
+    //
+    // ① What was lost is not the bell's ping: the old path reached `resolve_whisper_url`, so a
+    //    dark bell paged with the WHISPER's wording ("whisper is DARK — the attic has a voice and
+    //    no throat") about the WHISPER's register. Paging an operator about the wrong register is
+    //    worse than not paging, so losing that is a fix.
+    // ② Why not give the bell its own ping: CADENCE. The whisper is weekly and the lantern is a
+    //    scheduled tick, so one ping per dark event is one ping. **The bell fires per gift
+    //    unwrap** — a ping on its dark path would page on every claim for the life of a
+    //    misconfigured container, which is the furniture problem this register's own `info` level
+    //    exists to avoid.
+    // ③ The `Unresolved` face is NOT silent: `sendable` stamps it with
+    //    `REGISTER_UNRESOLVED_NEEDLE`, which is what the CloudWatch metric filter matches. So a
+    //    misconfigured bell still escalates — through the log, once, on a 300s alarm period,
+    //    instead of once per unwrap into Discord.
+    // ⇒ The trade is stated rather than implicit: immediate-and-noisy for delayed-and-bounded, on
+    //   the ONE register whose contract is already best-effort. `bell_does_not_page_ops_when_dark`
+    //   asserts it, so this comment cannot quietly stop being true.
+    let Some(url) = deps.bell_notify.sendable(crate::Register::Bell) else {
         return;
     };
     let body = match event {
@@ -181,7 +201,7 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
             thanks_card(&link.label, note, &deps.whisper_site_url)
         }
     };
-    if crate::whisper_send_body(&deps.http, &url, &body).await {
+    if crate::whisper_send_body(&deps.http, url, &body).await {
         // ledger of rings, best-effort like everything here: the count exists so the weekly
         // whisper can contradict a silent bell; a failed increment is a WARN, never a failed
         // ring. UNWRAP RINGS ONLY — `rings` must be a true pair with `unwraps` (same population,

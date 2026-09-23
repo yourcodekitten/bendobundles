@@ -160,3 +160,60 @@ resource "aws_cloudwatch_metric_alarm" "lantern_target_errors" {
   alarm_actions       = [aws_sns_topic.ops_alarms.arn]
   tags                = module.label_lantern.tags
 }
+
+# ── the switchboard 🎛️: a register that cannot announce its own darkness ──────────────────────
+# `ping_msg` cannot report that `ping_msg` is dark. The only channel that does not depend on the
+# thing being reported is the log itself, so this alarm rides a metric filter over the log and NOT
+# the ops webhook. A surface you must visit is not an alarm, and a message that rides a register
+# cannot report that register.
+#
+# ⚠️ FIRST log-content-derived alarm in this repo — every other one here rides a metric AWS emits
+# on its own (Lambda Errors/Invocations, AWS/Scheduler). Two consequences, both measured 2026-09-23:
+#
+#  ① THIS TERRAFORM MANAGES NO LOG GROUP. `grep -n aws_cloudwatch_log_group terraform/*.tf` returns
+#    ZERO; the group is created implicitly by Lambda. An earlier draft referenced
+#    `aws_cloudwatch_log_group.fulfillment.name` and would have failed at plan time on an undeclared
+#    resource. The name is derived the way `fulfillment_silent` addresses the function.
+#
+#  ② THE PATTERN IS A PLAIN-TEXT LITERAL, NOT `{ $.outcome = ... }`. These logs are tracing's TEXT
+#    format (`main.rs` installs `tracing_subscriber::fmt()`; the crate's `json` feature is off), and
+#    a CloudWatch JSON pattern matches ZERO text events — silently, forever, with the alarm sitting
+#    in INSUFFICIENT_DATA wearing green. That is the exact defect the switchboard exists to remove,
+#    rebuilt inside its own remedy; it was caught by measuring the subscriber rather than assuming
+#    it. The token below is `fulfillment::REGISTER_UNRESOLVED_NEEDLE`, and the test
+#    `the_alarm_and_the_code_agree_on_the_string` asserts the code and this file still share it.
+resource "aws_cloudwatch_log_metric_filter" "register_dark" {
+  name           = "${module.label_alarms.id}-register-dark"
+  log_group_name = "/aws/lambda/${module.lambda_fulfillment.lambda_function_name}"
+
+  # Only the UNRESOLVED face carries this token. `disabled` is operator-initiated silence and must
+  # never page — enforced by the needle being absent from that arm, not by a clause here.
+  pattern = "\"register_dark_unresolved\""
+
+  metric_transformation {
+    name      = "RegisterUnresolved" # keep in sync with the alarm's metric_name below
+    namespace = "bendobundles/switchboard"
+    value     = "1"
+    unit      = "Count"
+    # No default_value on purpose: absent data must read as "no signal", never as a stream of zeros
+    # that would hold the alarm permanently OK even if the log group stopped receiving entirely.
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "register_unresolved" {
+  alarm_name        = "${module.label_alarms.id}-register-unresolved"
+  alarm_description = "A bendobundles notification register is configured but UNREADABLE. This alarm rides the log, not the ops webhook, because a dark ops register cannot report itself."
+  namespace         = "bendobundles/switchboard"
+  metric_name       = "RegisterUnresolved"
+  statistic         = "Sum"
+  # CloudWatch enforces TWO limits invisible to `terraform validate`: period <= 86400 AND
+  # period * evaluation_periods <= 86400, both rejected only at APPLY time — documented on
+  # `fulfillment_silent` above after a gate review found them the hard way. 300x1 is inside both.
+  period              = 300
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.ops_alarms.arn]
+  tags                = module.label_alarms.tags
+}
