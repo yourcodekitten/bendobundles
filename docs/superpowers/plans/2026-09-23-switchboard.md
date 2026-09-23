@@ -13,10 +13,18 @@
 ## Where these tests can actually RUN — measured 2026-09-23, before a line was written
 
 🔴 **`dynamodb-local` CANNOT RUN ON THIS BOX.** No `docker`, no `podman`, no `java` (`which` finds
-none; `docker info` → rc 127). `store_or_skip` (`handler_test.rs:81`) therefore prints `SKIP` and
-returns `None` for every store-backed test here — **a green that asserted nothing.** With
-`DYNAMODB_LOCAL_URL` *set*, it instead **panics**: *"refusing to skip (this would forge a green
-run)"*. CI is the honest environment: `.github/workflows/ci.yml:12` runs
+none; `docker info` → rc 127). 🔴 **AND `DYNAMODB_LOCAL_URL` IS ALWAYS SET IN THIS WORKSPACE — measured during execution, and
+this plan's first draft had the premise backwards.** `.cargo/config.toml:5-6` carries
+`[env] DYNAMODB_LOCAL_URL = "http://localhost:8000"`, so **cargo sets it for every invocation** and
+`store_or_skip` (`handler_test.rs:81`) does **not** skip here — it **panics**: *"refusing to skip
+(this would forge a green run)"*. ⇒ **store-backed tests on this box always FAIL, never silently
+pass.** Measured on the full suite: **152 failed, 152 of them on that guard, zero with any other
+cause.**
+⚖️ **The design choice was right; my reason for it was wrong.** I chose `unreachable_store()` to
+avoid a vacuous skip. The real hazard was a hard panic that makes the whole suite unrunnable
+locally. *Same remedy, different disease — and stating the wrong one would have let the next reader
+"fix" it by unsetting the var, which would restore the vacuous-skip mode the repo deliberately
+removed.* CI is the honest environment: `.github/workflows/ci.yml:12` runs
 `amazon/dynamodb-local:2.5.2` with `DYNAMODB_LOCAL_URL: http://localhost:8000`.
 
 ⇒ **Each new test below is labelled LOCAL or CI-ONLY. Do not discover this per-task at 2am.**

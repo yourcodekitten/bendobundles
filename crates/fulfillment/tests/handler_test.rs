@@ -139,7 +139,7 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         // Signature keeps Option<String> so none of the 119 call sites move; the conversion
         // happens here. None means "deliberately off" for a test fixture, never "read failed".
         notify: match webhook_url {
-            Some(u) => fulfillment::Notify::Webhook(u),
+            Some(u) => fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(u)),
             None => fulfillment::Notify::Disabled,
         },
         // Whisper register defaults for existing tests: dark, with placeholder identity —
@@ -548,7 +548,7 @@ async fn deps_with_selfheal(
         // Signature keeps Option<String> so none of the 119 call sites move; the conversion
         // happens here. None means "deliberately off" for a test fixture, never "read failed".
         notify: match webhook_url {
-            Some(u) => fulfillment::Notify::Webhook(u),
+            Some(u) => fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(u)),
             None => fulfillment::Notify::Disabled,
         },
         // Whisper register defaults for existing tests: dark, with placeholder identity —
@@ -9134,7 +9134,7 @@ fn deps_whisper(
 ) -> Deps {
     let mut d = deps(store, humble_uri, ops_webhook);
     d.whisper_notify = match whisper_webhook {
-        Some(u) => fulfillment::Notify::Webhook(u),
+        Some(u) => fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(u)),
         None => fulfillment::Notify::Disabled,
     };
     d.whisper_site_url = "https://bendobundles.example".into();
@@ -9581,7 +9581,7 @@ async fn whisper_empty_pool_pings_ops_distinctly() {
 fn deps_lantern(store: Store, humble_uri: &str, webhook: Option<String>) -> Deps {
     let mut d = deps_whisper(store, humble_uri, None, webhook.clone());
     d.lantern_notify = match webhook {
-        Some(u) => fulfillment::Notify::Webhook(u),
+        Some(u) => fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(u)),
         None => fulfillment::Notify::Disabled,
     };
     d
@@ -9630,7 +9630,7 @@ async fn lantern_quiet_writes_exactly_one_row_and_sends_nothing() {
     let ops = discord_ok().await;
     // an OPS webhook is wired so "quiet must not page ops" is an assertion, not an accident
     let mut d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
-    d.notify = fulfillment::Notify::Webhook(ops.uri());
+    d.notify = fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(ops.uri()));
     assert_eq!(
         handle(&d, FulfillRequest::Lantern).await,
         FulfillResponse::Lanterned
@@ -9660,7 +9660,7 @@ async fn lantern_send_failure_leaves_an_undelivered_row_pings_ops_and_the_heartb
         .await;
     seed_stuck_pending(&store, 3).await;
     let mut d = deps_lantern(store.clone(), &humble.uri(), Some(discord.uri()));
-    d.notify = fulfillment::Notify::Webhook(ops.uri());
+    d.notify = fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(ops.uri()));
     let slot = fulfillment::lantern::tick_slot(OffsetDateTime::now_utc()).key();
     // Sunday: POST fails ⇒ recorded, undelivered, ops told
     assert_eq!(
@@ -9940,7 +9940,7 @@ async fn lantern_mute_is_its_own_and_the_whisper_mute_does_not_reach_it() {
     assert_eq!(discord.received_requests().await.unwrap().len(), 0);
     // WHISPER muted, lantern not ⇒ the lantern still lights (the review found the first draft
     // routed the lantern through resolve_whisper_url, which made WHISPER_DISABLED dark it too)
-    d.lantern_notify = fulfillment::Notify::Webhook(discord.uri());
+    d.lantern_notify = fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(discord.uri()));
     d.whisper_notify = fulfillment::Notify::Disabled;
     d.bell_disabled = true;
     assert_eq!(
@@ -9949,4 +9949,81 @@ async fn lantern_mute_is_its_own_and_the_whisper_mute_does_not_reach_it() {
     );
     assert_eq!(discord.received_requests().await.unwrap().len(), 1);
     assert_eq!(store.list_lanterns().await.unwrap().len(), 1);
+}
+
+// ─── the switchboard 🎛️ ────────────────────────────────────────────────────────
+// One gate for every outbound register. See docs/spec-switchboard.md.
+
+#[test]
+fn sendable_returns_url_only_for_webhook_and_logs_every_dark_face() {
+    use fulfillment::{DarkFace, Notify, Register, WebhookUrl};
+    const URL: &str = "https://discord.example/hook";
+
+    // 🔴 ALL FOUR REGISTERS x ALL THREE STATES = the 3x4 matrix spec §5 promises. An earlier draft
+    // asserted THREE CELLS (Ops/Whisper/Lantern, one state each) and never mentioned `Bell` — the
+    // register Task 4 exists for. A gate that worked for Ops and broke the bell would have passed.
+    const REGISTERS: [Register; 4] =
+        [Register::Ops, Register::Whisper, Register::Lantern, Register::Bell];
+
+    // ── the sendable face, on every register ──────────────────────────────────
+    for reg in REGISTERS {
+        let (buf, _g) = capture_logs();
+        let hook = Notify::Webhook(WebhookUrl::new(URL.to_string()));
+        assert_eq!(hook.sendable(reg), Some(URL), "{reg:?} cannot send a configured webhook");
+        // The healthy path must emit NOTHING — a gate that narrates success is furniture.
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("register_dark"),
+            "{reg:?}: the healthy path emitted a dark record: {logs}"
+        );
+    }
+
+    // ── the two dark faces, on every register: 8 cells, the whole note table ──
+    // 🔴 ONE BUFFER PER CELL, deliberately. Asserting over a shared buffer is how an earlier draft
+    // made INFO/ERROR undetectably swappable: both levels were present, so `contains` passed with
+    // the two faces INVERTED — the exact decision the family gate spent an hour settling.
+    for reg in REGISTERS {
+        for (notify, face, want_level) in [
+            (Notify::Disabled, DarkFace::Disabled, "INFO"),
+            (Notify::Unresolved, DarkFace::Unresolved, "ERROR"),
+        ] {
+            let (buf, _g) = capture_logs();
+            assert_eq!(notify.sendable(reg), None, "{reg:?}/{face:?} handed out a URL");
+            let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+
+            let line = logs
+                .lines()
+                .find(|l| l.contains(&format!(r#"register="{}""#, reg.as_str())))
+                .unwrap_or_else(|| panic!("{reg:?}/{face:?} emitted no record at all: {logs}"));
+
+            assert!(line.contains(r#"outcome="register_dark""#), "{reg:?}/{face:?}: {line}");
+            assert!(line.contains(want_level), "{reg:?}/{face:?} is not {want_level}: {line}");
+            // 🔴 ALL EIGHT NOTE CELLS ASSERTED. `Register::note` is `pub` precisely so this can
+            // read the table instead of a hand-typed copy of it; an earlier draft paid for the
+            // public accessor and then asserted ONE cell (Whisper/Disabled).
+            assert!(
+                line.contains(reg.note(face)),
+                "{reg:?}/{face:?} lost its own sentence: {line}"
+            );
+        }
+    }
+
+    // The machine contract: the alarm's needle rides the unresolved face and ONLY it.
+    let (buf, _g) = capture_logs();
+    assert_eq!(Notify::Unresolved.sendable(Register::Ops), None);
+    assert_eq!(Notify::Disabled.sendable(Register::Ops), None);
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let needle = fulfillment::REGISTER_UNRESOLVED_NEEDLE;
+    assert_eq!(
+        logs.lines().filter(|l| l.contains(needle)).count(),
+        1,
+        "the needle must appear on exactly one of the two dark faces: {logs}"
+    );
+    assert!(
+        logs.lines()
+            .find(|l| l.contains(needle))
+            .unwrap()
+            .contains(r#"reason="unresolved""#),
+        "the needle is on the wrong face — a deliberate mute would page: {logs}"
+    );
 }
