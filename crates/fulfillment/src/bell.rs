@@ -117,6 +117,27 @@ pub async fn ring(deps: &Deps, event: &BellEvent) {
     // gate below subsumes both returns and announces which face went dark. The retired
     // `outcome="bell_disabled"` record is carried by `register_dark register="bell"
     // reason="disabled"`, at the same `info` level it always used.
+    //
+    // 🔴 AND THE BELL DELIBERATELY DOES NOT PING OPS WHEN IT IS DARK, unlike the whisper and the
+    // lantern. That asymmetry is CHOSEN, not a side effect of deleting a call — review pass 1
+    // caught it as an unstated change and this is the decision.
+    //
+    // ① What was lost is not the bell's ping: the old path reached `resolve_whisper_url`, so a
+    //    dark bell paged with the WHISPER's wording ("whisper is DARK — the attic has a voice and
+    //    no throat") about the WHISPER's register. Paging an operator about the wrong register is
+    //    worse than not paging, so losing that is a fix.
+    // ② Why not give the bell its own ping: CADENCE. The whisper is weekly and the lantern is a
+    //    scheduled tick, so one ping per dark event is one ping. **The bell fires per gift
+    //    unwrap** — a ping on its dark path would page on every claim for the life of a
+    //    misconfigured container, which is the furniture problem this register's own `info` level
+    //    exists to avoid.
+    // ③ The `Unresolved` face is NOT silent: `sendable` stamps it with
+    //    `REGISTER_UNRESOLVED_NEEDLE`, which is what the CloudWatch metric filter matches. So a
+    //    misconfigured bell still escalates — through the log, once, on a 300s alarm period,
+    //    instead of once per unwrap into Discord.
+    // ⇒ The trade is stated rather than implicit: immediate-and-noisy for delayed-and-bounded, on
+    //   the ONE register whose contract is already best-effort. `bell_does_not_page_ops_when_dark`
+    //   asserts it, so this comment cannot quietly stop being true.
     let Some(url) = deps.bell_notify.sendable(crate::Register::Bell) else {
         return;
     };

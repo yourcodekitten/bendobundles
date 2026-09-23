@@ -161,6 +161,9 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     // and the last one that was not. Read at init like its siblings; a container's environment does
     // not change within its life.
     let bell_disabled = bell_suppressed(|k| std::env::var(k).ok());
+    // LAST USE — takes ownership of `whisper_read`; the two resolutions above clone. A fourth
+    // register must be added ABOVE this line (or this one loses the move and becomes a clone
+    // silently); adding it below is a use-after-move and the compiler says so.
     let bell_notify = Notify::resolve(whisper_read, bell_disabled);
     // Carried for the DARK announcement's one-liner: the message must always name something
     // actionable, so an unwired env gets a literal saying exactly that.

@@ -257,6 +257,31 @@ sites** — `handler_test.rs:150`, `:559`, `:9945`. The env var `BELL_DISABLED` 
 
 ---
 
+### 3.6 The bell does NOT ping ops when dark — a CHOSEN asymmetry (added 2026-09-23, review pass 1)
+
+My own review of PR #241 found that a dark bell silently stopped reaching ops, and that the change
+was **unstated**. Measured: the old `resolve_whisper_url` carried **2** `ping_msg` calls and
+`bell::ring` went through it; `sendable` carries **0**. Recorded here as a decision rather than left
+as a side effect of deleting a call.
+
+- **What was lost is not the bell's ping.** The old path paged with the WHISPER's wording — *"whisper
+  is DARK — the attic has a voice and no throat"* — about the WHISPER's register, fired from the
+  bell's code. **Paging an operator about the wrong register is worse than not paging.** Losing it is
+  a fix.
+- **Why the bell does not get its own ping: CADENCE.** The whisper is weekly and the lantern is a
+  scheduled tick, so one ping per dark event is one ping. ***The bell fires per gift unwrap*** — a
+  ping on its dark path pages on every claim for the life of a misconfigured container. That is the
+  furniture problem this register's own `info` level already exists to avoid.
+- **It is not silent either.** `Unresolved` still carries `REGISTER_UNRESOLVED_NEEDLE`, which the
+  metric filter matches — so a misconfigured bell escalates through the log, once, on a 300s alarm
+  period, instead of once per unwrap into Discord.
+
+⇒ **The trade is immediate-and-noisy for delayed-and-bounded, on the one register whose contract is
+already best-effort.** `bell_does_not_page_ops_when_dark` asserts both halves (zero ops traffic AND
+the needle still present), with a forced-red control, so this section cannot quietly stop being true.
+
+---
+
 ## 4. Open questions for the family gate (step 5)
 
 **Q1 — should `Unresolved` at the OPS register be fatal at init?** `Notify`'s doc says

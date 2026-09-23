@@ -10347,3 +10347,52 @@ fn the_alarm_and_the_code_agree_on_the_string() {
         "the DISABLED face carries the alarm's needle — a deliberate mute would page: {dis}"
     );
 }
+
+#[tokio::test]
+async fn bell_does_not_page_ops_when_dark() {
+    // Review pass 1 on this PR found that a dark bell silently stopped reaching ops, and that the
+    // change was unstated. It is now a DECISION (see `bell::ring`'s gate comment: the bell fires
+    // per gift-unwrap, so a ping on its dark path would page on every claim for the life of a
+    // misconfigured container). This test is what keeps the decision from quietly becoming a bug
+    // in either direction.
+    let ops = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&ops)
+        .await;
+
+    let (buf, _g) = capture_logs();
+    let mut d = deps(
+        unreachable_store().await,
+        "http://humble.invalid",
+        Some(ops.uri()),
+    );
+    d.bell_notify = fulfillment::Notify::Unresolved; // the LOUD face — the one that could page
+
+    let resp = handle(
+        &d,
+        FulfillRequest::Bell {
+            event: fulfillment::bell::BellEvent::Thanks {
+                link_token: "sw-nopage".into(),
+            },
+        },
+    )
+    .await;
+    assert!(matches!(resp, FulfillResponse::Belled));
+
+    // ① zero ops traffic, even on the loud face — that is the cadence decision
+    assert_eq!(
+        ops.received_requests().await.unwrap().len(),
+        0,
+        "the bell paged ops on a dark register — it fires per unwrap, so this pages per claim"
+    );
+
+    // ② but NOT silent: it still carries the needle the CloudWatch filter matches, so a
+    //    misconfigured bell escalates through the log rather than not at all.
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains(fulfillment::REGISTER_UNRESOLVED_NEEDLE)
+            && logs.contains(r#"register="bell""#),
+        "an unresolved bell is silent on BOTH channels — that is not the trade, that is a hole: {logs}"
+    );
+}
