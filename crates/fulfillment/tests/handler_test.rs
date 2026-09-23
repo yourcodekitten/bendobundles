@@ -10082,3 +10082,60 @@ async fn ping_msg_on_a_dark_ops_register_says_so() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_dark_whisper_emits_one_record_carrying_both_lifetimes() {
+    // Driven through `handle` like a real caller, not by calling the gate directly — a test that
+    // reaches past the dispatch proves the test's route, not the code's. WhisperPreview's dark
+    // path returns BEFORE `deps.store.list_whispers()`, so `unreachable_store()` is sound here
+    // (measured; see the plan's run-matrix).
+    let ops = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&ops)
+        .await;
+
+    let (log_buf, _capture) = capture_logs();
+    let d = deps_whisper(
+        unreachable_store().await,
+        "http://humble.invalid",
+        Some(ops.uri()), // ops LIVE, so the actionable ping really delivers
+        None,            // whisper DARK
+    );
+
+    let r = handle(&d, FulfillRequest::WhisperPreview).await;
+    assert!(matches!(r, FulfillResponse::PreviewBlocked));
+
+    let logs = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
+
+    // The machine contract: stable keys, what the filter reads. Must never churn.
+    assert!(logs.contains(r#"outcome="register_dark""#), "lost the countable record: {logs}");
+    assert!(logs.contains(r#"register="whisper""#), "the record does not say WHICH register: {logs}");
+    assert!(logs.contains(r#"reason="disabled""#), "the record does not say WHICH face: {logs}");
+
+    // The human half rides the SAME event as a message field, so improving the wording can never
+    // kill the alarm. Asserted against the note table, never a hand-typed copy of it.
+    assert!(
+        logs.contains(
+            fulfillment::Register::Whisper.note(fulfillment::DarkFace::Disabled)
+        ),
+        "the record lost this register's own sentence: {logs}"
+    );
+
+    // 🔴 ONE record for one event. The bespoke `whisper_dark` outcome is RETIRED — measured
+    // 2026-09-23, it had exactly one hit in the tree (its own emitter) and zero machine consumers.
+    // Two records for one dark event doubles volume on a per-send path to buy a separation that
+    // two FIELDS already provide.
+    assert!(
+        !logs.contains(r#"outcome="whisper_dark""#),
+        "the retired bespoke record is still being emitted alongside the uniform one: {logs}"
+    );
+
+    // And the ACTIONABLE half still goes out — it is a webhook payload, not a log line, and
+    // retiring the duplicate record must not retire the operator's one-liner.
+    let reqs = ops.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "the dark gate stopped pinging ops");
+    let body = String::from_utf8(reqs[0].body.clone()).unwrap();
+    assert!(body.contains("DARK"), "the ping lost its cause wording: {body}");
+    assert!(body.contains("put-parameter"), "the ping lost its actionable one-liner: {body}");
+}

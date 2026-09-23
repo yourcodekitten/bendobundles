@@ -5018,18 +5018,32 @@ pub async fn whisper_send_body_for_test(url: &str, body: &serde_json::Value) -> 
 /// announce themselves distinctly and return None (①a advises the put-parameter; ①b never
 /// advises overwrite — the stored value may be right and the fault the read path). Extracted
 /// UNCHANGED from handle_whisper — the two faces' wording is family-reviewed, do not edit in
-/// passing. Match all three states; never flatten with a let-else.
+/// passing.
+///
+/// 🔴 THIS LINE USED TO READ *"Match all three states; never flatten with a let-else."* Correct
+/// about the old world, and now the opposite of the rule: **the URL comes from
+/// [`Notify::sendable`] and nowhere else, so a let-else OVER `sendable()` is the correct shape** —
+/// the gate announces the dark face before returning `None`. What stays forbidden is a let-else
+/// over the **variant** (`let Notify::Webhook(u) = … else`), which is why `WebhookUrl`'s field is
+/// private to `mod gate`. Match all three arms below for the bespoke advice; no wildcard.
+/// *Left standing, this sentence would have had the repo's two exemplary gates forbidding by name
+/// the thing the repo's own gate now does.*
 pub(crate) async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
+    // `sendable` FIRST: the healthy path returns here, and each dark face emits THE record on the
+    // way past — machine keys (`outcome`/`register`/`reason`) plus this register's own sentence
+    // from the note table. ONE event, two lifetimes. The match below adds only the actionable
+    // PING, which is a webhook payload and not a log line.
+    if let Some(u) = deps.whisper_notify.sendable(Register::Whisper) {
+        return Some(u.to_owned());
+    }
     match &deps.whisper_notify {
-        // The URL comes from `sendable` and nowhere else — this module cannot reach it directly
-        // any more, which is the point. The arm stays written out so a new `Notify` variant still
-        // fails to compile here.
-        Notify::Webhook(_) => deps.whisper_notify.sendable(Register::Whisper).map(str::to_owned),
+        // NOT `unreachable!()`. `sendable` returns Some for Webhook, so this arm is dead today —
+        // but this is the notification path, whose whole contract is that it returns () and cannot
+        // break fulfilment. A panic here would trade a silent drop for a louder outage. Written
+        // out rather than wildcarded so a new `Notify` variant still fails to compile, and
+        // returning None fails CLOSED if `sendable`'s behaviour ever changes underneath it.
+        Notify::Webhook(_) => None,
         Notify::Disabled => {
-            tracing::warn!(
-                outcome = "whisper_dark",
-                "whisper webhook unconfigured — no-op, zero writes"
-            );
             ping_msg(deps, &OperatorMessage::fmt(
                 "whisper is DARK — the attic has a voice and no throat. Light it: aws ssm put-parameter --name {} --type SecureString --overwrite --value <discord webhook url>",
                 &[Part::Id(&deps.whisper_param_name)],
@@ -5038,10 +5052,6 @@ pub(crate) async fn resolve_whisper_url(deps: &Deps) -> Option<String> {
             None
         }
         Notify::Unresolved => {
-            tracing::error!(
-                outcome = "whisper_unresolved",
-                "whisper webhook configured but UNREADABLE — no-op, zero writes"
-            );
             ping_msg(deps, &OperatorMessage::fmt(
                 "whisper webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value; the stored secret may be fine and the fault is the read path.",
                 &[Part::Id(&deps.whisper_param_name)],
@@ -5366,18 +5376,21 @@ async fn lantern_reads(deps: &Deps) -> Option<LanternReads> {
 
 /// The lantern gate on ITS OWN Notify (never `resolve_whisper_url` — that one carries the
 /// whisper's mute). Same three faces as the whisper's gate; the dark advice names the whisper
-/// param because that IS the credential the lantern rides. Match all three; never let-else.
+/// param because that IS the credential the lantern rides.
+///
+/// 🔴 THIS LINE USED TO READ *"Match all three; never let-else."* — see the same correction on
+/// [`resolve_whisper_url`]. The URL comes from [`Notify::sendable`]; a let-else over the VARIANT
+/// is what the private field now prevents.
 async fn resolve_lantern_url(deps: &Deps) -> Option<String> {
+    // Same shape as the whisper's gate: `sendable` first, emitting the one record; the match adds
+    // only the actionable ping.
+    if let Some(u) = deps.lantern_notify.sendable(Register::Lantern) {
+        return Some(u.to_owned());
+    }
     match &deps.lantern_notify {
-        // The URL comes from `sendable` and nowhere else — this module cannot reach it directly
-        // any more, which is the point. The arm stays written out so a new `Notify` variant still
-        // fails to compile here.
-        Notify::Webhook(_) => deps.lantern_notify.sendable(Register::Lantern).map(str::to_owned),
+        // Dead-but-honest, and fails CLOSED — see the identical arm in `resolve_whisper_url`.
+        Notify::Webhook(_) => None,
         Notify::Disabled => {
-            tracing::warn!(
-                outcome = "lantern_dark",
-                "lantern register unconfigured or LANTERN_DISABLED — no-op, zero writes"
-            );
             ping_msg(deps, &OperatorMessage::fmt(
                 "the lantern is DARK — it rides the whisper webhook ({}); light that param, or unset LANTERN_DISABLED",
                 &[Part::Id(&deps.whisper_param_name)],
@@ -5386,10 +5399,6 @@ async fn resolve_lantern_url(deps: &Deps) -> Option<String> {
             None
         }
         Notify::Unresolved => {
-            tracing::error!(
-                outcome = "lantern_unresolved",
-                "lantern register configured but UNREADABLE — no-op, zero writes"
-            );
             ping_msg(deps, &OperatorMessage::fmt(
                 "the lantern's webhook {} is configured but UNREADABLE — check ssm:GetParameter and the KMS grant. Do NOT overwrite the value.",
                 &[Part::Id(&deps.whisper_param_name)],
