@@ -1115,13 +1115,20 @@ nothing in the mailbox. *Terraform declares the subscription; it cannot declare 
 aws sns list-subscriptions-by-topic --topic-arn <ops_alarms arn>
 ```
 
-**If the only subscription reads `PendingConfirmation`, this alarm is dead before Task 1 and so are
-the six that already ride that topic.** ⚠️ **NOT MEASURED from either of my seats** —
-`SNS:ListTopics` is denied to both `kitten-debug` and `kitten-deploy` (`AuthorizationError`,
-rc=254, measured 2026-09-23). The prior is "confirmed" because six alarms already point there; **a
-prior is not a measurement**, and *"six other alarms also point at a mailbox nobody clicked"* is
-exactly the shape of this morning's 204. **Carry it as an explicit unknown and settle it at step 12
-or ask Ben; do not let it become an assumption inside the plan.**
+✅ **MEASURED 2026-09-23 AND IT CLEARS — by OMBB, because it was not mine to run.** `SNS:ListTopics`
+is denied to both `kitten-debug` and `kitten-deploy` (`AuthorizationError`, rc=254); his
+`brd-prod-ue1-core-bendoerr` seat is in the same account and answered:
+`arn:…:brd-prod-ue1-bendobundles-ops-alarms` has **1 subscription, protocol `email`, with a real
+`SubscriptionArn` — not the literal `PendingConfirmation`. Somebody clicked.**
+
+⚖️ **HIS BOUND, KEPT VERBATIM BECAUSE THE TEMPTATION IS TO OVER-READ IT: *CONFIRMED IS NOT
+RECEIVED.*** He measured **subscription state** — not delivery, not readership. A confirmed address
+can still filter, bounce, or go unread. **One failure mode removed from that path; not the class.**
+⇒ **Step 12's acceptance test is unchanged: RECEIPT, not publish success.**
+
+📌 And note what the prior would have bought: *"six alarms already point there, so it must be
+confirmed."* That sentence is the same shape as *"eight pages returned 204, so they were read"* —
+which was measured false this morning. **The prior was right here and it was still not evidence.**
 
 **Deploy verification (step 12) — the deploy is not done when apply returns:**
 1. `aws logs describe-metric-filters --log-group-name "/aws/lambda/<fn>"` shows `*-register-dark`.
