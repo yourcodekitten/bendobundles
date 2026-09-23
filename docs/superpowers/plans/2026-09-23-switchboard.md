@@ -37,14 +37,14 @@
 ### Task 1: The gate — `Register`, `WebhookUrl`, `Notify::sendable`, and the structural assertion
 
 **Files:**
-- Modify: `crates/fulfillment/src/lib.rs` (the `Notify` enum, `:465-473`)
+- Modify: `crates/fulfillment/src/lib.rs` (the `Notify` enum — `#[derive]` at `:465`, `pub enum Notify` at `:466`, body to `:473`)
 - Modify: every `Notify::Webhook(...)` **construction** site — compile-enforced; census is **13** hits workspace-wide (`grep -rn 'Notify::Webhook' --include=*.rs . | grep -v /target/`), most of them test-side
 - Test: `crates/fulfillment/tests/handler_test.rs`
 
 **Interfaces:**
 - Consumes: nothing (first task)
 - Produces:
-  - `pub enum Register { Ops, Whisper, Lantern, Bell }` with `pub fn as_str(&self) -> &'static str` and `fn note(&self, DarkFace) -> &'static str` (8 cells, no wildcard)
+  - `pub enum Register { Ops, Whisper, Lantern, Bell }` with `pub fn as_str(&self) -> &'static str` and `pub fn note(&self, DarkFace) -> &'static str` (8 cells, no wildcard — **public so the integration test asserts against the table instead of a hand-typed copy of it**)
   - `pub enum DarkFace { Disabled, Unresolved }`
   - `pub const REGISTER_UNRESOLVED_NEEDLE: &str`
   - `pub struct WebhookUrl(String)` — field private to the crate root module, **no** `as_str`, **no** `Deref`, **no** `Into<String>`; constructed via `pub fn WebhookUrl::new(String) -> WebhookUrl`
@@ -80,10 +80,21 @@ fn sendable_returns_url_only_for_webhook_and_logs_every_dark_face() {
     assert!(logs.contains(r#"reason="unresolved""#), "unresolved face lost its reason: {logs}");
 
     // Levels differ: Disabled is operator-initiated silence (INFO — the level bell.rs already
-    // used for exactly this state); Unresolved is misconfiguration (ERROR). "Both returned None"
-    // is the bug, not the assertion.
-    assert!(logs.contains("INFO"), "disabled face must be INFO: {logs}");
-    assert!(logs.contains("ERROR"), "unresolved face must be ERROR: {logs}");
+    // used for exactly this state); Unresolved is misconfiguration (ERROR).
+    //
+    // 🔴 ASSERTED PER LINE, NOT OVER THE WHOLE BUFFER. Both faces emit into one buffer, so
+    // `logs.contains("INFO") && logs.contains("ERROR")` passes even if the two levels are
+    // SWAPPED — and which face gets which level is exactly what the family gate spent the
+    // morning settling. An assertion that cannot detect the inversion of the decision it
+    // encodes is not asserting the decision.
+    let line_for = |reason: &str| -> String {
+        logs.lines()
+            .find(|l| l.contains(&format!(r#"reason="{reason}""#)))
+            .unwrap_or_else(|| panic!("no record for reason={reason}: {logs}"))
+            .to_string()
+    };
+    assert!(line_for("disabled").contains("INFO"), "disabled face is not INFO: {}", line_for("disabled"));
+    assert!(line_for("unresolved").contains("ERROR"), "unresolved face is not ERROR: {}", line_for("unresolved"));
 
     // The machine contract: the alarm's needle must actually appear in the emitted text.
     assert!(
@@ -142,7 +153,7 @@ impl Register {
     /// **This is not a new shape; it is the one the file uses, generalised to all four registers.**
     /// The filter reads `outcome`/`reason`; nothing machine-readable ever reads this text, so
     /// improving the wording can never kill the alarm.
-    fn note(&self, face: DarkFace) -> &'static str {
+    pub fn note(&self, face: DarkFace) -> &'static str {
         match (self, face) {
             (Register::Ops, DarkFace::Disabled) => "operator notifications are off by request",
             (Register::Ops, DarkFace::Unresolved) => "operator notifications are configured but UNREADABLE — running blind",
@@ -199,6 +210,10 @@ impl Register {
 /// ***attention is aimed by the question you are asking, not by proximity.*** "Read it more
 /// carefully" is a remedy whose experiment has been run three times and lost three times.
 /// **That is why the guarantee is a private field and not a sentence.**
+///
+/// 🔑 The general form, from the same morning and three other artifacts that each stated their own
+/// rule in their own header and were violated anyway: ***a rule written inside the artifact it
+/// governs is not enforcement — it is decoration with good intentions.*** (Lilith's wording.)
 #[derive(Clone, Debug)]
 pub struct WebhookUrl(String);
 
@@ -368,16 +383,24 @@ git commit -S -m "🎛️ the gate: Register, WebhookUrl, and sendable() — a s
 ```rust
 #[tokio::test]
 async fn ping_msg_on_a_dark_ops_register_says_so() {
-    // "emits nothing" IS the bug. A test asserting only "does not panic" would have
-    // passed every day of the 70 days the prod alarm was being swallowed.
+    // "emits nothing" IS the bug. A test asserting only "does not panic" would have passed
+    // every one of the 78 days the prod alarm was being swallowed.
+    let Some(store) = store_or_skip("sw-ping-dark").await else {
+        return;
+    };
     let (log_buf, _capture) = capture_logs();
+
+    // `deps` is the fixture at handler_test.rs:135 — `fn deps(store: Store, humble_uri: &str,
+    // webhook_url: Option<String>) -> Deps`. `Store` is NOT Clone (main.rs reconstructs it
+    // per-invoke), so build ONE Deps and re-point `notify` between iterations.
+    let mut d = deps(store, "http://humble.invalid", None);
 
     for (notify, want_reason) in [
         (fulfillment::Notify::Disabled, "disabled"),
         (fulfillment::Notify::Unresolved, "unresolved"),
     ] {
-        let deps = deps_with_notify(notify);
-        fulfillment::ping_msg_for_test(&deps, &fulfillment::OperatorMessage::plain("knock knock")).await;
+        d.notify = notify;
+        fulfillment::ping_msg(&d, &fulfillment::OperatorMessage::literal("knock knock")).await;
 
         let logs = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
         assert!(
@@ -388,11 +411,17 @@ async fn ping_msg_on_a_dark_ops_register_says_so() {
 }
 ```
 
-**Note for the implementer:** `ping_msg` is `pub(crate)`. Expose it to the integration test the way this crate already exposes other internals — check for an existing `#[cfg(feature = "test-util")]` or `pub use` pattern in `lib.rs` and follow it. If none exists, make `ping_msg` `pub` and say so in the commit message; do **not** invent a new test-only feature flag for one function. `deps_with_notify` is a small local helper in the test file building a `Deps` with the given `notify` — reuse whatever `Deps` fixture `handler_test.rs:150` already constructs rather than writing a second one.
+**Decided, not left to the implementer:** `ping_msg` becomes **`pub`** (it is `pub(crate)` today).
+No new test-only feature flag for one function, and no `#[cfg(test)]` accessor — the integration
+test is a separate crate and needs the real symbol. Say so in the commit message.
+
+⚠️ **`OperatorMessage::plain` DOES NOT EXIST — this plan said so in an earlier draft and it was
+wrong.** The real constructors are `fmt` (59 call sites), `literal` (21) and `with` (3), in
+`crates/fulfillment/src/operator_message.rs:139`. Use `literal` for a fixed string.
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cargo test -p fulfillment --test handler_test ping_msg_on_a_dark_ops_register`
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test ping_msg_on_a_dark_ops_register`
 Expected: FAIL — the assertion fires with empty or record-less logs, because the bare `return` emits nothing.
 
 - [ ] **Step 3: Route it through the gate**
@@ -419,7 +448,7 @@ with:
 
 - [ ] **Step 4: Run it and watch it pass**
 
-Run: `cargo test -p fulfillment --test handler_test ping_msg_on_a_dark_ops_register`
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test ping_msg_on_a_dark_ops_register`
 Expected: PASS
 
 - [ ] **Step 5: Run the whole suite — this function is on every escalation path**
@@ -453,8 +482,14 @@ git commit -S -m "🎛️ ping_msg through the gate — the escalation path stop
 async fn a_dark_whisper_emits_one_record_carrying_both_lifetimes() {
     let (log_buf, _capture) = capture_logs();
 
-    let deps = deps_with_whisper_notify(fulfillment::Notify::Disabled);
-    assert_eq!(fulfillment::resolve_whisper_url(&deps).await, None);
+    let Some(store) = store_or_skip("sw-whisper-dark").await else {
+        return;
+    };
+    // The fixture at handler_test.rs:135; whisper_notify defaults to Disabled there already,
+    // set explicitly so the test states the state it is testing.
+    let mut d = deps(store, "http://humble.invalid", None);
+    d.whisper_notify = fulfillment::Notify::Disabled;
+    assert_eq!(fulfillment::resolve_whisper_url(&d).await, None);
 
     let logs = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
 
@@ -466,7 +501,7 @@ async fn a_dark_whisper_emits_one_record_carrying_both_lifetimes() {
     // The human half rides the SAME event as a message field, so improving the wording can
     // never kill the alarm. Asserted against the note table, not a hand-typed copy of it.
     assert!(
-        logs.contains(fulfillment::Register::Whisper.note_for_test(fulfillment::DarkFace::Disabled)),
+        logs.contains(fulfillment::Register::Whisper.note(fulfillment::DarkFace::Disabled)),
         "the record lost this register's own sentence: {logs}"
     );
 
@@ -479,14 +514,13 @@ async fn a_dark_whisper_emits_one_record_carrying_both_lifetimes() {
 }
 ```
 
-**Implementer note:** `Register::note` is private. Expose it to the integration test the same way
-Task 2 exposes `ping_msg` — follow whatever pattern `lib.rs` already uses; `note_for_test` above is
-a placeholder name for that accessor, not a second implementation. **Do not copy the sentence into
-the test** — a test that hand-types the string it is checking asserts only that you typed it twice.
+**`Register::note` is `pub`** (Task 1) precisely so this assertion can read the table rather than a
+copy of it. **Do not hand-type the sentence into the test** — a test that types the string it is
+checking asserts only that you typed it twice.
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cargo test -p fulfillment --test handler_test a_dark_whisper_emits_one_record`
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test a_dark_whisper_emits_one_record`
 Expected: FAIL — today only the bespoke `whisper_dark` record exists and no `register_dark` is emitted here.
 
 - [ ] **Step 3: Rewrite both gates in one shape**
@@ -552,7 +586,7 @@ Replace the rule clause in both (keep every other word):
 
 - [ ] **Step 5: Run it and watch it pass**
 
-Run: `cargo test -p fulfillment --test handler_test a_dark_whisper_emits_one_record`
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test a_dark_whisper_emits_one_record`
 Expected: PASS
 
 - [ ] **Step 6: Run the whole suite**
@@ -590,37 +624,53 @@ async fn the_bell_and_the_whisper_cannot_dark_each_other() {
     // states register-decoupling and illustrates only the direction that was built.
     // Both directions are asserted together so the asymmetry cannot come back.
 
-    // ① WHISPER_DISABLED must NOT dark the bell. (This is the half that is broken today.)
-    let deps = deps_with_registers(
-        /* whisper */ fulfillment::Notify::Disabled,
-        /* bell    */ fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(
-            "https://discord.example/hook".to_string(),
-        )),
-    );
+    let Some(store) = store_or_skip("sw-bell-decouple").await else {
+        return;
+    };
+    let discord = wiremock::MockServer::start().await;
+    // Accept any POST and count them — WHO posted is the assertion, not what.
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .mount(&discord)
+        .await;
+
+    let mut d = deps(store, "http://humble.invalid", None);
+    let hook = || fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(discord.uri()));
+
+    // ① WHISPER_DISABLED must NOT dark the bell. This is the half that is broken today, and it
+    //    is asserted through the WIRING (bell::ring), not by reading a field back off the
+    //    fixture — a field-level assertion would only prove the test set the field.
+    d.whisper_notify = fulfillment::Notify::Disabled;
+    d.bell_notify = hook();
+    let before = discord.received_requests().await.unwrap().len();
+    fulfillment::bell::ring(&d, &<the BellEvent the neighbouring bell tests build>).await;
     assert_eq!(
-        deps.bell_notify.sendable(fulfillment::Register::Bell),
-        Some("https://discord.example/hook"),
+        discord.received_requests().await.unwrap().len(),
+        before + 1,
         "WHISPER_DISABLED reached the bell — the mute is still coupled"
     );
 
-    // ② BELL_DISABLED must NOT dark the whisper. (Already true; asserted so it stays true.)
-    let deps = deps_with_registers(
-        /* whisper */ fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(
-            "https://discord.example/hook".to_string(),
-        )),
-        /* bell    */ fulfillment::Notify::Disabled,
-    );
-    assert_eq!(
-        deps.whisper_notify.sendable(fulfillment::Register::Whisper),
-        Some("https://discord.example/hook"),
+    // ② BELL_DISABLED must NOT dark the whisper. Already true; asserted so it stays true and the
+    //    symmetric rule can never again be implemented in one direction only.
+    d.whisper_notify = hook();
+    d.bell_notify = fulfillment::Notify::Disabled;
+    assert!(
+        fulfillment::resolve_whisper_url(&d).await.is_some(),
         "BELL_DISABLED reached the whisper"
     );
 }
 ```
 
+⚠️ **`<the BellEvent …>` is the ONE thing this task does not spell out, deliberately and
+narrowly: read `handler_test.rs:9945` and the bell tests around it and reuse the `BellEvent` they
+already construct** — `bell::ring`'s `Unwrap` arm does a `store.get_link` lookup and returns early
+on an unknown token, so an invented event would make this test pass by ringing nothing. **If you
+cannot find one, extend the existing test at `:9945` instead of writing a new one; it already has
+the wiremock + register scaffolding.** Do not invent a `BellEvent`.
+
 - [ ] **Step 2: Run it and watch direction ① fail**
 
-Run: `cargo test -p fulfillment --test handler_test the_bell_and_the_whisper_cannot_dark`
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test the_bell_and_the_whisper_cannot_dark`
 Expected: compile error (`bell_notify` does not exist). **That is the right failure** — the field is the fix.
 
 - [ ] **Step 3: Move the bool's destination**
@@ -677,7 +727,7 @@ Run: `cargo build --workspace 2>&1 | grep -E '^error' | head -20`
 
 - [ ] **Step 5: Run the test and the suite**
 
-Run: `cargo test -p fulfillment --test handler_test the_bell_and_the_whisper_cannot_dark`
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test the_bell_and_the_whisper_cannot_dark`
 Expected: PASS
 
 Run: `cargo test -p fulfillment 2>&1 | tail -15`
@@ -806,8 +856,14 @@ Append to `terraform/aws-cloudwatch-alarms.tf`:
 # coupling is asserted by `the_alarm_and_the_code_agree_on_the_string` in handler_test.rs so a
 # rename breaks a test rather than the alarm.
 resource "aws_cloudwatch_log_metric_filter" "register_dark" {
-  name           = "${module.label.id}-register-dark"
-  log_group_name = aws_cloudwatch_log_group.fulfillment.name
+  name = "${module.label.id}-register-dark"
+  # 🔴 THIS TERRAFORM MANAGES NO LOG GROUP — `grep -n aws_cloudwatch_log_group terraform/*.tf`
+  # returns ZERO. An earlier draft referenced `aws_cloudwatch_log_group.fulfillment.name` and would
+  # have failed at plan time on an undeclared resource. The group is created implicitly by Lambda,
+  # so the name is DERIVED the same way `fulfillment_silent` addresses the function (`:50`).
+  # ⚠️ Confirm against the lambda module's outputs before applying; if it exposes a log-group name
+  # or ARN output, USE THAT rather than reconstructing the convention by hand.
+  log_group_name = "/aws/lambda/${module.lambda_fulfillment.lambda_function_name}"
 
   # PLAIN-TEXT literal, NOT a `{ $.field = ... }` JSON pattern: these logs are tracing's text
   # format (main.rs:81; the crate's `json` feature is off), and a JSON pattern matches zero text
@@ -846,12 +902,21 @@ resource "aws_cloudwatch_metric_alarm" "register_unresolved" {
   comparison_operator = "GreaterThanOrEqualToThreshold"
   treat_missing_data  = "notBreaching"
 
-  alarm_actions = aws_sns_topic.ops_alarms[*].arn
+  # NOT a splat: `aws_sns_topic.ops_alarms` has no `count` in this file, and every existing alarm
+  # here writes it exactly this way (`:41`, `:63`, `:92`, `:115`, `:140`, `:160`).
+  alarm_actions = [aws_sns_topic.ops_alarms.arn]
   tags          = module.label.tags
 }
 ```
 
-**Implementer note:** `aws_cloudwatch_log_group.fulfillment`, `module.label`, and `aws_sns_topic.ops_alarms` are names this plan assumes from the existing file. **Read `terraform/aws-cloudwatch-alarms.tf` and use whatever the existing alarms actually reference** — if the log group is implicit (created by the Lambda, not by Terraform) you must add a `data` source or the `aws_cloudwatch_log_group` resource; do not guess. Match the `count`/`var.*_enabled` convention the neighbouring alarms use.
+**Implementer note — VERIFIED 2026-09-23, not assumed:** `aws_sns_topic.ops_alarms` exists at
+`:17` with **no `count`**, and `aws_sns_topic_subscription.ops_alarms_email` (`:23`) points at
+`var.ops_alarm_email` with the comment *"ben confirms the subscription once by mail"*. ⇒ **this
+alarm's destination is a mail subscription Ben has already confirmed**, not the shared agent ops
+webhook — so it does **not** inherit the readership problem measured on that webhook this morning
+(seven seats, one channel, at least two of seven cannot read it). `module.label` is used by the
+neighbouring alarms; **read the file and match whichever label module they use** — `label_lantern`
+and `label_alarms` both appear, and picking the wrong one only changes the resource's name.
 
 - [ ] **Step 2: Validate the terraform**
 
@@ -945,18 +1010,28 @@ fn the_alarm_and_the_code_agree_on_the_string() {
 
 - [ ] **Step 4: Run it and watch it pass, then prove it can FAIL**
 
-Run: `cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree`
+Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree`
 Expected: PASS
 
-Now the control — break the coupling on purpose and confirm the test notices:
+Now the control — break the coupling on purpose and confirm the test notices.
+
+🔴 **SABOTAGE THE CONST, NOT THE `outcome` FIELD — an earlier draft of this step got this wrong and
+the control could not have fired.** It renamed `outcome = "register_dark"`, while the test asserts
+on `REGISTER_UNRESOLVED_NEEDLE`, a **separate** const. Every assertion stayed true, so the step
+would have printed PASS where it says *Expected: FAIL* — and the executor's only options are to
+stall or to "fix" the test until it fails. ***A control aimed at a string its test does not read is
+the defect this whole task exists to prevent, rebuilt inside the proof that the task works.***
+
 ```bash
-sed -i 's/outcome = "register_dark"/outcome = "register_gloomy"/' crates/fulfillment/src/lib.rs
-cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree 2>&1 | tail -5
+sed -i 's/"register_dark_unresolved"/"register_dark_GLOOMY"/' crates/fulfillment/src/lib.rs
+DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree 2>&1 | tail -5
 ```
-Expected: **FAIL**, naming the string. Then revert:
+Expected: **FAIL**, and read WHICH assertion fired — it must be the `tf.contains(needle)` one
+("the metric filter pattern does not contain it"), because the code moved and the terraform did
+not. A failure on any other line means the control is testing something else. Then revert:
 ```bash
-sed -i 's/outcome = "register_gloomy"/outcome = "register_dark"/' crates/fulfillment/src/lib.rs
-cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree 2>&1 | tail -5
+sed -i 's/"register_dark_GLOOMY"/"register_dark_unresolved"/' crates/fulfillment/src/lib.rs
+DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree 2>&1 | tail -5
 ```
 Expected: PASS. *A guard that has never been seen to say no is unexercised.*
 
@@ -987,7 +1062,7 @@ AWS_PROFILE=kitten-deploy terraform apply tf.tfplan
 ⚠️ `production.tfvars` carries **6** keys and **not** `admin_password_hash` — a plan stops on *"No value for required variable"* if you assume otherwise. Never re-hash the plaintext for a routine apply.
 
 **Deploy verification (step 12) — the deploy is not done when apply returns:**
-1. `aws logs describe-metric-filters --log-group-name <the group>` shows `*-register-dark`.
+1. `aws logs describe-metric-filters --log-group-name "/aws/lambda/<fn>"` shows `*-register-dark`.
 2. The alarm exists and is in `OK` or `INSUFFICIENT_DATA` — **not** `ALARM`. If it is in `ALARM` on arrival, a register really is unresolved in prod and that is a finding, not a deploy failure.
 3. Force one real dark record if a safe path exists, and confirm the metric moves. **If it cannot be forced safely, say so plainly rather than reporting the alarm as verified** — an alarm that has never counted anything is a configuration, not an instrument.
 
