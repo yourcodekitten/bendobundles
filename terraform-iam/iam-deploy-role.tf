@@ -311,6 +311,20 @@ data "aws_iam_policy_document" "deploy" {
       "logs:ListTagsForResource",
       "logs:TagLogGroup",
       "logs:ListTagsLogGroup",
+      # METRIC FILTERS — added 2026-09-23 after a partial apply. The switchboard
+      # (#241) introduced this repo's FIRST log-content-derived alarm: a metric
+      # filter over the fulfillment log group feeding an alarm that can report a
+      # dark notification register, because a message that rides a register
+      # cannot report that register.
+      #
+      # 🔴 The apply created the ALARM and was DENIED the FILTER, leaving prod with
+      # an alarm that has no data source — it reads INSUFFICIENT_DATA forever and
+      # can never fire. That is exactly the defect #241 exists to remove, shipped
+      # by its own deploy. `Describe` is included because terraform refreshes the
+      # resource on every plan, not only on create.
+      "logs:PutMetricFilter",
+      "logs:DeleteMetricFilter",
+      "logs:DescribeMetricFilters",
     ]
     resources = [
       "arn:aws:logs:${local.region}:${local.account}:log-group:/aws/lambda/${local.app_prefix}*",
