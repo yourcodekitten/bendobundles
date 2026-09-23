@@ -10,6 +10,51 @@
 
 **Spec:** `docs/spec-switchboard.md` (status CURRENT, citations re-verified 2026-09-23)
 
+## Where these tests can actually RUN — measured 2026-09-23, before a line was written
+
+🔴 **`dynamodb-local` CANNOT RUN ON THIS BOX.** No `docker`, no `podman`, no `java` (`which` finds
+none; `docker info` → rc 127). `store_or_skip` (`handler_test.rs:81`) therefore prints `SKIP` and
+returns `None` for every store-backed test here — **a green that asserted nothing.** With
+`DYNAMODB_LOCAL_URL` *set*, it instead **panics**: *"refusing to skip (this would forge a green
+run)"*. CI is the honest environment: `.github/workflows/ci.yml:12` runs
+`amazon/dynamodb-local:2.5.2` with `DYNAMODB_LOCAL_URL: http://localhost:8000`.
+
+⇒ **Each new test below is labelled LOCAL or CI-ONLY. Do not discover this per-task at 2am.**
+
+| test | needs a live store? | why | where it runs |
+|---|---|---|---|
+| T1 `sendable` matrix | no | calls `Notify::sendable` directly, no `Deps` | **LOCAL** |
+| T1 doctests | no | lib target | **LOCAL** |
+| T2 `ping_msg…dark_ops` | **no** | measured: `ping_msg`'s dark path returns at the gate, **before** `msg.chunks` or any `deps.store` use | **LOCAL** — build a `Store` against an unreachable endpoint; it is never dereferenced |
+| T3 `a_dark_whisper…` | **no** | measured: `grep 'deps.store'` over `resolve_whisper_url`'s range returns **zero** | **LOCAL** — same unreachable-endpoint `Store` |
+| T4 `the_bool_and_the_gate…` | no | calls `Notify::resolve` directly | **LOCAL** |
+| T4 `the_bell_and_the_whisper…` | **YES** | `bell::ring` hits `deps.store.get_link` (`bell.rs:131`, `:142`, `:162`) on the path that must RING | **CI-ONLY** |
+| T5 coupling test | no | `sendable` + a file read | **LOCAL** |
+
+**Building that `Store` without a live endpoint** — `dynamo::Store::new(client, table)` is `pub`
+(`crates/dynamo/src/lib.rs:661`) and `aws_sdk_dynamodb::Client::new(config)` **does not connect at
+construction**. So:
+
+```rust
+// A Store that is VALID but never reachable. Sound only for tests whose path provably never
+// touches it — the table above says which. If a test you write starts touching the store, it
+// belongs in the CI-ONLY row, not behind a longer timeout.
+fn unreachable_store() -> Store {
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url("http://127.0.0.1:1")
+        .region("us-east-1")
+        .test_credentials()
+        .load();
+    let config = futures::executor::block_on(config); // or make the helper `async` and await it
+    Store::new(aws_sdk_dynamodb::Client::new(&config), "sw-unused".to_string())
+}
+```
+
+⚠️ **The CI-ONLY test's red/green cycle is a PUSH cycle, not a local one.** Write the failing test,
+push, watch the CI job go **red for the stated reason** (read the log, do not infer it from the
+red), then implement, push, watch it go green. **Do not mark that step done off a local run** — a
+local run of it is a skip or a panic, never a pass.
+
 ## Global Constraints
 
 - **Zero new dependencies.** 4GB box; the structural assertion uses rustdoc's built-in `compile_fail`, never `trybuild`.
@@ -1061,10 +1106,32 @@ AWS_PROFILE=kitten-deploy terraform apply tf.tfplan
 
 ⚠️ `production.tfvars` carries **6** keys and **not** `admin_password_hash` — a plan stops on *"No value for required variable"* if you assume otherwise. Never re-hash the plaintext for a routine apply.
 
+🔴 **BEFORE APPLY — THE ALARM'S DESTINATION MAY BE DEAD AND EVERY TEST WOULD STILL PASS.**
+Lilith, 2026-09-23: **an unconfirmed SNS email subscription sits in `PendingConfirmation`
+indefinitely, and every `Publish` to the topic still returns a MessageId.** Success at the API,
+nothing in the mailbox. *Terraform declares the subscription; it cannot declare the click.*
+
+```bash
+aws sns list-subscriptions-by-topic --topic-arn <ops_alarms arn>
+```
+
+**If the only subscription reads `PendingConfirmation`, this alarm is dead before Task 1 and so are
+the six that already ride that topic.** ⚠️ **NOT MEASURED from either of my seats** —
+`SNS:ListTopics` is denied to both `kitten-debug` and `kitten-deploy` (`AuthorizationError`,
+rc=254, measured 2026-09-23). The prior is "confirmed" because six alarms already point there; **a
+prior is not a measurement**, and *"six other alarms also point at a mailbox nobody clicked"* is
+exactly the shape of this morning's 204. **Carry it as an explicit unknown and settle it at step 12
+or ask Ben; do not let it become an assumption inside the plan.**
+
 **Deploy verification (step 12) — the deploy is not done when apply returns:**
 1. `aws logs describe-metric-filters --log-group-name "/aws/lambda/<fn>"` shows `*-register-dark`.
 2. The alarm exists and is in `OK` or `INSUFFICIENT_DATA` — **not** `ALARM`. If it is in `ALARM` on arrival, a register really is unresolved in prod and that is a finding, not a deploy failure.
 3. Force one real dark record if a safe path exists, and confirm the metric moves. **If it cannot be forced safely, say so plainly rather than reporting the alarm as verified** — an alarm that has never counted anything is a configuration, not an instrument.
+4. 🔑 **ASSERT RECEIPT, NOT PUBLISH SUCCESS.** OMBB's corpse, measured this morning: eight operator
+   pages returned a real HTTP **204** into a room he is not allowlisted to read — *8 sent, 0
+   received.* ***A MessageId is a 204.*** The acceptance test for this alarm is **a human
+   confirming the mail arrived**, not an API returning 200. Anything less verifies the request and
+   says nothing about the artifact.
 
 ---
 
