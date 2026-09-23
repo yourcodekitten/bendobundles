@@ -35,10 +35,21 @@ run)"*. CI is the honest environment: `.github/workflows/ci.yml:12` runs
 (`crates/dynamo/src/lib.rs:661`) and `aws_sdk_dynamodb::Client::new(config)` **does not connect at
 construction**. So:
 
+🔑 **AND THE ENDPOINT IS THE LINK, NOT A CONVENIENCE — this is the half the first draft left
+implicit and it is the whole reason this helper is safe.** `127.0.0.1:1` is a closed port. So the
+table above is not a *claim* a reader has to trust: **a test that touches the store gets a
+connection error and goes RED**, where `store_or_skip` would have gone green by skipping.
+***The table says which tests need a store; the endpoint makes that answer enforce itself.***
+
+⚠️ **The original defect was not "I measured and then ignored it" — it is that the table and the
+call sites were never made to TOUCH.** (Lilith, 2026-09-23.) A true statement sitting beside the
+thing it fails to govern is this plan's own thesis — the same shape as a prohibition 4,282 lines
+from its violation. **The fix is a LINK, never less evidence.**
+
 ```rust
-// A Store that is VALID but never reachable. Sound only for tests whose path provably never
-// touches it — the table above says which. If a test you write starts touching the store, it
-// belongs in the CI-ONLY row, not behind a longer timeout.
+// A Store that is VALID but never reachable. The port is closed ON PURPOSE: any test whose path
+// touches the store fails LOUDLY here instead of skipping. That is the enforcement — do not
+// "fix" it later by pointing this at something that answers.
 async fn unreachable_store() -> Store {
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url("http://127.0.0.1:1")
@@ -56,6 +67,20 @@ all three tests anyway, using the helper ZERO times.** With `DYNAMODB_LOCAL_URL`
 steps' own commands set) they panic; without it they skip and assert nothing. ***Building the tool,
 publishing the table, and then not using either is a worse failure than never measuring*** — the
 measurement made the plan *look* careful while the code stayed wrong. (OMBB's gate, 2026-09-23.)
+
+- [ ] **Control — prove the link can fire, once, before trusting it** (run this by hand during
+  Task 2; it is not a committed test):
+
+  ```rust
+  // Temporarily, inside ping_msg_on_a_dark_ops_register, BEFORE the dark assertions:
+  let _ = d.store.get_link("sw-control-should-explode").await.expect_err(
+      "unreachable_store() answered a query — the endpoint is not closed and the whole LOCAL row of \
+       the table above is unenforced",
+  );
+  ```
+  Expected: the test still passes (the call errors, as it must). **Then delete the line.** If it
+  instead *succeeds*, the helper is pointing at something live and every LOCAL row is back to being
+  an unenforced claim. *An enforcement mechanism nobody has watched fire is a comment.*
 
 ⚠️ **The CI-ONLY test's red/green cycle is a PUSH cycle, not a local one.** Write the failing test,
 push, watch the CI job go **red for the stated reason** (read the log, do not infer it from the
