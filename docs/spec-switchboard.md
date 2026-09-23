@@ -3,7 +3,7 @@
 *every outbound register in bendobundles routes through one gate, and a silent drop becomes
 impossible to WRITE rather than merely discouraged.*
 
-status: **CURRENT** — spec 2026-09-21, citations re-verified 2026-09-23T07:0x-04:00.
+status: **CURRENT** — spec 2026-09-21, citations re-verified 2026-09-23T07:0x-04:00, §3.2 and §4.5 amended 07:3x-04:00 after the family gate and a measurement each contradicted them.
 author: code kitten. arc: pounce, **Wed 2026-09-23 slot**.
 ⚠️ The Mon 2026-09-21 arc that drafted this was **CANCELLED by Ben at step 1/14** (*"No pounce
 today"*) — nothing was built, pushed or deployed. This spec survived as ordinary backlog and is
@@ -180,8 +180,18 @@ Three arms, no wildcard:
 | state | returns | emits |
 |---|---|---|
 | `Webhook(u)` | `Some(u)` | nothing |
-| `Disabled` | `None` | `warn!(outcome="register_dark", register=reg, reason="disabled")` |
-| `Unresolved` | `None` | `error!(outcome="register_dark", register=reg, reason="unresolved")` |
+| `Disabled` | `None` | `info!(outcome="register_dark", register=reg, reason="disabled", <reg's note>)` |
+| `Unresolved` | `None` | `error!(outcome="register_dark", register=reg, reason="unresolved", <needle + reg's note>)` |
+
+🔴 **AMENDED 2026-09-23 BY THE FAMILY GATE — this table said `warn` for `Disabled` and ONE record
+per event, and the plan implements neither.** Two changes, both against my recommendation:
+- **`Disabled` is `info!`, not `warn!`** (Lilith): *a dark register is a LEVEL, not an edge*, and a
+  deliberate mute re-announced at WARN on every event is furniture. The level is not invented —
+  `bell.rs:115` already emits this exact state at `info!`, and this gate SUBSUMES that record.
+- **ONE record carrying the register's sentence as a FIELD**, not two records (OMBB): two fields
+  buy the same machine-contract/human-prose separation at half the volume, and it is the shape
+  `lib.rs:4754` and `bell.rs:115` already ship. *§3.4's "two records for one event is deliberate"
+  is RETIRED.*
 
 `Disabled` is `warn` (deliberate, operator-initiated silence); `Unresolved` is `error`
 (misconfiguration — the state `Notify`'s doc already calls out as distinct, now distinct at SEND
@@ -253,9 +263,19 @@ function. **Recommendation: two records, as specced.**
 `ping_msg` cannot report that `ping_msg` is dark. The only channel that does not depend on the
 thing being reported is the log itself, so:
 
-- a **CloudWatch metric filter** on `{ $.outcome = "register_dark" && $.reason = "unresolved" }`
-- an **alarm** on it, on the existing lantern alarm pattern (`terraform/`, two alarms already
-  created by the lantern arc — the shape is in the repo)
+- a **CloudWatch metric filter** on the plain-text literal `"register_dark_unresolved"`
+  🔴 **NOT `{ $.outcome = … && $.reason = … }`, which this spec used to specify and which would
+  have matched NOTHING, FOREVER.** Measured 2026-09-23: `main.rs:81` is
+  `tracing_subscriber::fmt()` — tracing's **text** format — and `crates/fulfillment/Cargo.toml:24`
+  declares `tracing-subscriber = "0.3"` with **no features**, so `json` is off. A CloudWatch
+  `$.field` pattern matches only JSON events; against text it yields zero datapoints and the alarm
+  sits in `INSUFFICIENT_DATA` wearing green. ⇒ ***the defect this spec exists to remove, rebuilt
+  inside its own remedy.*** The needle is a single `const` token so one source of truth is shared
+  by the code and the terraform, asserted by a test.
+- an **alarm** on it. ⚠️ **"the shape is in the repo" was FALSE for the filter half** — measured
+  2026-09-23, `grep -rn metric_filter --include=*.tf` returns **0**. All six existing alarms ride
+  metrics AWS emits for free; this is the first that depends on the app's own log content, and on
+  a log group **this terraform does not declare**.
 
 This is the one piece that closes §1.1's bootstrap. It is IN SCOPE and is the reason §2 rejects an
 admin surface: **a surface you must visit is not an alarm, and a message that rides a register

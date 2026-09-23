@@ -39,16 +39,23 @@ construction**. So:
 // A Store that is VALID but never reachable. Sound only for tests whose path provably never
 // touches it — the table above says which. If a test you write starts touching the store, it
 // belongs in the CI-ONLY row, not behind a longer timeout.
-fn unreachable_store() -> Store {
+async fn unreachable_store() -> Store {
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .endpoint_url("http://127.0.0.1:1")
         .region("us-east-1")
         .test_credentials()
-        .load();
-    let config = futures::executor::block_on(config); // or make the helper `async` and await it
+        .load()
+        .await;
     Store::new(aws_sdk_dynamodb::Client::new(&config), "sw-unused".to_string())
 }
 ```
+
+🔴 **USE `unreachable_store()` IN EVERY ROW THE TABLE MARKS LOCAL. An earlier draft of this plan
+measured the environment, tabled the answer, wrote this helper — and then called `store_or_skip` in
+all three tests anyway, using the helper ZERO times.** With `DYNAMODB_LOCAL_URL` set (which those
+steps' own commands set) they panic; without it they skip and assert nothing. ***Building the tool,
+publishing the table, and then not using either is a worse failure than never measuring*** — the
+measurement made the plan *look* careful while the code stayed wrong. (OMBB's gate, 2026-09-23.)
 
 ⚠️ **The CI-ONLY test's red/green cycle is a PUSH cycle, not a local one.** Write the failing test,
 push, watch the CI job go **red for the stated reason** (read the log, do not infer it from the
@@ -102,53 +109,73 @@ In `crates/fulfillment/tests/handler_test.rs`:
 ```rust
 #[test]
 fn sendable_returns_url_only_for_webhook_and_logs_every_dark_face() {
-    let (log_buf, _capture) = capture_logs();
+    use fulfillment::{DarkFace, Notify, Register, WebhookUrl};
+    const URL: &str = "https://discord.example/hook";
 
-    let hook = fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(
-        "https://discord.example/hook".to_string(),
-    ));
+    // 🔴 ALL FOUR REGISTERS x ALL THREE STATES = the 3x4 matrix spec §5 promises. An earlier draft
+    // asserted THREE CELLS (Ops/Whisper/Lantern, one state each) and never mentioned `Bell` — the
+    // register Task 4 exists for. A gate that worked for Ops and broke the bell would have passed.
+    const REGISTERS: [Register; 4] =
+        [Register::Ops, Register::Whisper, Register::Lantern, Register::Bell];
+
+    // ── the sendable face, on every register ──────────────────────────────────
+    for reg in REGISTERS {
+        let (buf, _g) = capture_logs();
+        let hook = Notify::Webhook(WebhookUrl::new(URL.to_string()));
+        assert_eq!(hook.sendable(reg), Some(URL), "{reg:?} cannot send a configured webhook");
+        // The healthy path must emit NOTHING — a gate that narrates success is furniture.
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("register_dark"),
+            "{reg:?}: the healthy path emitted a dark record: {logs}"
+        );
+    }
+
+    // ── the two dark faces, on every register: 8 cells, the whole note table ──
+    // 🔴 ONE BUFFER PER CELL, deliberately. Asserting over a shared buffer is how an earlier draft
+    // made INFO/ERROR undetectably swappable: both levels were present, so `contains` passed with
+    // the two faces INVERTED — the exact decision the family gate spent an hour settling.
+    for reg in REGISTERS {
+        for (notify, face, want_level) in [
+            (Notify::Disabled, DarkFace::Disabled, "INFO"),
+            (Notify::Unresolved, DarkFace::Unresolved, "ERROR"),
+        ] {
+            let (buf, _g) = capture_logs();
+            assert_eq!(notify.sendable(reg), None, "{reg:?}/{face:?} handed out a URL");
+            let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+
+            let line = logs
+                .lines()
+                .find(|l| l.contains(&format!(r#"register="{}""#, reg.as_str())))
+                .unwrap_or_else(|| panic!("{reg:?}/{face:?} emitted no record at all: {logs}"));
+
+            assert!(line.contains(r#"outcome="register_dark""#), "{reg:?}/{face:?}: {line}");
+            assert!(line.contains(want_level), "{reg:?}/{face:?} is not {want_level}: {line}");
+            // 🔴 ALL EIGHT NOTE CELLS ASSERTED. `Register::note` is `pub` precisely so this can
+            // read the table instead of a hand-typed copy of it; an earlier draft paid for the
+            // public accessor and then asserted ONE cell (Whisper/Disabled).
+            assert!(
+                line.contains(reg.note(face)),
+                "{reg:?}/{face:?} lost its own sentence: {line}"
+            );
+        }
+    }
+
+    // The machine contract: the alarm's needle rides the unresolved face and ONLY it.
+    let (buf, _g) = capture_logs();
+    assert_eq!(Notify::Unresolved.sendable(Register::Ops), None);
+    assert_eq!(Notify::Disabled.sendable(Register::Ops), None);
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let needle = fulfillment::REGISTER_UNRESOLVED_NEEDLE;
     assert_eq!(
-        hook.sendable(fulfillment::Register::Ops),
-        Some("https://discord.example/hook")
+        logs.lines().filter(|l| l.contains(needle)).count(),
+        1,
+        "the needle must appear on exactly one of the two dark faces: {logs}"
     );
-
-    assert_eq!(fulfillment::Notify::Disabled.sendable(fulfillment::Register::Whisper), None);
-    assert_eq!(fulfillment::Notify::Unresolved.sendable(fulfillment::Register::Lantern), None);
-
-    let logs = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
-
-    // The dark faces must be DISTINGUISHABLE, not merely both absent-of-url.
-    assert!(logs.contains(r#"outcome="register_dark""#), "no register_dark record: {logs}");
-    assert!(logs.contains(r#"register="whisper""#), "disabled face not tagged with its register: {logs}");
-    assert!(logs.contains(r#"reason="disabled""#), "disabled face lost its reason: {logs}");
-    assert!(logs.contains(r#"register="lantern""#), "unresolved face not tagged with its register: {logs}");
-    assert!(logs.contains(r#"reason="unresolved""#), "unresolved face lost its reason: {logs}");
-
-    // Levels differ: Disabled is operator-initiated silence (INFO — the level bell.rs already
-    // used for exactly this state); Unresolved is misconfiguration (ERROR).
-    //
-    // 🔴 ASSERTED PER LINE, NOT OVER THE WHOLE BUFFER. Both faces emit into one buffer, so
-    // `logs.contains("INFO") && logs.contains("ERROR")` passes even if the two levels are
-    // SWAPPED — and which face gets which level is exactly what the family gate spent the
-    // morning settling. An assertion that cannot detect the inversion of the decision it
-    // encodes is not asserting the decision.
-    let line_for = |reason: &str| -> String {
-        logs.lines()
-            .find(|l| l.contains(&format!(r#"reason="{reason}""#)))
-            .unwrap_or_else(|| panic!("no record for reason={reason}: {logs}"))
-            .to_string()
-    };
-    assert!(line_for("disabled").contains("INFO"), "disabled face is not INFO: {}", line_for("disabled"));
-    assert!(line_for("unresolved").contains("ERROR"), "unresolved face is not ERROR: {}", line_for("unresolved"));
-
-    // The machine contract: the alarm's needle must actually appear in the emitted text.
     assert!(
-        logs.contains(fulfillment::REGISTER_UNRESOLVED_NEEDLE),
-        "the unresolved face does not carry the alarm's needle: {logs}"
+        logs.lines().find(|l| l.contains(needle)).unwrap().contains(r#"reason="unresolved""#),
+        "the needle is on the wrong face — a deliberate mute would page: {logs}"
     );
-
-    // A sendable Webhook emits NOTHING — the gate must not spam the healthy path.
-    assert!(!logs.contains(r#"register="ops""#), "the healthy path emitted a record: {logs}");
 }
 ```
 
@@ -430,15 +457,16 @@ git commit -S -m "🎛️ the gate: Register, WebhookUrl, and sendable() — a s
 async fn ping_msg_on_a_dark_ops_register_says_so() {
     // "emits nothing" IS the bug. A test asserting only "does not panic" would have passed
     // every one of the 78 days the prod alarm was being swallowed.
-    let Some(store) = store_or_skip("sw-ping-dark").await else {
-        return;
-    };
+    // 🔴 `unreachable_store()`, NOT `store_or_skip` — see the run-matrix table above. This test's
+    // path provably never touches the store (`ping_msg` returns at the gate), and `store_or_skip`
+    // would SKIP on this box (vacuous green) or PANIC with DYNAMODB_LOCAL_URL set. Neither is a
+    // test result.
     let (log_buf, _capture) = capture_logs();
 
     // `deps` is the fixture at handler_test.rs:135 — `fn deps(store: Store, humble_uri: &str,
     // webhook_url: Option<String>) -> Deps`. `Store` is NOT Clone (main.rs reconstructs it
     // per-invoke), so build ONE Deps and re-point `notify` between iterations.
-    let mut d = deps(store, "http://humble.invalid", None);
+    let mut d = deps(unreachable_store().await, "http://humble.invalid", None);
 
     for (notify, want_reason) in [
         (fulfillment::Notify::Disabled, "disabled"),
@@ -466,7 +494,7 @@ wrong.** The real constructors are `fmt` (59 call sites), `literal` (21) and `wi
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test ping_msg_on_a_dark_ops_register`
+Run: `cargo test -p fulfillment --test handler_test ping_msg_on_a_dark_ops_register`   ← **no `DYNAMODB_LOCAL_URL`**: this test needs no store, and setting it would make `store_or_skip` panic in the tests that do
 Expected: FAIL — the assertion fires with empty or record-less logs, because the bare `return` emits nothing.
 
 - [ ] **Step 3: Route it through the gate**
@@ -493,7 +521,7 @@ with:
 
 - [ ] **Step 4: Run it and watch it pass**
 
-Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test ping_msg_on_a_dark_ops_register`
+Run: `cargo test -p fulfillment --test handler_test ping_msg_on_a_dark_ops_register`   ← **no `DYNAMODB_LOCAL_URL`**: this test needs no store, and setting it would make `store_or_skip` panic in the tests that do
 Expected: PASS
 
 - [ ] **Step 5: Run the whole suite — this function is on every escalation path**
@@ -527,12 +555,9 @@ git commit -S -m "🎛️ ping_msg through the gate — the escalation path stop
 async fn a_dark_whisper_emits_one_record_carrying_both_lifetimes() {
     let (log_buf, _capture) = capture_logs();
 
-    let Some(store) = store_or_skip("sw-whisper-dark").await else {
-        return;
-    };
-    // The fixture at handler_test.rs:135; whisper_notify defaults to Disabled there already,
-    // set explicitly so the test states the state it is testing.
-    let mut d = deps(store, "http://humble.invalid", None);
+    // `unreachable_store()` again — measured: `grep 'deps.store'` over `resolve_whisper_url`'s
+    // range returns ZERO, so this path cannot touch it.
+    let mut d = deps(unreachable_store().await, "http://humble.invalid", None);
     d.whisper_notify = fulfillment::Notify::Disabled;
     assert_eq!(fulfillment::resolve_whisper_url(&d).await, None);
 
@@ -565,7 +590,7 @@ checking asserts only that you typed it twice.
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test a_dark_whisper_emits_one_record`
+Run: `cargo test -p fulfillment --test handler_test a_dark_whisper_emits_one_record`   ← **no `DYNAMODB_LOCAL_URL`**
 Expected: FAIL — today only the bespoke `whisper_dark` record exists and no `register_dark` is emitted here.
 
 - [ ] **Step 3: Rewrite both gates in one shape**
@@ -631,7 +656,7 @@ Replace the rule clause in both (keep every other word):
 
 - [ ] **Step 5: Run it and watch it pass**
 
-Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test a_dark_whisper_emits_one_record`
+Run: `cargo test -p fulfillment --test handler_test a_dark_whisper_emits_one_record`   ← **no `DYNAMODB_LOCAL_URL`**
 Expected: PASS
 
 - [ ] **Step 6: Run the whole suite**
@@ -791,8 +816,10 @@ fn the_bool_and_the_gate_cannot_disagree() {
     // Direction ①: flag set ⇒ can the gate still be sendable? `Notify::resolve` checks the flag
     // FIRST and it beats a resolved secret (its doc: "ORDER MATTERS AND IS DELIBERATE"), so a
     // set flag can only ever yield Disabled. Asserted over BOTH secret outcomes, not argued.
+    // Real variants, read from lib.rs:447-453: `Resolved(String)`, `DeliberatelyOff`, `ReadFailed`.
+    // An earlier draft wrote `SecretRead::Value`, which does not exist.
     for read in [
-        fulfillment::SecretRead::Value("https://discord.example/hook".to_string()),
+        fulfillment::SecretRead::Resolved("https://discord.example/hook".to_string()),
         fulfillment::SecretRead::DeliberatelyOff,
     ] {
         assert!(
@@ -1055,7 +1082,7 @@ fn the_alarm_and_the_code_agree_on_the_string() {
 
 - [ ] **Step 4: Run it and watch it pass, then prove it can FAIL**
 
-Run: `DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree`
+Run: `cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree`   ← needs no store
 Expected: PASS
 
 Now the control — break the coupling on purpose and confirm the test notices.
@@ -1069,14 +1096,14 @@ the defect this whole task exists to prevent, rebuilt inside the proof that the 
 
 ```bash
 sed -i 's/"register_dark_unresolved"/"register_dark_GLOOMY"/' crates/fulfillment/src/lib.rs
-DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree 2>&1 | tail -5
+cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree 2>&1 | tail -5
 ```
 Expected: **FAIL**, and read WHICH assertion fired — it must be the `tf.contains(needle)` one
 ("the metric filter pattern does not contain it"), because the code moved and the terraform did
 not. A failure on any other line means the control is testing something else. Then revert:
 ```bash
 sed -i 's/"register_dark_GLOOMY"/"register_dark_unresolved"/' crates/fulfillment/src/lib.rs
-DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree 2>&1 | tail -5
+cargo test -p fulfillment --test handler_test the_alarm_and_the_code_agree 2>&1 | tail -5
 ```
 Expected: PASS. *A guard that has never been seen to say no is unexercised.*
 
