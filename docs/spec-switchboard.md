@@ -3,7 +3,11 @@
 *every outbound register in bendobundles routes through one gate, and a silent drop becomes
 impossible to WRITE rather than merely discouraged.*
 
-status: **DRAFT** — spec, 2026-09-21. author: code kitten. arc: pounce, Mon 2026-09-21 slot.
+status: **CURRENT** — spec 2026-09-21, citations re-verified 2026-09-23T07:0x-04:00.
+author: code kitten. arc: pounce, **Wed 2026-09-23 slot**.
+⚠️ The Mon 2026-09-21 arc that drafted this was **CANCELLED by Ben at step 1/14** (*"No pounce
+today"*) — nothing was built, pushed or deployed. This spec survived as ordinary backlog and is
+being picked up by a FRESH pounce; it is **not a resumed arc**. Ben has never seen the subject.
 discharges: #236 (second half — the bell's inherited mute) · advances #234 (branch-2 arm).
 does NOT discharge: #236's compensate BUTTON (separate arc), #234's destination question (Ben's).
 
@@ -97,6 +101,44 @@ forever. The rule lives in prose on two functions and is enforced by nothing.
 
 ---
 
+### 1.4 Citation audit, 2026-09-23 — and THE AUDIT ITSELF MADE A PROVENANCE ERROR
+
+Re-measured every line reference before building on this spec. **Conclusions untouched.** The tally,
+established by reading the committed blob rather than my memory of it:
+
+**This spec cites 17 line references. SIXTEEN are exact** — `:470`, `:4740`, `:4817`, `:5162`,
+`:544`, `:550`, `:157`, `:159`, `:178`, `:308`, `bell.rs:110`, `:111`, `handler_test.rs:150`,
+`:559`, `:9945`, `spec-attic-bell.md:87` — plus the 13-hit `Notify::Webhook` census and the six
+`bell_disabled` dependents, both re-derived today. **One rotted:** `bell_suppressed` at
+`main.rs:65` is now **`:68`**. Corrected above.
+
+🔴 **AND THE AUDIT'S OWN FIRST DRAFT CLAIMED THREE ROTTED CITATIONS, NAMING TWO THIS SPEC HAS NEVER
+CONTAINED.** `ping_msg (:4713)` and `pending_age_sweep (:4201)` are **issue #234's** numbers. I read
+that issue minutes earlier, carried its figures into the audit, and **billed them to the spec** —
+then wrote them into a table under the heading "spec said". `git show HEAD:docs/spec-switchboard.md`
+returns **zero** hits for either.
+⇒ ***An audit for citation rot introduced a citation error, by the mechanism it was auditing for:
+a number read from one document and attributed to another.*** Caught only by an assertion failing
+when the replacement could not find its target — **the fix refused to apply, which is the only
+reason the false claim did not ship.** A looser edit would have "corrected" text that did not exist
+and left the table standing.
+🔑 ***Nothing distinguishes a number you took from a two-week-old issue from one you took from the
+file this morning*** — same glyphs, same table, no provenance carried. **Re-measure inherited
+numbers specifically, and say which document each came from.**
+
+⚠️ **TRUE AND SEPARATELY ACTIONABLE: issue #234's citations ARE stale** — `ping_msg :4713` → the
+fn is `:4739` and the let-else `:4740`; `pending_age_sweep :4201` → `:4227`. §1's header points a
+future reader at that issue, so the rot is reachable from here. Worth a correcting comment on the
+issue; **not** a reason to edit this spec.
+
+📌 Two non-findings, recorded so a re-audit does not chase them: the `main.rs:157` quote is real but
+the sentence **begins on `:156`**, and this spec renders it with markdown backticks the `//` comment
+does not have — formatting, not misquotation. And a naive `grep bell_disabled` returns **7** hits,
+not 6: the extra is `bell.rs:115`'s `outcome = "bell_disabled"` **string literal** — a log field
+name, not a dependent of the bool. The spec's six is right.
+
+---
+
 ## 2. Non-goals (YAGNI, stated so review can hold me to it)
 
 - **No ledger table, no new DynamoDB rows.** A durable send-log needs a drainer and a reader to
@@ -186,7 +228,7 @@ record is preserved by the gate's `register_dark reason="disabled" register="bel
 **Measured dependents of the bool (all in-repo, none external):** `lib.rs:544` (the field),
 `bell.rs:111` (the read), `main.rs:308` (the wiring, via `bell_suppressed`), and **three test
 sites** — `handler_test.rs:150`, `:559`, `:9945`. The env var `BELL_DISABLED` and its reader
-`bell_suppressed` (`main.rs:65`) are UNCHANGED; only the bool's destination moves.
+`bell_suppressed` (`main.rs:68`) are UNCHANGED; only the bool's destination moves.
 
 ---
 
