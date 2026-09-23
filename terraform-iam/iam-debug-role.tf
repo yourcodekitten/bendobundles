@@ -32,12 +32,21 @@ data "aws_iam_policy_document" "debug" {
       "logs:StartLiveTail",
       "logs:StopLiveTail",
       "logs:GetQueryResults",
+      # 2026-09-23: without these, the alarm the switchboard (#241) installs is
+      # UNVERIFIABLE from the read-only seat — both `describe-metric-filters` and
+      # `describe-alarms` returned AccessDenied while checking that very deploy.
+      # An alarm nobody can read is the shape this repo keeps learning about.
+      "logs:DescribeMetricFilters",
       "logs:StartQuery",
       "logs:StopQuery",
       # CloudWatch metrics.
       "cloudwatch:GetMetricData",
       "cloudwatch:GetMetricStatistics",
       "cloudwatch:ListMetrics",
+      # 2026-09-23, same reason as logs:DescribeMetricFilters above — verifying an
+      # alarm's STATE is how you tell "installed" from "installed and armed", and
+      # this seat could not do it for the alarm it had just deployed.
+      "cloudwatch:DescribeAlarms",
       # Lambda config / policy (not code download, not invoke).
       "lambda:GetFunction",
       "lambda:GetFunctionConfiguration",
