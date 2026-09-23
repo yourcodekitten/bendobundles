@@ -156,7 +156,18 @@ local run of it is a skip or a panic, never a pass.
   - `pub enum Register { Ops, Whisper, Lantern, Bell }` with `pub fn as_str(&self) -> &'static str` and `pub fn note(&self, DarkFace) -> &'static str` (8 cells, no wildcard — **public so the integration test asserts against the table instead of a hand-typed copy of it**)
   - `pub enum DarkFace { Disabled, Unresolved }`
   - `pub const REGISTER_UNRESOLVED_NEEDLE: &str`
-  - `pub struct WebhookUrl(String)` — field private to the crate root module, **no** `as_str`, **no** `Deref`, **no** `Into<String>`; constructed via `pub fn WebhookUrl::new(String) -> WebhookUrl`
+  - `pub struct WebhookUrl(String)` — **declared inside `mod gate`, NOT at the crate root**, with
+    `Notify::sendable` defined in that same module. **no** `as_str`, **no** `Deref`, **no**
+    `Into<String>`; constructed via `pub fn WebhookUrl::new(String) -> WebhookUrl`, re-exported as
+    `pub use gate::WebhookUrl`.
+    🔴 **THIS LINE SAID "private to the crate root module" UNTIL EXECUTION MEASURED IT FALSE, and
+    left as-is the plan would teach the version that had the hole.** A private field is private to
+    its MODULE, and `ping_msg` — the function this whole spec exists to fix — lives at the crate
+    root. Probed 2026-09-23 by planting `Some(u.0.clone())` at a root-module call site: **it
+    compiled, zero `E0616`.** ⚠️ And the `compile_fail` doctest stayed GREEN throughout, because
+    doctests compile as an EXTERNAL crate — the one vantage the field was already private from.
+    ⇒ ***the guarantee covered every caller except the one the bug was in, and reported success.***
+    (Caught by OMBB on the PR: the plan still carried the pre-fix wording after the code moved.)
   - `pub fn Notify::sendable(&self, reg: Register) -> Option<&str>`
 
 - [ ] **Step 1: Write the failing test — the `sendable` matrix**
