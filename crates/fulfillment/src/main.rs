@@ -169,10 +169,16 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     // whisper, lantern and bell — one secret, one rotation event, three independent mutes. So a
     // single `SecretRead::ReadFailed` here darks ALL THREE at once: three `register_dark` records
     // and two ops pings for ONE root cause, with nothing in the log saying they share it.
-    // (`notify` is NOT in that set — it resolves from `DISCORD_WEBHOOK_PARAM`, a different secret.
-    // That independence is what lets those pings go out while this credential is dead, and it is
-    // load-bearing: consolidating the two params would take the escalation path down with the
-    // thing it escalates about.)
+    // (`notify` is NOT in that set — it resolves from `DISCORD_WEBHOOK_PARAM`, a SEPARATE PARAM.
+    // That is what lets those pings go out while this credential is dead, and it is load-bearing:
+    // consolidating the two params would take the escalation path down with the thing it
+    // escalates about.
+    //
+    // ⚠️ SEPARATE PARAM, not verified-separate DESTINATION — say only what was measured. Two params
+    // can hold one URL; Lilith demonstrated exactly that upstairs on 2026-09-23, where seven seats'
+    // ops-webhook params were byte-identical to one webhook. **Different secret is not different
+    // room.** Nothing here has compared the two resolved values, and nothing should: they are
+    // SecureStrings and the comparison belongs in an operator's hands, not in a log line.)
     let bell_notify = Notify::resolve(whisper_read, bell_disabled);
     // Carried for the DARK announcement's one-liner: the message must always name something
     // actionable, so an unwired env gets a literal saying exactly that.
