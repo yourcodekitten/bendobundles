@@ -108,17 +108,16 @@ pub fn current_week() -> String {
 /// return — an Event-invoked lambda retries on function error, and a double ring is worse than a
 /// missed one. The gift may never miss; the bell may.
 pub async fn ring(deps: &Deps, event: &BellEvent) {
-    if deps.bell_disabled {
-        // the bell's OWN off-switch (shared secret, split disable flag): muting bells must not
-        // dark the weekly whisper, and vice versa. Loud, so a muted bell never reads as broken.
-        tracing::info!(
-            outcome = "bell_disabled",
-            "bell: BELL_DISABLED set — not ringing, by choice"
-        );
-        return;
-    }
-    let Some(url) = crate::resolve_whisper_url(deps).await else {
-        // dark deploy: same loud no-op face as the whisper — the resolve fn already logged it.
+    // ONE switch, ONE lamp. This used to be TWO returns: `deps.bell_disabled` (the bell's own
+    // flag) and then `crate::resolve_whisper_url`, whose Notify was resolved under
+    // `WHISPER_DISABLED` — so muting the WHISPER darked the BELL, contrary to the
+    // register-decoupling rule spec-attic-bell states and illustrates in only one direction.
+    //
+    // `bell_notify` is resolved in main.rs from the same credential under `BELL_DISABLED`, so the
+    // gate below subsumes both returns and announces which face went dark. The retired
+    // `outcome="bell_disabled"` record is carried by `register_dark register="bell"
+    // reason="disabled"`, at the same `info` level it always used.
+    let Some(url) = deps.bell_notify.sendable(crate::Register::Bell) else {
         return;
     };
     let body = match event {

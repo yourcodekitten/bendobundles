@@ -738,10 +738,21 @@ pub struct Deps {
     /// operator an actionable one-liner. When the env isn't even wired, main.rs passes a literal
     /// that says so — the message must always name something actionable.
     pub whisper_param_name: String,
-    /// The bell's OWN off-switch (spec-attic-bell Q①: shared secret, SPLIT disable flag) —
-    /// muting per-event bells must not dark the weekly whisper, and vice versa. Resolved in
-    /// main.rs from `BELL_DISABLED`, mirroring `WHISPER_DISABLED`'s register-decoupling rule.
-    pub bell_disabled: bool,
+    /// The BELL register: the whisper's CREDENTIAL (same `SecretRead`, one rotation event)
+    /// resolved with the bell's OWN flag, `BELL_DISABLED` — so `WHISPER_DISABLED` cannot dark the
+    /// bell and vice versa.
+    ///
+    /// 🔴 This used to be `bell_disabled: bool` PLUS a call to `resolve_whisper_url`, which is the
+    /// exact anti-pattern `lantern_notify`'s own doc names four lines down: *"A split `bool` beside
+    /// `whisper_notify` (the bell's shape) is NOT enough … routing through it re-couples the
+    /// mutes."* The lantern arc identified the anti-pattern BY NAME, avoided it for the new
+    /// register, and left the existing one standing in it — a premise inherited from one's own
+    /// prior work being the least-audited thing in the file.
+    ///
+    /// The env var `BELL_DISABLED` and its reader `bell_suppressed` are UNCHANGED; only the bool's
+    /// destination moved. Deleting it is pure subsumption, licensed by a constructed test
+    /// (`the_bool_and_the_gate_cannot_disagree`) rather than by argument.
+    pub bell_notify: Notify,
     /// The LANTERN register: the whisper's CREDENTIAL (same SecretRead, one rotation event)
     /// resolved with the lantern's OWN flag, `LANTERN_DISABLED` — so `WHISPER_DISABLED` cannot
     /// dark the lantern and vice versa. A split `bool` beside `whisper_notify` (the bell's shape)

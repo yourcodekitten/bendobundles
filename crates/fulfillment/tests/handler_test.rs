@@ -147,7 +147,7 @@ fn deps(store: Store, humble_uri: &str, webhook_url: Option<String>) -> Deps {
         whisper_notify: fulfillment::Notify::Disabled,
         whisper_site_url: String::new(),
         whisper_param_name: String::new(),
-        bell_disabled: false,
+        bell_notify: fulfillment::Notify::Disabled,
         lantern_notify: fulfillment::Notify::Disabled,
         http: reqwest::Client::new(),
         // No self-login in these handler tests — a dead session keeps the flag-and-ping path.
@@ -556,7 +556,7 @@ async fn deps_with_selfheal(
         whisper_notify: fulfillment::Notify::Disabled,
         whisper_site_url: String::new(),
         whisper_param_name: String::new(),
-        bell_disabled: false,
+        bell_notify: fulfillment::Notify::Disabled,
         lantern_notify: fulfillment::Notify::Disabled,
         http: reqwest::Client::new(),
         session_store: Some(SessionStore {
@@ -9942,7 +9942,7 @@ async fn lantern_mute_is_its_own_and_the_whisper_mute_does_not_reach_it() {
     // routed the lantern through resolve_whisper_url, which made WHISPER_DISABLED dark it too)
     d.lantern_notify = fulfillment::Notify::Webhook(fulfillment::WebhookUrl::new(discord.uri()));
     d.whisper_notify = fulfillment::Notify::Disabled;
-    d.bell_disabled = true;
+    d.bell_notify = fulfillment::Notify::Disabled;
     assert_eq!(
         handle(&d, FulfillRequest::Lantern).await,
         FulfillResponse::Lanterned
@@ -10138,4 +10138,108 @@ async fn a_dark_whisper_emits_one_record_carrying_both_lifetimes() {
     let body = String::from_utf8(reqs[0].body.clone()).unwrap();
     assert!(body.contains("DARK"), "the ping lost its cause wording: {body}");
     assert!(body.contains("put-parameter"), "the ping lost its actionable one-liner: {body}");
+}
+
+#[test]
+fn the_bool_and_the_gate_cannot_disagree() {
+    // 🔑 THE TEST THAT LICENSES DELETING `Deps.bell_disabled` — Lilith's method, and it is stronger
+    // than the argument it replaced. My reason for removing the bool was "operator muscle memory is
+    // unaffected", which is true and is not a warrant. Hers: CONSTRUCT a state where the bool and
+    // the gate disagree, both directions. Unconstructible ⇒ pure subsumption, delete it.
+    // Constructible ⇒ a finding, not a refactor.
+    //
+    // OMBB argued the question was decidable by reading `Notify::resolve`'s six cells. It is not:
+    // that settles what the GATE does, while the question is about the BOOL's dependents — and
+    // `bell.rs` read `deps.bell_disabled` DIRECTLY, never through `resolve`. Settled by grep, then
+    // by this.
+    use fulfillment::{DarkFace, Notify, Register, SecretRead};
+
+    // ① flag SET ⇒ can the gate still be sendable? `resolve` checks the flag FIRST and it beats a
+    //   resolved secret (its own doc: "ORDER MATTERS AND IS DELIBERATE"). Asserted over BOTH
+    //   secret outcomes rather than argued from the doc.
+    for read in [
+        SecretRead::Resolved("https://discord.example/hook".to_string()),
+        SecretRead::DeliberatelyOff,
+    ] {
+        assert!(
+            matches!(Notify::resolve(read, true), Notify::Disabled),
+            "flag set but the gate is not dark — the bool is NOT subsumed, and deleting it would \
+             be a behaviour change rather than a refactor"
+        );
+    }
+
+    // ② flag CLEAR but the secret unreadable ⇒ the gate alone must still refuse. The old code
+    //   returned early on the bool and then ALSO on the dark resolve: two switches, one lamp.
+    assert_eq!(
+        Notify::resolve(SecretRead::ReadFailed, false).sendable(Register::Bell),
+        None,
+        "flag clear and secret unreadable must still be unsendable"
+    );
+
+    // ③ and the bell's dark face must carry the bell's OWN sentence — the record that replaces
+    //   the retired `outcome="bell_disabled"` line, which had zero machine consumers (measured).
+    let (buf, _g) = capture_logs();
+    assert_eq!(Notify::Disabled.sendable(Register::Bell), None);
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains(Register::Bell.note(DarkFace::Disabled)) && logs.contains(r#"register="bell""#),
+        "the bell's dark face lost its own sentence: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn the_bell_and_the_whisper_cannot_dark_each_other() {
+    // The defect was a ONE-WAY implementation of a symmetric rule: spec-attic-bell.md:87 states
+    // register-decoupling and illustrates only the direction that was built. Both directions are
+    // asserted TOGETHER so the asymmetry cannot come back.
+    //
+    // LOCAL, not CI-only: `ring` now takes its gate FIRST, and the store lookup happens after it —
+    // so a store failure is itself evidence the gate was PASSED. That makes `unreachable_store()`
+    // the instrument rather than an obstacle.
+    use fulfillment::{Notify, Register, WebhookUrl};
+    let hook = || Notify::Webhook(WebhookUrl::new("https://discord.example/hook".to_string()));
+
+    // ① WHISPER_DISABLED must NOT dark the bell. This is the half that was broken: `ring` used to
+    //    call `resolve_whisper_url`, whose Notify carries the WHISPER's mute.
+    let (buf, _g) = capture_logs();
+    let mut d = deps(unreachable_store().await, "http://humble.invalid", None);
+    d.whisper_notify = Notify::Disabled;
+    d.bell_notify = hook();
+    let resp = handle(
+        &d,
+        FulfillRequest::Bell {
+            event: fulfillment::bell::BellEvent::Thanks {
+                link_token: "sw-decouple".into(),
+            },
+        },
+    )
+    .await;
+    assert!(matches!(resp, FulfillResponse::Belled), "the bell must always come home as Belled");
+
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        !logs.contains(r#"register="bell""#),
+        "WHISPER_DISABLED reached the bell — its gate refused while its OWN register was live: {logs}"
+    );
+    // …and it got far enough to try the store, which only happens PAST the gate.
+    assert!(
+        logs.contains("link read failed") || logs.contains("unknown link"),
+        "the bell never reached its store lookup, so this proves nothing about the gate: {logs}"
+    );
+
+    // ② BELL_DISABLED must NOT dark the whisper. Already true; asserted so it stays true.
+    let (buf2, _g2) = capture_logs();
+    d.whisper_notify = hook();
+    d.bell_notify = Notify::Disabled;
+    assert!(
+        fulfillment::Register::Bell.note(fulfillment::DarkFace::Disabled).contains("BELL_DISABLED"),
+        "the bell's disabled sentence stopped naming its own flag"
+    );
+    assert_eq!(
+        d.whisper_notify.sendable(Register::Whisper),
+        Some("https://discord.example/hook"),
+        "BELL_DISABLED reached the whisper"
+    );
+    let logs2 = String::from_utf8(buf2.lock().unwrap().clone()).unwrap();
+    assert!(!logs2.contains("register_dark"), "the live whisper emitted a dark record: {logs2}");
 }

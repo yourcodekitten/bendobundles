@@ -156,7 +156,12 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     // The LANTERN register: the SAME credential read, its OWN flag. Resolving a second Notify
     // (rather than a bool beside whisper_notify) is what keeps WHISPER_DISABLED from reaching it.
     let lantern_disabled = lantern_suppressed(|k| std::env::var(k).ok());
-    let lantern_notify = Notify::resolve(whisper_read, lantern_disabled);
+    let lantern_notify = Notify::resolve(whisper_read.clone(), lantern_disabled);
+    // The BELL register: same credential read, its OWN flag — the third register resolved this way
+    // and the last one that was not. Read at init like its siblings; a container's environment does
+    // not change within its life.
+    let bell_disabled = bell_suppressed(|k| std::env::var(k).ok());
+    let bell_notify = Notify::resolve(whisper_read, bell_disabled);
     // Carried for the DARK announcement's one-liner: the message must always name something
     // actionable, so an unwired env gets a literal saying exactly that.
     let whisper_param_name =
@@ -188,6 +193,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
         let notify = notify.clone();
         let whisper_notify = whisper_notify.clone();
         let lantern_notify = lantern_notify.clone();
+        let bell_notify = bell_notify.clone();
         let whisper_param_name = whisper_param_name.clone();
         let whisper_site_url = whisper_site_url.clone();
         let base_url = base_url.clone();
@@ -305,7 +311,7 @@ async fn main() -> Result<(), lambda_runtime::Error> {
                     whisper_notify,
                     whisper_site_url,
                     whisper_param_name,
-                    bell_disabled: bell_suppressed(|k| std::env::var(k).ok()),
+                    bell_notify,
                     lantern_notify,
                     http: http_client,
                     session_store,
