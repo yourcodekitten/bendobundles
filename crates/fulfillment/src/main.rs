@@ -164,6 +164,15 @@ async fn main() -> Result<(), lambda_runtime::Error> {
     // LAST USE — takes ownership of `whisper_read`; the two resolutions above clone. A fourth
     // register must be added ABOVE this line (or this one loses the move and becomes a clone
     // silently); adding it below is a use-after-move and the compiler says so.
+    //
+    // ⚠️ BLAST RADIUS, because the log will not say it: `whisper_read` feeds THREE registers —
+    // whisper, lantern and bell — one secret, one rotation event, three independent mutes. So a
+    // single `SecretRead::ReadFailed` here darks ALL THREE at once: three `register_dark` records
+    // and two ops pings for ONE root cause, with nothing in the log saying they share it.
+    // (`notify` is NOT in that set — it resolves from `DISCORD_WEBHOOK_PARAM`, a different secret.
+    // That independence is what lets those pings go out while this credential is dead, and it is
+    // load-bearing: consolidating the two params would take the escalation path down with the
+    // thing it escalates about.)
     let bell_notify = Notify::resolve(whisper_read, bell_disabled);
     // Carried for the DARK announcement's one-liner: the message must always name something
     // actionable, so an unwired env gets a literal saying exactly that.
