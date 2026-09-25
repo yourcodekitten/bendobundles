@@ -10409,7 +10409,9 @@ async fn stuck_claims_lists_a_pending_claim_past_the_bar_oldest_first() {
     seed_aged_pending(&store, "gk:b", "tok-friend", "c-new", hours_ago(30)).await;
     let d = deps(store.clone(), &humble.uri(), None);
 
-    let FulfillResponse::StuckClaims(rows) = handle(&d, FulfillRequest::StuckClaims).await else {
+    let FulfillResponse::StuckClaims { claims: rows } =
+        handle(&d, FulfillRequest::StuckClaims).await
+    else {
         panic!("StuckClaims must answer with the StuckClaims variant");
     };
     assert_eq!(rows.len(), 2);
@@ -10443,7 +10445,9 @@ async fn a_claim_just_past_the_bar_is_listed() {
     seed_aged_pending(&store, "gk:d", SELF_LINK_TOKEN, "c-exact", hours_ago(24)).await;
     let d = deps(store.clone(), &humble.uri(), None);
 
-    let FulfillResponse::StuckClaims(rows) = handle(&d, FulfillRequest::StuckClaims).await else {
+    let FulfillResponse::StuckClaims { claims: rows } =
+        handle(&d, FulfillRequest::StuckClaims).await
+    else {
         panic!("StuckClaims must answer with the StuckClaims variant");
     };
     assert_eq!(
@@ -10463,7 +10467,9 @@ async fn a_claim_one_hour_inside_the_bar_is_not_listed() {
     seed_aged_pending(&store, "gk:c", SELF_LINK_TOKEN, "c-fresh", hours_ago(23)).await;
     let d = deps(store.clone(), &humble.uri(), None);
 
-    let FulfillResponse::StuckClaims(rows) = handle(&d, FulfillRequest::StuckClaims).await else {
+    let FulfillResponse::StuckClaims { claims: rows } =
+        handle(&d, FulfillRequest::StuckClaims).await
+    else {
         panic!("StuckClaims must answer with the StuckClaims variant");
     };
     assert!(

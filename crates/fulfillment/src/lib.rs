@@ -152,13 +152,16 @@ pub enum FulfillRequest {
     /// Read-only — this verb never writes. It lives on `FulfillRequest` because `Sync` already
     /// established this enum as the admin-ops channel (`admin-api` fires it from a human-pressed
     /// button), and because the compensate verb beside it must keep claim-state transitions in one
-    /// role: `compensate_any` already owns the self-vs-link discrimination and re-deriving that
-    /// predicate in a second place is how the two drift.
+    /// role: `compensate_any` already owns the self-vs-link ROUTING DECISION, and re-deriving
+    /// *that* in a second place is how the two drift. ⚠️ Scoped deliberately: the bare predicate
+    /// `link_token == SELF_LINK_TOKEN` is read freely for DISPLAY and LOGGING in this file (8+
+    /// sites, e.g. `:2445`, `:2452`, and `is_self` below) and always has been. What must have one
+    /// owner is the choice of compensation PATH — not every look at the token.
     StuckClaims,
     /// Operator write: move one Pending claim to Compensated. **Human-pressed only** — nothing in
     /// this crate calls it on a timer. Delegates to [`compensate_any`], which already owns the
-    /// self-vs-link discrimination for every reconcile arm; re-deriving that predicate in a second
-    /// place is how the two drift. `link_token` is required because `get_claim` is keyed on it.
+    /// self-vs-link ROUTING for every reconcile arm; re-deriving *that decision* in a second
+    /// place is how the two drift (reading the token for display or logs is not that). `link_token` is required because `get_claim` is keyed on it.
     Compensate {
         claim_id: String,
         link_token: String,
@@ -268,7 +271,15 @@ pub enum FulfillResponse {
         message: String,
     },
     /// Operator read: every Pending claim past the bar, oldest first.
-    StuckClaims(Vec<StuckClaim>),
+    ///
+    /// 🔴 A STRUCT VARIANT, NOT A NEWTYPE, AND THAT IS LOAD-BEARING. This enum is
+    /// `#[serde(tag = "result")]` — internally tagged — and serde cannot merge a tag into a
+    /// SEQUENCE: `StuckClaims(Vec<StuckClaim>)` compiles clean and fails at runtime with
+    /// "cannot serialize tagged newtype variant ... containing a sequence", for a populated
+    /// AND an empty vec alike. A map has somewhere to put the tag; a list does not.
+    /// This is the only field-carrying-collection variant here — see `tagged_newtype_...` in
+    /// the tests, which walks every variant so the next one cannot repeat it.
+    StuckClaims { claims: Vec<StuckClaim> },
     /// Operator write: one Pending claim moved to Compensated. Fieldless — the operator's
     /// confirmation is the 204; the row's new state lives in the store.
     Compensated,
@@ -1029,7 +1040,7 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
                 })
                 .collect();
             rows.sort_by_key(|r| r.pending_since);
-            FulfillResponse::StuckClaims(rows)
+            FulfillResponse::StuckClaims { claims: rows }
         }
         FulfillRequest::Compensate {
             claim_id,
@@ -6197,6 +6208,112 @@ mod tests {
             serde_json::from_str::<FulfillResponse>(&json).unwrap(),
             resp
         );
+    }
+
+    /// 🔴 A CENSUS, NOT A SPECIMEN — every `FulfillResponse` variant must survive a JSON
+    /// round-trip, because this enum is `#[serde(tag = "result")]` and internal tagging
+    /// silently forbids some shapes.
+    ///
+    /// **The bug this exists for:** `StuckClaims(Vec<StuckClaim>)` — a newtype variant wrapping a
+    /// SEQUENCE — compiled clean, passed every test, and failed only at runtime with
+    /// *"cannot serialize tagged newtype variant ... containing a sequence"*, for an EMPTY vec as
+    /// well as a full one. serde rejects on the SHAPE, before it looks at the contents. It was
+    /// invisible because every handler test mocks `AdminInvoker` in-process, so the suite ran
+    /// **zero serde** on the only path that matters (`main.rs` hands the whole response to
+    /// `lambda_runtime`, admin-api `from_slice`s it back).
+    ///
+    /// 🔑 **`sample_of_every_variant` ends in a match with NO WILDCARD ARM. That is the guard.**
+    /// Add a variant and this file stops compiling until you add a sample here — so the census
+    /// cannot silently fall behind the enum, which is what a test aimed at one specimen does.
+    /// ⚠️ **NEVER add a `_ =>` arm to it.** A wildcard disarms this completely and nothing fails.
+    #[test]
+    fn every_fulfill_response_variant_survives_a_json_round_trip() {
+        /// Names each variant via an EXHAUSTIVE match. The compiler is the tripwire.
+        fn tag_of(r: &FulfillResponse) -> &'static str {
+            match r {
+                FulfillResponse::GiftUrl { .. } => "gift_url",
+                FulfillResponse::RevealedKey { .. } => "revealed_key",
+                FulfillResponse::AlreadyRedeemed => "already_redeemed",
+                FulfillResponse::KeyDead => "key_dead",
+                FulfillResponse::Parked { .. } => "parked",
+                FulfillResponse::SyncDone => "sync_done",
+                FulfillResponse::Whispered => "whispered",
+                FulfillResponse::Lanterned => "lanterned",
+                FulfillResponse::PreviewSent => "preview_sent",
+                FulfillResponse::Belled => "belled",
+                FulfillResponse::PreviewBlocked => "preview_blocked",
+                FulfillResponse::PreviewSendFailed => "preview_send_failed",
+                FulfillResponse::PreviewQuiet => "preview_quiet",
+                FulfillResponse::CookieStatus { .. } => "cookie_status",
+                FulfillResponse::Error { .. } => "error",
+                FulfillResponse::StuckClaims { .. } => "stuck_claims",
+                FulfillResponse::Compensated => "compensated",
+                // 🔴 NO WILDCARD. See the doc comment above.
+            }
+        }
+
+        let row = StuckClaim {
+            claim_id: "c-old".into(),
+            game_id: "gk:a".into(),
+            link_token: domain::SELF_LINK_TOKEN.into(),
+            is_self: true,
+            pending_since: OffsetDateTime::UNIX_EPOCH,
+            age_hours: 1920,
+        };
+        let samples = vec![
+            FulfillResponse::GiftUrl { url: "u".into() },
+            FulfillResponse::RevealedKey { key: "k".into() },
+            FulfillResponse::AlreadyRedeemed,
+            FulfillResponse::KeyDead,
+            FulfillResponse::Parked { reason: "r".into() },
+            FulfillResponse::SyncDone,
+            FulfillResponse::Whispered,
+            FulfillResponse::Lanterned,
+            FulfillResponse::PreviewSent,
+            FulfillResponse::Belled,
+            FulfillResponse::PreviewBlocked,
+            FulfillResponse::PreviewSendFailed,
+            FulfillResponse::PreviewQuiet,
+            FulfillResponse::CookieStatus { ok: true },
+            FulfillResponse::Error { message: "m".into() },
+            // BOTH the empty and populated collection: serde rejects a bad shape on an empty
+            // vec too, so testing only the populated case would still have caught this one —
+            // but testing only the EMPTY case is the tempting shortcut, and it must hold too.
+            FulfillResponse::StuckClaims { claims: vec![] },
+            FulfillResponse::StuckClaims { claims: vec![row] },
+            FulfillResponse::Compensated,
+        ];
+
+        // Every variant NAME reachable through the exhaustive match must appear in the samples.
+        // This is the half that makes the compile-time tripwire actually bite: adding a variant
+        // breaks `tag_of`, and adding its arm without a sample fails HERE.
+        let covered: std::collections::BTreeSet<&str> = samples.iter().map(tag_of).collect();
+        assert_eq!(
+            covered.len(),
+            17,
+            "census population changed — a variant was added or removed. Add a sample above; \
+             do NOT relax this number without adding one. Covered: {covered:?}"
+        );
+
+        for resp in &samples {
+            let tag = tag_of(resp);
+            let json = serde_json::to_string(resp).unwrap_or_else(|e| {
+                panic!(
+                    "variant `{tag}` does not serialize under #[serde(tag = \"result\")]: {e}. \
+                     A newtype variant wrapping a Vec/sequence is the known cause — use a STRUCT \
+                     variant (`{{ items: Vec<_> }}`) so the tag has a map to live in."
+                )
+            });
+            assert!(
+                json.contains(&format!("\"result\":\"{tag}\"")),
+                "variant `{tag}` serialized without its internal tag: {json}"
+            );
+            assert_eq!(
+                &serde_json::from_str::<FulfillResponse>(&json).unwrap(),
+                resp,
+                "variant `{tag}` did not survive the round trip"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------------------------
