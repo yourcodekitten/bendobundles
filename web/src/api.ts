@@ -792,7 +792,27 @@ export interface StuckClaimView {
   age_hours: number;
 }
 
-export async function adminStuckClaims(): Promise<StuckClaimView[]> {
+/**
+ * One `PENDINGCLAIM` row the store could not parse. Mirrors fulfillment's `UnreadableClaimRow`.
+ * The key is all there is — the body is the thing that failed to read.
+ */
+export interface UnreadableClaimView {
+  pk: string;
+  sk: string;
+  why: string;
+}
+
+/**
+ * The stuck-claim window's answer. `unreadable` being non-empty means `claims` is PARTIAL: rows
+ * exist that the store could not parse, and the panel has to say so. Before #244 one such row
+ * turned the whole call into a 502, which an operator could not tell apart from a dead lambda.
+ */
+export interface StuckClaimsView {
+  claims: StuckClaimView[];
+  unreadable: UnreadableClaimView[];
+}
+
+export async function adminStuckClaims(): Promise<StuckClaimsView> {
   const response = await fetch('/admin/api/ops/stuck-claims');
   if (response.status === 401) throw new Unauthorized();
   if (!response.ok) throw new FetchFailed();

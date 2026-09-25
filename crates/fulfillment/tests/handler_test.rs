@@ -10399,6 +10399,76 @@ async fn bell_does_not_page_ops_when_dark() {
 
 // ── Task 1: StuckClaims — the operator's read ────────────────────────────────
 
+/// #244, end to end through the handler: the window shows what it CAN read and reports what it
+/// could not, in the same answer.
+///
+/// Before this, the `?` inside `list_pending_claims`' page loop turned one malformed row into a
+/// store error, the handler turned that into `FulfillResponse::Error`, and admin-api turned THAT
+/// into a `502` — so the surface built to reveal stuck claims went blank at exactly the moment
+/// the data was unusual, and an operator could not tell it apart from a dead lambda.
+#[tokio::test]
+async fn stuck_claims_reports_an_unreadable_row_without_hiding_the_readable_ones() {
+    let test = "stuck_unreadable";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:a", SELF_LINK_TOKEN, "c-old", hours_ago(80 * 24)).await;
+
+    // A row in GSI_PENDING whose body is not a Claim. Planted raw because the Store API keeps
+    // item and body in lockstep and cannot produce one — which is exactly why the listing had
+    // never met one until a partial write or a schema change made one.
+    raw_client()
+        .await
+        .put_item()
+        .table_name(format!("t-fulfill-{test}"))
+        .item(
+            "pk",
+            aws_sdk_dynamodb::types::AttributeValue::S("LINK#tok-bad".into()),
+        )
+        .item(
+            "sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("CLAIM#c-bad".into()),
+        )
+        .item(
+            "body",
+            aws_sdk_dynamodb::types::AttributeValue::S("{\"not\":\"a claim\"}".into()),
+        )
+        .item(
+            "gsi2pk",
+            aws_sdk_dynamodb::types::AttributeValue::S("PENDINGCLAIM".into()),
+        )
+        .item(
+            "gsi2sk",
+            aws_sdk_dynamodb::types::AttributeValue::S("2026-01-01T00:00:00Z".into()),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    let d = deps(store.clone(), &humble.uri(), None);
+    let FulfillResponse::StuckClaims { claims, unreadable } =
+        handle(&d, FulfillRequest::StuckClaims).await
+    else {
+        panic!("one unreadable row must not turn the answer into an Error variant");
+    };
+
+    assert_eq!(
+        claims.len(),
+        1,
+        "the readable stuck claim must still be listed"
+    );
+    assert_eq!(claims[0].claim_id, "c-old");
+    assert_eq!(
+        unreadable.len(),
+        1,
+        "and the row that could not be read must be REPORTED, not silently skipped — a quiet \
+         omission is worse than the 502 it replaced"
+    );
+    assert_eq!(unreadable[0].sk, "CLAIM#c-bad");
+    assert_eq!(unreadable[0].why, "bad body json");
+}
+
 #[tokio::test]
 async fn stuck_claims_lists_a_pending_claim_past_the_bar_oldest_first() {
     let Some(store) = store_or_skip("stuck_list").await else {
@@ -10409,7 +10479,7 @@ async fn stuck_claims_lists_a_pending_claim_past_the_bar_oldest_first() {
     seed_aged_pending(&store, "gk:b", "tok-friend", "c-new", hours_ago(30)).await;
     let d = deps(store.clone(), &humble.uri(), None);
 
-    let FulfillResponse::StuckClaims { claims: rows } =
+    let FulfillResponse::StuckClaims { claims: rows, .. } =
         handle(&d, FulfillRequest::StuckClaims).await
     else {
         panic!("StuckClaims must answer with the StuckClaims variant");
@@ -10445,7 +10515,7 @@ async fn a_claim_just_past_the_bar_is_listed() {
     seed_aged_pending(&store, "gk:d", SELF_LINK_TOKEN, "c-exact", hours_ago(24)).await;
     let d = deps(store.clone(), &humble.uri(), None);
 
-    let FulfillResponse::StuckClaims { claims: rows } =
+    let FulfillResponse::StuckClaims { claims: rows, .. } =
         handle(&d, FulfillRequest::StuckClaims).await
     else {
         panic!("StuckClaims must answer with the StuckClaims variant");
@@ -10467,7 +10537,7 @@ async fn a_claim_one_hour_inside_the_bar_is_not_listed() {
     seed_aged_pending(&store, "gk:c", SELF_LINK_TOKEN, "c-fresh", hours_ago(23)).await;
     let d = deps(store.clone(), &humble.uri(), None);
 
-    let FulfillResponse::StuckClaims { claims: rows } =
+    let FulfillResponse::StuckClaims { claims: rows, .. } =
         handle(&d, FulfillRequest::StuckClaims).await
     else {
         panic!("StuckClaims must answer with the StuckClaims variant");

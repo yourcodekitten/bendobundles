@@ -651,6 +651,76 @@ fn self_claim_cancellation_error(
     None
 }
 
+/// The outcome of a pending-claim listing: the rows that parsed, and the rows that did not.
+///
+/// The two travel TOGETHER, in one value, because every caller has to decide what to do about the
+/// unreadable ones and a type is the only thing that can force the question. The predecessor
+/// returned `Vec<Claim>` and aborted the whole listing on the first bad row, so a single malformed
+/// item made every other stuck claim invisible — and reconcile, which bails on a read error, then
+/// decided nothing for ANY claim, on EVERY pass, for as long as the bad row existed. A permanent
+/// denial of service, dressed as a completeness guarantee (#244).
+///
+/// 🔑 **A non-empty [`unreadable`](Self::unreadable) means THIS ANSWER IS PARTIAL.** A caller that
+/// renders `claims` without saying so has traded a loud blank for a quiet lie, which is the worse
+/// of the two. There is deliberately no accessor that hands over `claims` alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingClaims {
+    /// Every row that parsed — oldest-first, exhaustive across pages.
+    pub claims: Vec<Claim>,
+    /// Every row that did not, named by primary key so a human can go look at the item.
+    pub unreadable: Vec<UnreadableClaim>,
+}
+
+impl PendingClaims {
+    /// `true` when at least one row could not be read, i.e. when `claims` is an INCOMPLETE answer.
+    pub fn is_partial(&self) -> bool {
+        !self.unreadable.is_empty()
+    }
+}
+
+/// A `PENDINGCLAIM` row the store could not turn into a [`Claim`].
+///
+/// Carries the KEY rather than the item: the point is to send a human to the row, and an item's
+/// body is the thing that just proved untrustworthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableClaim {
+    /// The item's `pk`, or `<missing>` if even that is absent.
+    pub pk: String,
+    /// The item's `sk`, or `<missing>`.
+    pub sk: String,
+    /// Why it failed to parse — the payload of [`StoreError::Corrupt`].
+    pub why: &'static str,
+}
+
+impl UnreadableClaim {
+    /// Read the key off an item that failed to parse. Never fails: an item whose KEY is unreadable
+    /// is exactly the case a human most needs told about, so a missing attribute becomes a visible
+    /// `<missing>` rather than dropping the row from the report entirely.
+    fn from_item(
+        item: &HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+        why: &'static str,
+    ) -> Self {
+        let at = |k: &str| {
+            item.get(k)
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str)
+                .unwrap_or("<missing>")
+                .to_string()
+        };
+        Self {
+            pk: at("pk"),
+            sk: at("sk"),
+            why,
+        }
+    }
+}
+
+impl std::fmt::Display for UnreadableClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{} ({})", self.pk, self.sk, self.why)
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
     client: Client,
@@ -2771,7 +2841,11 @@ impl Store {
     /// COMPLETENESS guarantee — a claim missing from a truncated page would be parked forever,
     /// invisibly — so unlike a cosmetic list, partial results here are corruption, not
     /// degradation. Ordering is preserved across pages (Query pages continue the gsi2sk sort).
-    pub async fn list_pending_claims(&self) -> Result<Vec<Claim>, StoreError> {
+    ///
+    /// That guarantee is about a TRUNCATED PAGE, which is silent. A row that fails to PARSE is the
+    /// opposite: it is known, and it can be named. See [`PendingClaims`] for why the two come back
+    /// side by side instead of the second aborting the first.
+    pub async fn list_pending_claims(&self) -> Result<PendingClaims, StoreError> {
         self.list_pending_claims_paged(None).await
     }
 
@@ -2782,8 +2856,9 @@ impl Store {
     pub async fn list_pending_claims_paged(
         &self,
         page_limit: Option<i32>,
-    ) -> Result<Vec<Claim>, StoreError> {
+    ) -> Result<PendingClaims, StoreError> {
         let mut claims: Vec<Claim> = Vec::new();
+        let mut unreadable: Vec<UnreadableClaim> = Vec::new();
         let mut last_key: Option<HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> = None;
         loop {
             let mut req = self
@@ -2806,14 +2881,24 @@ impl Store {
                 .await
                 .map_err(|e| StoreError::Aws(AwsFault::from_sdk_error("query", &e)))?;
             for item in out.items() {
-                claims.push(parse_body(item)?);
+                match parse_body(item) {
+                    Ok(c) => claims.push(c),
+                    // ONLY `Corrupt` is a bad ROW. Any other StoreError out of `parse_body` would
+                    // be a fault of this crate rather than of the item, and filing one under
+                    // "unreadable rows" would turn a real bug into a footnote — so it still
+                    // aborts. Degrade on the understood failure; fail closed on the unexpected.
+                    Err(StoreError::Corrupt(why)) => {
+                        unreadable.push(UnreadableClaim::from_item(item, why));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             match out.last_evaluated_key() {
                 None => break,
                 Some(k) => last_key = Some(k.clone()),
             }
         }
-        Ok(claims)
+        Ok(PendingClaims { claims, unreadable })
     }
 
     /// Full-catalog Scan over every GAME# item. Admin needs completeness: game IDs are scattered

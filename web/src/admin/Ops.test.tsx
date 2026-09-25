@@ -52,7 +52,7 @@ describe('Ops', () => {
     // 🔴 Every one of this file's pre-existing tests now mounts the stuck-claims fetch.
     // Without this default the automock returns `undefined` and they all break — this line
     // is this task's blast-radius fix, not a convenience.
-    vi.mocked(adminStuckClaims).mockResolvedValue([]);
+    vi.mocked(adminStuckClaims).mockResolvedValue({ claims: [], unreadable: [] });
   });
 
   afterEach(() => {
@@ -459,13 +459,52 @@ describe('Ops', () => {
     };
 
     it('renders nothing-to-see when there are no stuck claims', async () => {
-      vi.mocked(adminStuckClaims).mockResolvedValue([]);
+      vi.mocked(adminStuckClaims).mockResolvedValue({ claims: [], unreadable: [] });
       renderOps();
       expect(await screen.findByText(/no stuck claims/i)).toBeInTheDocument();
     });
 
+    // ── #244: a partial answer has to announce itself ────────────────────────
+    it('says the list is incomplete, and names the rows, when some could not be read', async () => {
+      vi.mocked(adminStuckClaims).mockResolvedValue({
+        claims: [FRIEND_ROW],
+        unreadable: [{ pk: 'LINK#tok', sk: 'CLAIM#c-bad', why: 'bad body json' }],
+      });
+      renderOps();
+
+      const banner = await screen.findByTestId('stuck-unreadable');
+      expect(banner).toHaveTextContent(/could not be read/i);
+      expect(banner).toHaveTextContent(/incomplete/i);
+      // the KEY, so an operator can go look at the item rather than guess at it
+      expect(banner).toHaveTextContent('CLAIM#c-bad');
+      expect(banner).toHaveTextContent('bad body json');
+      // and the readable row is still there — the whole point is BESIDE, not INSTEAD
+      expect(await screen.findByTestId('claim-kind-c-fr')).toBeInTheDocument();
+    });
+
+    // The control. Without it, a banner that rendered unconditionally would pass the test above
+    // while telling an operator every healthy board is incomplete — and a warning that is always
+    // on is a warning nobody reads.
+    it('shows no incompleteness banner when every row read', async () => {
+      vi.mocked(adminStuckClaims).mockResolvedValue({ claims: [FRIEND_ROW], unreadable: [] });
+      renderOps();
+      expect(await screen.findByTestId('claim-kind-c-fr')).toBeInTheDocument();
+      expect(screen.queryByTestId('stuck-unreadable')).not.toBeInTheDocument();
+    });
+
+    // "no stuck claims" is FALSE when a row exists that could not be read: the unreadable one may
+    // be the very claim the operator came for.
+    it('does not claim there are no stuck claims when a row was unreadable', async () => {
+      vi.mocked(adminStuckClaims).mockResolvedValue({
+        claims: [],
+        unreadable: [{ pk: 'LINK#tok', sk: 'CLAIM#c-bad', why: 'missing body' }],
+      });
+      renderOps();
+      expect(await screen.findByText(/no READABLE stuck claims/i)).toBeInTheDocument();
+    });
+
     it('badges a self row and a friend row differently', async () => {
-      vi.mocked(adminStuckClaims).mockResolvedValue([SELF_ROW, FRIEND_ROW]);
+      vi.mocked(adminStuckClaims).mockResolvedValue({ claims: [SELF_ROW, FRIEND_ROW], unreadable: [] });
       renderOps();
 
       // BY TEST-ID, NOT BY TEXT. getByText(/self/i) matches the link_token "SELF" in the row
@@ -481,7 +520,7 @@ describe('Ops', () => {
 
     it('needs two presses and sends the CLAIM id, not the game id', async () => {
       const user = userEvent.setup();
-      vi.mocked(adminStuckClaims).mockResolvedValue([FRIEND_ROW]);
+      vi.mocked(adminStuckClaims).mockResolvedValue({ claims: [FRIEND_ROW], unreadable: [] });
       vi.mocked(adminCompensateClaim).mockResolvedValue(undefined);
       renderOps();
 
