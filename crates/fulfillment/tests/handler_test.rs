@@ -10574,13 +10574,18 @@ async fn compensate_on_a_missing_claim_answers_error_not_compensated_and_not_alr
 
     // POSITIVE assertion on the variant. `assert_ne!(got, Compensated)` is what let a placeholder
     // returning `AlreadyRedeemed` pass an earlier revision of this plan.
+    // POSITIVE, and on the VARIANT rather than a substring. This used to assert
+    // `message.contains("not found")`, which cannot distinguish a genuine absence from a store
+    // fault whose AWS text happens to carry those words — the distinction `handle` takes care to
+    // preserve three lines earlier.
     match got {
-        FulfillResponse::Error { ref message } => {
-            assert!(
-                message.contains("not found"),
-                "the operator must be told WHICH failure: {message}"
-            );
+        FulfillResponse::ClaimNotFound {
+            ref claim_id,
+            ref link_token,
+        } => {
+            assert_eq!(claim_id, "nope");
+            assert_eq!(link_token, SELF_LINK_TOKEN);
         }
-        other => panic!("a compensate that found nothing must answer Error, got {other:?}"),
+        other => panic!("a compensate that found nothing must answer ClaimNotFound, got {other:?}"),
     }
 }

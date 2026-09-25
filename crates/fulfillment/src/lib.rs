@@ -286,6 +286,25 @@ pub enum FulfillResponse {
     /// Operator write: one Pending claim moved to Compensated. Fieldless — the operator's
     /// confirmation is the 204; the row's new state lives in the store.
     Compensated,
+    /// The claim genuinely is not there. **A TYPED ANSWER, BECAUSE THE ALTERNATIVE ROUTES AN HTTP
+    /// STATUS ON FREE TEXT.**
+    ///
+    /// `admin-api` answers 404 for this and 502 for `Error` (`handle_compensate_claim`). It used to
+    /// decide that with `message.contains("not found")`, and Lilith found the direction that makes
+    /// it dangerous: `StoreError::Aws` renders AWS's own message, and DynamoDB's
+    /// `ResourceNotFoundException` reads *"Requested resource not found"* — so **a missing or
+    /// misnamed TABLE would have told the operator the claim does not exist.** That is exactly
+    /// *a failure wearing the shape of an absence*, which `handle` closes at the store hop and the
+    /// router re-opened one crate up. `aws_fault.rs:42-44` already documents that `message` is
+    /// **behavioural, not structural** — the one field not closed by construction — and it was the
+    /// routing key.
+    ///
+    /// Safe to add mid-deploy: this can only answer `Compensate`, a verb only the NEW `admin-api`
+    /// sends, so an old reader can never receive it. Deploy fulfillment first regardless.
+    ClaimNotFound {
+        claim_id: String,
+        link_token: String,
+    },
 }
 
 /// The pure gift-ladder decision. Compensate ONLY on definitive `AlreadyRedeemed`; park on
@@ -1056,8 +1075,9 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
             let claim = match deps.store.get_claim(&link_token, &claim_id).await {
                 Ok(Some(c)) => c,
                 Ok(None) => {
-                    return FulfillResponse::Error {
-                        message: format!("claim not found: {claim_id} on link {link_token}"),
+                    return FulfillResponse::ClaimNotFound {
+                        claim_id,
+                        link_token,
                     };
                 }
                 Err(e) => {
@@ -6251,6 +6271,7 @@ mod tests {
                 FulfillResponse::Error { .. } => "error",
                 FulfillResponse::StuckClaims { .. } => "stuck_claims",
                 FulfillResponse::Compensated => "compensated",
+                FulfillResponse::ClaimNotFound { .. } => "claim_not_found",
                 // 🔴 NO WILDCARD. See the doc comment above.
             }
         }
@@ -6303,6 +6324,8 @@ mod tests {
             FulfillResponse::Error { message: "m".into() } => FulfillResponse::Error { .. },
             FulfillResponse::StuckClaims { claims: vec![row] } => FulfillResponse::StuckClaims { .. },
             FulfillResponse::Compensated => FulfillResponse::Compensated,
+            FulfillResponse::ClaimNotFound { claim_id: "c".into(), link_token: "SELF".into() }
+                => FulfillResponse::ClaimNotFound { .. },
         ];
         // DERIVED, not declared: one sample per variant, guaranteed by `_exhaustive` above.
         let variant_count = samples.len();

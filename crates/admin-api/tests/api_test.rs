@@ -3915,8 +3915,9 @@ async fn compensate_with_confirm_invokes_and_returns_204() {
 async fn compensate_on_a_vanished_claim_is_404_not_502() {
     let (app, _store, _log) = test_app_with_call_invoker(
         "comp_404",
-        FulfillResponse::Error {
-            message: "claim not found: sc9 on link SELF".into(),
+        FulfillResponse::ClaimNotFound {
+            claim_id: "sc9".into(),
+            link_token: "SELF".into(),
         },
     )
     .await;

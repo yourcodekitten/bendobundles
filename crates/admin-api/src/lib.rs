@@ -1392,9 +1392,21 @@ async fn handle_compensate_claim(
         .await
     {
         Ok(FulfillResponse::Compensated) => StatusCode::NO_CONTENT.into_response(),
-        Ok(FulfillResponse::Error { message }) if message.contains("not found") => (
+        // 🔴 STRUCTURAL, NEVER A SUBSTRING. This was
+        // `Error { message } if message.contains("not found")`, which routes an HTTP status on
+        // AWS-authored free text: DynamoDB's ResourceNotFoundException renders "Requested resource
+        // not found", so a missing or misnamed TABLE answered 404 — telling the operator that a
+        // claim they are looking at does not exist. `aws_fault.rs:42-44` already calls `message`
+        // BEHAVIOURAL, not structural: the one joint not closed by construction. It was the
+        // routing key. The compiler holds this coupling now.
+        Ok(FulfillResponse::ClaimNotFound {
+            claim_id,
+            link_token,
+        }) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": message })),
+            Json(serde_json::json!({
+                "error": format!("claim {claim_id} not found on link {link_token}")
+            })),
         )
             .into_response(),
         Ok(FulfillResponse::Error { message }) => (
