@@ -92,6 +92,11 @@ jobs:
       # StoreError::Aws must keep carrying only the bounded AwsFault. A free-text payload
       # would make the sealer optional again, in one line that does not look like a regression.
       - run: ./scripts/check-store-error-sealed.sh
+
+      # The claim state machine has one owner: fulfillment. admin-api may CREATE a claim
+      # (claim_game_self, intended) but must never move one out of Pending. IAM will not stop
+      # it — the deployed policy is unconditioned on the table — so this is the sole guard.
+      - run: ./scripts/check-claim-state-owner.sh
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
