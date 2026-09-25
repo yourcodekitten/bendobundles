@@ -1149,10 +1149,15 @@ describe('ops: stuck claims', () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
       status: 200,
-      json: vi.fn().mockResolvedValue([{ claim_id: 'c1' }]),
+      json: vi
+        .fn()
+        .mockResolvedValue({ claims: [{ claim_id: 'c1' }], unreadable: [] }),
     });
 
-    await expect(adminStuckClaims()).resolves.toEqual([{ claim_id: 'c1' }]);
+    await expect(adminStuckClaims()).resolves.toEqual({
+      claims: [{ claim_id: 'c1' }],
+      unreadable: [],
+    });
     expect(mockFetch).toHaveBeenCalledWith('/admin/api/ops/stuck-claims');
   });
 

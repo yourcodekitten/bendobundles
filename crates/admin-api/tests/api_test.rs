@@ -3822,7 +3822,10 @@ async fn scrapbook_endpoint_composes() {
 async fn stuck_claims_requires_a_session() {
     let (app, _store, _log) = test_app_with_call_invoker(
         "stuck_unauth",
-        FulfillResponse::StuckClaims { claims: vec![] },
+        FulfillResponse::StuckClaims {
+            claims: vec![],
+            unreadable: vec![],
+        },
     )
     .await;
     let req = Request::get("/admin/api/ops/stuck-claims")
@@ -3852,6 +3855,7 @@ async fn stuck_claims_returns_the_rows_the_invoker_answered_with() {
                 pending_since: datetime!(2026-07-06 00:00 UTC),
                 age_hours: 80 * 24,
             }],
+            unreadable: vec![],
         },
     )
     .await;
@@ -3859,9 +3863,54 @@ async fn stuck_claims_returns_the_rows_the_invoker_answered_with() {
     let res = authed_get(&app, "/admin/api/ops/stuck-claims").await;
     assert_eq!(res.status(), StatusCode::OK);
     let v: serde_json::Value = body_json(res).await;
-    assert_eq!(v[0]["claim_id"], "c-old");
-    assert_eq!(v[0]["is_self"], true);
+    assert_eq!(v["claims"][0]["claim_id"], "c-old");
+    assert_eq!(v["claims"][0]["is_self"], true);
+    assert_eq!(
+        v["unreadable"].as_array().map(Vec::len),
+        Some(0),
+        "the field must be PRESENT and empty, never absent — a client that has to distinguish \
+         `no unreadable rows` from `this server does not report them` is back where #244 started"
+    );
     assert_eq!(*log.lock().unwrap(), vec![FulfillRequest::StuckClaims]);
+}
+
+/// The half that #244 is actually about: unreadable rows reach the wire ALONGSIDE the readable
+/// ones, so the surface can say the answer is partial instead of going blank or lying by omission.
+#[tokio::test]
+async fn stuck_claims_reports_unreadable_rows_beside_the_readable_ones() {
+    let (app, _store, _log) = test_app_with_call_invoker(
+        "stuck_partial",
+        FulfillResponse::StuckClaims {
+            claims: vec![fulfillment::StuckClaim {
+                claim_id: "c-ok".into(),
+                game_id: "gk:a".into(),
+                link_token: "SELF".into(),
+                is_self: true,
+                pending_since: datetime!(2026-07-06 00:00 UTC),
+                age_hours: 80 * 24,
+            }],
+            unreadable: vec![fulfillment::UnreadableClaimRow {
+                pk: "LINK#tok".into(),
+                sk: "CLAIM#c-bad".into(),
+                why: "bad body json".into(),
+            }],
+        },
+    )
+    .await;
+
+    let res = authed_get(&app, "/admin/api/ops/stuck-claims").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: serde_json::Value = body_json(res).await;
+    assert_eq!(
+        v["claims"][0]["claim_id"], "c-ok",
+        "a readable row must not be withheld because another row was unreadable"
+    );
+    assert_eq!(v["unreadable"][0]["sk"], "CLAIM#c-bad");
+    assert_eq!(
+        v["unreadable"][0]["why"], "bad body json",
+        "the reason travels with the key — an operator needs to know whether to go look at the \
+         item or at the parser"
+    );
 }
 
 // ── Task 4: POST /admin/api/ops/claims/{claim_id}/compensate ─────────────────

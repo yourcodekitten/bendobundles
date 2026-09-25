@@ -1332,9 +1332,16 @@ async fn handle_self_claims(State(s): State<AppState>) -> Response {
 /// was retracted: the deployed policy is one unconditioned Allow, so it constrains neither design.)
 async fn handle_stuck_claims(State(s): State<AppState>) -> Response {
     match s.invoker.call(FulfillRequest::StuckClaims).await {
-        Ok(FulfillResponse::StuckClaims { claims }) => {
-            (StatusCode::OK, Json(claims)).into_response()
-        }
+        // 🔴 AN OBJECT, NOT A BARE ARRAY (#244). The route used to serialize `claims` alone, so
+        // there was nowhere on the wire for "and N rows could not be read" to go. A partial answer
+        // that cannot announce itself is a quiet lie, and this window's whole job is to surface
+        // what nothing else does. The SPA is deployed with the lambdas, so there is no version of
+        // the client that reads the old shape.
+        Ok(FulfillResponse::StuckClaims { claims, unreadable }) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "claims": claims, "unreadable": unreadable })),
+        )
+            .into_response(),
         Ok(FulfillResponse::Error { message }) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": message })),

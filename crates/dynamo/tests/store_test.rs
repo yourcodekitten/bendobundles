@@ -1210,8 +1210,9 @@ async fn pending_claims_and_sync_state_and_sessions() {
         .await
         .unwrap();
     let pending = store.list_pending_claims().await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].id, "c1");
+    assert_eq!(pending.claims.len(), 1);
+    assert_eq!(pending.claims[0].id, "c1");
+    assert!(!pending.is_partial(), "nothing planted here is unreadable");
 
     let st = SyncState {
         last_run_epoch: 1_800_000_000,
@@ -1596,6 +1597,119 @@ async fn list_listable_games_paginates() {
     }
 }
 
+/// 🔴 ONE UNREADABLE ROW MUST NOT HIDE EVERY OTHER STUCK CLAIM.
+///
+/// `list_pending_claims` parsed inside the page loop with `?`, so the FIRST `PENDINGCLAIM` row that
+/// failed to parse aborted the entire listing. The caller saw a store error instead of a short
+/// list, and every readable stuck claim went invisible — including to reconcile, which then did
+/// nothing at all, for every claim, on every pass, for as long as the bad row existed.
+///
+/// The row is planted through the RAW client on purpose: the Store API cannot produce it, which is
+/// exactly why the listing had never met one. A partial write or a schema change can.
+#[tokio::test]
+async fn list_pending_claims_survives_one_unreadable_row() {
+    let test = "list-pending-unreadable";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let raw = raw_client(test).await;
+
+    let mut lnk = link("tok-ur");
+    lnk.claims_allowed = 2;
+    store.create_link(&lnk).await.unwrap();
+    for n in 0..2u32 {
+        store.put_game(&game(n, true)).await.unwrap();
+        let now = datetime!(2026-07-02 12:00 UTC) + time::Duration::minutes(n as i64);
+        store
+            .claim_game(
+                "tok-ur",
+                &game_id(&format!("gk{n}"), "mn"),
+                &format!("c{n}"),
+                now,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Sorts BETWEEN the two good rows in the index, so a listing that aborts on it loses c1 as
+    // well as the bad row itself — an abort-on-first-bad-row cannot be mistaken for a short read.
+    raw.put_item()
+        .table_name(format!("t-{test}"))
+        .item("pk", AttributeValue::S("LINK#tok-ur".into()))
+        .item("sk", AttributeValue::S("CLAIM#c-unreadable".into()))
+        .item("body", AttributeValue::S("{\"not\":\"a claim\"}".into()))
+        .item("gsi2pk", AttributeValue::S("PENDINGCLAIM".into()))
+        .item("gsi2sk", AttributeValue::S("2026-07-02T12:00:30Z".into()))
+        .send()
+        .await
+        .unwrap();
+
+    let listed = store.list_pending_claims().await;
+    assert!(
+        listed.is_ok(),
+        "one unreadable row must not abort the whole listing: {:?}",
+        listed.err()
+    );
+    let listed = listed.unwrap();
+
+    let ids: Vec<_> = listed.claims.iter().map(|c| c.id.clone()).collect();
+    assert_eq!(
+        ids,
+        vec!["c0", "c1"],
+        "every READABLE pending claim must still come back, in order"
+    );
+
+    // The other half, and the one that makes the first half safe to ship: a skip that says nothing
+    // trades a loud blank for a quiet lie. The answer has to announce that it is partial.
+    assert!(
+        listed.is_partial(),
+        "a listing that dropped a row must report itself PARTIAL"
+    );
+    assert_eq!(listed.unreadable.len(), 1);
+    assert_eq!(listed.unreadable[0].pk, "LINK#tok-ur");
+    assert_eq!(
+        listed.unreadable[0].sk, "CLAIM#c-unreadable",
+        "the KEY is the whole point — an operator has to be able to go look at the item"
+    );
+    assert_eq!(listed.unreadable[0].why, "bad body json");
+}
+
+/// The control for the arm above: with nothing planted, `unreadable` is EMPTY and `is_partial()`
+/// is false. Without this, a bug that reported every row as unreadable would still pass the
+/// partial-listing test — the assertion there would read as discrimination while measuring only
+/// that the vector is non-empty.
+#[tokio::test]
+async fn list_pending_claims_reports_not_partial_when_every_row_reads() {
+    let test = "list-pending-all-readable";
+    let Some(store) = store_or_skip(test).await else {
+        return;
+    };
+    let mut lnk = link("tok-ar");
+    lnk.claims_allowed = 2;
+    store.create_link(&lnk).await.unwrap();
+    for n in 0..2u32 {
+        store.put_game(&game(n, true)).await.unwrap();
+        let now = datetime!(2026-07-02 12:00 UTC) + time::Duration::minutes(n as i64);
+        store
+            .claim_game(
+                "tok-ar",
+                &game_id(&format!("gk{n}"), "mn"),
+                &format!("c{n}"),
+                now,
+            )
+            .await
+            .unwrap();
+    }
+
+    let listed = store.list_pending_claims().await.unwrap();
+    assert_eq!(listed.claims.len(), 2);
+    assert!(
+        listed.unreadable.is_empty(),
+        "no row was planted unreadable, so none may be reported so"
+    );
+    assert!(!listed.is_partial(), "a complete answer is not partial");
+}
+
 /// `list_pending_claims` feeds reconcile completeness — a truncated page parks claims forever.
 /// Force a 1-item page across three pending claims and assert all three come back, oldest-first
 /// ordering preserved across the page boundaries.
@@ -1623,16 +1737,20 @@ async fn list_pending_claims_paginates_and_keeps_order() {
     }
 
     let all = store.list_pending_claims().await.unwrap();
-    assert_eq!(all.len(), 3, "full read must return every pending claim");
+    assert_eq!(
+        all.claims.len(),
+        3,
+        "full read must return every pending claim"
+    );
 
     let paged = store.list_pending_claims_paged(Some(1)).await.unwrap();
     assert_eq!(
-        paged.len(),
+        paged.claims.len(),
         3,
         "paginated read must exhaust all pages — a dropped claim would be parked forever"
     );
     // gsi2sk is created_at ascending; the loop must preserve that order across pages
-    let ids: Vec<_> = paged.iter().map(|c| c.id.clone()).collect();
+    let ids: Vec<_> = paged.claims.iter().map(|c| c.id.clone()).collect();
     assert_eq!(
         ids,
         vec!["c0", "c1", "c2"],
@@ -1947,6 +2065,7 @@ async fn fail_claim_dead_key_flips_all_three_items() {
             .list_pending_claims()
             .await
             .unwrap()
+            .claims
             .iter()
             .all(|p| p.id != "c1"),
         "pending marker consumed -- claim leaves the GSI"

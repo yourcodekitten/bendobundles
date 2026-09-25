@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useNavigate, useOutletContext } from 'react-router-dom';
 import { adminSync, adminSteamIdentity, adminSetSteamIdentity, adminClearSteamIdentity, adminSteamOwned, adminStuckClaims, adminCompensateClaim } from '../api';
-import type { StuckClaimView } from '../api';
+import type { StuckClaimView, UnreadableClaimView } from '../api';
 import {
   consumeReturnFragment,
   loadIdentity,
@@ -86,15 +86,22 @@ export function Ops() {
   // `armed` holds the claim_id whose Confirm button is showing. Arming lives in state, not
   // window.confirm, so the two-press contract is drivable from a test.
   const [stuck, setStuck] = useState<StuckClaimView[] | null>(null);
+  // Rows the store could not parse. Rendered BESIDE the readable ones, never instead of them:
+  // #244's whole point is that a window built to surface what nothing else shows must not go
+  // blank — or, worse, quietly short — on the one row it cannot read.
+  const [unreadable, setUnreadable] = useState<UnreadableClaimView[]>([]);
   const [armed, setArmed] = useState<string | null>(null);
   const [stuckMsg, setStuckMsg] = useState<string | null>(null);
 
   const loadStuck = useCallback(async () => {
     try {
-      setStuck(await adminStuckClaims());
+      const view = await adminStuckClaims();
+      setStuck(view.claims);
+      setUnreadable(view.unreadable);
     } catch {
       // A failed read must not blank the panel silently — say so.
       setStuck([]);
+      setUnreadable([]);
       setStuckMsg('couldn’t load stuck claims');
     }
   }, []);
@@ -328,10 +335,35 @@ export function Ops() {
       {/* ── Stuck claims ─────────────────────────────────────────────────── */}
       <section className="flex flex-col gap-3 rounded bg-floor p-4">
         <h2 className="text-sm font-medium text-ink-soft">stuck claims</h2>
+        {/* Above the list on purpose: it qualifies everything below it. A partial answer that
+            announces itself underneath the rows it is qualifying has already been misread. */}
+        {unreadable.length > 0 && (
+          <div
+            data-testid="stuck-unreadable"
+            className="flex flex-col gap-1 rounded bg-control px-3 py-2 text-xs text-ink-soft"
+          >
+            <p>
+              {unreadable.length} claim {unreadable.length === 1 ? 'row' : 'rows'} could not be
+              read — this list is incomplete.
+            </p>
+            <ul className="flex flex-col gap-0.5">
+              {unreadable.map((u) => (
+                <li key={`${u.pk}/${u.sk}`} className="text-dust-faint">
+                  {u.pk} / {u.sk} — {u.why}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {stuck === null ? (
           <p className="text-xs text-dust-faint">loading…</p>
         ) : stuck.length === 0 ? (
-          <p className="text-xs text-dust-faint">no stuck claims</p>
+          // "no stuck claims" is a FALSE statement when a row exists that we could not read — the
+          // unreadable one might be exactly the claim an operator came here for. The banner above
+          // already says the list is incomplete; the empty state must not contradict it.
+          <p className="text-xs text-dust-faint">
+            {unreadable.length > 0 ? 'no READABLE stuck claims' : 'no stuck claims'}
+          </p>
         ) : (
           <ul className="flex flex-col gap-2">
             {stuck.map((c) => (

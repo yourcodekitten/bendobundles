@@ -214,6 +214,30 @@ pub struct StuckClaim {
     pub age_hours: i64,
 }
 
+/// One `PENDINGCLAIM` row the store could not read, on the operator wire. Mirrors dynamo's
+/// [`dynamo::UnreadableClaim`].
+///
+/// It carries the KEY and nothing else: the point is to send an operator to the row, and the
+/// body is the thing that just proved untrustworthy. Its presence in a response means **that
+/// response is a partial answer**, and the surface rendering it has to say so — a list that
+/// quietly omits what it could not read is worse than the `502` this replaced (#244).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnreadableClaimRow {
+    pub pk: String,
+    pub sk: String,
+    pub why: String,
+}
+
+impl From<&dynamo::UnreadableClaim> for UnreadableClaimRow {
+    fn from(u: &dynamo::UnreadableClaim) -> Self {
+        Self {
+            pk: u.pk.clone(),
+            sk: u.sk.clone(),
+            why: u.why.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum FulfillResponse {
@@ -282,6 +306,12 @@ pub enum FulfillResponse {
     /// every variant so the next one cannot repeat it.
     StuckClaims {
         claims: Vec<StuckClaim>,
+        /// Rows the store could not parse. **Non-empty means `claims` is a PARTIAL answer** and
+        /// the surface must say so — see [`UnreadableClaimRow`] and #244. Defaulted on the wire
+        /// so an older client deserializing a newer response gets an empty list rather than an
+        /// error; the SERVER always sends the field.
+        #[serde(default)]
+        unreadable: Vec<UnreadableClaimRow>,
     },
     /// Operator write: one Pending claim moved to Compensated. Fieldless — the operator's
     /// confirmation is the 204; the row's new state lives in the store.
@@ -1039,16 +1069,22 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
         FulfillRequest::StuckClaims => {
             // `handle` is INFALLIBLE (`-> FulfillResponse`). A StoreError becomes a RESPONSE
             // variant, never a `?`.
-            let claims = match deps.store.list_pending_claims().await {
-                Ok(c) => c,
+            let pending = match deps.store.list_pending_claims().await {
+                Ok(p) => p,
                 Err(e) => {
                     return FulfillResponse::Error {
                         message: format!("list_pending_claims: {e}"),
                     };
                 }
             };
+            // The unreadable rows ride ALONG with the readable ones, never instead of them. This
+            // window exists to show an operator claims that nothing else surfaces; going blank on
+            // the one row it cannot parse is the exact failure it was built to prevent (#244).
+            let unreadable: Vec<UnreadableClaimRow> =
+                pending.unreadable.iter().map(Into::into).collect();
             let now = OffsetDateTime::now_utc();
-            let mut rows: Vec<StuckClaim> = claims
+            let mut rows: Vec<StuckClaim> = pending
+                .claims
                 .into_iter()
                 .filter(|c| now - c.created_at >= RECONCILE_STUCK_ALERT_AGE)
                 .map(|c| StuckClaim {
@@ -1062,7 +1098,10 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
                 })
                 .collect();
             rows.sort_by_key(|r| r.pending_since);
-            FulfillResponse::StuckClaims { claims: rows }
+            FulfillResponse::StuckClaims {
+                claims: rows,
+                unreadable,
+            }
         }
         FulfillRequest::Compensate {
             claim_id,
@@ -4564,10 +4603,35 @@ async fn discover_choice_games(
 /// PINNED by stale_pending_claim_pings_even_when_listing_is_dead — an early return
 /// added above this call fails that test.
 async fn pending_age_sweep(deps: &Deps) {
-    let claims = match deps.store.list_pending_claims().await {
-        Ok(c) => c,
+    let pending = match deps.store.list_pending_claims().await {
+        Ok(p) => p,
         Err(_) => return, // can't read this pass — the next sync retries.
     };
+    // 🔴 THE OPERATOR PING FOR UNREADABLE ROWS LIVES HERE AND NOWHERE ELSE. This is the alerting
+    // pass; `reconcile` is the decision engine and only LOGS them, so one bad row produces one
+    // ping per sync rather than two. Both run in the same `handle_sync`, so nothing is lost by
+    // the split.
+    //
+    // Repeated every sync ON PURPOSE, matching this function's own cadence rule: a once-ever
+    // alert that scrolls away IS the silent-loop bug it exists to kill. An unreadable row needs a
+    // human to go edit an item; it will not clear itself.
+    if pending.is_partial() {
+        let keys: Vec<String> = pending.unreadable.iter().map(|u| u.to_string()).collect();
+        let joined = keys.join("; ");
+        let count = pending.unreadable.len().to_string();
+        tracing::error!(
+            unreadable = %joined,
+            count = pending.unreadable.len(),
+            outcome = "pending_claim_unreadable",
+            "pending-age sweep: PENDINGCLAIM row(s) could not be parsed"
+        );
+        ping_msg(deps, &OperatorMessage::fmt(
+            "{} pending-claim row(s) cannot be parsed and are invisible to reconcile — {} — these claims stay pending until the items are fixed by hand; every other pending claim was still swept",
+            &[Part::Id(&count), Part::Id(&joined)],
+        ))
+        .await;
+    }
+    let claims = pending.claims;
     let now = OffsetDateTime::now_utc();
     for claim in &claims {
         let age = now - claim.created_at;
@@ -4603,12 +4667,27 @@ async fn pending_age_sweep(deps: &Deps) {
 ///   `cookie_ok=false`) instead of silently skipping every remaining claim — the caller's order
 ///   walk hits the same dead session moments later and pings.
 async fn reconcile(deps: &Deps, healed_this_run: &mut bool, cookie_ok: &mut bool) {
-    let claims = match deps.store.list_pending_claims().await {
-        Ok(c) => c,
+    let pending = match deps.store.list_pending_claims().await {
+        Ok(p) => p,
         Err(_) => return, // can't read pending claims this pass — try again next time.
     };
+    // Reconcile can decide NOTHING for a row it cannot parse — but until #244 it decided nothing
+    // for the OTHER rows either, because the `?` inside the store's page loop turned one bad item
+    // into a read error and this `return` did the rest. Every pass, silently, for as long as the
+    // row existed. Now the readable claims get reconciled and the unreadable ones are named.
+    // The operator PING is `pending_age_sweep`'s (same `handle_sync` pass) so this does not
+    // double-alert.
+    if pending.is_partial() {
+        for u in &pending.unreadable {
+            tracing::error!(
+                unreadable = %u,
+                outcome = "pending_claim_unreadable",
+                "reconcile: skipping a PENDINGCLAIM row that could not be parsed"
+            );
+        }
+    }
     let now = OffsetDateTime::now_utc();
-    for claim in claims {
+    for claim in pending.claims {
         let age = now - claim.created_at;
         if age < RECONCILE_MIN_AGE {
             continue; // too fresh — a live redeem may still be recording.
@@ -5463,6 +5542,9 @@ async fn lantern_reads(deps: &Deps) -> Option<LanternReads> {
             tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list links")
         })
         .ok()?;
+    // `.claims` only: the lantern is a narrative summary, and an unreadable row has no story to
+    // tell. It is NOT dropped on the floor — `pending_age_sweep` pings it and `reconcile` logs it
+    // in the same pass, which is where an operator can act on it.
     let pending = deps
         .store
         .list_pending_claims()
@@ -5470,7 +5552,8 @@ async fn lantern_reads(deps: &Deps) -> Option<LanternReads> {
         .map_err(|e| {
             tracing::error!(error = ?e, outcome = "lantern_read_failed", "lantern: cannot list pending")
         })
-        .ok()?;
+        .ok()?
+        .claims;
     let friends = deps
         .store
         .list_friends()
@@ -6322,7 +6405,7 @@ mod tests {
             FulfillResponse::PreviewQuiet => FulfillResponse::PreviewQuiet,
             FulfillResponse::CookieStatus { ok: true } => FulfillResponse::CookieStatus { .. },
             FulfillResponse::Error { message: "m".into() } => FulfillResponse::Error { .. },
-            FulfillResponse::StuckClaims { claims: vec![row] } => FulfillResponse::StuckClaims { .. },
+            FulfillResponse::StuckClaims { claims: vec![row], unreadable: vec![] } => FulfillResponse::StuckClaims { .. },
             FulfillResponse::Compensated => FulfillResponse::Compensated,
             FulfillResponse::ClaimNotFound { claim_id: "c".into(), link_token: "SELF".into() }
                 => FulfillResponse::ClaimNotFound { .. },
@@ -6333,7 +6416,20 @@ mod tests {
         // EXTRA sample, deliberately outside the census: serde rejects a bad shape on an EMPTY
         // collection too, so the no-rows path needs its own row. It is appended rather than
         // listed because a second `StuckClaims { .. }` pattern would be unreachable.
-        samples.push(FulfillResponse::StuckClaims { claims: vec![] });
+        samples.push(FulfillResponse::StuckClaims {
+            claims: vec![],
+            unreadable: vec![],
+        });
+        // And the PARTIAL shape (#244): rows present in `unreadable` must survive the round trip,
+        // or the operator surface learns about them only in a serialization it never receives.
+        samples.push(FulfillResponse::StuckClaims {
+            claims: vec![],
+            unreadable: vec![UnreadableClaimRow {
+                pk: "LINK#t".into(),
+                sk: "CLAIM#c".into(),
+                why: "bad body json".into(),
+            }],
+        });
 
         // Distinct tags must equal the variant count — this catches two arms of `tag_of`
         // returning the same string, which would silently shrink the census.
