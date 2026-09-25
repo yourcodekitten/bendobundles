@@ -10396,3 +10396,78 @@ async fn bell_does_not_page_ops_when_dark() {
         "an unresolved bell is silent on BOTH channels — that is not the trade, that is a hole: {logs}"
     );
 }
+
+// ── Task 1: StuckClaims — the operator's read ────────────────────────────────
+
+#[tokio::test]
+async fn stuck_claims_lists_a_pending_claim_past_the_bar_oldest_first() {
+    let Some(store) = store_or_skip("stuck_list").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:a", SELF_LINK_TOKEN, "c-old", hours_ago(80 * 24)).await;
+    seed_aged_pending(&store, "gk:b", "tok-friend", "c-new", hours_ago(30)).await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let FulfillResponse::StuckClaims(rows) = handle(&d, FulfillRequest::StuckClaims).await else {
+        panic!("StuckClaims must answer with the StuckClaims variant");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].claim_id, "c-old",
+        "oldest first — the operator reads row one"
+    );
+    assert!(rows[0].is_self);
+    assert!(
+        !rows[1].is_self,
+        "a friend claim must be distinguishable from a self claim"
+    );
+    assert!(rows[0].age_hours >= 80 * 24);
+}
+
+// 🔴 THE JUST-PAST SIDE OF THE BAR. Spec §6.3 asks for "the boundary, BOTH sides" and the other
+// tests only have the inside (1920h, 30h, 23h).
+// 🔴 IT DOES **NOT** PIN THE OPERATOR, and an earlier revision of the plan claimed it did:
+//   `hours_ago(24)` is `now_utc() - 24h` evaluated at SEED time (`:1007`); the arm calls
+//   `now_utc()` again at EVAL time ⇒ elapsed = 24h + ε, STRICTLY GREATER ⇒ this lists under `>=`
+//   AND under `>`. The distinction is UNOBSERVABLE through this path: `now` is read inside
+//   `handle`, so no wall-clock seed can land exactly on the bar. There is no test to write.
+// ⇒ `>=` rests on a CITATION, not a test: the repo's own stuck sweep uses `>=` at
+//   `fulfillment/src/lib.rs:4446`, against RECONCILE_STUCK_ALERT_AGE = Duration::hours(24) (`:114`).
+#[tokio::test]
+async fn a_claim_just_past_the_bar_is_listed() {
+    let Some(store) = store_or_skip("stuck_bar_exact").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:d", SELF_LINK_TOKEN, "c-exact", hours_ago(24)).await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let FulfillResponse::StuckClaims(rows) = handle(&d, FulfillRequest::StuckClaims).await else {
+        panic!("StuckClaims must answer with the StuckClaims variant");
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "a claim just past the 24h bar is listed — the spec's other side"
+    );
+    assert_eq!(rows[0].claim_id, "c-exact");
+}
+
+#[tokio::test]
+async fn a_claim_one_hour_inside_the_bar_is_not_listed() {
+    let Some(store) = store_or_skip("stuck_bar").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:c", SELF_LINK_TOKEN, "c-fresh", hours_ago(23)).await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let FulfillResponse::StuckClaims(rows) = handle(&d, FulfillRequest::StuckClaims).await else {
+        panic!("StuckClaims must answer with the StuckClaims variant");
+    };
+    assert!(
+        rows.is_empty(),
+        "23h is inside the 24h bar — listing it would cry wolf"
+    );
+}

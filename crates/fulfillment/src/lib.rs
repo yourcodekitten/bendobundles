@@ -148,6 +148,13 @@ pub enum FulfillRequest {
         requires_choice: bool,
     },
     Sync,
+    /// Operator read: every `Pending` claim older than [`RECONCILE_STUCK_ALERT_AGE`], oldest first.
+    /// Read-only — this verb never writes. It lives on `FulfillRequest` because `Sync` already
+    /// established this enum as the admin-ops channel (`admin-api` fires it from a human-pressed
+    /// button), and because the compensate verb beside it must keep claim-state transitions in one
+    /// role: `compensate_any` already owns the self-vs-link discrimination and re-deriving that
+    /// predicate in a second place is how the two drift.
+    StuckClaims,
     /// MANUAL-INVOKE-ONLY diagnostic since the cookie-paste teardown. Its only in-app sender was
     /// admin-api's paste-validate (removed with the paste flow); EventBridge fires `Sync`, which
     /// already self-heals + reports `cookie_ok` on cadence. Reach this by a hand-run
@@ -181,6 +188,19 @@ pub enum FulfillRequest {
     Bell {
         event: bell::BellEvent,
     },
+}
+
+/// One row of the operator's stuck-claim window. Field names are the JSON contract — `admin-api`
+/// serialises this straight out, and the web fixtures mirror it exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StuckClaim {
+    pub claim_id: String,
+    pub game_id: String,
+    pub link_token: String,
+    pub is_self: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    pub pending_since: OffsetDateTime,
+    pub age_hours: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -239,6 +259,8 @@ pub enum FulfillResponse {
     Error {
         message: String,
     },
+    /// Operator read: every Pending claim past the bar, oldest first.
+    StuckClaims(Vec<StuckClaim>),
 }
 
 /// The pure gift-ladder decision. Compensate ONLY on definitive `AlreadyRedeemed`; park on
@@ -970,6 +992,34 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
             }
         }
         FulfillRequest::Sync => handle_sync(deps).await,
+        FulfillRequest::StuckClaims => {
+            // `handle` is INFALLIBLE (`-> FulfillResponse`). A StoreError becomes a RESPONSE
+            // variant, never a `?`.
+            let claims = match deps.store.list_pending_claims().await {
+                Ok(c) => c,
+                Err(e) => {
+                    return FulfillResponse::Error {
+                        message: format!("list_pending_claims: {e}"),
+                    };
+                }
+            };
+            let now = OffsetDateTime::now_utc();
+            let mut rows: Vec<StuckClaim> = claims
+                .into_iter()
+                .filter(|c| now - c.created_at >= RECONCILE_STUCK_ALERT_AGE)
+                .map(|c| StuckClaim {
+                    // `is_self` BORROWS link_token; the move below must come after it.
+                    is_self: c.link_token == domain::SELF_LINK_TOKEN,
+                    age_hours: (now - c.created_at).whole_hours(),
+                    pending_since: c.created_at,
+                    claim_id: c.id,
+                    game_id: c.game_id,
+                    link_token: c.link_token,
+                })
+                .collect();
+            rows.sort_by_key(|r| r.pending_since);
+            FulfillResponse::StuckClaims(rows)
+        }
         FulfillRequest::ValidateCookie => handle_validate_cookie(deps).await,
         FulfillRequest::Whisper => handle_whisper(deps).await,
         FulfillRequest::WhisperPreview => handle_whisper_preview(deps).await,
