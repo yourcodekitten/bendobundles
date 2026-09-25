@@ -3813,3 +3813,51 @@ async fn scrapbook_endpoint_composes() {
     assert_eq!(j["orphan_claim_count"], 0);
     assert_eq!(j["stale_pending_count"], 0);
 }
+
+// ── Task 3: GET /admin/api/ops/stuck-claims ─────────────────────────────────
+
+/// The ops surface must sit INSIDE the session layer. A route added AFTER `.route_layer(...)`
+/// ships unauthenticated, and this is the test that would catch it.
+#[tokio::test]
+async fn stuck_claims_requires_a_session() {
+    let (app, _store, _log) =
+        test_app_with_call_invoker("stuck_unauth", FulfillResponse::StuckClaims { claims: vec![] })
+            .await;
+    let req = Request::get("/admin/api/ops/stuck-claims")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "an ops surface must sit INSIDE the route_layer"
+    );
+}
+
+#[tokio::test]
+async fn stuck_claims_returns_the_rows_the_invoker_answered_with() {
+    let (app, _store, log) = test_app_with_call_invoker(
+        "stuck_ok",
+        FulfillResponse::StuckClaims {
+            claims: vec![fulfillment::StuckClaim {
+                claim_id: "c-old".into(),
+                game_id: "gk:a".into(),
+                link_token: "SELF".into(),
+                is_self: true,
+                // NOT `hours_ago` — that helper lives in crates/fulfillment/tests/handler_test.rs
+                // and is not importable here (0 hits in this file, 17 there). This crate's idiom
+                // is `time::macros::datetime!`, already imported at :21.
+                pending_since: datetime!(2026-07-06 00:00 UTC),
+                age_hours: 80 * 24,
+            }],
+        },
+    )
+    .await;
+
+    let res = authed_get(&app, "/admin/api/ops/stuck-claims").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: serde_json::Value = body_json(res).await;
+    assert_eq!(v[0]["claim_id"], "c-old");
+    assert_eq!(v[0]["is_self"], true);
+    assert_eq!(*log.lock().unwrap(), vec![FulfillRequest::StuckClaims]);
+}

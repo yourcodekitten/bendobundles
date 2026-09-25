@@ -128,6 +128,9 @@ pub fn router(
         )
         .route("/admin/api/friends/{id}", post(handle_patch_friend))
         .route("/admin/api/claims/self", get(handle_self_claims))
+        // 🔴 INSIDE `protected`, ABOVE `.route_layer(...)`. A route added after that call ships
+        // UNAUTHENTICATED — `stuck_claims_requires_a_session` is the test that catches it.
+        .route("/admin/api/ops/stuck-claims", get(handle_stuck_claims))
         .route("/admin/api/scrapbook", get(handle_scrapbook))
         .route("/admin/api/sync", post(handle_sync))
         .route("/admin/api/status", get(handle_status))
@@ -1312,6 +1315,38 @@ async fn handle_self_claims(State(s): State<AppState>) -> Response {
             (StatusCode::OK, Json(views)).into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+// ── GET /admin/api/ops/stuck-claims ──────────────────────────────────────────
+
+/// Operator read: the stuck-claim window on /admin/ops. Read-only; the hand is a separate route.
+///
+/// This goes through `FulfillRequest` rather than calling the store directly, so that claim-state
+/// transitions keep ONE owner — `compensate_any` already owns the self-vs-link discrimination, and
+/// re-deriving it here is how two code paths drift. (The IAM argument that once sat in this comment
+/// was retracted: the deployed policy is one unconditioned Allow, so it constrains neither design.)
+async fn handle_stuck_claims(State(s): State<AppState>) -> Response {
+    match s.invoker.call(FulfillRequest::StuckClaims).await {
+        Ok(FulfillResponse::StuckClaims { claims }) => (StatusCode::OK, Json(claims)).into_response(),
+        Ok(FulfillResponse::Error { message }) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+        Ok(other) => {
+            tracing::error!(outcome = "stuck_claims_wrong_variant", got = ?other);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "fulfillment answered the wrong variant" })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
