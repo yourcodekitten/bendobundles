@@ -1332,7 +1332,9 @@ async fn handle_self_claims(State(s): State<AppState>) -> Response {
 /// was retracted: the deployed policy is one unconditioned Allow, so it constrains neither design.)
 async fn handle_stuck_claims(State(s): State<AppState>) -> Response {
     match s.invoker.call(FulfillRequest::StuckClaims).await {
-        Ok(FulfillResponse::StuckClaims { claims }) => (StatusCode::OK, Json(claims)).into_response(),
+        Ok(FulfillResponse::StuckClaims { claims }) => {
+            (StatusCode::OK, Json(claims)).into_response()
+        }
         Ok(FulfillResponse::Error { message }) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({ "error": message })),

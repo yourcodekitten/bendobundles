@@ -3820,9 +3820,11 @@ async fn scrapbook_endpoint_composes() {
 /// ships unauthenticated, and this is the test that would catch it.
 #[tokio::test]
 async fn stuck_claims_requires_a_session() {
-    let (app, _store, _log) =
-        test_app_with_call_invoker("stuck_unauth", FulfillResponse::StuckClaims { claims: vec![] })
-            .await;
+    let (app, _store, _log) = test_app_with_call_invoker(
+        "stuck_unauth",
+        FulfillResponse::StuckClaims { claims: vec![] },
+    )
+    .await;
     let req = Request::get("/admin/api/ops/stuck-claims")
         .body(Body::empty())
         .unwrap();

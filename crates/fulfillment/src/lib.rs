@@ -277,9 +277,12 @@ pub enum FulfillResponse {
     /// SEQUENCE: `StuckClaims(Vec<StuckClaim>)` compiles clean and fails at runtime with
     /// "cannot serialize tagged newtype variant ... containing a sequence", for a populated
     /// AND an empty vec alike. A map has somewhere to put the tag; a list does not.
-    /// This is the only field-carrying-collection variant here — see `tagged_newtype_...` in
-    /// the tests, which walks every variant so the next one cannot repeat it.
-    StuckClaims { claims: Vec<StuckClaim> },
+    /// This is the only field-carrying-collection variant here — see
+    /// `every_fulfill_response_variant_survives_a_json_round_trip` in the tests, which walks
+    /// every variant so the next one cannot repeat it.
+    StuckClaims {
+        claims: Vec<StuckClaim>,
+    },
     /// Operator write: one Pending claim moved to Compensated. Fieldless — the operator's
     /// confirmation is the 204; the row's new state lives in the store.
     Compensated,
@@ -6252,6 +6255,27 @@ mod tests {
             }
         }
 
+        // 🔴 SAMPLE ⇄ PATTERN IN ONE LIST, so the COMPILER maintains the samples too.
+        //
+        // The previous version kept `samples` as a hand-written vec beside a literal count, and
+        // Lilith walked it: add a variant, add its `tag_of` arm (forced), add NO sample — the 17
+        // old tags still make `covered.len() == 17` and the test goes GREEN on an untested
+        // variant. It only ever caught a DELETED sample. ⇒ rung 1 for "you must notice",
+        // rung 3 for "you must test it", while the comment claimed rung 1 for both.
+        //
+        // Now each entry supplies a value AND a pattern, and the generated `_exhaustive` fn
+        // matches on those patterns — so a new variant cannot compile until it is listed HERE,
+        // and listing it here IS adding its sample. The count is derived, never written down.
+        macro_rules! census {
+            ($($sample:expr => $pat:pat),+ $(,)?) => {{
+                #[allow(dead_code)]
+                fn _exhaustive(r: &FulfillResponse) {
+                    match r { $($pat => (),)+ }
+                }
+                vec![$($sample),+]
+            }};
+        }
+
         let row = StuckClaim {
             claim_id: "c-old".into(),
             game_id: "gk:a".into(),
@@ -6260,39 +6284,42 @@ mod tests {
             pending_since: OffsetDateTime::UNIX_EPOCH,
             age_hours: 1920,
         };
-        let samples = vec![
-            FulfillResponse::GiftUrl { url: "u".into() },
-            FulfillResponse::RevealedKey { key: "k".into() },
-            FulfillResponse::AlreadyRedeemed,
-            FulfillResponse::KeyDead,
-            FulfillResponse::Parked { reason: "r".into() },
-            FulfillResponse::SyncDone,
-            FulfillResponse::Whispered,
-            FulfillResponse::Lanterned,
-            FulfillResponse::PreviewSent,
-            FulfillResponse::Belled,
-            FulfillResponse::PreviewBlocked,
-            FulfillResponse::PreviewSendFailed,
-            FulfillResponse::PreviewQuiet,
-            FulfillResponse::CookieStatus { ok: true },
-            FulfillResponse::Error { message: "m".into() },
-            // BOTH the empty and populated collection: serde rejects a bad shape on an empty
-            // vec too, so testing only the populated case would still have caught this one —
-            // but testing only the EMPTY case is the tempting shortcut, and it must hold too.
-            FulfillResponse::StuckClaims { claims: vec![] },
-            FulfillResponse::StuckClaims { claims: vec![row] },
-            FulfillResponse::Compensated,
-        ];
 
-        // Every variant NAME reachable through the exhaustive match must appear in the samples.
-        // This is the half that makes the compile-time tripwire actually bite: adding a variant
-        // breaks `tag_of`, and adding its arm without a sample fails HERE.
+        let mut samples = census![
+            FulfillResponse::GiftUrl { url: "u".into() } => FulfillResponse::GiftUrl { .. },
+            FulfillResponse::RevealedKey { key: "k".into() } => FulfillResponse::RevealedKey { .. },
+            FulfillResponse::AlreadyRedeemed => FulfillResponse::AlreadyRedeemed,
+            FulfillResponse::KeyDead => FulfillResponse::KeyDead,
+            FulfillResponse::Parked { reason: "r".into() } => FulfillResponse::Parked { .. },
+            FulfillResponse::SyncDone => FulfillResponse::SyncDone,
+            FulfillResponse::Whispered => FulfillResponse::Whispered,
+            FulfillResponse::Lanterned => FulfillResponse::Lanterned,
+            FulfillResponse::PreviewSent => FulfillResponse::PreviewSent,
+            FulfillResponse::Belled => FulfillResponse::Belled,
+            FulfillResponse::PreviewBlocked => FulfillResponse::PreviewBlocked,
+            FulfillResponse::PreviewSendFailed => FulfillResponse::PreviewSendFailed,
+            FulfillResponse::PreviewQuiet => FulfillResponse::PreviewQuiet,
+            FulfillResponse::CookieStatus { ok: true } => FulfillResponse::CookieStatus { .. },
+            FulfillResponse::Error { message: "m".into() } => FulfillResponse::Error { .. },
+            FulfillResponse::StuckClaims { claims: vec![row] } => FulfillResponse::StuckClaims { .. },
+            FulfillResponse::Compensated => FulfillResponse::Compensated,
+        ];
+        // DERIVED, not declared: one sample per variant, guaranteed by `_exhaustive` above.
+        let variant_count = samples.len();
+
+        // EXTRA sample, deliberately outside the census: serde rejects a bad shape on an EMPTY
+        // collection too, so the no-rows path needs its own row. It is appended rather than
+        // listed because a second `StuckClaims { .. }` pattern would be unreachable.
+        samples.push(FulfillResponse::StuckClaims { claims: vec![] });
+
+        // Distinct tags must equal the variant count — this catches two arms of `tag_of`
+        // returning the same string, which would silently shrink the census.
         let covered: std::collections::BTreeSet<&str> = samples.iter().map(tag_of).collect();
         assert_eq!(
             covered.len(),
-            17,
-            "census population changed — a variant was added or removed. Add a sample above; \
-             do NOT relax this number without adding one. Covered: {covered:?}"
+            variant_count,
+            "tag_of maps two variants to the same name — the census is smaller than it looks. \
+             Covered: {covered:?}"
         );
 
         for resp in &samples {
