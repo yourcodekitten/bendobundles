@@ -662,7 +662,17 @@ fn self_claim_cancellation_error(
 ///
 /// 🔑 **A non-empty [`unreadable`](Self::unreadable) means THIS ANSWER IS PARTIAL.** A caller that
 /// renders `claims` without saying so has traded a loud blank for a quiet lie, which is the worse
-/// of the two. There is deliberately no accessor that hands over `claims` alone.
+/// of the two.
+///
+/// 🔴 **WHAT THIS TYPE DOES NOT BUY, stated because the first draft of this comment claimed it
+/// did** (OMBB on the review of #246): it said *"there is deliberately no accessor that hands over
+/// `claims` alone"* — and **`pub claims` IS that accessor.** `lantern` uses exactly that shape, in
+/// the same change. What the type actually bought was a **ONE-TIME MIGRATION**: changing the return
+/// type made the compiler name all four existing callers, each of which then had to state its own
+/// answer. **A NEW caller can write `.claims` and ignore `unreadable`, and nothing will stop it.**
+/// That is a convention this doc comment asks for, not a guarantee the type enforces — and a
+/// sentence that reads like a compile-time promise while being a request is the exact species of
+/// quiet lie the rest of this type exists to prevent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PendingClaims {
     /// Every row that parsed — oldest-first, exhaustive across pages.
