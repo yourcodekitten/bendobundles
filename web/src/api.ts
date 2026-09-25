@@ -777,6 +777,54 @@ export async function adminSelfClaims(): Promise<SelfClaimView[]> {
   return response.json();
 }
 
+// ── Ops: stuck claims ────────────────────────────────────────────────────────
+
+/**
+ * One Pending claim that has sat past the stale bar. Mirrors fulfillment's `StuckClaim`.
+ * `pending_since` is RFC3339; `age_hours` is whole hours at the time of the read.
+ */
+export interface StuckClaimView {
+  claim_id: string;
+  game_id: string;
+  link_token: string;
+  is_self: boolean;
+  pending_since: string;
+  age_hours: number;
+}
+
+export async function adminStuckClaims(): Promise<StuckClaimView[]> {
+  const response = await fetch('/admin/api/ops/stuck-claims');
+  if (response.status === 401) throw new Unauthorized();
+  if (!response.ok) throw new FetchFailed();
+  return response.json();
+}
+
+/**
+ * Compensate one stuck claim. The claim id rides in the URL; the body carries only
+ * `link_token` and `confirm`. `confirm` is required server-side too — this is a
+ * destructive op and a single stray POST must not move a claim.
+ */
+export async function adminCompensateClaim(
+  claimId: string,
+  linkToken: string,
+): Promise<void> {
+  const response = await fetch(
+    `/admin/api/ops/claims/${encodeURIComponent(claimId)}/compensate`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...ADMIN_CSRF_HEADER },
+      body: JSON.stringify({ link_token: linkToken, confirm: true }),
+    },
+  );
+  await checkUnauthorized(response);
+  if (response.status === 404) {
+    throw new Error('that claim is already gone — refresh the list');
+  }
+  if (!response.ok) {
+    throw new Error('couldn’t compensate that claim — try again');
+  }
+}
+
 // ── Steam API ────────────────────────────────────────────────────────────────
 
 /**

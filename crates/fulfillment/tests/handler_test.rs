@@ -10396,3 +10396,196 @@ async fn bell_does_not_page_ops_when_dark() {
         "an unresolved bell is silent on BOTH channels — that is not the trade, that is a hole: {logs}"
     );
 }
+
+// ── Task 1: StuckClaims — the operator's read ────────────────────────────────
+
+#[tokio::test]
+async fn stuck_claims_lists_a_pending_claim_past_the_bar_oldest_first() {
+    let Some(store) = store_or_skip("stuck_list").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:a", SELF_LINK_TOKEN, "c-old", hours_ago(80 * 24)).await;
+    seed_aged_pending(&store, "gk:b", "tok-friend", "c-new", hours_ago(30)).await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let FulfillResponse::StuckClaims { claims: rows } =
+        handle(&d, FulfillRequest::StuckClaims).await
+    else {
+        panic!("StuckClaims must answer with the StuckClaims variant");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].claim_id, "c-old",
+        "oldest first — the operator reads row one"
+    );
+    assert!(rows[0].is_self);
+    assert!(
+        !rows[1].is_self,
+        "a friend claim must be distinguishable from a self claim"
+    );
+    assert!(rows[0].age_hours >= 80 * 24);
+}
+
+// 🔴 THE JUST-PAST SIDE OF THE BAR. Spec §6.3 asks for "the boundary, BOTH sides" and the other
+// tests only have the inside (1920h, 30h, 23h).
+// 🔴 IT DOES **NOT** PIN THE OPERATOR, and an earlier revision of the plan claimed it did:
+//   `hours_ago(24)` is `now_utc() - 24h` evaluated at SEED time (`:1007`); the arm calls
+//   `now_utc()` again at EVAL time ⇒ elapsed = 24h + ε, STRICTLY GREATER ⇒ this lists under `>=`
+//   AND under `>`. The distinction is UNOBSERVABLE through this path: `now` is read inside
+//   `handle`, so no wall-clock seed can land exactly on the bar. There is no test to write.
+// ⇒ `>=` rests on a CITATION, not a test: the repo's own stuck sweep uses `>=` at
+//   `fulfillment/src/lib.rs:4446`, against RECONCILE_STUCK_ALERT_AGE = Duration::hours(24) (`:114`).
+#[tokio::test]
+async fn a_claim_just_past_the_bar_is_listed() {
+    let Some(store) = store_or_skip("stuck_bar_exact").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:d", SELF_LINK_TOKEN, "c-exact", hours_ago(24)).await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let FulfillResponse::StuckClaims { claims: rows } =
+        handle(&d, FulfillRequest::StuckClaims).await
+    else {
+        panic!("StuckClaims must answer with the StuckClaims variant");
+    };
+    assert_eq!(
+        rows.len(),
+        1,
+        "a claim just past the 24h bar is listed — the spec's other side"
+    );
+    assert_eq!(rows[0].claim_id, "c-exact");
+}
+
+#[tokio::test]
+async fn a_claim_one_hour_inside_the_bar_is_not_listed() {
+    let Some(store) = store_or_skip("stuck_bar").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:c", SELF_LINK_TOKEN, "c-fresh", hours_ago(23)).await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let FulfillResponse::StuckClaims { claims: rows } =
+        handle(&d, FulfillRequest::StuckClaims).await
+    else {
+        panic!("StuckClaims must answer with the StuckClaims variant");
+    };
+    assert!(
+        rows.is_empty(),
+        "23h is inside the 24h bar — listing it would cry wolf"
+    );
+}
+
+// ── Task 2: Compensate — the operator's hand ─────────────────────────────────
+
+#[tokio::test]
+async fn compensate_moves_a_self_claim_to_compensated() {
+    let Some(store) = store_or_skip("comp_self").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:s", SELF_LINK_TOKEN, "sc1", hours_ago(30)).await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let got = handle(
+        &d,
+        FulfillRequest::Compensate {
+            claim_id: "sc1".into(),
+            link_token: SELF_LINK_TOKEN.into(),
+        },
+    )
+    .await; // INFALLIBLE — no unwrap, no `?`
+
+    assert_eq!(got, FulfillResponse::Compensated);
+    let c = store
+        .get_claim(SELF_LINK_TOKEN, "sc1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.state, ClaimState::Compensated);
+}
+
+// 🔴 THE FRIEND ARM. This is the ONLY arm that touches `claims_used`, and `claims_used` is the
+// entire basis of the double-spend reason this design ships as "the SOLE guard" — with the policy
+// unconditioned on the table, IAM will not stop admin-api performing that decrement, so the design
+// is the only thing that does. Without this test that reason is prose.
+#[tokio::test]
+async fn compensate_on_a_friend_claim_returns_the_slot_by_decrementing_claims_used() {
+    let Some(store) = store_or_skip("comp_friend").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:f", "tok-friend", "fc1", hours_ago(30)).await;
+    let before = store
+        .get_link("tok-friend")
+        .await
+        .unwrap()
+        .unwrap()
+        .claims_used;
+    assert_eq!(
+        before, 1,
+        "claiming consumed a slot — the precondition, asserted not assumed"
+    );
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let got = handle(
+        &d,
+        FulfillRequest::Compensate {
+            claim_id: "fc1".into(),
+            link_token: "tok-friend".into(),
+        },
+    )
+    .await;
+
+    assert_eq!(got, FulfillResponse::Compensated);
+    let c = store.get_claim("tok-friend", "fc1").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Compensated);
+    let after = store
+        .get_link("tok-friend")
+        .await
+        .unwrap()
+        .unwrap()
+        .claims_used;
+    assert_eq!(
+        after,
+        before - 1,
+        "the friend's slot must come back — this is the double-spend invariant"
+    );
+}
+
+#[tokio::test]
+async fn compensate_on_a_missing_claim_answers_error_not_compensated_and_not_already_redeemed() {
+    let Some(store) = store_or_skip("comp_missing").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let got = handle(
+        &d,
+        FulfillRequest::Compensate {
+            claim_id: "nope".into(),
+            link_token: SELF_LINK_TOKEN.into(),
+        },
+    )
+    .await;
+
+    // POSITIVE assertion on the variant. `assert_ne!(got, Compensated)` is what let a placeholder
+    // returning `AlreadyRedeemed` pass an earlier revision of this plan.
+    // POSITIVE, and on the VARIANT rather than a substring. This used to assert
+    // `message.contains("not found")`, which cannot distinguish a genuine absence from a store
+    // fault whose AWS text happens to carry those words — the distinction `handle` takes care to
+    // preserve three lines earlier.
+    match got {
+        FulfillResponse::ClaimNotFound {
+            ref claim_id,
+            ref link_token,
+        } => {
+            assert_eq!(claim_id, "nope");
+            assert_eq!(link_token, SELF_LINK_TOKEN);
+        }
+        other => panic!("a compensate that found nothing must answer ClaimNotFound, got {other:?}"),
+    }
+}

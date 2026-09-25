@@ -25,6 +25,8 @@ import {
   adminReissueFriendToken,
   adminRevokeFriendToken,
   adminSetLinkFriend,
+  adminStuckClaims,
+  adminCompensateClaim,
   CreateLinkValidationError,
   NotFound,
   FetchFailed,
@@ -1139,5 +1141,44 @@ describe('adminScrapbook', () => {
   it('throws Unauthorized on 401', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 401, json: vi.fn() });
     await expect(adminScrapbook()).rejects.toBeInstanceOf(Unauthorized);
+  });
+});
+
+describe('ops: stuck claims', () => {
+  it('adminStuckClaims GETs the ops route and returns the rows', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue([{ claim_id: 'c1' }]),
+    });
+
+    await expect(adminStuckClaims()).resolves.toEqual([{ claim_id: 'c1' }]);
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/ops/stuck-claims');
+  });
+
+  it('adminStuckClaims throws Unauthorized on 401', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 401 });
+    await expect(adminStuckClaims()).rejects.toBeInstanceOf(Unauthorized);
+  });
+
+  it('adminCompensateClaim POSTs the claim id in the URL with the CSRF header and a confirm', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: true, status: 204 });
+
+    await adminCompensateClaim('c/1', 'tok-friend');
+
+    // THE WHOLE CALL, not just the URL. This is the ONLY place ADMIN_CSRF_HEADER is ever
+    // executed — Ops.test.tsx does vi.mock('../api') and never reaches it.
+    // The 'c/1' id is deliberate: a plain id passes with or without encodeURIComponent, so a
+    // fixture that cannot fail is a fixture that tests nothing.
+    expect(mockFetch).toHaveBeenCalledWith('/admin/api/ops/claims/c%2F1/compensate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Admin-Request': '1' },
+      body: JSON.stringify({ link_token: 'tok-friend', confirm: true }),
+    });
+  });
+
+  it('adminCompensateClaim turns a 404 into an operator-readable message', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 404 });
+    await expect(adminCompensateClaim('gone', 'SELF')).rejects.toThrow(/already gone/);
   });
 });

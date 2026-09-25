@@ -3813,3 +3813,123 @@ async fn scrapbook_endpoint_composes() {
     assert_eq!(j["orphan_claim_count"], 0);
     assert_eq!(j["stale_pending_count"], 0);
 }
+
+// ── Task 3: GET /admin/api/ops/stuck-claims ─────────────────────────────────
+
+/// The ops surface must sit INSIDE the session layer. A route added AFTER `.route_layer(...)`
+/// ships unauthenticated, and this is the test that would catch it.
+#[tokio::test]
+async fn stuck_claims_requires_a_session() {
+    let (app, _store, _log) = test_app_with_call_invoker(
+        "stuck_unauth",
+        FulfillResponse::StuckClaims { claims: vec![] },
+    )
+    .await;
+    let req = Request::get("/admin/api/ops/stuck-claims")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "an ops surface must sit INSIDE the route_layer"
+    );
+}
+
+#[tokio::test]
+async fn stuck_claims_returns_the_rows_the_invoker_answered_with() {
+    let (app, _store, log) = test_app_with_call_invoker(
+        "stuck_ok",
+        FulfillResponse::StuckClaims {
+            claims: vec![fulfillment::StuckClaim {
+                claim_id: "c-old".into(),
+                game_id: "gk:a".into(),
+                link_token: "SELF".into(),
+                is_self: true,
+                // NOT `hours_ago` — that helper lives in crates/fulfillment/tests/handler_test.rs
+                // and is not importable here (0 hits in this file, 17 there). This crate's idiom
+                // is `time::macros::datetime!`, already imported at :21.
+                pending_since: datetime!(2026-07-06 00:00 UTC),
+                age_hours: 80 * 24,
+            }],
+        },
+    )
+    .await;
+
+    let res = authed_get(&app, "/admin/api/ops/stuck-claims").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let v: serde_json::Value = body_json(res).await;
+    assert_eq!(v[0]["claim_id"], "c-old");
+    assert_eq!(v[0]["is_self"], true);
+    assert_eq!(*log.lock().unwrap(), vec![FulfillRequest::StuckClaims]);
+}
+
+// ── Task 4: POST /admin/api/ops/claims/{claim_id}/compensate ─────────────────
+
+#[tokio::test]
+async fn compensate_refuses_without_confirm() {
+    let (app, _store, log) =
+        test_app_with_call_invoker("comp_noconfirm", FulfillResponse::Compensated).await;
+    let res = authed_post(
+        &app,
+        "/admin/api/ops/claims/sc1/compensate",
+        r#"{"link_token":"SELF"}"#,
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a destructive op needs an explicit confirm"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "a refused confirm must not reach fulfillment"
+    );
+}
+
+#[tokio::test]
+async fn compensate_with_confirm_invokes_and_returns_204() {
+    let (app, _store, log) =
+        test_app_with_call_invoker("comp_ok", FulfillResponse::Compensated).await;
+    let res = authed_post(
+        &app,
+        "/admin/api/ops/claims/sc1/compensate",
+        r#"{"link_token":"tok-friend","confirm":true}"#,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![FulfillRequest::Compensate {
+            claim_id: "sc1".into(),
+            link_token: "tok-friend".into()
+        }],
+        "the claim id comes from the PATH and the link token from the BODY"
+    );
+}
+
+/// Only correct alongside Task 2: fulfillment answers a vanished claim with
+/// `Error { message }` because there is no not-found variant, so a handler mapping every
+/// non-`Compensated` to 502 would tell an operator "bad gateway" about a missing row.
+#[tokio::test]
+async fn compensate_on_a_vanished_claim_is_404_not_502() {
+    let (app, _store, _log) = test_app_with_call_invoker(
+        "comp_404",
+        FulfillResponse::ClaimNotFound {
+            claim_id: "sc9".into(),
+            link_token: "SELF".into(),
+        },
+    )
+    .await;
+    let res = authed_post(
+        &app,
+        "/admin/api/ops/claims/sc9/compensate",
+        r#"{"link_token":"SELF","confirm":true}"#,
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "a missing claim is the operator's problem to see, not a gateway error to debug"
+    );
+}

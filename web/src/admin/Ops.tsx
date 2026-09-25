@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useNavigate, useOutletContext } from 'react-router-dom';
-import { adminSync, adminSteamIdentity, adminSetSteamIdentity, adminClearSteamIdentity, adminSteamOwned } from '../api';
+import { adminSync, adminSteamIdentity, adminSetSteamIdentity, adminClearSteamIdentity, adminSteamOwned, adminStuckClaims, adminCompensateClaim } from '../api';
+import type { StuckClaimView } from '../api';
 import {
   consumeReturnFragment,
   loadIdentity,
@@ -80,6 +81,38 @@ export function Ops() {
     }, 2000);
     return () => clearInterval(id);
   }, [syncing, syncRunning, refreshStatus]);
+
+  // ── stuck claims panel ──────────────────────────────────────────────────────
+  // `armed` holds the claim_id whose Confirm button is showing. Arming lives in state, not
+  // window.confirm, so the two-press contract is drivable from a test.
+  const [stuck, setStuck] = useState<StuckClaimView[] | null>(null);
+  const [armed, setArmed] = useState<string | null>(null);
+  const [stuckMsg, setStuckMsg] = useState<string | null>(null);
+
+  const loadStuck = useCallback(async () => {
+    try {
+      setStuck(await adminStuckClaims());
+    } catch {
+      // A failed read must not blank the panel silently — say so.
+      setStuck([]);
+      setStuckMsg('couldn’t load stuck claims');
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadStuck();
+  }, [loadStuck]);
+
+  const handleCompensate = async (claim: StuckClaimView) => {
+    setStuckMsg(null);
+    try {
+      await adminCompensateClaim(claim.claim_id, claim.link_token);
+      setArmed(null);
+      await loadStuck();
+    } catch (e) {
+      setStuckMsg(e instanceof Error ? e.message : 'compensate failed');
+    }
+  };
 
   // ── steam connect panel state ───────────────────────────────────────────────
   // undefined = still loading from server; null = not connected; string = steamid
@@ -289,6 +322,74 @@ export function Ops() {
               </div>
             )}
           </div>
+        )}
+      </section>
+
+      {/* ── Stuck claims ─────────────────────────────────────────────────── */}
+      <section className="flex flex-col gap-3 rounded bg-floor p-4">
+        <h2 className="text-sm font-medium text-ink-soft">stuck claims</h2>
+        {stuck === null ? (
+          <p className="text-xs text-dust-faint">loading…</p>
+        ) : stuck.length === 0 ? (
+          <p className="text-xs text-dust-faint">no stuck claims</p>
+        ) : (
+          <ul className="flex flex-col gap-2">
+            {stuck.map((c) => (
+              <li
+                key={c.claim_id}
+                className="flex flex-wrap items-center gap-3 rounded bg-shelf px-3 py-2 text-xs"
+              >
+                <span
+                  data-testid={`claim-kind-${c.claim_id}`}
+                  className="rounded bg-control px-2 py-0.5 text-ink-soft"
+                >
+                  {c.is_self ? 'self' : 'friend'}
+                </span>
+                <span className="text-ink-soft">{c.game_id}</span>
+                <span className="text-dust-faint">
+                  {Math.floor(c.age_hours / 24)}d stuck
+                </span>
+                {/* the Pending timestamp, beside the age — spec §A wants both */}
+                <span data-testid={`claim-since-${c.claim_id}`} className="text-dust-faint">
+                  {c.pending_since.slice(0, 10)}
+                </span>
+                {/* the link token, on friend rows only — spec §A */}
+                {!c.is_self && (
+                  <span
+                    data-testid={`claim-token-${c.claim_id}`}
+                    className="text-dust-faint"
+                  >
+                    {c.link_token}
+                  </span>
+                )}
+                <span className="ml-auto flex gap-2">
+                  <button
+                    type="button"
+                    data-testid={`compensate-${c.claim_id}`}
+                    onClick={() => setArmed(c.claim_id)}
+                    className="rounded bg-control px-3 py-1 hover:bg-control-bright"
+                  >
+                    compensate
+                  </button>
+                  {armed === c.claim_id && (
+                    <button
+                      type="button"
+                      data-testid={`confirm-${c.claim_id}`}
+                      onClick={() => void handleCompensate(c)}
+                      className="rounded bg-control-bright px-3 py-1"
+                    >
+                      confirm
+                    </button>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+        {stuckMsg !== null && (
+          <p role="status" className="text-xs text-dust-faint">
+            {stuckMsg}
+          </p>
         )}
       </section>
     </div>

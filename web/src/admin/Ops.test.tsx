@@ -8,6 +8,7 @@ import type { StatusView } from '../api';
 vi.mock('../api');
 vi.mock('../steamIdentity');
 import { adminSync, adminSteamIdentity, adminSetSteamIdentity, adminClearSteamIdentity, adminSteamOwned } from '../api';
+import { adminStuckClaims, adminCompensateClaim } from '../api';
 import { consumeReturnFragment, loadIdentity, beginConnect } from '../steamIdentity';
 
 // Provides the Outlet context that Ops requires without needing the real AdminApp.
@@ -48,6 +49,10 @@ describe('Ops', () => {
     vi.mocked(loadIdentity).mockReturnValue(null);
     vi.mocked(adminSteamIdentity).mockResolvedValue(null);
     vi.mocked(beginConnect).mockImplementation(() => {});
+    // 🔴 Every one of this file's pre-existing tests now mounts the stuck-claims fetch.
+    // Without this default the automock returns `undefined` and they all break — this line
+    // is this task's blast-radius fix, not a convenience.
+    vi.mocked(adminStuckClaims).mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -440,6 +445,54 @@ describe('Ops', () => {
         expect(screen.getByRole('status')).toBeInTheDocument(),
       );
       expect(screen.getByRole('status').textContent).toMatch(/unavailable|unreachable/i);
+    });
+  });
+
+  describe('stuck claims', () => {
+    const SELF_ROW = {
+      claim_id: 'c-old', game_id: 'gk:a', link_token: 'SELF',
+      is_self: true, pending_since: '2026-07-06T00:00:00Z', age_hours: 1920,
+    };
+    const FRIEND_ROW = {
+      claim_id: 'c-fr', game_id: 'gk:b', link_token: 'tok-friend',
+      is_self: false, pending_since: '2026-09-24T00:00:00Z', age_hours: 30,
+    };
+
+    it('renders nothing-to-see when there are no stuck claims', async () => {
+      vi.mocked(adminStuckClaims).mockResolvedValue([]);
+      renderOps();
+      expect(await screen.findByText(/no stuck claims/i)).toBeInTheDocument();
+    });
+
+    it('badges a self row and a friend row differently', async () => {
+      vi.mocked(adminStuckClaims).mockResolvedValue([SELF_ROW, FRIEND_ROW]);
+      renderOps();
+
+      // BY TEST-ID, NOT BY TEXT. getByText(/self/i) matches the link_token "SELF" in the row
+      // whether a badge exists or not — a vacuous assertion.
+      expect(await screen.findByTestId('claim-kind-c-old')).toHaveTextContent('self');
+      expect(await screen.findByTestId('claim-kind-c-fr')).toHaveTextContent('friend');
+
+      // BY CONTENT, not presence: toBeInTheDocument() passes on an empty span and on one
+      // rendering the wrong field entirely.
+      expect(await screen.findByTestId('claim-since-c-old')).toHaveTextContent('2026-07-06');
+      expect(await screen.findByTestId('claim-token-c-fr')).toHaveTextContent('tok-friend');
+    });
+
+    it('needs two presses and sends the CLAIM id, not the game id', async () => {
+      const user = userEvent.setup();
+      vi.mocked(adminStuckClaims).mockResolvedValue([FRIEND_ROW]);
+      vi.mocked(adminCompensateClaim).mockResolvedValue(undefined);
+      renderOps();
+
+      await user.click(await screen.findByTestId('compensate-c-fr'));
+      expect(adminCompensateClaim).not.toHaveBeenCalled();   // arming is not acting
+
+      await user.click(await screen.findByTestId('confirm-c-fr'));
+      // ASSERT THE ARGUMENTS: a component sending game_id would still have "called" it.
+      await waitFor(() =>
+        expect(adminCompensateClaim).toHaveBeenCalledWith('c-fr', 'tok-friend'),
+      );
     });
   });
 });

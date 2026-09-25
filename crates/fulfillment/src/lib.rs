@@ -148,6 +148,24 @@ pub enum FulfillRequest {
         requires_choice: bool,
     },
     Sync,
+    /// Operator read: every `Pending` claim older than [`RECONCILE_STUCK_ALERT_AGE`], oldest first.
+    /// Read-only — this verb never writes. It lives on `FulfillRequest` because `Sync` already
+    /// established this enum as the admin-ops channel (`admin-api` fires it from a human-pressed
+    /// button), and because the compensate verb beside it must keep claim-state transitions in one
+    /// role: `compensate_any` already owns the self-vs-link ROUTING DECISION, and re-deriving
+    /// *that* in a second place is how the two drift. ⚠️ Scoped deliberately: the bare predicate
+    /// `link_token == SELF_LINK_TOKEN` is read freely for DISPLAY and LOGGING in this file (8+
+    /// sites, e.g. `:2445`, `:2452`, and `is_self` below) and always has been. What must have one
+    /// owner is the choice of compensation PATH — not every look at the token.
+    StuckClaims,
+    /// Operator write: move one Pending claim to Compensated. **Human-pressed only** — nothing in
+    /// this crate calls it on a timer. Delegates to [`compensate_any`], which already owns the
+    /// self-vs-link ROUTING for every reconcile arm; re-deriving *that decision* in a second
+    /// place is how the two drift (reading the token for display or logs is not that). `link_token` is required because `get_claim` is keyed on it.
+    Compensate {
+        claim_id: String,
+        link_token: String,
+    },
     /// MANUAL-INVOKE-ONLY diagnostic since the cookie-paste teardown. Its only in-app sender was
     /// admin-api's paste-validate (removed with the paste flow); EventBridge fires `Sync`, which
     /// already self-heals + reports `cookie_ok` on cadence. Reach this by a hand-run
@@ -181,6 +199,19 @@ pub enum FulfillRequest {
     Bell {
         event: bell::BellEvent,
     },
+}
+
+/// One row of the operator's stuck-claim window. Field names are the JSON contract — `admin-api`
+/// serialises this straight out, and the web fixtures mirror it exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StuckClaim {
+    pub claim_id: String,
+    pub game_id: String,
+    pub link_token: String,
+    pub is_self: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    pub pending_since: OffsetDateTime,
+    pub age_hours: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,6 +269,41 @@ pub enum FulfillResponse {
     },
     Error {
         message: String,
+    },
+    /// Operator read: every Pending claim past the bar, oldest first.
+    ///
+    /// 🔴 A STRUCT VARIANT, NOT A NEWTYPE, AND THAT IS LOAD-BEARING. This enum is
+    /// `#[serde(tag = "result")]` — internally tagged — and serde cannot merge a tag into a
+    /// SEQUENCE: `StuckClaims(Vec<StuckClaim>)` compiles clean and fails at runtime with
+    /// "cannot serialize tagged newtype variant ... containing a sequence", for a populated
+    /// AND an empty vec alike. A map has somewhere to put the tag; a list does not.
+    /// This is the only field-carrying-collection variant here — see
+    /// `every_fulfill_response_variant_survives_a_json_round_trip` in the tests, which walks
+    /// every variant so the next one cannot repeat it.
+    StuckClaims {
+        claims: Vec<StuckClaim>,
+    },
+    /// Operator write: one Pending claim moved to Compensated. Fieldless — the operator's
+    /// confirmation is the 204; the row's new state lives in the store.
+    Compensated,
+    /// The claim genuinely is not there. **A TYPED ANSWER, BECAUSE THE ALTERNATIVE ROUTES AN HTTP
+    /// STATUS ON FREE TEXT.**
+    ///
+    /// `admin-api` answers 404 for this and 502 for `Error` (`handle_compensate_claim`). It used to
+    /// decide that with `message.contains("not found")`, and Lilith found the direction that makes
+    /// it dangerous: `StoreError::Aws` renders AWS's own message, and DynamoDB's
+    /// `ResourceNotFoundException` reads *"Requested resource not found"* — so **a missing or
+    /// misnamed TABLE would have told the operator the claim does not exist.** That is exactly
+    /// *a failure wearing the shape of an absence*, which `handle` closes at the store hop and the
+    /// router re-opened one crate up. `aws_fault.rs:42-44` already documents that `message` is
+    /// **behavioural, not structural** — the one field not closed by construction — and it was the
+    /// routing key.
+    ///
+    /// Safe to add mid-deploy: this can only answer `Compensate`, a verb only the NEW `admin-api`
+    /// sends, so an old reader can never receive it. Deploy fulfillment first regardless.
+    ClaimNotFound {
+        claim_id: String,
+        link_token: String,
     },
 }
 
@@ -970,6 +1036,68 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
             }
         }
         FulfillRequest::Sync => handle_sync(deps).await,
+        FulfillRequest::StuckClaims => {
+            // `handle` is INFALLIBLE (`-> FulfillResponse`). A StoreError becomes a RESPONSE
+            // variant, never a `?`.
+            let claims = match deps.store.list_pending_claims().await {
+                Ok(c) => c,
+                Err(e) => {
+                    return FulfillResponse::Error {
+                        message: format!("list_pending_claims: {e}"),
+                    };
+                }
+            };
+            let now = OffsetDateTime::now_utc();
+            let mut rows: Vec<StuckClaim> = claims
+                .into_iter()
+                .filter(|c| now - c.created_at >= RECONCILE_STUCK_ALERT_AGE)
+                .map(|c| StuckClaim {
+                    // `is_self` BORROWS link_token; the move below must come after it.
+                    is_self: c.link_token == domain::SELF_LINK_TOKEN,
+                    age_hours: (now - c.created_at).whole_hours(),
+                    pending_since: c.created_at,
+                    claim_id: c.id,
+                    game_id: c.game_id,
+                    link_token: c.link_token,
+                })
+                .collect();
+            rows.sort_by_key(|r| r.pending_since);
+            FulfillResponse::StuckClaims { claims: rows }
+        }
+        FulfillRequest::Compensate {
+            claim_id,
+            link_token,
+        } => {
+            // 🔴 THREE OUTCOMES, THREE ANSWERS. `.ok().flatten()` would collapse a StoreError and a
+            // genuine not-found into one `None`, so a transient DynamoDB fault would tell the
+            // operator "claim not found" about a claim they are looking at on screen — a failure
+            // wearing the shape of an absence.
+            let claim = match deps.store.get_claim(&link_token, &claim_id).await {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    return FulfillResponse::ClaimNotFound {
+                        claim_id,
+                        link_token,
+                    };
+                }
+                Err(e) => {
+                    return FulfillResponse::Error {
+                        message: format!("could not read claim {claim_id}: {e}"),
+                    };
+                }
+            };
+            if let Err(e) = compensate_any(deps, &claim).await {
+                // NO `.expect()`. A panic here is a lambda crash and the operator gets a 502
+                // instead of the reason; `handle` is infallible precisely so failures become
+                // readable responses.
+                tracing::error!(outcome = "compensate_failed", claim_id = %claim.id, error = %e);
+                return FulfillResponse::Error {
+                    message: format!("compensate failed: {e}"),
+                };
+            }
+            tracing::info!(outcome = "claim_compensated", claim_id = %claim.id, game_id = %claim.game_id);
+            FulfillResponse::Compensated
+        }
         FulfillRequest::ValidateCookie => handle_validate_cookie(deps).await,
         FulfillRequest::Whisper => handle_whisper(deps).await,
         FulfillRequest::WhisperPreview => handle_whisper_preview(deps).await,
@@ -6103,6 +6231,139 @@ mod tests {
             serde_json::from_str::<FulfillResponse>(&json).unwrap(),
             resp
         );
+    }
+
+    /// 🔴 A CENSUS, NOT A SPECIMEN — every `FulfillResponse` variant must survive a JSON
+    /// round-trip, because this enum is `#[serde(tag = "result")]` and internal tagging
+    /// silently forbids some shapes.
+    ///
+    /// **The bug this exists for:** `StuckClaims(Vec<StuckClaim>)` — a newtype variant wrapping a
+    /// SEQUENCE — compiled clean, passed every test, and failed only at runtime with
+    /// *"cannot serialize tagged newtype variant ... containing a sequence"*, for an EMPTY vec as
+    /// well as a full one. serde rejects on the SHAPE, before it looks at the contents. It was
+    /// invisible because every handler test mocks `AdminInvoker` in-process, so the suite ran
+    /// **zero serde** on the only path that matters (`main.rs` hands the whole response to
+    /// `lambda_runtime`, admin-api `from_slice`s it back).
+    ///
+    /// 🔑 **`sample_of_every_variant` ends in a match with NO WILDCARD ARM. That is the guard.**
+    /// Add a variant and this file stops compiling until you add a sample here — so the census
+    /// cannot silently fall behind the enum, which is what a test aimed at one specimen does.
+    /// ⚠️ **NEVER add a `_ =>` arm to it.** A wildcard disarms this completely and nothing fails.
+    #[test]
+    fn every_fulfill_response_variant_survives_a_json_round_trip() {
+        /// Names each variant via an EXHAUSTIVE match. The compiler is the tripwire.
+        fn tag_of(r: &FulfillResponse) -> &'static str {
+            match r {
+                FulfillResponse::GiftUrl { .. } => "gift_url",
+                FulfillResponse::RevealedKey { .. } => "revealed_key",
+                FulfillResponse::AlreadyRedeemed => "already_redeemed",
+                FulfillResponse::KeyDead => "key_dead",
+                FulfillResponse::Parked { .. } => "parked",
+                FulfillResponse::SyncDone => "sync_done",
+                FulfillResponse::Whispered => "whispered",
+                FulfillResponse::Lanterned => "lanterned",
+                FulfillResponse::PreviewSent => "preview_sent",
+                FulfillResponse::Belled => "belled",
+                FulfillResponse::PreviewBlocked => "preview_blocked",
+                FulfillResponse::PreviewSendFailed => "preview_send_failed",
+                FulfillResponse::PreviewQuiet => "preview_quiet",
+                FulfillResponse::CookieStatus { .. } => "cookie_status",
+                FulfillResponse::Error { .. } => "error",
+                FulfillResponse::StuckClaims { .. } => "stuck_claims",
+                FulfillResponse::Compensated => "compensated",
+                FulfillResponse::ClaimNotFound { .. } => "claim_not_found",
+                // 🔴 NO WILDCARD. See the doc comment above.
+            }
+        }
+
+        // 🔴 SAMPLE ⇄ PATTERN IN ONE LIST, so the COMPILER maintains the samples too.
+        //
+        // The previous version kept `samples` as a hand-written vec beside a literal count, and
+        // Lilith walked it: add a variant, add its `tag_of` arm (forced), add NO sample — the 17
+        // old tags still make `covered.len() == 17` and the test goes GREEN on an untested
+        // variant. It only ever caught a DELETED sample. ⇒ rung 1 for "you must notice",
+        // rung 3 for "you must test it", while the comment claimed rung 1 for both.
+        //
+        // Now each entry supplies a value AND a pattern, and the generated `_exhaustive` fn
+        // matches on those patterns — so a new variant cannot compile until it is listed HERE,
+        // and listing it here IS adding its sample. The count is derived, never written down.
+        macro_rules! census {
+            ($($sample:expr => $pat:pat),+ $(,)?) => {{
+                #[allow(dead_code)]
+                fn _exhaustive(r: &FulfillResponse) {
+                    match r { $($pat => (),)+ }
+                }
+                vec![$($sample),+]
+            }};
+        }
+
+        let row = StuckClaim {
+            claim_id: "c-old".into(),
+            game_id: "gk:a".into(),
+            link_token: domain::SELF_LINK_TOKEN.into(),
+            is_self: true,
+            pending_since: OffsetDateTime::UNIX_EPOCH,
+            age_hours: 1920,
+        };
+
+        let mut samples = census![
+            FulfillResponse::GiftUrl { url: "u".into() } => FulfillResponse::GiftUrl { .. },
+            FulfillResponse::RevealedKey { key: "k".into() } => FulfillResponse::RevealedKey { .. },
+            FulfillResponse::AlreadyRedeemed => FulfillResponse::AlreadyRedeemed,
+            FulfillResponse::KeyDead => FulfillResponse::KeyDead,
+            FulfillResponse::Parked { reason: "r".into() } => FulfillResponse::Parked { .. },
+            FulfillResponse::SyncDone => FulfillResponse::SyncDone,
+            FulfillResponse::Whispered => FulfillResponse::Whispered,
+            FulfillResponse::Lanterned => FulfillResponse::Lanterned,
+            FulfillResponse::PreviewSent => FulfillResponse::PreviewSent,
+            FulfillResponse::Belled => FulfillResponse::Belled,
+            FulfillResponse::PreviewBlocked => FulfillResponse::PreviewBlocked,
+            FulfillResponse::PreviewSendFailed => FulfillResponse::PreviewSendFailed,
+            FulfillResponse::PreviewQuiet => FulfillResponse::PreviewQuiet,
+            FulfillResponse::CookieStatus { ok: true } => FulfillResponse::CookieStatus { .. },
+            FulfillResponse::Error { message: "m".into() } => FulfillResponse::Error { .. },
+            FulfillResponse::StuckClaims { claims: vec![row] } => FulfillResponse::StuckClaims { .. },
+            FulfillResponse::Compensated => FulfillResponse::Compensated,
+            FulfillResponse::ClaimNotFound { claim_id: "c".into(), link_token: "SELF".into() }
+                => FulfillResponse::ClaimNotFound { .. },
+        ];
+        // DERIVED, not declared: one sample per variant, guaranteed by `_exhaustive` above.
+        let variant_count = samples.len();
+
+        // EXTRA sample, deliberately outside the census: serde rejects a bad shape on an EMPTY
+        // collection too, so the no-rows path needs its own row. It is appended rather than
+        // listed because a second `StuckClaims { .. }` pattern would be unreachable.
+        samples.push(FulfillResponse::StuckClaims { claims: vec![] });
+
+        // Distinct tags must equal the variant count — this catches two arms of `tag_of`
+        // returning the same string, which would silently shrink the census.
+        let covered: std::collections::BTreeSet<&str> = samples.iter().map(tag_of).collect();
+        assert_eq!(
+            covered.len(),
+            variant_count,
+            "tag_of maps two variants to the same name — the census is smaller than it looks. \
+             Covered: {covered:?}"
+        );
+
+        for resp in &samples {
+            let tag = tag_of(resp);
+            let json = serde_json::to_string(resp).unwrap_or_else(|e| {
+                panic!(
+                    "variant `{tag}` does not serialize under #[serde(tag = \"result\")]: {e}. \
+                     A newtype variant wrapping a Vec/sequence is the known cause — use a STRUCT \
+                     variant (`{{ items: Vec<_> }}`) so the tag has a map to live in."
+                )
+            });
+            assert!(
+                json.contains(&format!("\"result\":\"{tag}\"")),
+                "variant `{tag}` serialized without its internal tag: {json}"
+            );
+            assert_eq!(
+                &serde_json::from_str::<FulfillResponse>(&json).unwrap(),
+                resp,
+                "variant `{tag}` did not survive the round trip"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------------------------
