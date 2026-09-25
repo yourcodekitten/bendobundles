@@ -10471,3 +10471,110 @@ async fn a_claim_one_hour_inside_the_bar_is_not_listed() {
         "23h is inside the 24h bar — listing it would cry wolf"
     );
 }
+
+// ── Task 2: Compensate — the operator's hand ─────────────────────────────────
+
+#[tokio::test]
+async fn compensate_moves_a_self_claim_to_compensated() {
+    let Some(store) = store_or_skip("comp_self").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:s", SELF_LINK_TOKEN, "sc1", hours_ago(30)).await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let got = handle(
+        &d,
+        FulfillRequest::Compensate {
+            claim_id: "sc1".into(),
+            link_token: SELF_LINK_TOKEN.into(),
+        },
+    )
+    .await; // INFALLIBLE — no unwrap, no `?`
+
+    assert_eq!(got, FulfillResponse::Compensated);
+    let c = store
+        .get_claim(SELF_LINK_TOKEN, "sc1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(c.state, ClaimState::Compensated);
+}
+
+// 🔴 THE FRIEND ARM. This is the ONLY arm that touches `claims_used`, and `claims_used` is the
+// entire basis of the double-spend reason this design ships as "the SOLE guard" — with the policy
+// unconditioned on the table, IAM will not stop admin-api performing that decrement, so the design
+// is the only thing that does. Without this test that reason is prose.
+#[tokio::test]
+async fn compensate_on_a_friend_claim_returns_the_slot_by_decrementing_claims_used() {
+    let Some(store) = store_or_skip("comp_friend").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    seed_aged_pending(&store, "gk:f", "tok-friend", "fc1", hours_ago(30)).await;
+    let before = store
+        .get_link("tok-friend")
+        .await
+        .unwrap()
+        .unwrap()
+        .claims_used;
+    assert_eq!(
+        before, 1,
+        "claiming consumed a slot — the precondition, asserted not assumed"
+    );
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let got = handle(
+        &d,
+        FulfillRequest::Compensate {
+            claim_id: "fc1".into(),
+            link_token: "tok-friend".into(),
+        },
+    )
+    .await;
+
+    assert_eq!(got, FulfillResponse::Compensated);
+    let c = store.get_claim("tok-friend", "fc1").await.unwrap().unwrap();
+    assert_eq!(c.state, ClaimState::Compensated);
+    let after = store
+        .get_link("tok-friend")
+        .await
+        .unwrap()
+        .unwrap()
+        .claims_used;
+    assert_eq!(
+        after,
+        before - 1,
+        "the friend's slot must come back — this is the double-spend invariant"
+    );
+}
+
+#[tokio::test]
+async fn compensate_on_a_missing_claim_answers_error_not_compensated_and_not_already_redeemed() {
+    let Some(store) = store_or_skip("comp_missing").await else {
+        return;
+    };
+    let humble = MockServer::start().await;
+    let d = deps(store.clone(), &humble.uri(), None);
+
+    let got = handle(
+        &d,
+        FulfillRequest::Compensate {
+            claim_id: "nope".into(),
+            link_token: SELF_LINK_TOKEN.into(),
+        },
+    )
+    .await;
+
+    // POSITIVE assertion on the variant. `assert_ne!(got, Compensated)` is what let a placeholder
+    // returning `AlreadyRedeemed` pass an earlier revision of this plan.
+    match got {
+        FulfillResponse::Error { ref message } => {
+            assert!(
+                message.contains("not found"),
+                "the operator must be told WHICH failure: {message}"
+            );
+        }
+        other => panic!("a compensate that found nothing must answer Error, got {other:?}"),
+    }
+}

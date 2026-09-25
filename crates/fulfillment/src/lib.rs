@@ -155,6 +155,14 @@ pub enum FulfillRequest {
     /// role: `compensate_any` already owns the self-vs-link discrimination and re-deriving that
     /// predicate in a second place is how the two drift.
     StuckClaims,
+    /// Operator write: move one Pending claim to Compensated. **Human-pressed only** — nothing in
+    /// this crate calls it on a timer. Delegates to [`compensate_any`], which already owns the
+    /// self-vs-link discrimination for every reconcile arm; re-deriving that predicate in a second
+    /// place is how the two drift. `link_token` is required because `get_claim` is keyed on it.
+    Compensate {
+        claim_id: String,
+        link_token: String,
+    },
     /// MANUAL-INVOKE-ONLY diagnostic since the cookie-paste teardown. Its only in-app sender was
     /// admin-api's paste-validate (removed with the paste flow); EventBridge fires `Sync`, which
     /// already self-heals + reports `cookie_ok` on cadence. Reach this by a hand-run
@@ -261,6 +269,9 @@ pub enum FulfillResponse {
     },
     /// Operator read: every Pending claim past the bar, oldest first.
     StuckClaims(Vec<StuckClaim>),
+    /// Operator write: one Pending claim moved to Compensated. Fieldless — the operator's
+    /// confirmation is the 204; the row's new state lives in the store.
+    Compensated,
 }
 
 /// The pure gift-ladder decision. Compensate ONLY on definitive `AlreadyRedeemed`; park on
@@ -1019,6 +1030,39 @@ pub async fn handle(deps: &Deps, req: FulfillRequest) -> FulfillResponse {
                 .collect();
             rows.sort_by_key(|r| r.pending_since);
             FulfillResponse::StuckClaims(rows)
+        }
+        FulfillRequest::Compensate {
+            claim_id,
+            link_token,
+        } => {
+            // 🔴 THREE OUTCOMES, THREE ANSWERS. `.ok().flatten()` would collapse a StoreError and a
+            // genuine not-found into one `None`, so a transient DynamoDB fault would tell the
+            // operator "claim not found" about a claim they are looking at on screen — a failure
+            // wearing the shape of an absence.
+            let claim = match deps.store.get_claim(&link_token, &claim_id).await {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    return FulfillResponse::Error {
+                        message: format!("claim not found: {claim_id} on link {link_token}"),
+                    };
+                }
+                Err(e) => {
+                    return FulfillResponse::Error {
+                        message: format!("could not read claim {claim_id}: {e}"),
+                    };
+                }
+            };
+            if let Err(e) = compensate_any(deps, &claim).await {
+                // NO `.expect()`. A panic here is a lambda crash and the operator gets a 502
+                // instead of the reason; `handle` is infallible precisely so failures become
+                // readable responses.
+                tracing::error!(outcome = "compensate_failed", claim_id = %claim.id, error = %e);
+                return FulfillResponse::Error {
+                    message: format!("compensate failed: {e}"),
+                };
+            }
+            tracing::info!(outcome = "claim_compensated", claim_id = %claim.id, game_id = %claim.game_id);
+            FulfillResponse::Compensated
         }
         FulfillRequest::ValidateCookie => handle_validate_cookie(deps).await,
         FulfillRequest::Whisper => handle_whisper(deps).await,
