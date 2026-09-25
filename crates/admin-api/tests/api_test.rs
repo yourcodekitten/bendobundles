@@ -3861,3 +3861,72 @@ async fn stuck_claims_returns_the_rows_the_invoker_answered_with() {
     assert_eq!(v[0]["is_self"], true);
     assert_eq!(*log.lock().unwrap(), vec![FulfillRequest::StuckClaims]);
 }
+
+// ── Task 4: POST /admin/api/ops/claims/{claim_id}/compensate ─────────────────
+
+#[tokio::test]
+async fn compensate_refuses_without_confirm() {
+    let (app, _store, log) =
+        test_app_with_call_invoker("comp_noconfirm", FulfillResponse::Compensated).await;
+    let res = authed_post(
+        &app,
+        "/admin/api/ops/claims/sc1/compensate",
+        r#"{"link_token":"SELF"}"#,
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a destructive op needs an explicit confirm"
+    );
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "a refused confirm must not reach fulfillment"
+    );
+}
+
+#[tokio::test]
+async fn compensate_with_confirm_invokes_and_returns_204() {
+    let (app, _store, log) =
+        test_app_with_call_invoker("comp_ok", FulfillResponse::Compensated).await;
+    let res = authed_post(
+        &app,
+        "/admin/api/ops/claims/sc1/compensate",
+        r#"{"link_token":"tok-friend","confirm":true}"#,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec![FulfillRequest::Compensate {
+            claim_id: "sc1".into(),
+            link_token: "tok-friend".into()
+        }],
+        "the claim id comes from the PATH and the link token from the BODY"
+    );
+}
+
+/// Only correct alongside Task 2: fulfillment answers a vanished claim with
+/// `Error { message }` because there is no not-found variant, so a handler mapping every
+/// non-`Compensated` to 502 would tell an operator "bad gateway" about a missing row.
+#[tokio::test]
+async fn compensate_on_a_vanished_claim_is_404_not_502() {
+    let (app, _store, _log) = test_app_with_call_invoker(
+        "comp_404",
+        FulfillResponse::Error {
+            message: "claim not found: sc9 on link SELF".into(),
+        },
+    )
+    .await;
+    let res = authed_post(
+        &app,
+        "/admin/api/ops/claims/sc9/compensate",
+        r#"{"link_token":"SELF","confirm":true}"#,
+    )
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "a missing claim is the operator's problem to see, not a gateway error to debug"
+    );
+}

@@ -131,6 +131,10 @@ pub fn router(
         // 🔴 INSIDE `protected`, ABOVE `.route_layer(...)`. A route added after that call ships
         // UNAUTHENTICATED — `stuck_claims_requires_a_session` is the test that catches it.
         .route("/admin/api/ops/stuck-claims", get(handle_stuck_claims))
+        .route(
+            "/admin/api/ops/claims/{claim_id}/compensate",
+            post(handle_compensate_claim),
+        )
         .route("/admin/api/scrapbook", get(handle_scrapbook))
         .route("/admin/api/sync", post(handle_sync))
         .route("/admin/api/status", get(handle_status))
@@ -1336,6 +1340,68 @@ async fn handle_stuck_claims(State(s): State<AppState>) -> Response {
             .into_response(),
         Ok(other) => {
             tracing::error!(outcome = "stuck_claims_wrong_variant", got = ?other);
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "fulfillment answered the wrong variant" })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+// ── POST /admin/api/ops/claims/{claim_id}/compensate ─────────────────────────
+
+#[derive(serde::Deserialize)]
+struct CompensateBody {
+    link_token: String,
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// Operator write: compensate one stuck claim. Two-press by contract — `confirm` must be present
+/// AND true, so a single stray POST cannot move a claim.
+///
+/// The 404 arm is load-bearing and only correct alongside the `Compensate` verb: fulfillment answers
+/// a vanished claim with `Error { message }` (there is no not-found variant), so mapping every
+/// non-`Compensated` to 502 would tell an operator "bad gateway" about a missing row.
+async fn handle_compensate_claim(
+    State(s): State<AppState>,
+    Path(claim_id): Path<String>,
+    Json(body): Json<CompensateBody>,
+) -> Response {
+    if !body.confirm {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "confirm is required for a destructive op" })),
+        )
+            .into_response();
+    }
+    match s
+        .invoker
+        .call(FulfillRequest::Compensate {
+            claim_id: claim_id.clone(),
+            link_token: body.link_token,
+        })
+        .await
+    {
+        Ok(FulfillResponse::Compensated) => StatusCode::NO_CONTENT.into_response(),
+        Ok(FulfillResponse::Error { message }) if message.contains("not found") => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+        Ok(FulfillResponse::Error { message }) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+        Ok(other) => {
+            tracing::error!(outcome = "compensate_wrong_variant", claim_id = %claim_id, got = ?other);
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": "fulfillment answered the wrong variant" })),
