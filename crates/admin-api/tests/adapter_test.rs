@@ -343,7 +343,7 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
     let hash = test_admin_hash("pw");
 
     // lambda_runtime is NOT a dependency of admin-api and must not become one —
-    // lambda_http RE-EXPORTS it (lambda_http-1.3.0/src/lib.rs:77), the only
+    // lambda_http RE-EXPORTS it (lambda_http-1.3.1/src/lib.rs:77), the only
     // sanctioned path here (plan-review M3).
     use lambda_http::lambda_runtime;
     let payload: lambda_http::request::LambdaRequest = serde_json::from_str(&load_v1_fixture(

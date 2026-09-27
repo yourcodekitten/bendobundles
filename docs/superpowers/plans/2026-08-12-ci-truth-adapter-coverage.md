@@ -362,9 +362,9 @@ resourcePath, httpMethod, apiId`, **and `path` = `"/" + stage + top-level path`*
 missing five of these — the loader predicate below is what makes "real-shaped" a machine
 check instead of an adjective.
 
-`apigw_v2_guard.json` — copy `~/.cargo/registry/src/*/lambda_http-1.3.0/tests/data/apigw_v2_proxy_request_minimal.json` verbatim, then set `"rawPath": "/api/l/x"`, `"routeKey": "$default"`. (It must keep parsing as v2 AND not be captured by the v1 arm — spec D4.)
+`apigw_v2_guard.json` — copy `~/.cargo/registry/src/*/lambda_http-1.3.1/tests/data/apigw_v2_proxy_request_minimal.json` verbatim, then set `"rawPath": "/api/l/x"`, `"routeKey": "$default"`. (It must keep parsing as v2 AND not be captured by the v1 arm — spec D4.)
 
-`alb_guard.json` — copy `~/.cargo/registry/src/*/lambda_http-1.3.0/tests/data/alb_request.json` verbatim, set its path to `/api/l/x`. (The cascade has more arms than v1/v2; one ALB fixture pins the fall-through class — spec D4, OMBB Q4.)
+`alb_guard.json` — copy `~/.cargo/registry/src/*/lambda_http-1.3.1/tests/data/alb_request.json` verbatim, set its path to `/api/l/x`. (The cascade has more arms than v1/v2; one ALB fixture pins the fall-through class — spec D4, OMBB Q4.)
 
 **Degenerate fixtures — ONE PLANTED DEFECT PER COPY** (Lilith's required edit: a fixture
 carrying both defect classes proves only the arm that panics first — the masked arm's
@@ -392,7 +392,7 @@ Both are loaded ONLY by the predicate's own red tests, never by a translation te
 //! The env-free twin (adapter_stage_control_test.rs) proves the flag is load-bearing.
 //!
 //! Fixture provenance (spec D5): all apigw_v1_*.json derive from lambda_http 1.3.0's
-//! shipped corpus (registry: lambda_http-1.3.0/tests/data/apigw_proxy_request.json and
+//! shipped corpus (registry: lambda_http-1.3.1/tests/data/apigw_proxy_request.json and
 //! siblings), adapted to this app's routes and the deployed shape: REST v1, stage
 //! `live`, CloudFront origin_path /live (terraform/aws-cloudfront.tf:135-140).
 
@@ -975,7 +975,7 @@ async fn v1_response_translation_puts_set_cookie_in_multi_value_headers() {
     let hash = test_admin_hash("pw");
 
     // lambda_runtime is NOT a dependency of admin-api and must not become one —
-    // lambda_http RE-EXPORTS it (lambda_http-1.3.0/src/lib.rs:77: `pub use
+    // lambda_http RE-EXPORTS it (lambda_http-1.3.1/src/lib.rs:77: `pub use
     // lambda_runtime::{self, Context, LambdaEvent}`), which is the only sanctioned path
     // here (plan-review M3).
     use lambda_http::lambda_runtime;

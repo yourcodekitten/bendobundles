@@ -35,7 +35,7 @@ output. One theme: **a green CI must mean what it appears to mean.**
    stripping to API GW and does not mention the flag; the terraform comment is the accurate
    account. (Archives stay unedited; this spec is the correction of record.)
 3. **The flag is PRESENCE-triggered, not value-triggered** (OMBB + Lilith D5-4, independently;
-   verified at `lambda_http-1.3.0/src/request.rs:408`): `env::var(...).is_ok()` — any value
+   verified at `lambda_http-1.3.1/src/request.rs:408`): `env::var(...).is_ok()` — any value
    activates it, including `"false"` and `""`. Terraform's `= "true"` works by presence, not
    truth. Consequences: the env-free control requires the var *absent*, never falsy; and an
    operator "disabling" the flag with `false` would silently change nothing — D3 pins this
@@ -159,7 +159,7 @@ red; a guard that has never screamed never guarded).
 correction-class one level down).**
 - **The authority chain, stated honestly:** fixtures are built to the **documented full REST
   proxy event shape + this repo's terraform config** — NOT "derived from lambda_http's test
-  corpus." The corpus (`lambda_http-1.3.0/tests/data/apigw_proxy_request.json`) is a
+  corpus." The corpus (`lambda_http-1.3.1/tests/data/apigw_proxy_request.json`) is a
   **parser-exercise artifact**: eight top-level keys, no `multiValueHeaders`, no
   `multiValueQueryStringParameters`, no `body`, no `isBase64Encoded`, no
   `requestContext.path`. It bites mechanically: v1 translation **prefers the multi-value
