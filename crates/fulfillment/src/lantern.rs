@@ -407,11 +407,27 @@ mod tests {
             created_at: created,
         }
     }
-    /// The doors room BY HEADING, never by position. Position is doors only because doors happens
-    /// to be first in the array today: insert a room ahead of it and every positional assertion
-    /// below keeps passing while asserting nothing about doors at all. The chimney, wrapped and
-    /// closing tests already look up by heading — doors was the one population that did not.
-    /// (OMBB, #256 review.)
+    /// The doors room BY HEADING, never by position.
+    ///
+    /// The `#256` wording said "insert a room ahead of doors" and **understated it: the hazard is
+    /// not edit-dependent, it is live today.** `room()` returns `None` when its lines are empty
+    /// and the rooms vec is `.flatten()`ed, so an empty room is **dropped** — while `counts` stays
+    /// a fixed `[u32; 4]`. ⇒ `rooms[0]` is the doors room **only when doors is non-empty.**
+    ///
+    /// Measured, not imagined: `chimney_lists_pending_past_24h_…` builds `links: Vec<Link> =
+    /// vec![]`, so doors is `None` and `rooms[0]` is the **chimney** room — on merged `main`, with
+    /// no edit required. That makes the pre-existing heading lookups for chimney/wrapped/closing
+    /// **load-bearing rather than stylistic**, and doors the one place the coupling was real and
+    /// unguarded. `doors_room_is_not_rooms_zero_when_doors_is_empty` pins it.
+    ///
+    /// The `.expect` below is therefore doing more than documenting an invariant: it turns a
+    /// silently-wrong room into a loud failure.
+    ///
+    /// (Mechanism OMBB's; **the understatement was his too** — the edit-dependent framing comes from
+    /// his `#256` review body — **and I carried it forward without checking it.** He corrected the
+    /// attribution off me in `#257`: over-charging yourself is the same error as under-charging, it
+    /// just reads as rigour so nobody audits it. The accurate split is the better finding anyway —
+    /// it records that the framing survived a review AND a second author.)
     fn doors_room(l: &Lantern) -> &Room {
         l.rooms
             .iter()
@@ -737,6 +753,46 @@ mod tests {
                 .any(|x| x.contains("doors older than two months")),
             "no backlog line may be rendered at backlog == 0: {:?}",
             doors_room(&l).lines
+        );
+    }
+
+    #[test]
+    fn doors_room_is_not_rooms_zero_when_doors_is_empty() {
+        // Pins the mechanism the doc comment on `doors_room` describes: empty rooms are DROPPED
+        // (`room()` -> None, vec `.flatten()`ed), so position cannot identify the doors room.
+        // 🔴 THE FIRST VERSION OF THIS TEST INDEXED `rooms[0]` IN BOTH ASSERTIONS, SO IT PINNED
+        // "doors is not FIRST" AND NEVER "doors is ABSENT" — two different claims, and only the
+        // second is the documented mechanism. OMBB's counter-mutation, constructed and confirmed at
+        // my seat: have `room()` return `Some(Room { lines: vec![], .. })` AND order non-empty rooms
+        // first, and the old pair went GREEN with the doors room at index 1, present and undropped.
+        // (#257 review. Same defect as the one this whole sequence is about, one rung down.)
+        let mut games = HashMap::new();
+        games.insert("g1".into(), game("g1", "T"));
+        let friends = HashMap::new();
+        let links: Vec<Link> = vec![];
+        let pending = vec![claim("c1", "g1", SUN_TICK - time::Duration::days(72))];
+        let l = compose(&input(&links, &pending, &games, &friends, SUN_TICK, true)).unwrap();
+        // LOAD-BEARING: asserted over the WHOLE vec, so it pins DROPPED rather than displaced.
+        assert!(
+            !l.rooms
+                .iter()
+                .any(|r| r.heading.contains("doors nobody has walked through")),
+            "zero links ⇒ doors is None ⇒ dropped ⇒ ABSENT from rooms entirely, not merely moved: {:?}",
+            l.rooms.iter().map(|r| &r.heading).collect::<Vec<_>>()
+        );
+        // NON-VACUITY, not position. The previous version asserted `rooms[0]` and merely DOCUMENTED
+        // its own brittleness — but a comment saying "deliberately not load-bearing" does not stop an
+        // `assert!` reddening CI when a new room type lands between doors and chimney. *Naming a
+        // hazard inside the artifact that has it is not a guard against it.* And the positional form
+        // carried almost no information: `rooms` is a dense Vec, so "the next room takes index 0"
+        // follows from the whole-vec assertion above. This keeps the only thing it was really for —
+        // proof the fixture is non-vacuous, so the absence assertion is not being satisfied by an
+        // empty lantern. (OMBB, #257 nit; his own note-1 fix applied one line down.)
+        assert!(
+            l.rooms.iter().any(|r| r.heading.contains("chimney")),
+            "fixture must be NON-VACUOUS — a chimney room must exist, or the absence assertion above \
+             proves nothing: {:?}",
+            l.rooms.iter().map(|r| &r.heading).collect::<Vec<_>>()
         );
     }
 
