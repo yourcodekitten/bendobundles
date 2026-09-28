@@ -407,11 +407,22 @@ mod tests {
             created_at: created,
         }
     }
-    /// The doors room BY HEADING, never by position. Position is doors only because doors happens
-    /// to be first in the array today: insert a room ahead of it and every positional assertion
-    /// below keeps passing while asserting nothing about doors at all. The chimney, wrapped and
-    /// closing tests already look up by heading — doors was the one population that did not.
-    /// (OMBB, #256 review.)
+    /// The doors room BY HEADING, never by position.
+    ///
+    /// The `#256` wording said "insert a room ahead of doors" and **understated it: the hazard is
+    /// not edit-dependent, it is live today.** `room()` returns `None` when its lines are empty
+    /// and the rooms vec is `.flatten()`ed, so an empty room is **dropped** — while `counts` stays
+    /// a fixed `[u32; 4]`. ⇒ `rooms[0]` is the doors room **only when doors is non-empty.**
+    ///
+    /// Measured, not imagined: `chimney_lists_pending_past_24h_…` builds `links: Vec<Link> =
+    /// vec![]`, so doors is `None` and `rooms[0]` is the **chimney** room — on merged `main`, with
+    /// no edit required. That makes the pre-existing heading lookups for chimney/wrapped/closing
+    /// **load-bearing rather than stylistic**, and doors the one place the coupling was real and
+    /// unguarded. `doors_room_is_not_rooms_zero_when_doors_is_empty` pins it.
+    ///
+    /// The `.expect` below is therefore doing more than documenting an invariant: it turns a
+    /// silently-wrong room into a loud failure. (Mechanism OMBB's, `#256` review; the original
+    /// understatement was mine.)
     fn doors_room(l: &Lantern) -> &Room {
         l.rooms
             .iter()
@@ -737,6 +748,31 @@ mod tests {
                 .any(|x| x.contains("doors older than two months")),
             "no backlog line may be rendered at backlog == 0: {:?}",
             doors_room(&l).lines
+        );
+    }
+
+    #[test]
+    fn doors_room_is_not_rooms_zero_when_doors_is_empty() {
+        // Pins the mechanism the doc comment on `doors_room` now describes, so it is an assertion
+        // rather than a claim: empty rooms are DROPPED (`room()` -> None, vec `.flatten()`ed), so
+        // position does not identify the doors room. If `room()` or the flatten ever changes, this
+        // is what says so. (OMBB's specimen from the #256 review, made executable.)
+        let mut games = HashMap::new();
+        games.insert("g1".into(), game("g1", "T"));
+        let friends = HashMap::new();
+        let links: Vec<Link> = vec![];
+        let pending = vec![claim("c1", "g1", SUN_TICK - time::Duration::days(72))];
+        let l = compose(&input(&links, &pending, &games, &friends, SUN_TICK, true)).unwrap();
+        assert!(
+            l.rooms[0].heading.contains("chimney"),
+            "zero links ⇒ doors is None ⇒ flattened away ⇒ rooms[0] is the NEXT room: {:?}",
+            l.rooms.iter().map(|r| &r.heading).collect::<Vec<_>>()
+        );
+        assert!(
+            !l.rooms[0]
+                .heading
+                .contains("doors nobody has walked through"),
+            "…and definitively not the doors room, which is why position cannot identify it"
         );
     }
 
