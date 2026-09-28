@@ -146,10 +146,15 @@ pub struct Lantern {
     pub rooms: Vec<Room>,
     /// doors, chimney, wrapped, closing — what compose JUDGED (logged on quiet too).
     pub counts: [u32; 4],
-    /// Doors past their 60d birthday summarised by the backlog line (only before the first
-    /// delivery). Separate from `counts[0]` so the first lantern's log does not read "doors=0"
-    /// on the one week it carries nine of them (pass-1 review, minor 5).
+    /// Doors past their 60d birthday. Counted on EVERY tick, whether or not the backlog line is
+    /// rendered — `backlog: 0` therefore means "no such doors", never "suppressed" (#251). Separate
+    /// from `counts[0]` so the first lantern's log does not read "doors=0" on the one week it
+    /// carries nine of them (pass-1 review, minor 5).
     pub backlog: u32,
+    /// Whether the backlog LINE was rendered this tick — `!any_delivered && backlog > 0`. Pair it
+    /// with `backlog` to tell "announced" from "counted but gated off"; the gate is one-shot, so
+    /// after the first delivery this is permanently false while `backlog` may stay non-zero.
+    pub backlog_announced: bool,
 }
 
 fn is_shelf(l: &Link) -> bool {
@@ -236,12 +241,16 @@ pub fn compose(input: &Input) -> Option<Lantern> {
                     "· the door for {who} — open two months, {left} still inside. shall it stay open?"
                 )
             });
-        } else if !any_delivered && b60 < slot.start() {
+        } else if b60 < slot.start() {
+            // Counted UNCONDITIONALLY. Only the LINE is gated (below) — if the count rode the gate
+            // too, the log would read backlog=0 both when there are no old doors and when there are
+            // old doors nobody can see (#251).
             backlog += 1;
         }
     }
     let door_count = doors.len() as u32;
-    if backlog > 0 {
+    let backlog_announced = !any_delivered && backlog > 0;
+    if backlog_announced {
         // FIRST, so the room cap can never push it into "and N more" on the one tick that has it
         doors.insert(
             0,
@@ -338,6 +347,7 @@ pub fn compose(input: &Input) -> Option<Lantern> {
             rooms,
             counts,
             backlog,
+            backlog_announced,
         })
     }
 }
@@ -615,6 +625,69 @@ mod tests {
             compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).is_none(),
             "delivered once ⇒ backlog gone ⇒ quiet"
         );
+    }
+
+    #[test]
+    fn backlog_counts_past_sixty_day_doors_even_when_the_line_is_suppressed() {
+        // #251: the COUNT must not ride the same gate as the LINE. Once anything is delivered the
+        // backlog line is suppressed by design — but if the COUNT is suppressed with it, the log
+        // reads backlog=0 both when there are no old doors AND when there are old doors nobody can
+        // see. Those two states must be distinguishable.
+        let games = HashMap::new();
+        let friends = HashMap::new();
+        let none: Vec<Claim> = vec![];
+        let links = vec![
+            link("old1", SUN_TICK - time::Duration::days(70)),
+            link("old2", SUN_TICK - time::Duration::days(200)),
+            // b14 lands INSIDE this slot ⇒ a real door line, so the card is not quiet and the
+            // counts actually get logged. Without it this fixture proves nothing: compose would
+            // return None and there would be no card to read a count off.
+            // 15 days, not 14: the slot is the week ENDING at the tick (`start() = end() - 7d`),
+            // so created-14d puts b14 exactly ON `end()`, which `contains` excludes. Cost me a red.
+            link("fresh", SUN_TICK - time::Duration::days(15)),
+        ];
+
+        let before = compose(&input(&links, &none, &games, &friends, SUN_TICK, false)).unwrap();
+        assert_eq!(before.backlog, 2, "before any delivery: {:?}", before.rooms);
+        assert!(
+            before.backlog_announced,
+            "the line IS rendered before delivery"
+        );
+        assert!(
+            before.rooms[0].lines[0].contains("2 doors older than two months"),
+            "backlog line is FIRST: {:?}",
+            before.rooms[0].lines
+        );
+
+        let after = compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).unwrap();
+        assert_eq!(
+            after.backlog, 2,
+            "THE POINT: delivered ⇒ line suppressed, count STILL 2, so a reader can tell this from \
+             'no old doors at all'. rooms: {:?}",
+            after.rooms
+        );
+        assert!(
+            !after.backlog_announced,
+            "delivered ⇒ the line is NOT rendered"
+        );
+        assert!(
+            !after.rooms[0]
+                .lines
+                .iter()
+                .any(|l| l.contains("older than two months")),
+            "RENDERING UNCHANGED control — no backlog line after delivery: {:?}",
+            after.rooms[0].lines
+        );
+        assert_eq!(
+            after.counts[0], before.counts[0],
+            "door_count excludes the backlog line in BOTH states (:149-151, pass-1 minor 5)"
+        );
+
+        // A world with no old doors at all must read 0 — otherwise the distinguishability above is
+        // vacuous, because every state would report a non-zero backlog.
+        let only_fresh = vec![link("fresh", SUN_TICK - time::Duration::days(15))];
+        let nil = compose(&input(&only_fresh, &none, &games, &friends, SUN_TICK, true)).unwrap();
+        assert_eq!(nil.backlog, 0, "no old doors ⇒ 0, and 0 now MEANS none");
     }
 
     #[test]

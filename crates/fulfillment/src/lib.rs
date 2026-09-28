@@ -5715,7 +5715,7 @@ async fn run_lantern(deps: &Deps, slot: &lantern::Slot) -> bool {
             return false;
         }
     }
-    tracing::info!(slot = %slot.key(), doors = d, chimney = c, wrapped = w, closing = x, backlog = card.backlog, "lantern composed");
+    tracing::info!(slot = %slot.key(), doors = d, chimney = c, wrapped = w, closing = x, backlog = card.backlog, backlog_announced = card.backlog_announced, "lantern composed");
     send_and_mark(deps, &url, slot, &card).await
 }
 
@@ -5869,6 +5869,7 @@ async fn handle_lantern_preview(deps: &Deps) -> FulfillResponse {
         wrapped = w,
         closing = x,
         backlog = card.backlog,
+        backlog_announced = card.backlog_announced,
         "lantern_preview: composed"
     );
     let body = lantern::render(&card, &input.slot, &deps.whisper_site_url, true);
