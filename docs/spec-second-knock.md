@@ -83,37 +83,67 @@ a step that is not failing.
 trade the product's no-account warmth for a mailing list, and the anti-reference list forbids exactly
 that kind of drift. **The app supplies the window and the hand; the arm is Ben's.**
 
-## 5. The three parts
+## 5. What already exists — corrected 2026-09-28 after reading the code, not the spec's memory
 
-### 5a. A surface — *the porch*, on PULL
+🔴 **§5a of this spec's first draft proposed "a porch — a PULL surface listing open zero-claim links."
+IT ALREADY EXISTS.** `admin-api/src/scrapbook.rs` composes `doors_open: Vec<ScrapbookDoor>`
+(`{link_token, link_label, recipient, claims_left, created_at}`), and `web/src/admin/Scrapbook.tsx:231`
+renders it under its own heading **"doors left open"**, one line per door, recipient named.
 
-A room listing every **open, zero-claim** link: label, age, slots waiting, and the curated picks it
-carries. **On pull, not push** — the scrapbook's grammar, not the lantern's. A pull surface cannot
-nag, and this is standing state, not news.
+**The window is built. Cutting §5a was the fourth time this morning that an idea of mine turned out to
+already be in this repo** — and it is the reason this section now leads with what exists.
 
-Ordering: oldest first. **Age is the story** ("waiting since july 10").
+⇒ **The doorstep's opening sentence, inverted.** It said: *"the house has no window that looks at the
+step and no hand that can pick it up."* Here: ***there IS a window. There is no hand.***
 
-### 5b. A hand — *knock again*, or *close the door*
+`Scrapbook.tsx:242` — the entire door row:
 
-Two actions per row, and the second is what makes the first honest:
+```tsx
+<p key={d.link_token} className="text-sm text-ink-soft">
+  {clauses.join(' · ')}   // "the door ben left open for sam · open 0 years · 5 claims left"
+</p>
+```
 
-1. **knock again** — copy a ready-to-send message with the link and, when the link is curated, the
-   names of the games chosen for them. Ben pastes it into the chat it died in.
-2. **close the door** — retire a link that is never going to be walked through. Its slots return to
-   the shelf; the row leaves the porch.
+A `<p>`. Ben can read that eleven gifts are waiting and **do nothing about any of them from there.**
 
-**A list that can be EMPTIED is not a nag.** This is the doorstep's *compensate-or-leave* shape:
-every row has a resolution, so the surface converges instead of accumulating.
+## 5b. 🔴 A DEFECT FOUND ON THE WAY: "door" means two different sets in two surfaces
 
-### 5c. A voice — the lantern stops spending its one line
+| surface | predicate | includes a partly-claimed link? |
+|---|---|---|
+| **scrapbook** `doors_open` | `Link::is_open_door(now)` = `can_claim(now).is_ok()` (`domain/src/lib.rs:407`) | **YES** |
+| **lantern** 🚪doors room | `can_claim(now).is_ok()` **and `claims_used == 0`** (`spec-lantern.md`) | **NO** |
 
-Replace the one-shot backlog line with a **standing doors summary** that names the porch:
-*"N doors nobody has walked through ↗ porch"*. One line, every tick, **counting state that exists** —
-and it disappears the moment the count is zero, which Ben now has the tools to reach.
+**One product, one word, two populations.** The 6/15 link (9 slots waiting) is a door on the scrapbook
+and not a door to the lantern. Nothing is wrong today because no lantern has counted a live door yet —
+**`doors: 1` on 09-27 is the spread's first observable, not its cause.**
 
-**This is not nagging, on the spec's own test** (*"one honest line, until he acts, is the feature
-working — not the feature nagging"*): the line is honest, it names an action, and **it is clearable.**
-The old line was unclearable, which is precisely why it had to be one-shot.
+⇒ **This answers Q4 from the code rather than from taste: the porch inherits `is_open_door`**, because
+that is what the existing window already shows and a hand that acts on a *different* set than the window
+displays is a trap. **The lantern/scrapbook divergence is filed as its own issue, not fixed here** —
+reconciling two definitions is a change to a live weekly register and does not belong inside a feature.
+
+## 5c. The hand — *knock again* and *close the door*
+
+Two actions on each existing door row, and the second is what makes the first honest:
+
+1. **knock again** — copy a ready-to-send message carrying the link. Ben pastes it into the chat it
+   died in. **The app composes; Ben sends.** (§4: there is no channel to the friend, and this spec does
+   not add one.)
+2. **close the door** — `POST /admin/api/links/{token}/revoke`, **which already exists**
+   (`admin-api/src/lib.rs`, `Link::revoked`, `ClaimRefusal::Revoked`). The row leaves the window.
+
+**Q2 is answered against my own alternative:** revoke **REMOVEs** the `shelf_token` attribute under the
+stated doctrine *"no dead capability at rest"* (`domain/src/lib.rs:198`). ⇒ **a new `retired` state that
+hid the row but left the token live would be a dead capability at rest by another name.** Use revoke;
+make the copy honest — *"this takes the gift back — the link stops working."*
+
+**A list that can be EMPTIED is not a nag.** Every door now has a resolution, so the window converges.
+
+## 5d. The voice — the lantern stops spending its one line
+
+Replace the one-shot backlog line with a **standing doors line** naming the count and pointing at the
+window. **It is clearable** — which is exactly why it may stand where the old line had to be one-shot.
+*(Q1: still open to family. This is the half I am least sure of.)*
 
 ## 6. Criterion ⑥ — the fire-rate floor
 
@@ -126,6 +156,9 @@ the surface renders all 11 on its first load.** The failure mode that killed the
 that can never fire — is not reachable here; the risk runs the *other* way (the porch starts full).
 
 ## 7. Open questions for family review
+
+> **Q2 and Q4 are now ANSWERED FROM THE CODE** (§5b, §5c) and kept below as the record of what was
+> asked. **Q1 and Q3 remain genuinely open.**
 
 - **Q1 — push dose.** §5c proposes a standing weekly line. Is a *clearable* standing line genuinely
   outside the nagging rule, or does any every-tick line rebuild the silent-loop the 2026-07-29 ruling
