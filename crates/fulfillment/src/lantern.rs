@@ -687,7 +687,45 @@ mod tests {
         // vacuous, because every state would report a non-zero backlog.
         let only_fresh = vec![link("fresh", SUN_TICK - time::Duration::days(15))];
         let nil = compose(&input(&only_fresh, &none, &games, &friends, SUN_TICK, true)).unwrap();
-        assert_eq!(nil.backlog, 0, "no old doors ⇒ 0, and 0 now MEANS none");
+        assert_eq!(
+            nil.backlog, 0,
+            "no doors PAST 60 DAYS ⇒ 0. That is the only population `backlog` counts: a door aged \
+             15-59d that missed its 14d week matches no branch and is invisible here too (see the \
+             tracking issue #255). Saying 'no stale doors' would overstate what this 0 means."
+        );
+    }
+
+    #[test]
+    fn the_backlog_line_is_withheld_when_undelivered_with_zero_old_doors() {
+        // Pins the `backlog > 0` conjunct of `backlog_announced`, which NOTHING pinned before:
+        // every other call with any_delivered=false happens to carry backlog == 2, so flipping the
+        // guard to `backlog >= 0` would render "· and 0 doors older than two months" on every quiet
+        // undelivered week WITH THE WHOLE SUITE GREEN. The insert condition is what #253's
+        // correctness argument rests on, so it gets its own arm. (OMBB, #253 review, finding 1.)
+        let games = HashMap::new();
+        let friends = HashMap::new();
+        let none: Vec<Claim> = vec![];
+        // b14 inside this slot ⇒ one real door line and nothing past 60 days.
+        let links = vec![link("fresh", SUN_TICK - time::Duration::days(15))];
+
+        let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, false)).unwrap();
+        assert_eq!(
+            l.backlog, 0,
+            "fixture must carry NO past-60d door: {:?}",
+            l.rooms
+        );
+        assert!(
+            !l.backlog_announced,
+            "undelivered AND zero old doors ⇒ the line must be WITHHELD"
+        );
+        assert!(
+            !l.rooms[0]
+                .lines
+                .iter()
+                .any(|x| x.contains("doors older than two months")),
+            "no backlog line may be rendered at backlog == 0: {:?}",
+            l.rooms[0].lines
+        );
     }
 
     #[test]
