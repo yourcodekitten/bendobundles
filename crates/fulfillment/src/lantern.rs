@@ -780,11 +780,18 @@ mod tests {
             "zero links ⇒ doors is None ⇒ dropped ⇒ ABSENT from rooms entirely, not merely moved: {:?}",
             l.rooms.iter().map(|r| &r.heading).collect::<Vec<_>>()
         );
-        // Ordinary sanity, deliberately NOT load-bearing: brittle by nature — insert any new room
-        // type between doors and chimney and this reddens for a reason unrelated to the mechanism.
+        // NON-VACUITY, not position. The previous version asserted `rooms[0]` and merely DOCUMENTED
+        // its own brittleness — but a comment saying "deliberately not load-bearing" does not stop an
+        // `assert!` reddening CI when a new room type lands between doors and chimney. *Naming a
+        // hazard inside the artifact that has it is not a guard against it.* And the positional form
+        // carried almost no information: `rooms` is a dense Vec, so "the next room takes index 0"
+        // follows from the whole-vec assertion above. This keeps the only thing it was really for —
+        // proof the fixture is non-vacuous, so the absence assertion is not being satisfied by an
+        // empty lantern. (OMBB, #257 nit; his own note-1 fix applied one line down.)
         assert!(
-            l.rooms[0].heading.contains("chimney"),
-            "sanity: with doors dropped, the next room takes index 0: {:?}",
+            l.rooms.iter().any(|r| r.heading.contains("chimney")),
+            "fixture must be NON-VACUOUS — a chimney room must exist, or the absence assertion above \
+             proves nothing: {:?}",
             l.rooms.iter().map(|r| &r.heading).collect::<Vec<_>>()
         );
     }
