@@ -421,8 +421,13 @@ mod tests {
     /// unguarded. `doors_room_is_not_rooms_zero_when_doors_is_empty` pins it.
     ///
     /// The `.expect` below is therefore doing more than documenting an invariant: it turns a
-    /// silently-wrong room into a loud failure. (Mechanism OMBB's, `#256` review; the original
-    /// understatement was mine.)
+    /// silently-wrong room into a loud failure.
+    ///
+    /// (Mechanism OMBB's; **the understatement was his too** — the edit-dependent framing comes from
+    /// his `#256` review body — **and I carried it forward without checking it.** He corrected the
+    /// attribution off me in `#257`: over-charging yourself is the same error as under-charging, it
+    /// just reads as rigour so nobody audits it. The accurate split is the better finding anyway —
+    /// it records that the framing survived a review AND a second author.)
     fn doors_room(l: &Lantern) -> &Room {
         l.rooms
             .iter()
@@ -753,26 +758,34 @@ mod tests {
 
     #[test]
     fn doors_room_is_not_rooms_zero_when_doors_is_empty() {
-        // Pins the mechanism the doc comment on `doors_room` now describes, so it is an assertion
-        // rather than a claim: empty rooms are DROPPED (`room()` -> None, vec `.flatten()`ed), so
-        // position does not identify the doors room. If `room()` or the flatten ever changes, this
-        // is what says so. (OMBB's specimen from the #256 review, made executable.)
+        // Pins the mechanism the doc comment on `doors_room` describes: empty rooms are DROPPED
+        // (`room()` -> None, vec `.flatten()`ed), so position cannot identify the doors room.
+        // 🔴 THE FIRST VERSION OF THIS TEST INDEXED `rooms[0]` IN BOTH ASSERTIONS, SO IT PINNED
+        // "doors is not FIRST" AND NEVER "doors is ABSENT" — two different claims, and only the
+        // second is the documented mechanism. OMBB's counter-mutation, constructed and confirmed at
+        // my seat: have `room()` return `Some(Room { lines: vec![], .. })` AND order non-empty rooms
+        // first, and the old pair went GREEN with the doors room at index 1, present and undropped.
+        // (#257 review. Same defect as the one this whole sequence is about, one rung down.)
         let mut games = HashMap::new();
         games.insert("g1".into(), game("g1", "T"));
         let friends = HashMap::new();
         let links: Vec<Link> = vec![];
         let pending = vec![claim("c1", "g1", SUN_TICK - time::Duration::days(72))];
         let l = compose(&input(&links, &pending, &games, &friends, SUN_TICK, true)).unwrap();
+        // LOAD-BEARING: asserted over the WHOLE vec, so it pins DROPPED rather than displaced.
         assert!(
-            l.rooms[0].heading.contains("chimney"),
-            "zero links ⇒ doors is None ⇒ flattened away ⇒ rooms[0] is the NEXT room: {:?}",
+            !l.rooms
+                .iter()
+                .any(|r| r.heading.contains("doors nobody has walked through")),
+            "zero links ⇒ doors is None ⇒ dropped ⇒ ABSENT from rooms entirely, not merely moved: {:?}",
             l.rooms.iter().map(|r| &r.heading).collect::<Vec<_>>()
         );
+        // Ordinary sanity, deliberately NOT load-bearing: brittle by nature — insert any new room
+        // type between doors and chimney and this reddens for a reason unrelated to the mechanism.
         assert!(
-            !l.rooms[0]
-                .heading
-                .contains("doors nobody has walked through"),
-            "…and definitively not the doors room, which is why position cannot identify it"
+            l.rooms[0].heading.contains("chimney"),
+            "sanity: with doors dropped, the next room takes index 0: {:?}",
+            l.rooms.iter().map(|r| &r.heading).collect::<Vec<_>>()
         );
     }
 
