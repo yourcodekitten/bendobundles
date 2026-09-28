@@ -407,6 +407,18 @@ mod tests {
             created_at: created,
         }
     }
+    /// The doors room BY HEADING, never by position. Position is doors only because doors happens
+    /// to be first in the array today: insert a room ahead of it and every positional assertion
+    /// below keeps passing while asserting nothing about doors at all. The chimney, wrapped and
+    /// closing tests already look up by heading — doors was the one population that did not.
+    /// (OMBB, #256 review.)
+    fn doors_room(l: &Lantern) -> &Room {
+        l.rooms
+            .iter()
+            .find(|r| r.heading.contains("doors nobody has walked through"))
+            .expect("this fixture must produce a doors room")
+    }
+
     // `Game` and `Claim` do NOT impl Default (measured) — every field is listed.
     fn game(id: &str, title: &str) -> Game {
         Game {
@@ -561,7 +573,7 @@ mod tests {
         );
         let links = vec![inside, at_end, before, sixty];
         let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).unwrap();
-        let doors = &l.rooms[0];
+        let doors = doors_room(&l);
         assert_eq!(doors.lines.len(), 2, "{:?}", doors.lines);
         // oldest first: `sixty` (created ~60d ago) precedes `in` (~14d ago); `-` is not a
         // Markdown metacharacter, so labels render unescaped
@@ -597,7 +609,7 @@ mod tests {
         door.friend_id = Some("f1".into());
         let links = vec![shelf, door];
         let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).unwrap();
-        let lines = &l.rooms[0].lines;
+        let lines = &doors_room(&l).lines;
         assert!(
             lines[0].contains("the shelf for") && lines[0].contains("15 slots"),
             "{lines:?}"
@@ -617,9 +629,9 @@ mod tests {
         ];
         let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, false)).unwrap();
         assert!(
-            l.rooms[0].lines[0].contains("2 doors older than two months"),
+            doors_room(&l).lines[0].contains("2 doors older than two months"),
             "backlog line is FIRST: {:?}",
-            l.rooms[0].lines
+            doors_room(&l).lines
         );
         assert!(
             compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).is_none(),
@@ -654,9 +666,9 @@ mod tests {
             "the line IS rendered before delivery"
         );
         assert!(
-            before.rooms[0].lines[0].contains("2 doors older than two months"),
+            doors_room(&before).lines[0].contains("2 doors older than two months"),
             "backlog line is FIRST: {:?}",
-            before.rooms[0].lines
+            doors_room(&before).lines
         );
 
         let after = compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).unwrap();
@@ -671,12 +683,12 @@ mod tests {
             "delivered ⇒ the line is NOT rendered"
         );
         assert!(
-            !after.rooms[0]
+            !doors_room(&after)
                 .lines
                 .iter()
                 .any(|l| l.contains("older than two months")),
             "RENDERING UNCHANGED control — no backlog line after delivery: {:?}",
-            after.rooms[0].lines
+            doors_room(&after).lines
         );
         assert_eq!(
             after.counts[0], before.counts[0],
@@ -687,7 +699,45 @@ mod tests {
         // vacuous, because every state would report a non-zero backlog.
         let only_fresh = vec![link("fresh", SUN_TICK - time::Duration::days(15))];
         let nil = compose(&input(&only_fresh, &none, &games, &friends, SUN_TICK, true)).unwrap();
-        assert_eq!(nil.backlog, 0, "no old doors ⇒ 0, and 0 now MEANS none");
+        assert_eq!(
+            nil.backlog, 0,
+            "no doors PAST 60 DAYS ⇒ 0. That is the only population `backlog` counts: a door aged \
+             15-59d that missed its 14d week matches no branch and is invisible here too (see the \
+             tracking issue #255). Saying 'no stale doors' would overstate what this 0 means."
+        );
+    }
+
+    #[test]
+    fn the_backlog_line_is_withheld_when_undelivered_with_zero_old_doors() {
+        // Pins the `backlog > 0` conjunct of `backlog_announced`, which NOTHING pinned before:
+        // every other call with any_delivered=false happens to carry backlog == 2, so flipping the
+        // guard to `backlog >= 0` would render "· and 0 doors older than two months" on every quiet
+        // undelivered week WITH THE WHOLE SUITE GREEN. The insert condition is what #253's
+        // correctness argument rests on, so it gets its own arm. (OMBB, #253 review, finding 1.)
+        let games = HashMap::new();
+        let friends = HashMap::new();
+        let none: Vec<Claim> = vec![];
+        // b14 inside this slot ⇒ one real door line and nothing past 60 days.
+        let links = vec![link("fresh", SUN_TICK - time::Duration::days(15))];
+
+        let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, false)).unwrap();
+        assert_eq!(
+            l.backlog, 0,
+            "fixture must carry NO past-60d door: {:?}",
+            l.rooms
+        );
+        assert!(
+            !l.backlog_announced,
+            "undelivered AND zero old doors ⇒ the line must be WITHHELD"
+        );
+        assert!(
+            !doors_room(&l)
+                .lines
+                .iter()
+                .any(|x| x.contains("doors older than two months")),
+            "no backlog line may be rendered at backlog == 0: {:?}",
+            doors_room(&l).lines
+        );
     }
 
     #[test]
@@ -795,8 +845,8 @@ mod tests {
             })
             .collect();
         let l = compose(&input(&links, &none, &games, &friends, SUN_TICK, true)).unwrap();
-        assert_eq!(l.rooms[0].lines.len(), ROOM_CAP);
-        assert_eq!(l.rooms[0].more, 3);
+        assert_eq!(doors_room(&l).lines.len(), ROOM_CAP);
+        assert_eq!(doors_room(&l).more, 3);
     }
 
     #[test]
