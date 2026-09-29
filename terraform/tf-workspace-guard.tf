@@ -27,6 +27,17 @@
 # would move live state ("bendobundles/production/terraform.tfstate" -> a new path). That is a
 # state migration and Ben's call, not an edit. Recorded rather than coded around.
 #
+# 🔴 MEASURED LIMIT — THIS DOES NOT COVER `terraform destroy`. On a fixture whose
+# default workspace was seeded with real state BEFORE the guard was armed:
+#     terraform plan            -> precondition FIRES (rc=1)      check block FIRES
+#     terraform plan -destroy   -> precondition SILENT            check block SILENT
+#                                  ("Plan: 0 to add, 0 to change, 1 to destroy")
+# Terraform evaluates neither resource preconditions nor `check` assertions during
+# DESTROY planning, so both mechanisms are blind on the operation with the largest
+# blast radius. Stated rather than coded around: a guard's silence IS its pass state,
+# so a mis-scoped guard is invisible — including this one. (OMBB asked the question
+# from the docs and could not settle it; this is the fixture answer.)
+#
 # NOT a `check` block: those only WARN, and the consequence here is a plan against
 # the account foundation. This must refuse.
 #
@@ -37,14 +48,30 @@
 #
 # CI-safe, measured not assumed: ci.yml runs `init -backend=false` + `validate`,
 # and preconditions are evaluated at PLAN time, not by `validate`. Verified green.
-# Mechanism red/green-controlled before shipping: default workspace -> rc=1 naming
-# the refusal; workspace "production" -> rc=0, plan succeeds.
+# Mechanism controlled on an isolated fixture before shipping — THREE arms, because
+# two would not have caught the denylist defect:
+#     default      -> rc=1  REFUSING (the root-adoption case)
+#     producton    -> rc=1  REFUSING (a MISTYPED workspace; the old `!= "default"`
+#                                     PASSED this and proposed creating the stack)
+#     production  -> rc=0  plan succeeds
+locals {
+  # ALLOWLIST, not a denylist. `!= "default"` accepted every other string, so a
+  # MISTYPED workspace ("producton") passed, got the prefix applied, resolved to a
+  # path that does not exist, and the plan proposed CREATING THE ENTIRE STACK —
+  # duplicate infrastructure rather than root adoption, and on an IAM stack that is
+  # not the milder failure. (OMBB on #258.)
+  # 🔑 And the guard's own remediation text said `workspace new`, which is the route
+  #    to the case it missed. An allowlist closes the hole AND the advice.
+  allowed_workspaces = ["production"]
+}
+
 resource "terraform_data" "workspace_guard" {
   lifecycle {
     precondition {
-      condition     = terraform.workspace != "default"
+      condition     = contains(local.allowed_workspaces, terraform.workspace)
       error_message = <<-EOT
-        REFUSING: this stack is running in the DEFAULT workspace.
+        REFUSING: workspace "${terraform.workspace}" is not an allowed workspace
+        for this stack. Allowed: ${join(", ", local.allowed_workspaces)}.
 
         The backend key is bare and workspace_key_prefix applies only to
         non-default workspaces, so the default workspace resolves to the
