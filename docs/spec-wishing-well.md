@@ -37,15 +37,15 @@ Owned tells you what to skip. This tells you what to take.
 ## 2. What the friend sees
 
 1. **The star.** Every card whose `steam_app_id` is on the friend's wishlist gets a `⭐ on your
-   wishlist` pill, in the same chip row as the owned pill. Hovering or focusing it shows the date:
-   `since mar 2023`, taken from `date_added`. The card's accessible name includes the same text.
+   wishlist` pill, in the same chip row as the owned pill. Hovering it shows the date:
+   `since mar 2023`, taken from `date_added`. The card's accessible name includes the same text. (The pill is not focusable. Keyboard and screen-reader users get the date through the card's name. Touch users see the pill but not the date, and that is accepted for v1.)
 2. **The float (open-shelf links only).** In a shuffled link, starred games move to the front. **The
    shuffle still happens inside each group:** starred games are shuffled among themselves, then the
    rest. The per-visit rank lock (`shuffleRanksRef`) still holds, so a claim refresh never
    rearranges the shelf.
 3. **Curated links keep Ben's order.** A curated link's order is the order Ben picked (spec §5 of the
    curated work), so starred cards are marked but **never moved**.
-4. **The count line (open AND curated links).** When at least one game matches, one line appears above the grid:
+4. **The count line (open AND curated links).** It counts the starred **cards** the grid renders: one per game on curated links, and one per title on open shelves (the grid dedupes by title). Its slot is **reserved** whenever a Steam identity is on the page, so a line that arrives late fills in place and moves no card. When at least one card is starred, the line reads:
    `⭐ 3 of these are on your wishlist` (singular form: `1 of these is`). When nothing matches, no
    line appears. Silence is the correct output for "no match", and also for "can't see".
 5. **Precedence.** If a game is both owned and wishlisted (Steam normally removes a game from the
@@ -71,7 +71,7 @@ link's own games.** The server intersects before it answers, for two reasons:
   mirror of it.)
 - **Size.** The payload is bounded by the shelf, not by someone's 2,000-item wishlist.
 
-A hidden or empty wishlist ⇒ `{"items":[]}`. There is no `private` flag, because we cannot measure one
+A store error while reading the shelf ⇒ `500 try again`, which the client treats silently like any failure. A hidden or empty wishlist ⇒ `{"items":[]}`. There is no `private` flag, because we cannot measure one
 (§1.1). Steam unavailable ⇒ `503`, which the client treats as "no stars" and never as an error banner.
 The response gets `Cache-Control: private, max-age=3600`, so it lives only in the friend's own browser (§4).
 
@@ -99,12 +99,23 @@ his options: no server-side record at all.**
 
 - `steamWishlistForLink(token, steamid) -> Promise<WishItem[]>`. It throws `FetchFailed` on
   404/409/!ok, the same as `steamOwnedForLink`.
-- **Fetched whenever a Steam identity is present on the page**, whether from the OpenID return or
-  restored from localStorage. `SteamIdentity`'s stored shape is **unchanged**, so friends who connected
-  before this ships see stars too, with no migration.
+- **When it is fetched (revised at review, #259):** its own effect, keyed on `(token, steamid, eligible)`.
+  Eligible means the link is **loading** (so the request runs in parallel with the link fetch) or
+  **active**. Consequences, stated rather than implied:
+  - A sealed or dead link gets **one** request during the load. It 409s silently and is not asked again.
+  - A gift that **unwraps** during the visit becomes eligible and **is** asked.
+  - An **exhausted** link 409s, so it never shows stars. After a friend's last claim the link turns
+    exhausted and the stars and count line go away mid-visit, which is correct: there is nothing
+    left to take.
+  - The steamid comes from the stored identity or the OpenID return. `SteamIdentity`'s stored shape
+    is **unchanged**, so friends who connected before this ships see stars too, with no migration.
+- **Stars need an identity on the page.** If the owned call fails on the OpenID return, no identity
+  is saved and no stars show, since there would be no "disconnect" to clear them. Disconnect clears
+  the steamid, which cancels any request still in flight.
 - **A wishlist failure never blocks owned** and never sets `steamError`. It degrades to no stars.
 - **The float lands before the cards do (amended at implementation, from Lilith's layout-jump review).**
-  On an active open shelf, the first render waits **at most 400 ms** for the wishlist. If it lands in
+  On an active open shelf, the **grid** (not the page) waits **at most 400 ms** for the wishlist, and on
+  the OpenID return it also waits for owned, so an owned game can never freeze into the float. If it lands in
   time, starred games float, and the order is **frozen for the visit** from that render onward. If it
   lands later, it **adds stars and moves nothing**, because a card never slides away under a friend's
   cursor. Curated links never wait. A reload is a new visit and reshuffles, as the shelf shuffle

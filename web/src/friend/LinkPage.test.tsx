@@ -926,6 +926,8 @@ describe("typewriter (animations on)", () => {
       expect(screen.queryByText(/of these (are|is) on your wishlist/)).not.toBeInTheDocument();
       expect(screen.queryByText(/wishlist/i)).not.toBeInTheDocument();
       expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      // steamError renders as a plain <p> (no role) — assert its TEXT is absent too (pass 2 #4)
+      expect(screen.queryByText(/Steam is currently unavailable|couldn.t verify/i)).not.toBeInTheDocument();
     });
 
     it("open shelf: starred cards render first", async () => {
@@ -961,7 +963,9 @@ describe("typewriter (animations on)", () => {
       renderLinkPage();
       await act(async () => { await vi.advanceTimersByTimeAsync(0); });
       await act(async () => { await vi.advanceTimersByTimeAsync(200); });
-      expect(screen.getByText("loading...")).toBeInTheDocument();
+      // the HOLD is the grid's, not the page's (review pass 2 #7): the page is up, the grid empty
+      expect(screen.queryByText("loading...")).not.toBeInTheDocument();
+      expect(screen.getByText("Test Bundle")).toBeInTheDocument();
       expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0);
       await act(async () => { resolveWish([{ appid: 1005, added: 1678000000 }]); });
       await act(async () => { await vi.advanceTimersByTimeAsync(0); });
@@ -1029,6 +1033,45 @@ describe("typewriter (animations on)", () => {
       await waitFor(() => expect(screen.getByText("⭐ 1 of these is on your wishlist")).toBeInTheDocument());
       await userEvent.click(screen.getByRole("button", { name: /disconnect/i }));
       await waitFor(() => expect(screen.queryByText(/on your wishlist/)).not.toBeInTheDocument());
+    });
+
+    // ── review pass 2 (#259) ──
+
+    it("an EMPTY wishlist ([] — private or empty, same bytes) shows no count line and no error", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(3) });
+      vi.mocked(loadIdentity).mockReturnValue(stored);
+      vi.mocked(steamWishlistForLink).mockResolvedValue([]);
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText("G0")).toBeInTheDocument());
+      await act(async () => { await new Promise((r) => setTimeout(r, 30)); });
+      expect(screen.queryByText(/on your wishlist/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Steam is currently unavailable|couldn.t verify/i)).not.toBeInTheDocument();
+    });
+
+    it("the count line's slot is RESERVED before the wishlist lands, so a late line moves no card (pass 2 #1)", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, curated: true, games: shelf(3) });
+      vi.mocked(loadIdentity).mockReturnValue(stored);
+      let res!: (v: { appid: number; added: number }[]) => void;
+      vi.mocked(steamWishlistForLink).mockReturnValue(new Promise((r) => { res = r; }));
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText("G0")).toBeInTheDocument());
+      const slot = screen.getByTestId("wish-count-line");
+      expect(slot).toHaveTextContent("");
+      await act(async () => { res([{ appid: 1001, added: 1678000000 }]); });
+      await waitFor(() => expect(screen.getByTestId("wish-count-line")).toHaveTextContent("⭐ 1 of these is on your wishlist"));
+      expect(screen.getByTestId("wish-count-line")).toBe(slot); // same node: it filled, it did not mount
+    });
+
+    it("open shelf: the count matches the grid's title-deduped cards, not raw appids (pass 2 #6)", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: [
+        makeGame({ id: "a", title: "Edition A", steam_app_id: 420 }),
+        makeGame({ id: "b", title: "Edition B", steam_app_id: 420 }),
+      ] });
+      vi.mocked(loadIdentity).mockReturnValue(stored);
+      vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 420, added: 1678000000 }]);
+      renderLinkPage();
+      await waitFor(() => expect(screen.getAllByText("⭐ on your wishlist")).toHaveLength(2));
+      expect(screen.getByText("⭐ 2 of these are on your wishlist")).toBeInTheDocument();
     });
 
     // ── review pass 1 (#259): each of these reproduced a defect before its fix ──

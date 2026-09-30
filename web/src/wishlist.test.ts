@@ -32,3 +32,10 @@ it("floatRanks with nothing starred is a plain shuffle of all ids", () => {
   const r = floatRanks(["a", "b", "c"], new Set(), Math.random);
   expect([...r.values()].sort()).toEqual([0, 1, 2]);
 });
+
+it("floatRanks SHUFFLES within each group — exact order under a seeded rand (pass 2 #5)", () => {
+  // rand ≡ 0 ⇒ Fisher–Yates on [x0..x(n-1)] rotates: [a,b,c] → [b,c,a]
+  const r = floatRanks(["a", "b", "c", "d", "e", "f"], new Set(["a", "c", "e"]), () => 0);
+  const order = [...r.entries()].sort((x, y) => x[1] - y[1]).map(([id]) => id);
+  expect(order).toEqual(["c", "e", "a", "d", "f", "b"]);
+});
