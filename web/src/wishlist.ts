@@ -7,3 +7,20 @@ export function formatSince(addedEpochSecs: number): string | null {
     .toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" })
     .toLowerCase();
 }
+
+/** Per-visit shelf ranks with the ⭐ float (spec §2.2): starred ids first, each group
+ *  Fisher–Yates-shuffled on its own, so the rummage survives inside both groups. */
+export function floatRanks(ids: string[], starred: Set<string>, rand: () => number): Map<string, number> {
+  const shuffle = (xs: string[]) => {
+    for (let i = xs.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      [xs[i], xs[j]] = [xs[j]!, xs[i]!];
+    }
+    return xs;
+  };
+  const ordered = [
+    ...shuffle(ids.filter((id) => starred.has(id))),
+    ...shuffle(ids.filter((id) => !starred.has(id))),
+  ];
+  return new Map(ordered.map((id, pos) => [id, pos]));
+}

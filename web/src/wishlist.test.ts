@@ -1,5 +1,5 @@
 import { it, expect } from "vitest";
-import { formatSince } from "./wishlist";
+import { formatSince, floatRanks } from "./wishlist";
 it("formats UTC month + year, lowercase", () => {
   expect(formatSince(1678000000)).toBe("mar 2023"); // 2023-03-05T07:06:40Z
 });
@@ -17,4 +17,18 @@ it("uses UTC, not local time, at a month boundary", () => {
 });
 it("returns null for a missing date", () => {
   expect(formatSince(0)).toBeNull();
+});
+
+it("floatRanks puts every starred id before every unstarred id", () => {
+  let seed = 7; const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const ids = ["a", "b", "c", "d", "e", "f"];
+  const r = floatRanks(ids, new Set(["e", "b"]), rand);
+  const maxStar = Math.max(r.get("e")!, r.get("b")!);
+  const minRest = Math.min(...["a", "c", "d", "f"].map((x) => r.get(x)!));
+  expect(maxStar).toBeLessThan(minRest);
+  expect(new Set(r.values()).size).toBe(6);
+});
+it("floatRanks with nothing starred is a plain shuffle of all ids", () => {
+  const r = floatRanks(["a", "b", "c"], new Set(), Math.random);
+  expect([...r.values()].sort()).toEqual([0, 1, 2]);
 });

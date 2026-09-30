@@ -4,6 +4,7 @@ import {
   fetchLink,
   fetchGameDetail,
   steamOwnedForLink,
+  steamWishlistForLink,
   NotFound,
   type GameView,
   type LinkView,
@@ -26,6 +27,14 @@ import { CursorCompanion } from "./CursorCompanion";
 import { prefersReducedMotion, motionOK } from "../motion";
 import { graphemes } from "../text";
 import { BootScreen } from "./BootScreen";
+import { floatRanks } from "../wishlist";
+
+/** ⭐ the first open-shelf render waits at most this long for the wishlist (spec §5). */
+const WISH_HOLD_MS = 400;
+type Wish =
+  | { kind: "none" }
+  | { kind: "pending" }
+  | { kind: "done"; wished: Map<number, number> };
 
 type ViewState =
   | { kind: "loading" }
@@ -187,6 +196,9 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   );
   const [steamPrivate, setSteamPrivate] = useState(false);
   const [steamError, setSteamError] = useState<string | null>(null);
+  // ⭐ the wishing well — never persisted (spec §4: nothing at rest, not even localStorage)
+  const [wish, setWish] = useState<Wish>({ kind: "none" });
+  const [holdOver, setHoldOver] = useState(false);
 
   const refresh = useCallback(() => setRefreshTick((t) => t + 1), []);
 
@@ -194,13 +206,30 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   useEffect(() => {
     let cancelled = false;
 
+    const loadWish = (steamid: string) => {
+      setWish({ kind: "pending" });
+      // Promise.resolve() first: a mock (or future caller) returning a non-promise degrades
+      // silently instead of throwing inside the effect.
+      Promise.resolve()
+        .then(() => steamWishlistForLink(token!, steamid))
+        .then((items) => {
+          if (!cancelled) setWish({ kind: "done", wished: new Map(items.map((i) => [i.appid, i.added])) });
+        })
+        .catch(() => {
+          if (!cancelled) setWish({ kind: "done", wished: new Map() });
+        });
+    };
+
     const fragment = consumeReturnFragment();
 
     if (fragment === null) {
       // No return fragment — restore from localStorage
       const stored = loadIdentity();
       if (!cancelled) setSteamIdentity(stored);
-      return;
+      if (stored) loadWish(stored.steamid);
+      return () => {
+        cancelled = true;
+      };
     }
 
     if ("error" in fragment) {
@@ -230,6 +259,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       }
     }
 
+    loadWish(steamid);
     void fetchOwned();
     return () => {
       cancelled = true;
@@ -282,6 +312,17 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
     [steamIdentity],
   );
 
+  // Hold only an ACTIVE open shelf. Curated never floats, and dead or sealed links 409 on the proxy.
+  const openShelf =
+    view.kind === "loaded" && view.data.curated !== true && view.data.state === "active";
+  useEffect(() => {
+    if (!openShelf || wish.kind !== "pending") return;
+    const t = setTimeout(() => setHoldOver(true), WISH_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [openShelf, wish.kind]);
+  const holding = openShelf && wish.kind === "pending" && !holdOver;
+  const wishedMap = wish.kind === "done" ? wish.wished : undefined;
+
   // ── The shelf shuffle (ben, 2026-07-09) ─────────────────────────────────────
   // Games render in a random order so each visit rummages the trove afresh —
   // but the order is locked per visit (ranks assigned once, then reused), so
@@ -295,16 +336,27 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       // the shuffle ranks: a mode flip must not inherit stale ranks.
       return view.data.games;
     }
+    // ⭐ held for the wishlist (≤ WISH_HOLD_MS): render nothing yet, and do NOT freeze ranks.
+    if (holding) return [];
     const games = view.data.games;
     if (shuffleRanksRef.current === null) {
-      const ids = games.map((g) => g.id);
-      for (let i = ids.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const tmp = ids[i]!;
-        ids[i] = ids[j]!;
-        ids[j] = tmp;
-      }
-      shuffleRanksRef.current = new Map(ids.map((id, pos) => [id, pos]));
+      // Frozen ONCE per visit, float included (spec §2.2/§5): a wishlist that lands after this
+      // point adds stars and moves nothing. Owned wins, so an owned game never floats.
+      const starred = new Set(
+        games
+          .filter(
+            (g) =>
+              g.steam_app_id !== null &&
+              !ownedSet.has(g.steam_app_id) &&
+              wishedMap?.has(g.steam_app_id) === true,
+          )
+          .map((g) => g.id),
+      );
+      shuffleRanksRef.current = floatRanks(
+        games.map((g) => g.id),
+        starred,
+        Math.random,
+      );
     }
     const ranks = shuffleRanksRef.current;
     return [...games].sort(
@@ -312,9 +364,9 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
         (ranks.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
         (ranks.get(b.id) ?? Number.MAX_SAFE_INTEGER),
     );
-  }, [view]);
+  }, [view, holding, wishedMap, ownedSet]);
 
-  if (view.kind === "loading") {
+  if (view.kind === "loading" || holding) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-room text-ink">
         <p className="text-dust">loading...</p>
@@ -375,6 +427,23 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   // Explicit server state — never inferred from side signals like games.length
   const exhausted = data.state === "exhausted";
   const dead = data.state === "revoked" || data.state === "expired";
+  // ⭐ count line (spec §2.4): DISTINCT appids — the open shelf renders one card per title.
+  // Absent at 0: private and empty are the same bytes, so "0 of these" would lie.
+  const starCount = new Set(
+    shelfGames
+      .filter(
+        (g) =>
+          g.gone !== true &&
+          g.steam_app_id !== null &&
+          !ownedSet.has(g.steam_app_id) &&
+          wishedMap?.has(g.steam_app_id) === true,
+      )
+      .map((g) => g.steam_app_id),
+  ).size;
+  const starLine =
+    starCount >= 1
+      ? `⭐ ${starCount} of these ${starCount === 1 ? "is" : "are"} on your wishlist`
+      : null;
 
   return (
     <div className="min-h-screen bg-room text-ink">
@@ -479,6 +548,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
                   onClick={() => {
                     clearIdentity();
                     setSteamIdentity(null);
+                    setWish({ kind: "none" });
                     setSteamPrivate(false);
                     setSteamError(null);
                   }}
@@ -567,11 +637,15 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
 
       {/* Grid: shown for exhausted or active (claiming lives in the detail modal,
           which respects link state); hidden for revoked/expired */}
+      {!dead && starLine !== null && (
+        <p className="px-6 pt-2 text-sm text-ink-soft">{starLine}</p>
+      )}
       {!dead && (
         <GameGrid
           games={shelfGames}
           curated={data.curated === true}
           owned={ownedSet}
+          wished={wishedMap}
           onDetail={setDetailGame}
         />
       )}

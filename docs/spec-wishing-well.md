@@ -103,10 +103,12 @@ his options: no server-side record at all.**
   restored from localStorage. `SteamIdentity`'s stored shape is **unchanged**, so friends who connected
   before this ships see stars too, with no migration.
 - **A wishlist failure never blocks owned** and never sets `steamError`. It degrades to no stars.
-- **The float is applied once.** The wishlist resolves after the first render. When it lands,
-  starred games move up in one reorder. After that the order is locked for the visit, like the shuffle
-  ranks, so a claim refresh never moves a card. A reload is a new visit and reshuffles, as the shelf
-  shuffle already does (Ben, 2026-07-09).
+- **The float lands before the cards do (amended at implementation, from Lilith's layout-jump review).**
+  On an active open shelf, the first render waits **at most 400 ms** for the wishlist. If it lands in
+  time, starred games float, and the order is **frozen for the visit** from that render onward. If it
+  lands later, it **adds stars and moves nothing**, because a card never slides away under a friend's
+  cursor. Curated links never wait. A reload is a new visit and reshuffles, as the shelf shuffle
+  already does (Ben, 2026-07-09).
 - **Disconnect** clears the wishlist state along with the identity.
 
 ## 6. Non-goals
