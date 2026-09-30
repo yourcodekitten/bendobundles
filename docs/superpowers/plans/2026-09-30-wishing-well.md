@@ -389,7 +389,138 @@ fn captured() -> String {
 }
 ```
 
-Then **one** `#[tokio::test] async fn wishlist_proxy_logs_no_appids()` that: calls `install()`; emits `tracing::info!("canary-9913377")` and asserts `captured().contains("canary-9913377")` (**positive control**); runs the wishlist proxy against a seeded link whose shelf and wishlist both carry appid **`8675309`**, with a wishlist-only appid **`7340033`** (seed with `test_game(9301)`, `steam_app_id: Some(8675309)`; copy `test_game`, `test_link`, `MockInvoker` **including its `bell` impl**, `steam_router` and the `TEST_BASE_URL` const it uses; reuse the helper bodies from Step 1 by copying them. They live in another test binary and cannot be imported); asserts a 200 whose body contains `8675309`; and finally asserts `!captured().contains("8675309") && !captured().contains("7340033")`. Use `store_or_skip` copied from `api_test.rs:24` (the first ~50 lines are self-contained helpers).
+Then the rest of the file, written out in full. It uses a **minimal** invoker, because the proxy never invokes, and it uses **no** `tokio::sync::Mutex`, so nothing clashes with the `std::sync::Mutex` above:
+
+```rust
+use async_trait::async_trait;
+use axum::{body::Body, http::{Request, StatusCode}};
+use domain::{Game, GameStatus, Link, game_id};
+use dynamo::Store;
+use fulfillment::{FulfillRequest, FulfillResponse};
+use public_api::{Invoker, router};
+use steam_client::{SteamApiKey, SteamClient};
+use time::macros::datetime;
+use tower::ServiceExt;
+
+const TEST_STEAMID: &str = "76561198000000001";
+const TEST_BASE_URL: &str = "https://test.bendobundles.com";
+
+/// Copied from api_test.rs:24 — KEEP the explicit-variable panic branch verbatim: it is the
+/// only thing that stops a missing store from forging a green here.
+async fn store_or_skip(test: &str) -> Option<Arc<Store>> {
+    let (url, explicit) = match std::env::var("DYNAMODB_LOCAL_URL") {
+        Ok(v) => (v, true),
+        Err(_) => ("http://localhost:8000".into(), false),
+    };
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(&url)
+        .region("us-east-1")
+        .test_credentials()
+        .load()
+        .await;
+    let client = aws_sdk_dynamodb::Client::new(&config);
+    if client.list_tables().send().await.is_err() {
+        if explicit {
+            panic!(
+                "DYNAMODB_LOCAL_URL is set but dynamodb-local is unreachable — \
+                 refusing to skip (this would forge a green run)"
+            );
+        }
+        eprintln!("SKIP {test}: no dynamodb-local at {url}");
+        return None;
+    }
+    let store = Store::new(client, format!("t-pub-{test}"));
+    store.create_table_for_tests().await.unwrap();
+    Some(Arc::new(store))
+}
+
+/// The proxy never invokes fulfillment; this invoker exists only to satisfy `router`.
+struct NoInvoker;
+#[async_trait]
+impl Invoker for NoInvoker {
+    async fn gift(&self, _req: FulfillRequest) -> Result<FulfillResponse, String> {
+        Err("not used".into())
+    }
+    async fn bell(&self, _req: FulfillRequest) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn wishlist_proxy_logs_no_appids() {
+    install();
+    // POSITIVE CONTROL: the capture can see an INFO event on this task.
+    tracing::info!("canary-9913377");
+    assert!(captured().contains("canary-9913377"), "capture is blind — the test would be vacuous");
+
+    let Some(store) = store_or_skip("wish-logs").await else { return };
+    let mut g = Game {
+        id: game_id("gk9301", "mn"),
+        title: "Game 9301".into(),
+        bundle: "Test Bundle".into(),
+        gamekey: "gk9301".into(),
+        machine_name: "mn".into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 9301,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+        acquired_at: None,
+    };
+    g.steam_app_id = Some(8675309);
+    store.put_game(&g).await.unwrap();
+    store
+        .create_link(&Link {
+            token: "wish-logs-tok".into(),
+            label: "Test Friend".into(),
+            gift_note: None,
+            thank_note: None,
+            thanked_at: None,
+            claims_allowed: 1,
+            claims_used: 0,
+            revoked: false,
+            expires_at: None,
+            unlock_at: None,
+            curated_game_ids: None,
+            curated_notes: None,
+            friend_id: None,
+            created_at: datetime!(2026-07-02 00:00 UTC),
+        })
+        .await
+        .unwrap();
+
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/IWishlistService/GetWishlist/v1/"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"items":[{"appid":8675309,"priority":0,"date_added":1678000000},{"appid":7340033,"priority":0,"date_added":1678000000}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let steam = SteamClient::new(&server.uri(), &server.uri(), &server.uri(), SteamApiKey::new("TESTKEY".into())).unwrap();
+    let app = router(store, Arc::new(NoInvoker), Some(Arc::new(steam)), TEST_BASE_URL.to_string());
+
+    let resp = app
+        .oneshot(Request::get(format!("/api/l/wish-logs-tok/steam/wishlist/{TEST_STEAMID}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("8675309"), "the overlap must be served");
+
+    let logs = captured();
+    assert!(!logs.contains("8675309"), "an overlap appid reached the logs:\n{logs}");
+    assert!(!logs.contains("7340033"), "a wishlist-only appid reached the logs:\n{logs}");
+}
+```
+
+If any `use` is unused or a dev-dependency (`aws-config`, `aws-sdk-dynamodb`, `async-trait`, `wiremock`, `tower`, `time`) is missing from `crates/public-api/Cargo.toml`'s `[dev-dependencies]`, mirror what `api_test.rs` already compiles with. It is the same crate, so they are all present today.
 
 - [ ] **Step 3: Run and confirm they fail.** `cargo test -p public-api --test api_test wishlist` and `cargo test -p public-api --test wishlist_logs_test` ⇒ all 404 (no route) or fail to compile.
 
@@ -536,14 +667,14 @@ async fn handle_steam_wishlist_proxy(
 
 (e) Update the module doc comment at `lib.rs:6` to list the new route.
 
-- [ ] **Step 5: Run.** DynamoDB-local must be up on `:8000` (`moto_server`); the env var is `DYNAMODB_LOCAL_URL`. Then prove the tests **ran**, not skipped (`store_or_skip` prints an upper-case `SKIP <test>: …`):
+- [ ] **Step 5: Run.** DynamoDB-local must be up on `:8000` (`moto_server`). **The guard against a forged green is setting `DYNAMODB_LOCAL_URL` EXPLICITLY:** with the variable set, `store_or_skip` **panics** on an unreachable store instead of skipping (`api_test.rs:31-37`). A `grep SKIP` cannot catch a skip, because libtest captures a passing test's `eprintln!` and a skipped test still prints `... ok`. So:
 
 ```bash
-echo 'SKIP x' | grep -c SKIP                                   # positive control ⇒ 1
 DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p public-api 2>&1 | tee /tmp/wish-pub.log
 grep -cE '^test wishlist_proxy_\S+ \.\.\. ok$' /tmp/wish-pub.log     # ⇒ 8 (7 in api_test + 1 logs test)
-grep -c SKIP /tmp/wish-pub.log                                  # ⇒ 0
 ```
+
+The logs test's copy of `store_or_skip` **must keep the explicit-variable panic branch verbatim**.
 
 Then `cargo fmt --all && cargo clippy -p public-api --all-targets --all-features -- -D warnings`.
 
@@ -625,6 +756,7 @@ it("uses UTC, not local time, at a month boundary", () => {
   const old = process.env.TZ;
   process.env.TZ = "America/Los_Angeles";
   try {
+    expect(new Date(1680307200000).getDate()).toBe(31); // the override TOOK (else this test is vacuous)
     expect(formatSince(1680307200)).toBe("apr 2023"); // 2023-04-01T00:00:00Z
   } finally {
     process.env.TZ = old;
@@ -995,7 +1127,7 @@ with (**the bare `return;` becomes a cleanup, so `cancelled` can actually flip o
   7. In the `shelfGames` memo: `if (holding) return [];` before the rank block, and replace the inline Fisher–Yates with `shuffleRanksRef.current = floatRanks(games.map((g) => g.id), starredIds, Math.random)`, where `starredIds` is built from `games`, `wishedMap` and `ownedSet` (non-owned, `steam_app_id` in `wishedMap`). Add `holding`, `wishedMap` and `ownedSet` to the deps. Ranks are still assigned only while `shuffleRanksRef.current === null`, which is the freeze. **Do not reset the ref when the wishlist lands.**
   8. The render gate: extend the existing `if (view.kind === "loading")` to `if (view.kind === "loading" || holding)`.
   9. The count line counts **distinct appids**, because the open shelf renders one card per title (`dedupedByTitle`): `const starCount = new Set(shelfGames.filter((g) => g.gone !== true && g.steam_app_id !== null && !ownedSet.has(g.steam_app_id) && wishedMap?.has(g.steam_app_id)).map((g) => g.steam_app_id)).size;`. Render it directly above `<GameGrid …/>` when `starCount >= 1`: `<p className="px-6 pt-2 text-sm text-ink-soft">⭐ {starCount} of these {starCount === 1 ? "is" : "are"} on your wishlist</p>`. The text must be a **single text node** so `getByText` matches: build the string first, `const line = \`⭐ ${starCount} of these ${starCount === 1 ? "is" : "are"} on your wishlist\`;`, then render `{line}`.
-  10. Pass `wished={wishedMap}` to `<GameGrid>`.
+  10. Pass `wished={wishedMap}` to `<GameGrid>`. **Known, accepted (OMBB minor):** the typewriter's `viewLoaded` gate (`:67`) is true during the hold, so for ≤400 ms the gift-note typing and its Enter/Space skip run behind the loading view. It is harmless: nothing is lost, and the note is either still typing or complete when the grid appears. Do not re-order hooks to fix it.
   11. In the disconnect handler next to `clearIdentity();`, add `setWish({ kind: "none" });`.
 
 - [ ] **Step 5: Run the whole web suite:** `cd web && npx vitest run && npm run typecheck && npm run lint` ⇒ green. The lint baseline is **3 warnings** (measured 2026-09-30), and this task must not add one.
@@ -1008,7 +1140,9 @@ with (**the bare `return;` becomes a cleanup, so `cancelled` can actually flip o
 - [ ] **Step 1: The diff boundary.** Run `git diff --name-only origin/main...HEAD`. The printed list must contain **no** path under `crates/dynamo/`, `terraform/` or `crates/fulfillment/`, and no `iam-request-corpus.json`. Assert it rather than eyeballing it:
 
 ```bash
-git diff --name-only origin/main...HEAD | tee /dev/stderr \
+set -o pipefail
+files=$(git diff --name-only origin/main...HEAD) && [ -n "$files" ] || { echo "🔴 NOT MEASURED — empty or failed diff"; exit 2; }
+printf '%s\n' "$files" | tee /dev/stderr \
   | grep -E '^(crates/dynamo/|crates/fulfillment/|terraform/|terraform-iam/)' \
   && { echo "🔴 NOTHING-AT-REST BOUNDARY BROKEN"; exit 1; } || echo "✅ boundary holds"
 ```
@@ -1026,7 +1160,9 @@ Full deploy per `terraform/README.md` → "Deploying as kitten". This changes la
 
 ## Post-deploy verification (pounce step 12)
 
+0a. **Baseline scan BEFORE step 1:** `AWS_PROFILE=kitten-debug aws dynamodb scan --region us-east-1 --table-name brd-prod-ue1-bendobundles-table --filter-expression 'contains(pk,:id) OR contains(sk,:id)' --expression-attribute-values '{":id":{"S":"<id64>"}}' --output json | jq -S '.Items' > scan-before.json`.
 0. **Pre-register the subject BEFORE deploy (non-vacuous overlap).** Pick a live open-shelf link token and an id64 from the 2026-09-30 probe (or any public profile) whose **raw** keyless wishlist ∩ that link's `games[].steam_app_id` is **non-empty**, and whose raw wishlist also carries appids **not** on the link. Compute both sets from the raw Steam call and the live `/api/l/<token>` payload, and write the id64, the token and the expected overlap into the checkpoint. If no public id64 overlaps, use a curated test link whose games are chosen from a known wishlist.
 1. `curl -sSi "https://<prod-host>/api/l/<token>/steam/wishlist/<id64>"` ⇒ `200`, `cache-control: private, max-age=3600`. Assert **both** halves mechanically with jq: returned ⊆ link appids (set-difference ⇒ empty) **and** returned == the pre-registered overlap (so returned ≠ the raw wishlist).
-2. **Nothing at rest, measured:** `AWS_PROFILE=kitten-debug aws dynamodb scan --filter-expression 'contains(pk,:id) OR contains(sk,:id)' --expression-attribute-values '{":id":{"S":"<id64>"}}'` over the table. Pre-registered expectation: **only** `STEAMOWN#<id64>`, and only if an owned call happened for that id. **Logs:** a Logs Insights query over the public-api log group for the request window, filtered on one returned appid ⇒ 0. Positive control on the same query and window: filter on `REPORT RequestId` (always logged by the Lambda runtime) ⇒ ≥1. API Gateway execution logs run at INFO with `data_trace_enabled=false`, so they carry the path (which holds the id64, not appids) and no bodies. That is stated, not assumed: check `terraform/aws-apigateway.tf`.
+2. **Logs:** a Logs Insights query over the public-api log group for the request window, filtered on (i) one returned overlap appid and (ii) one **wishlist-only** appid (≥7 digits, so `REPORT` numbers cannot collide) ⇒ 0 each. Positive control on the same query and window: filter on `REPORT RequestId` ⇒ ≥1. API Gateway execution logs run at INFO with `data_trace_enabled=false`, so they carry the path (which holds the id64, not appids) and no bodies. Check that in `terraform/aws-apigateway.tf`; don't assume it.
 3. Load the page in a browser (Playwright) with a stored identity for that id64 and screenshot the stars and the count line.
+4. **Nothing at rest, measured:** re-run the step 0a scan into `scan-after.json`, then `diff scan-before.json scan-after.json` ⇒ **identical** (rc 0). The proxy call and the browser load in between must have written nothing keyed to that id64. This is unconditional; there is no "only if" clause.
