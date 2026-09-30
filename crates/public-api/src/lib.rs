@@ -718,12 +718,11 @@ async fn handle_steam_wishlist_proxy(
         )
             .into_response();
     }
+    // Bound, not a temporary: the joined future borrows it past this statement (E0716).
+    let sid = steam_client::SteamId64(steamid);
     // Both reads are needed before answering, and the client holds its first render ≤400ms
     // for this response, so run them concurrently.
-    let (shelf, wish) = tokio::join!(
-        link_live_app_ids(&s.store, &link),
-        steam.get_wishlist(&steam_client::SteamId64(steamid)),
-    );
+    let (shelf, wish) = tokio::join!(link_live_app_ids(&s.store, &link), steam.get_wishlist(&sid));
     let shelf = match shelf {
         Ok(set) => set,
         Err(_) => {
