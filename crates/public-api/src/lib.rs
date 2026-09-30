@@ -3,7 +3,8 @@
 //! Routes: `GET /api/l/{token}`, `POST /api/l/{token}/claim`,
 //!         `POST /api/l/{token}/thanks`,
 //!         `GET /api/steam/login`, `GET /api/steam/return`,
-//!         `GET /api/l/{token}/steam/owned/{steamid}`, fallback 404.
+//!         `GET /api/l/{token}/steam/owned/{steamid}`,
+//!         `GET /api/l/{token}/steam/wishlist/{steamid}` (⭐ docs/spec-wishing-well.md), fallback 404.
 mod unfurl;
 
 pub use unfurl::{S3Template, TemplateError, TemplateSource};
@@ -285,6 +286,10 @@ pub fn router_with_template(
             "/api/l/{token}/steam/owned/{steamid}",
             get(handle_steam_owned_proxy),
         )
+        .route(
+            "/api/l/{token}/steam/wishlist/{steamid}",
+            get(handle_steam_wishlist_proxy),
+        )
         .route("/api/l/{token}/games/{id}/detail", get(handle_game_detail))
         .route("/api/steam/login", get(handle_steam_login))
         .route("/api/steam/return", get(handle_steam_return))
@@ -543,6 +548,47 @@ async fn handle_steam_return(
     ))
 }
 
+/// The claim-path refusal ⇒ 409 mapping, shared by both steam proxies (one exhaustive match:
+/// a new refusal variant forces a decision here at compile time).
+fn dead_link_conflict(refusal: domain::ClaimRefusal) -> Response {
+    use domain::ClaimRefusal;
+    let msg = match refusal {
+        ClaimRefusal::Revoked => "this link has been revoked",
+        ClaimRefusal::Sealed => "this gift is still wrapped",
+        ClaimRefusal::Expired => "this link has expired",
+        ClaimRefusal::Exhausted => "no claims left on this link",
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": msg})),
+    )
+        .into_response()
+}
+
+/// The steam appids a friend can actually see as LIVE cards on this link — the set the
+/// wishlist proxy intersects against. Curated: members that pass `live_on_link` (ghosts are
+/// excluded; a star on a ghost would point at nothing). Open: the listable catalog.
+async fn link_live_app_ids(
+    store: &Store,
+    link: &domain::Link,
+) -> Result<std::collections::HashSet<u32>, StoreError> {
+    Ok(match &link.curated_game_ids {
+        Some(ids) => store
+            .batch_get_games(ids)
+            .await?
+            .values()
+            .filter(|g| live_on_link(link, g))
+            .filter_map(|g| g.steam_app_id)
+            .collect(),
+        None => store
+            .list_listable_games()
+            .await?
+            .iter()
+            .filter_map(|g| g.steam_app_id)
+            .collect(),
+    })
+}
+
 // ── GET /api/l/{token}/steam/owned/{steamid} ────────────────────────────────────
 
 /// Token-scoped proxy to the Steam owned-games endpoint.
@@ -584,18 +630,7 @@ async fn handle_steam_owned_proxy(
     // 2. Liveness gate — dead link → 409 like the claim-path refusals.
     let now = OffsetDateTime::now_utc();
     if let Err(refusal) = link.can_claim(now) {
-        use domain::ClaimRefusal;
-        let msg = match refusal {
-            ClaimRefusal::Revoked => "this link has been revoked",
-            ClaimRefusal::Sealed => "this gift is still wrapped",
-            ClaimRefusal::Expired => "this link has expired",
-            ClaimRefusal::Exhausted => "no claims left on this link",
-        };
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": msg})),
-        )
-            .into_response();
+        return dead_link_conflict(refusal);
     }
 
     // 3. Validate steamid — invariant (8): exactly 17 ASCII digits.
@@ -637,6 +672,85 @@ async fn handle_steam_owned_proxy(
             (StatusCode::OK, Json(serde_json::json!({"private": true}))).into_response()
         }
         OwnedProxyOutcome::Unavailable => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+// ── GET /api/l/{token}/steam/wishlist/{steamid} ─────────────────────────────────
+
+/// ⭐ Token-scoped wishlist proxy (docs/spec-wishing-well.md). Same preamble ORDER as the
+/// owned proxy (token → liveness → id64). Then a LIVE, keyless Steam read — nothing is
+/// stored (§4: the server holds nothing about a wishlist) — intersected with the link's
+/// live appids so the proxy never serves anyone's full list. Every Steam failure is one
+/// plain 503 that the client renders silent. No tracing here, by contract: appids are
+/// the friend's data.
+async fn handle_steam_wishlist_proxy(
+    State(s): State<AppState>,
+    Path((token, steamid)): Path<(String, String)>,
+) -> Response {
+    let steam = match s.steam.as_ref() {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "steam not configured"})),
+            )
+                .into_response();
+        }
+    };
+    let link = match s.store.get_link(&token).await {
+        Ok(Some(l)) => l,
+        Ok(None) => return link_not_found_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "try again"})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(refusal) = link.can_claim(OffsetDateTime::now_utc()) {
+        return dead_link_conflict(refusal);
+    }
+    if !steam_client::is_valid_steam_id64(&steamid) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": steam_client::STEAM_ID64_ERROR_MSG})),
+        )
+            .into_response();
+    }
+    // Both reads are needed before answering, and the client holds its first render ≤400ms
+    // for this response, so run them concurrently.
+    let (shelf, wish) = tokio::join!(
+        link_live_app_ids(&s.store, &link),
+        steam.get_wishlist(&steam_client::SteamId64(steamid)),
+    );
+    let shelf = match shelf {
+        Ok(set) => set,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "try again"})),
+            )
+                .into_response();
+        }
+    };
+    match wish {
+        Ok(items) => {
+            let items: Vec<serde_json::Value> = items
+                .into_iter()
+                .filter(|i| shelf.contains(&i.appid))
+                .map(|i| serde_json::json!({"appid": i.appid, "added": i.date_added}))
+                .collect();
+            (
+                StatusCode::OK,
+                // private: per-friend, never shared-cacheable. The ONLY copy of the overlap
+                // lives in the friend's own browser for an hour (spec §4).
+                [(header::CACHE_CONTROL, "private, max-age=3600")],
+                Json(serde_json::json!({"items": items})),
+            )
+                .into_response()
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
