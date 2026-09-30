@@ -30,6 +30,7 @@ import {
   CreateLinkValidationError,
   NotFound,
   FetchFailed,
+  steamWishlistForLink,
   Unauthorized,
   type ClaimResult,
   type StatusView,
@@ -1185,5 +1186,23 @@ describe('ops: stuck claims', () => {
   it('adminCompensateClaim turns a 404 into an operator-readable message', async () => {
     mockFetch.mockResolvedValueOnce({ ok: false, status: 404 });
     await expect(adminCompensateClaim('gone', 'SELF')).rejects.toThrow(/already gone/);
+  });
+});
+
+describe("steamWishlistForLink", () => {
+  it("returns the items on 200", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ items: [{ appid: 420, added: 1678000000 }] }), { status: 200 })));
+    await expect(steamWishlistForLink("tok", "76561198000000001"))
+      .resolves.toEqual([{ appid: 420, added: 1678000000 }]);
+    expect(fetch).toHaveBeenCalledWith("/api/l/tok/steam/wishlist/76561198000000001");
+  });
+  it("throws FetchFailed on 503", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 503 })));
+    await expect(steamWishlistForLink("tok", "1")).rejects.toBeInstanceOf(FetchFailed);
+  });
+  it("throws FetchFailed on network error", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("offline")));
+    await expect(steamWishlistForLink("tok", "1")).rejects.toBeInstanceOf(FetchFailed);
   });
 });

@@ -869,6 +869,22 @@ export async function steamOwnedForLink(
   return data.appids ?? [];
 }
 
+export type WishItem = { appid: number; added: number };
+
+/** ⭐ token-scoped wishlist overlap (spec-wishing-well §3). Server already intersected
+ *  with this link's live games. Any failure throws FetchFailed — callers render it SILENT. */
+export async function steamWishlistForLink(token: string, steamid: string): Promise<WishItem[]> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/l/${token}/steam/wishlist/${encodeURIComponent(steamid)}`);
+  } catch {
+    throw new FetchFailed();
+  }
+  if (!response.ok) throw new FetchFailed();
+  const data = (await response.json()) as { items?: WishItem[] };
+  return data.items ?? [];
+}
+
 /**
  * Admin-surface: fetch owned appids for the admin steam identity.
  * Returns 'private' when the library is locked down.

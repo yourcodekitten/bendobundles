@@ -1,0 +1,1168 @@
+# The Wishing Well ⭐ Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** On a gift link, mark (and on open shelves, float) the games that are on the connected friend's public Steam wishlist. The server keeps nothing at rest.
+
+**Architecture:** A keyless `steam-client::get_wishlist` call, used by a new token-scoped proxy `GET /api/l/{token}/steam/wishlist/{steamid}`. The proxy runs the owned proxy's exact preamble order, then **intersects with the link's own live appids** before answering. The web fetches it whenever a Steam identity is on the page, and `GameGrid` renders a ⭐ pill. `LinkPage` briefly holds the first open-shelf render (≤400 ms) so the float lands before the cards do. A wishlist that arrives late adds stars and moves nothing.
+
+**Tech Stack:** Rust (axum, reqwest, serde, wiremock tests, DynamoDB-local via `store_or_skip`), React + TypeScript + vitest.
+
+**Spec:** `docs/spec-wishing-well.md` (at `fe74c92` or later; §5's float wording is amended by this PR's Task 5, so it matches the hold-then-freeze contract below). Read it first. §4 ("nothing at rest") and §2 (what the friend sees) are the contract.
+
+## Global Constraints
+
+- **Nothing at rest.** No `dynamo` crate change, no new `Store` method, no `terraform/` change, no IAM corpus change. **Task 6 asserts this from the diff.**
+- **No appids in logs.** The new handler and `get_wishlist` emit **no** `tracing` events that carry wishlist data. Task 2 asserts this with a log capture that has a positive control.
+- **Keyless.** `get_wishlist` sends **no** `key` query param. Task 1 asserts this on the recorded request.
+- **Private == empty.** `{"response":{}}` ⇒ `Ok(vec![])`. No copy anywhere says "empty" or "private" about a wishlist.
+- **Silent degrade.** Any wishlist failure (Steam 429/5xx/network ⇒ proxy `503`; client `FetchFailed`) renders exactly like "no match": no stars, no count line, no error text, and it never blocks owned.
+- **Copy (verbatim):** pill `⭐ on your wishlist`. Pill `title` and accessible name `on your wishlist since <mon yyyy>`, lowercase, UTC month (e.g. `since mar 2023`). Count line `⭐ N of these are on your wishlist`, singular `⭐ 1 of these is on your wishlist`. The count line exists only for N ≥ 1.
+- **Precedence:** owned wins (no star on an owned game). A `gone` (ghost) card never gets a star, and the server already excludes ghosts from the intersection.
+- **Curated links never reorder.** Open shelves float starred games first, shuffled within each group. The order is frozen for the visit.
+- **Rust gates match CI** (`ci.yml`): run `cargo fmt --all` before every Rust commit; clippy is always `--all-targets --all-features -- -D warnings`. **Web gates match CI:** `npm run typecheck` and `npm run lint`. Root `npx tsc --noEmit` checks **0 files** here (`tsconfig.json` has `"files": []`), so never use it as a gate.
+- Commits GPG-signed as `code kitten <yourcodekitten@gmail.com>`; branch `kitten/wishing-well`.
+
+---
+
+## File map
+
+| File | Responsibility | Task |
+|---|---|---|
+| `crates/steam-client/src/lib.rs` | `WishItem`, wire types, `get_wishlist` | 1 |
+| `crates/steam-client/tests/client_test.rs` | wishlist client tests | 1 |
+| `crates/public-api/src/lib.rs` | route, `handle_steam_wishlist_proxy`, `link_live_app_ids`, shared `dead_link_conflict` | 2 |
+| `crates/public-api/tests/api_test.rs` | proxy behaviour tests | 2 |
+| `crates/public-api/tests/wishlist_logs_test.rs` (new) | no-appids-in-logs capture (own test binary, owns the global subscriber) | 2 |
+| `web/src/api.ts` + `web/src/api.test.ts` | `WishItem`, `steamWishlistForLink` | 3 |
+| `web/src/friend/GameGrid.tsx` + `.test.tsx` | ⭐ pill, `since` title, precedence | 4 |
+| `web/src/wishlist.ts` + `web/src/wishlist.test.ts` (new) | pure helpers: `formatSince`, `floatRanks` | 4, 5 |
+| `web/src/friend/LinkPage.tsx` + `.test.tsx` | fetch, hold, float, count line, disconnect | 5 |
+
+---
+
+### Task 1: `steam-client::get_wishlist` (keyless)
+
+**Files:**
+- Modify: `crates/steam-client/src/lib.rs` (types near `OwnedGames` ~L126; method after `get_owned_games` ~L496)
+- Test: `crates/steam-client/tests/client_test.rs` (append)
+
+**Interfaces:**
+- Produces: `pub struct WishItem { pub appid: u32, pub date_added: i64 }` (derive `Debug, Clone, PartialEq, Eq`), and `impl SteamClient { pub async fn get_wishlist(&self, steamid: &SteamId64) -> Result<Vec<WishItem>, SteamError> }`.
+
+- [ ] **Step 1: Write the failing tests** (append to `client_test.rs`; `test_client` already exists at the top of the file)
+
+```rust
+#[tokio::test]
+async fn wishlist_returns_items_and_sends_no_key() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/IWishlistService/GetWishlist/v1/"))
+        .and(wiremock::matchers::query_param("steamid", "76561198000000001"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"items":[{"appid":413150,"priority":1,"date_added":1678000000},{"appid":1273400,"priority":0,"date_added":1700000000}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = test_client(&server)
+        .get_wishlist(&steam_client::SteamId64("76561198000000001".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            steam_client::WishItem { appid: 413150, date_added: 1678000000 },
+            steam_client::WishItem { appid: 1273400, date_added: 1700000000 },
+        ]
+    );
+    // Keyless by construction: the recorded request carries NO key param.
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert!(
+        !reqs[0].url.query_pairs().any(|(k, _)| k == "key"),
+        "wishlist must not send the api key: {}",
+        reqs[0].url
+    );
+}
+
+#[tokio::test]
+async fn wishlist_empty_response_object_is_empty_vec_not_error() {
+    // Measured 2026-09-30: private and empty are the SAME bytes. Not an error.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/IWishlistService/GetWishlist/v1/"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(r#"{"response":{}}"#))
+        .mount(&server)
+        .await;
+    let out = test_client(&server)
+        .get_wishlist(&steam_client::SteamId64("76561198000000001".into()))
+        .await
+        .unwrap();
+    assert!(out.is_empty());
+}
+
+#[tokio::test]
+async fn wishlist_429_is_rate_limited() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/IWishlistService/GetWishlist/v1/"))
+        .respond_with(wiremock::ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+    let err = test_client(&server)
+        .get_wishlist(&steam_client::SteamId64("76561198000000001".into()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, steam_client::SteamError::RateLimited), "{err:?}");
+}
+
+#[tokio::test]
+async fn wishlist_malformed_body_is_parse_error() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/IWishlistService/GetWishlist/v1/"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("<html>nope</html>"))
+        .mount(&server)
+        .await;
+    let err = test_client(&server)
+        .get_wishlist(&steam_client::SteamId64("76561198000000001".into()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, steam_client::SteamError::Parse(_)), "{err:?}");
+}
+```
+
+- [ ] **Step 2: Run and confirm they fail.** `cargo test -p steam-client --test client_test wishlist` ⇒ compile error: `no method named get_wishlist` / `WishItem` not found.
+
+- [ ] **Step 3: Implement.** Add the types next to `OwnedGames`:
+
+```rust
+/// One entry on a friend's public Steam wishlist (spec-wishing-well §1.1). `priority` is
+/// deliberately not carried — v1 does not order by it (spec §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WishItem {
+    pub appid: u32,
+    /// Epoch seconds the game was wishlisted; 0 if Steam omitted it.
+    pub date_added: i64,
+}
+```
+
+and the wire structs next to `OwnedWire`:
+
+```rust
+#[derive(Deserialize)]
+struct WishWire {
+    response: WishResp,
+}
+/// `{"response":{}}` is BOTH a private and an empty wishlist (measured) — so `items`
+/// defaults to empty and neither case is an error.
+#[derive(Deserialize)]
+struct WishResp {
+    #[serde(default)]
+    items: Vec<WishWireItem>,
+}
+#[derive(Deserialize)]
+struct WishWireItem {
+    appid: u32,
+    #[serde(default)]
+    date_added: i64,
+}
+```
+
+and the method after `get_owned_games`:
+
+```rust
+    /// Public wishlist for `steamid`. **Keyless** — the endpoint does not need the Web API
+    /// key (measured 2026-09-30), and a secret on a request that does not need it is only risk.
+    /// Private and empty wishlists are indistinguishable on the wire; both are `Ok(vec![])`.
+    /// Status mapping reuses `keyed_json` (a 401/403 surfaces as `KeyRejected`, which is a
+    /// misnomer on a keyless call — every caller maps all errors to one silent 503).
+    pub async fn get_wishlist(&self, steamid: &SteamId64) -> Result<Vec<WishItem>, SteamError> {
+        let url = format!("{}/IWishlistService/GetWishlist/v1/", self.base_web_api);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("steamid", &steamid.0)])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: WishWire = keyed_json(resp).await?;
+        Ok(wire
+            .response
+            .items
+            .into_iter()
+            .map(|i| WishItem { appid: i.appid, date_added: i.date_added })
+            .collect())
+    }
+```
+
+- [ ] **Step 4: Run.** `cargo test -p steam-client` ⇒ all pass, including the 4 new tests. Then `cargo fmt --all && cargo clippy -p steam-client --all-targets --all-features -- -D warnings`.
+
+- [ ] **Step 5: Commit.** `git add crates/steam-client && git commit -S -m "⭐ steam-client: get_wishlist — keyless, private==empty is Ok(vec![])"`
+
+---
+
+### Task 2: the token-scoped wishlist proxy
+
+**Files:**
+- Modify: `crates/public-api/src/lib.rs` (route table ~L280; new handler after `handle_steam_owned_proxy`; refactor its 409 match into `dead_link_conflict`)
+- Test: `crates/public-api/tests/api_test.rs` (append; uses the existing `store_or_skip`, `steam_router`, `test_link`, `MockInvoker`, `body_json`, `CTX_TOKEN`, `TEST_STEAMID`)
+- Create: `crates/public-api/tests/wishlist_logs_test.rs`
+
+**Interfaces:**
+- Consumes: `SteamClient::get_wishlist`, `WishItem` (Task 1). Existing: `Store::get_link`, `Store::batch_get_games(&[String]) -> Result<HashMap<String, Game>, StoreError>`, `Store::list_listable_games() -> Result<Vec<Game>, StoreError>`, `live_on_link(&Link, &Game) -> bool`, `link_not_found_response()`, `steam_client::is_valid_steam_id64`, `steam_client::STEAM_ID64_ERROR_MSG`.
+- Produces: HTTP `GET /api/l/{token}/steam/wishlist/{steamid}` ⇒ `200 {"items":[{"appid":u32,"added":i64}]}` with `Cache-Control: private, max-age=3600` | `404` (byte-identical unknown-link) | `409 {"error":…}` | `400` | `500 {"error":"try again"}` | `503` (empty body when Steam fails; `{"error":"steam not configured"}` when no client is configured).
+
+- [ ] **Step 1: Write the failing proxy tests** (append to `api_test.rs`). Seed games the way the existing tests do (`store.put_game(&game)` with a `Game` whose `steam_app_id` is set and status listable; copy the `Game` literal from the nearest existing test that seeds a listable game with a `steam_app_id`, and change only `id`/`title`/`steam_app_id`).
+
+```rust
+fn wish_body(items: &[(u32, i64)]) -> String {
+    let xs: Vec<String> = items
+        .iter()
+        .map(|(a, d)| format!(r#"{{"appid":{a},"priority":0,"date_added":{d}}}"#))
+        .collect();
+    format!(r#"{{"response":{{"items":[{}]}}}}"#, xs.join(","))
+}
+
+async fn mount_wishlist(server: &wiremock::MockServer, status: u16, body: &str) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/IWishlistService/GetWishlist/v1/"))
+        .respond_with(wiremock::ResponseTemplate::new(status).set_body_string(body.to_string()))
+        .mount(server)
+        .await;
+}
+
+/// Unknown token ⇒ the byte-identical unknown-link 404, even with a malformed id64
+/// (token beats id: no oracle upgrade).
+#[tokio::test]
+async fn wishlist_proxy_unknown_token_is_byte_identical_404_even_with_bad_id() {
+    let Some(store) = store_or_skip("wish-404").await else { return };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let a = app.clone().oneshot(Request::get(format!("/api/l/{CTX_TOKEN}/steam/wishlist/not-an-id")).body(Body::empty()).unwrap()).await.unwrap();
+    let b = app.clone().oneshot(Request::get(format!("/api/l/{CTX_TOKEN}")).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(a.status(), StatusCode::NOT_FOUND);
+    let ab = axum::body::to_bytes(a.into_body(), usize::MAX).await.unwrap();
+    let bb = axum::body::to_bytes(b.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(ab, bb);
+}
+
+/// Dead link ⇒ 409 before the id64 is looked at.
+#[tokio::test]
+async fn wishlist_proxy_revoked_link_is_409_even_with_bad_id() {
+    let Some(store) = store_or_skip("wish-409").await else { return };
+    let server = wiremock::MockServer::start().await;
+    let mut lnk = test_link("wish-409-tok");
+    lnk.revoked = true;
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app.oneshot(Request::get("/api/l/wish-409-tok/steam/wishlist/not-an-id").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+}
+
+/// Live link + bad id64 ⇒ 400.
+#[tokio::test]
+async fn wishlist_proxy_bad_id_on_live_link_is_400() {
+    let Some(store) = store_or_skip("wish-400").await else { return };
+    let server = wiremock::MockServer::start().await;
+    store.create_link(&test_link("wish-400-tok")).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app.oneshot(Request::get("/api/l/wish-400-tok/steam/wishlist/7656119800000000x").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Curated link: the response is the INTERSECTION with the link's LIVE games — a wishlisted
+/// appid that is not on the shelf is absent, and a ghost (not live_on_link) is absent.
+#[tokio::test]
+async fn wishlist_proxy_curated_returns_only_live_shelf_overlap() {
+    let Some(store) = store_or_skip("wish-curated").await else { return };
+    let server = wiremock::MockServer::start().await;
+    // A (appid 111) is live; B (appid 222) is hidden ⇒ a ghost on a curated link
+    // (`live_on_link` requires `!game.hidden`, lib.rs:651).
+    let mut a = test_game(9101);
+    a.steam_app_id = Some(111);
+    let mut b = test_game(9102);
+    b.steam_app_id = Some(222);
+    b.hidden = true;
+    store.put_game(&a).await.unwrap();
+    store.put_game(&b).await.unwrap();
+    let mut lnk = test_link("wish-cur-tok");
+    lnk.curated_game_ids = Some(vec![a.id.clone(), b.id.clone()]);
+    store.create_link(&lnk).await.unwrap();
+    // Wishlist carries A, B and 333 (not on the shelf at all).
+    mount_wishlist(&server, 200, &wish_body(&[(111, 1678000000), (222, 1678000001), (333, 1678000002)])).await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app.oneshot(Request::get(format!("/api/l/wish-cur-tok/steam/wishlist/{TEST_STEAMID}")).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.headers()[axum::http::header::CACHE_CONTROL], "private, max-age=3600");
+    let j = body_json(r).await;
+    assert_eq!(j, serde_json::json!({"items":[{"appid":111,"added":1678000000}]}));
+}
+
+/// Open shelf: intersection with the listable catalog.
+#[tokio::test]
+async fn wishlist_proxy_open_shelf_returns_catalog_overlap() {
+    let Some(store) = store_or_skip("wish-open").await else { return };
+    let server = wiremock::MockServer::start().await;
+    // test_game is Available + giftable + !hidden ⇒ listable. Unique n: the table is shared.
+    let mut g = test_game(9201);
+    g.steam_app_id = Some(444);
+    store.put_game(&g).await.unwrap();
+    store.create_link(&test_link("wish-open-tok")).await.unwrap();
+    mount_wishlist(&server, 200, &wish_body(&[(444, 1600000000), (555, 1600000001)])).await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app.oneshot(Request::get(format!("/api/l/wish-open-tok/steam/wishlist/{TEST_STEAMID}")).body(Body::empty()).unwrap()).await.unwrap();
+    let j = body_json(r).await;
+    let appids: Vec<u64> = j["items"].as_array().unwrap().iter().map(|i| i["appid"].as_u64().unwrap()).collect();
+    assert!(appids.contains(&444));
+    assert!(!appids.contains(&555));
+}
+
+/// Private/empty ⇒ 200 {"items":[]}; there is NO "private" flag (unmeasurable).
+#[tokio::test]
+async fn wishlist_proxy_empty_is_empty_items_no_private_flag() {
+    let Some(store) = store_or_skip("wish-empty").await else { return };
+    let server = wiremock::MockServer::start().await;
+    store.create_link(&test_link("wish-empty-tok")).await.unwrap();
+    mount_wishlist(&server, 200, r#"{"response":{}}"#).await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app.oneshot(Request::get(format!("/api/l/wish-empty-tok/steam/wishlist/{TEST_STEAMID}")).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(body_json(r).await, serde_json::json!({"items":[]}));
+}
+
+/// Steam 429 (shared Lambda egress IPs get rate-limited too) ⇒ plain 503; the client
+/// renders that silent (Task 5 pins the client half).
+#[tokio::test]
+async fn wishlist_proxy_steam_429_is_503() {
+    let Some(store) = store_or_skip("wish-429").await else { return };
+    let server = wiremock::MockServer::start().await;
+    store.create_link(&test_link("wish-429-tok")).await.unwrap();
+    mount_wishlist(&server, 429, "").await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl { url: "https://x.com/g".into() });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app.oneshot(Request::get(format!("/api/l/wish-429-tok/steam/wishlist/{TEST_STEAMID}")).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+```
+
+Seeding uses the file's own `test_game(n)` (`api_test.rs:85`: `Available`, `giftable`, `!hidden`, `steam_app_id: None`). Every test sets `steam_app_id` and uses a **unique `n` ≥ 9100**, which is harmless and keeps ids readable. (`store_or_skip` creates a fresh table per test, `t-pub-{test}` at `api_test.rs:46`, so there is no cross-test sharing.) **`api_test.rs` does not import `header`:** spell it `axum::http::header::CACHE_CONTROL`, as the existing test at `:1571` does.
+
+- [ ] **Step 2: Write the failing log-capture test** — new file `crates/public-api/tests/wishlist_logs_test.rs`. It is its own test binary, so it may own the **global** subscriber. (The fulfillment tests explain why a thread-local `set_default` is unsafe with tracing's callsite cache, `handler_test.rs:4327`.)
+
+```rust
+//! "No appids in logs" is a promise (spec-wishing-well §4) — this makes it an assertion.
+//! Own test binary ⇒ owns the global subscriber; POSITIVE CONTROL first, so a capture that
+//! sees nothing cannot pass vacuously.
+use std::sync::{Arc, Mutex, OnceLock};
+
+static BUF: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+
+struct Cap;
+impl std::io::Write for Cap {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        BUF.get().unwrap().lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+fn install() {
+    BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
+    // PRODUCTION PARITY: main.rs installs `fmt().with_ansi(false).without_time().init()`, which is
+    // INFO across all targets, and that is what reaches CloudWatch. Do NOT raise it to TRACE:
+    // aws-smithy-runtime logs full DynamoDB request/response bodies at TRACE
+    // (orchestrator.rs:486/:541, orchestrator/http.rs:42), and the seeded game's own
+    // `steam_app_id` would appear in them whatever the handler does. That would be a red
+    // against a correct handler.
+    let _ = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(|| Cap)
+        .try_init();
+}
+
+fn captured() -> String {
+    String::from_utf8_lossy(&BUF.get().unwrap().lock().unwrap()).into_owned()
+}
+```
+
+Then the rest of the file, written out in full. It uses a **minimal** invoker, because the proxy never invokes, and it uses **no** `tokio::sync::Mutex`, so nothing clashes with the `std::sync::Mutex` above:
+
+```rust
+use async_trait::async_trait;
+use axum::{body::Body, http::{Request, StatusCode}};
+use domain::{Game, GameStatus, Link, game_id};
+use dynamo::Store;
+use fulfillment::{FulfillRequest, FulfillResponse};
+use public_api::{Invoker, router};
+use steam_client::{SteamApiKey, SteamClient};
+use time::macros::datetime;
+use tower::ServiceExt;
+
+const TEST_STEAMID: &str = "76561198000000001";
+const TEST_BASE_URL: &str = "https://test.bendobundles.com";
+
+/// Copied from api_test.rs:24 — KEEP the explicit-variable panic branch verbatim: it is the
+/// only thing that stops a missing store from forging a green here.
+async fn store_or_skip(test: &str) -> Option<Arc<Store>> {
+    let (url, explicit) = match std::env::var("DYNAMODB_LOCAL_URL") {
+        Ok(v) => (v, true),
+        Err(_) => ("http://localhost:8000".into(), false),
+    };
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .endpoint_url(&url)
+        .region("us-east-1")
+        .test_credentials()
+        .load()
+        .await;
+    let client = aws_sdk_dynamodb::Client::new(&config);
+    if client.list_tables().send().await.is_err() {
+        if explicit {
+            panic!(
+                "DYNAMODB_LOCAL_URL is set but dynamodb-local is unreachable — \
+                 refusing to skip (this would forge a green run)"
+            );
+        }
+        eprintln!("SKIP {test}: no dynamodb-local at {url}");
+        return None;
+    }
+    let store = Store::new(client, format!("t-pub-{test}"));
+    store.create_table_for_tests().await.unwrap();
+    Some(Arc::new(store))
+}
+
+/// The proxy never invokes fulfillment; this invoker exists only to satisfy `router`.
+struct NoInvoker;
+#[async_trait]
+impl Invoker for NoInvoker {
+    async fn gift(&self, _req: FulfillRequest) -> Result<FulfillResponse, String> {
+        Err("not used".into())
+    }
+    async fn bell(&self, _req: FulfillRequest) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn wishlist_proxy_logs_no_appids() {
+    install();
+    // POSITIVE CONTROL: the capture can see an INFO event on this task.
+    tracing::info!("canary-9913377");
+    assert!(captured().contains("canary-9913377"), "capture is blind — the test would be vacuous");
+
+    let Some(store) = store_or_skip("wish-logs").await else { return };
+    let mut g = Game {
+        id: game_id("gk9301", "mn"),
+        title: "Game 9301".into(),
+        bundle: "Test Bundle".into(),
+        gamekey: "gk9301".into(),
+        machine_name: "mn".into(),
+        key_type: "steam".into(),
+        giftable: true,
+        hidden: false,
+        status: GameStatus::Available,
+        claim_id: None,
+        artwork_url: None,
+        keyindex: 9301,
+        requires_choice: false,
+        steam_app_id: None,
+        appid_source: None,
+        owned_by_ben: false,
+        hidden_source: None,
+        acquired_at: None,
+    };
+    g.steam_app_id = Some(8675309);
+    store.put_game(&g).await.unwrap();
+    store
+        .create_link(&Link {
+            token: "wish-logs-tok".into(),
+            label: "Test Friend".into(),
+            gift_note: None,
+            thank_note: None,
+            thanked_at: None,
+            claims_allowed: 1,
+            claims_used: 0,
+            revoked: false,
+            expires_at: None,
+            unlock_at: None,
+            curated_game_ids: None,
+            curated_notes: None,
+            friend_id: None,
+            created_at: datetime!(2026-07-02 00:00 UTC),
+        })
+        .await
+        .unwrap();
+
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/IWishlistService/GetWishlist/v1/"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"items":[{"appid":8675309,"priority":0,"date_added":1678000000},{"appid":7340033,"priority":0,"date_added":1678000000}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let steam = SteamClient::new(&server.uri(), &server.uri(), &server.uri(), SteamApiKey::new("TESTKEY".into())).unwrap();
+    let app = router(store, Arc::new(NoInvoker), Some(Arc::new(steam)), TEST_BASE_URL.to_string());
+
+    let resp = app
+        .oneshot(Request::get(format!("/api/l/wish-logs-tok/steam/wishlist/{TEST_STEAMID}")).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("8675309"), "the overlap must be served");
+
+    let logs = captured();
+    assert!(!logs.contains("8675309"), "an overlap appid reached the logs:\n{logs}");
+    assert!(!logs.contains("7340033"), "a wishlist-only appid reached the logs:\n{logs}");
+}
+```
+
+If any `use` is unused or a dev-dependency (`aws-config`, `aws-sdk-dynamodb`, `async-trait`, `wiremock`, `tower`, `time`) is missing from `crates/public-api/Cargo.toml`'s `[dev-dependencies]`, mirror what `api_test.rs` already compiles with. It is the same crate, so they are all present today.
+
+- [ ] **Step 3: Run and confirm they fail.** `cargo test -p public-api --test api_test wishlist` and `cargo test -p public-api --test wishlist_logs_test` ⇒ all 404 (no route) or fail to compile.
+
+- [ ] **Step 4: Implement.** In `lib.rs`:
+
+(a) **Extract the dead-link 409** out of `handle_steam_owned_proxy` so both proxies share one mapping:
+
+```rust
+/// The claim-path refusal ⇒ 409 mapping, shared by both steam proxies (one exhaustive match:
+/// a new refusal variant forces a decision here at compile time).
+fn dead_link_conflict(refusal: domain::ClaimRefusal) -> Response {
+    use domain::ClaimRefusal;
+    let msg = match refusal {
+        ClaimRefusal::Revoked => "this link has been revoked",
+        ClaimRefusal::Sealed => "this gift is still wrapped",
+        ClaimRefusal::Expired => "this link has expired",
+        ClaimRefusal::Exhausted => "no claims left on this link",
+    };
+    (StatusCode::CONFLICT, Json(serde_json::json!({"error": msg}))).into_response()
+}
+```
+
+and replace the owned proxy's inline block with `if let Err(refusal) = link.can_claim(now) { return dead_link_conflict(refusal); }`. The existing owned-proxy tests must stay green unchanged. (The claim handler has a third copy of this match, at `lib.rs:903`. Leave it alone: its messages feed a different response shape, and this PR does not touch the claim path.)
+
+(b) **The live-appid set:**
+
+```rust
+/// The steam appids a friend can actually see as LIVE cards on this link — the set the
+/// wishlist proxy intersects against. Curated: members that pass `live_on_link` (ghosts are
+/// excluded; a star on a ghost would point at nothing). Open: the listable catalog.
+async fn link_live_app_ids(
+    store: &Store,
+    link: &domain::Link,
+) -> Result<std::collections::HashSet<u32>, StoreError> {
+    Ok(match &link.curated_game_ids {
+        Some(ids) => store
+            .batch_get_games(ids)
+            .await?
+            .values()
+            .filter(|g| live_on_link(link, g))
+            .filter_map(|g| g.steam_app_id)
+            .collect(),
+        None => store
+            .list_listable_games()
+            .await?
+            .iter()
+            .filter_map(|g| g.steam_app_id)
+            .collect(),
+    })
+}
+```
+
+(c) **The handler** (after `handle_steam_owned_proxy`). **It contains no `tracing::` call at all:**
+
+```rust
+// ── GET /api/l/{token}/steam/wishlist/{steamid} ─────────────────────────────────
+
+/// ⭐ Token-scoped wishlist proxy (docs/spec-wishing-well.md). Same preamble ORDER as the
+/// owned proxy (token → liveness → id64). Then a LIVE, keyless Steam read — nothing is
+/// stored (§4: the server holds nothing about a wishlist) — intersected with the link's
+/// live appids so the proxy never serves anyone's full list. Every Steam failure is one
+/// plain 503 that the client renders silent. No tracing here, by contract: appids are
+/// the friend's data.
+async fn handle_steam_wishlist_proxy(
+    State(s): State<AppState>,
+    Path((token, steamid)): Path<(String, String)>,
+) -> Response {
+    let steam = match s.steam.as_ref() {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "steam not configured"})),
+            )
+                .into_response();
+        }
+    };
+    let link = match s.store.get_link(&token).await {
+        Ok(Some(l)) => l,
+        Ok(None) => return link_not_found_response(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "try again"})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(refusal) = link.can_claim(OffsetDateTime::now_utc()) {
+        return dead_link_conflict(refusal);
+    }
+    if !steam_client::is_valid_steam_id64(&steamid) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": steam_client::STEAM_ID64_ERROR_MSG})),
+        )
+            .into_response();
+    }
+    // Both reads are needed before answering, and the client holds its first render ≤400ms
+    // for this response, so run them concurrently.
+    let (shelf, wish) = tokio::join!(
+        link_live_app_ids(&s.store, &link),
+        steam.get_wishlist(&steam_client::SteamId64(steamid)),
+    );
+    let shelf = match shelf {
+        Ok(set) => set,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "try again"})),
+            )
+                .into_response();
+        }
+    };
+    match wish {
+        Ok(items) => {
+            let items: Vec<serde_json::Value> = items
+                .into_iter()
+                .filter(|i| shelf.contains(&i.appid))
+                .map(|i| serde_json::json!({"appid": i.appid, "added": i.date_added}))
+                .collect();
+            (
+                StatusCode::OK,
+                // private: per-friend, never shared-cacheable. The ONLY copy of the overlap
+                // lives in the friend's own browser for an hour (spec §4).
+                [(header::CACHE_CONTROL, "private, max-age=3600")],
+                Json(serde_json::json!({"items": items})),
+            )
+                .into_response()
+        }
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+```
+
+(d) **Route**, next to the owned one:
+
+```rust
+        .route(
+            "/api/l/{token}/steam/wishlist/{steamid}",
+            get(handle_steam_wishlist_proxy),
+        )
+```
+
+(e) Update the module doc comment at `lib.rs:6` to list the new route.
+
+- [ ] **Step 5: Run.** DynamoDB-local must be up on `:8000` (`moto_server`). **The guard against a forged green is setting `DYNAMODB_LOCAL_URL` EXPLICITLY:** with the variable set, `store_or_skip` **panics** on an unreachable store instead of skipping (`api_test.rs:31-37`). A `grep SKIP` cannot catch a skip, because libtest captures a passing test's `eprintln!` and a skipped test still prints `... ok`. So:
+
+```bash
+DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p public-api 2>&1 | tee /tmp/wish-pub.log
+grep -cE '^test wishlist_proxy_\S+ \.\.\. ok$' /tmp/wish-pub.log     # ⇒ 8 (7 in api_test + 1 logs test)
+```
+
+The logs test's copy of `store_or_skip` **must keep the explicit-variable panic branch verbatim**.
+
+Then `cargo fmt --all && cargo clippy -p public-api --all-targets --all-features -- -D warnings`.
+
+- [ ] **Step 6: Commit.** `git add crates/public-api && git commit -S -m "⭐ public-api: token-scoped wishlist proxy — live, intersected, nothing at rest"`
+
+---
+
+### Task 3: web client `steamWishlistForLink`
+
+**Files:** Modify `web/src/api.ts` (after `steamOwnedForLink` ~L870); Test `web/src/api.test.ts`.
+
+**Interfaces:**
+- Produces: `export type WishItem = { appid: number; added: number }` and `export async function steamWishlistForLink(token: string, steamid: string): Promise<WishItem[]>`. It throws `FetchFailed` on network error or any non-2xx.
+
+- [ ] **Step 1: Failing tests** (`api.test.ts` has no owned-proxy tests. Its pattern is a module-level `mockFetch` stubbed in `beforeEach`, and the per-test `vi.stubGlobal` below also works. **Add `steamWishlistForLink` to the file's import from `./api`**, or the red is "not a function" rather than the real one):
+
+```ts
+describe("steamWishlistForLink", () => {
+  it("returns the items on 200", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ items: [{ appid: 420, added: 1678000000 }] }), { status: 200 })));
+    await expect(steamWishlistForLink("tok", "76561198000000001"))
+      .resolves.toEqual([{ appid: 420, added: 1678000000 }]);
+    expect(fetch).toHaveBeenCalledWith("/api/l/tok/steam/wishlist/76561198000000001");
+  });
+  it("throws FetchFailed on 503", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 503 })));
+    await expect(steamWishlistForLink("tok", "1")).rejects.toBeInstanceOf(FetchFailed);
+  });
+  it("throws FetchFailed on network error", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("offline")));
+    await expect(steamWishlistForLink("tok", "1")).rejects.toBeInstanceOf(FetchFailed);
+  });
+});
+```
+
+- [ ] **Step 2: Run** `cd web && npx vitest run src/api.test.ts` ⇒ FAIL (not exported).
+- [ ] **Step 3: Implement:**
+
+```ts
+export type WishItem = { appid: number; added: number };
+
+/** ⭐ token-scoped wishlist overlap (spec-wishing-well §3). Server already intersected
+ *  with this link's live games. Any failure throws FetchFailed — callers render it SILENT. */
+export async function steamWishlistForLink(token: string, steamid: string): Promise<WishItem[]> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/l/${token}/steam/wishlist/${encodeURIComponent(steamid)}`);
+  } catch {
+    throw new FetchFailed();
+  }
+  if (!response.ok) throw new FetchFailed();
+  const data = (await response.json()) as { items?: WishItem[] };
+  return data.items ?? [];
+}
+```
+
+- [ ] **Step 4: Run** ⇒ PASS. **Step 5: Commit** `⭐ web: steamWishlistForLink`.
+
+---
+
+### Task 4: the ⭐ pill in `GameGrid` + `formatSince`
+
+**Files:** Create `web/src/wishlist.ts`, `web/src/wishlist.test.ts`; Modify `web/src/friend/GameGrid.tsx`, `web/src/friend/GameGrid.test.tsx`.
+
+**Interfaces:**
+- Produces: `export function formatSince(addedEpochSecs: number): string | null` (e.g. `1678000000` ⇒ `"mar 2023"`; `0` ⇒ `null`). New optional `GameGrid` prop `wished?: Map<number, number>` (appid ⇒ added epoch secs).
+
+- [ ] **Step 1: Failing tests.** `wishlist.test.ts`:
+
+```ts
+import { formatSince } from "./wishlist";
+it("formats UTC month + year, lowercase", () => {
+  expect(formatSince(1678000000)).toBe("mar 2023"); // 2023-03-05T07:06:40Z
+});
+it("uses UTC, not local time, at a month boundary", () => {
+  // CI and the box run TZ=UTC, so without this override a local-time implementation also
+  // passes. In Los Angeles this instant is still Mar 31, so only a UTC formatter says apr.
+  const old = process.env.TZ;
+  process.env.TZ = "America/Los_Angeles";
+  try {
+    expect(new Date(1680307200000).getDate()).toBe(31); // the override TOOK (else this test is vacuous)
+    expect(formatSince(1680307200)).toBe("apr 2023"); // 2023-04-01T00:00:00Z
+  } finally {
+    process.env.TZ = old;
+  }
+});
+it("returns null for a missing date", () => {
+  expect(formatSince(0)).toBeNull();
+});
+```
+
+In `GameGrid.test.tsx` (reuse its `makeGame`):
+
+```ts
+it("stars a wishlisted game with its since-date as the accessible name", () => {
+  render(<GameGrid games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420 })]}
+    wished={new Map([[420, 1678000000]])} onDetail={() => {}} />);
+  expect(screen.getByText("⭐ on your wishlist")).toHaveAttribute("title", "on your wishlist since mar 2023");
+  // spec §2.1: the CARD's accessible name carries it. The card is a button whose aria-label
+  // replaces its descendants' text (GameGrid.tsx:~203), so a label on the pill is never heard.
+  expect(screen.getByRole("button", { name: "Portal — details, on your wishlist since mar 2023" })).toBeInTheDocument();
+});
+it("owned wins: no star on an owned game", () => {
+  render(<GameGrid games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420 })]}
+    owned={new Set([420])} wished={new Map([[420, 1678000000]])} onDetail={() => {}} />);
+  expect(screen.getByText(/you own this/i)).toBeInTheDocument();
+  expect(screen.queryByText("⭐ on your wishlist")).not.toBeInTheDocument();
+});
+it("never stars a ghost", () => {
+  render(<GameGrid curated games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420, gone: true })]}
+    wished={new Map([[420, 1678000000]])} onDetail={() => {}} />);
+  expect(screen.queryByText("⭐ on your wishlist")).not.toBeInTheDocument();
+});
+it("a missing date still stars, without a since", () => {
+  render(<GameGrid games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420 })]}
+    wished={new Map([[420, 0]])} onDetail={() => {}} />);
+  expect(screen.getByText("⭐ on your wishlist")).toHaveAttribute("title", "on your wishlist");
+});
+```
+
+- [ ] **Step 2: Run** `npx vitest run src/wishlist.test.ts src/friend/GameGrid.test.tsx` ⇒ FAIL.
+- [ ] **Step 3: Implement.** `wishlist.ts`:
+
+```ts
+// ⭐ the wishing well — pure helpers (docs/spec-wishing-well.md). No I/O here.
+
+/** "mar 2023" from epoch seconds, in UTC (a wishlist date is a calendar fact, not local). */
+export function formatSince(addedEpochSecs: number): string | null {
+  if (!addedEpochSecs) return null;
+  return new Date(addedEpochSecs * 1000)
+    .toLocaleString("en-US", { month: "short", year: "numeric", timeZone: "UTC" })
+    .toLowerCase();
+}
+```
+
+`GameGrid.tsx`: add the prop to `GameGridProps` with a doc comment (`/** ⭐ appid ⇒ added epoch secs, already intersected server-side. Owned wins; ghosts never star. */ wished?: Map<number, number>;`), destructure it, and compute beside `youOwnThis`:
+
+```tsx
+        const wishedAt =
+          !youOwnThis && game.gone !== true && game.steam_app_id !== null
+            ? wished?.get(game.steam_app_id)
+            : undefined;
+        const wishLabel =
+          wishedAt === undefined
+            ? null
+            : (() => {
+                const since = formatSince(wishedAt);
+                return since ? `on your wishlist since ${since}` : "on your wishlist";
+              })();
+```
+
+and render right after the `youOwnThis` pill:
+
+```tsx
+            {wishLabel !== null && (
+              <span
+                className="rounded bg-floor px-2 py-0.5 text-xs text-ink-soft"
+                title={wishLabel}
+              >
+                ⭐ on your wishlist
+              </span>
+            )}
+```
+
+**Colour, decided:** a **floor chip** (`bg-floor … text-ink-soft`) where the ⭐ glyph carries the meaning, which is the `✍ from ben` presence-marker precedent. **Not amber:** `DESIGN.md` §2 reserves amber for pending/caution, and it is already the page's "used all your claims" alert.
+
+**Also add `import { formatSince } from "../wishlist";` to `GameGrid.tsx`**, and extend the card button's label (search `aria-label={\`${game.title} — details\`}`) to:
+
+```tsx
+aria-label={`${game.title} — details${wishLabel ? `, ${wishLabel}` : ""}`}
+```
+
+The existing exact-label assertion (`LinkPage.test.tsx:122`) has no wishlist, so it stays green. **Note:** the "owned wins" and "ghost" tests are **regression guards** and are already green at red (ghost cards return before the chip row). Only the star test and the missing-date test are true reds.
+
+- [ ] **Step 4: Run** ⇒ PASS, plus the whole `GameGrid.test.tsx` and `LinkPage.test.tsx` (the label change touches its `:122` assertion); then `npm run typecheck && npm run lint`. **Step 5: Commit** `⭐ web: the wishlist star — owned wins, ghosts never star`.
+
+---
+
+### Task 5: `LinkPage` — fetch, hold, float, count line
+
+**Files:** Modify `web/src/friend/LinkPage.tsx`, `web/src/friend/LinkPage.test.tsx`; add `floatRanks` to `web/src/wishlist.ts` (+ test).
+
+**Interfaces:**
+- Consumes: `steamWishlistForLink`, `WishItem` (Task 3); `GameGrid.wished` (Task 4).
+- Produces: `export function floatRanks(ids: string[], starred: Set<string>, rand: () => number): Map<string, number>`. Starred ids get ranks `0..k-1` in shuffled order, the rest get `k..n-1` in shuffled order. `rand` is injectable so the partition test is deterministic.
+
+**Behaviour contract (from spec §2, §5 and the family review):**
+1. The wishlist fetch starts when a Steam identity is present: on the OpenID-return path (with the fragment's steamid) or the restore path (with the stored steamid). It runs **in parallel** with `steamOwnedForLink`. State: `type Wish = { kind: "none" } | { kind: "pending" } | { kind: "done"; wished: Map<number, number> }`. On failure ⇒ `done` with an empty map (**silent**). It never touches `steamError` or `steamPrivate`.
+2. **The hold (Lilith's layout-jump fix):** on an **open-shelf** link, when the link has loaded **and** `wish.kind === "pending"`, keep rendering the existing loading view for at most **400 ms** (`WISH_HOLD_MS = 400`). After the cap, render anyway. Curated links never hold. No identity means no hold.
+3. **The freeze:** the shuffle ranks are computed **once**, at the first open-shelf render that is not held, with `floatRanks(ids, starredIds, Math.random)`. `starredIds` is the ids of games whose `steam_app_id` is in `wished` **and not in `ownedSet`**. If the wishlist lands later, **ranks are not recomputed**. Late stars appear and nothing moves.
+4. The count line renders above the grid when `N ≥ 1`, where N is the number of **live, non-owned** games on the current shelf that are starred. It shows on both curated and open links. Absent at 0.
+5. Disconnect (`clearIdentity` handler ~L480) also sets `wish` to `{ kind: "none" }`.
+
+- [ ] **Step 1: Failing tests.** `wishlist.test.ts`:
+
+```ts
+import { floatRanks } from "./wishlist";
+it("floatRanks puts every starred id before every unstarred id", () => {
+  let seed = 7; const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const ids = ["a", "b", "c", "d", "e", "f"];
+  const r = floatRanks(ids, new Set(["e", "b"]), rand);
+  const maxStar = Math.max(r.get("e")!, r.get("b")!);
+  const minRest = Math.min(...["a", "c", "d", "f"].map((x) => r.get(x)!));
+  expect(maxStar).toBeLessThan(minRest);
+  expect(new Set(r.values()).size).toBe(6);
+});
+it("floatRanks with nothing starred is a plain shuffle of all ids", () => {
+  const r = floatRanks(["a", "b", "c"], new Set(), Math.random);
+  expect([...r.values()].sort()).toEqual([0, 1, 2]);
+});
+```
+
+`LinkPage.test.tsx`: add `steamWishlistForLink: vi.fn()` to the `vi.mock("../api")` factory and to the import list. **Set the default in the TOP-LEVEL `describe("LinkPage")` `beforeEach`**, right after `loadIdentity` is set to null (~`:80`): `vi.mocked(steamWishlistForLink).mockResolvedValue([]);`. Nowhere else will do: the existing steam-identity tests (`:629`, `:658`, `:685`) restore an identity, and a bare `vi.fn()` returns `undefined`. **Nest `describe("wishing well")` INSIDE `describe("LinkPage")`** so it inherits that `beforeEach` and the `consumeReturnFragment` default. Add `afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); })` inside the wishing-well describe (the second call undoes the `Math.random` spies), so a failing fake-timer test cannot leak. Then:
+
+```tsx
+describe("wishing well", () => {
+  const stored = { steamid: "76561198000000001", persona: "Alice", owned: [], fetched_at: 0 };
+  const shelf = (n: number) => Array.from({ length: n }, (_, i) =>
+    makeGame({ id: String(i), title: `G${i}`, steam_app_id: 1000 + i }));
+
+  it("stars a wishlisted game and shows the count line (N ≥ 1)", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(5) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockResolvedValue([
+      { appid: 1003, added: 1678000000 }, { appid: 1001, added: 1678000000 }]);
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("⭐ 2 of these are on your wishlist")).toBeInTheDocument());
+    expect(screen.getAllByText("⭐ on your wishlist")).toHaveLength(2);
+  });
+
+  it("singular count copy", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(3) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 1002, added: 1678000000 }]);
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("⭐ 1 of these is on your wishlist")).toBeInTheDocument());
+  });
+
+  it("no count line at 0 — and none on failure (silent, no error text)", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(3) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockRejectedValue(new FetchFailed());
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("G0")).toBeInTheDocument());
+    expect(screen.queryByText(/of these (are|is) on your wishlist/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/wishlist/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("open shelf: starred cards render first", async () => {
+    // Pin the shuffle: rand≈1 makes Fisher–Yates the identity, so G6 is first ONLY via the float.
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(8) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 1006, added: 1678000000 }]);
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("⭐ on your wishlist")).toBeInTheDocument());
+    const titles = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent);
+    expect(titles[0]).toBe("G6");
+  });
+
+  it("curated: order is ben's, stars do not move, count line still shows", async () => {
+    const games = shelf(4);
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, curated: true, games });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 1003, added: 1678000000 }]);
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("⭐ 1 of these is on your wishlist")).toBeInTheDocument());
+    const titles = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent);
+    expect(titles).toEqual(["G0", "G1", "G2", "G3"]);
+  });
+
+  it("the hold ENGAGES: a deferred wishlist keeps the loading view, then floats (OMBB M1)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.spyOn(Math, "random").mockReturnValue(0.999); // identity shuffle ⇒ G5 first only via the float
+    let resolveWish!: (v: { appid: number; added: number }[]) => void;
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(6) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockReturnValue(new Promise((r) => { resolveWish = r; }));
+    renderLinkPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    expect(screen.getByText("loading...")).toBeInTheDocument();
+    expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0);
+    await act(async () => { resolveWish([{ appid: 1005, added: 1678000000 }]); });
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 3 })[0]).toHaveTextContent("G5"));
+  });
+
+  it("the hold is CAPPED at 400ms: held at 399, rendered (unfloated) at 401 (OMBB M1)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(4) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockReturnValue(new Promise(() => {})); // never lands
+    renderLinkPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(399); });
+    expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2); });
+    expect(screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent)).toEqual(["G0", "G1", "G2", "G3"]);
+  });
+
+  it("a wishlist that lands AFTER the hold cap adds stars without moving any card", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Pinned (OMBB M2): identity order puts G7 LAST, so a wrong late re-rank (G7 → first)
+    // cannot pass on shuffle luck. Unpinned, it passed 1 run in 8 for free.
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    let resolveWish!: (v: { appid: number; added: number }[]) => void;
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(8) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockReturnValue(new Promise((r) => { resolveWish = r; }));
+    renderLinkPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });   // let fetchLink resolve ⇒ hold timer scheduled
+    await act(async () => { await vi.advanceTimersByTimeAsync(450); }); // past WISH_HOLD_MS
+    await waitFor(() => expect(screen.getByText("G0")).toBeInTheDocument());
+    const before = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent);
+    await act(async () => { resolveWish([{ appid: 1007, added: 1678000000 }]); });
+    await waitFor(() => expect(screen.getByText("⭐ on your wishlist")).toBeInTheDocument());
+    const after = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent);
+    expect(after).toEqual(before);
+  });
+
+  it("two copies of one wishlisted title count ONCE (the grid dedupes by title)", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: [
+      makeGame({ id: "a", title: "Portal", steam_app_id: 420 }),
+      makeGame({ id: "b", title: "Portal", steam_app_id: 420 }),
+      makeGame({ id: "c", title: "Other", steam_app_id: 999 }),
+    ] });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 420, added: 1678000000 }]);
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("⭐ 1 of these is on your wishlist")).toBeInTheDocument());
+  });
+
+  it("restore path fetches the wishlist with the stored steamid", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(2) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    renderLinkPage();
+    await waitFor(() => expect(steamWishlistForLink).toHaveBeenCalledWith("abc123", stored.steamid));
+  });
+
+  it("disconnect clears the stars and the count line", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(3) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 1001, added: 1678000000 }]);
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("⭐ 1 of these is on your wishlist")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: /disconnect/i }));
+    await waitFor(() => expect(screen.queryByText(/on your wishlist/)).not.toBeInTheDocument());
+  });
+
+  it("wishlist failure never blocks owned", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(2) });
+    vi.mocked(consumeReturnFragment).mockReturnValue({ steamid: "76561198000000001", persona: "Alice" });
+    vi.mocked(steamOwnedForLink).mockResolvedValue([1000]);
+    vi.mocked(steamWishlistForLink).mockRejectedValue(new FetchFailed());
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText(/you own this/i)).toBeInTheDocument());
+  });
+});
+```
+
+(If `baseLink` in the file already has a `curated` field, spread over it as written. If the heading level for card titles is not 3, match `GameGrid`'s `<h3>`, which is what it is today.)
+
+- [ ] **Step 2: Run** `npx vitest run src/wishlist.test.ts src/friend/LinkPage.test.tsx` ⇒ the new ones FAIL, and the old ones still pass.
+
+- [ ] **Step 3: Implement `floatRanks`** in `wishlist.ts`:
+
+```ts
+/** Per-visit shelf ranks with the ⭐ float (spec §2.2): starred ids first, each group
+ *  Fisher–Yates-shuffled on its own, so the rummage survives inside both groups. */
+export function floatRanks(ids: string[], starred: Set<string>, rand: () => number): Map<string, number> {
+  const shuffle = (xs: string[]) => {
+    for (let i = xs.length - 1; i > 0; i--) {
+      const j = Math.floor(rand() * (i + 1));
+      [xs[i], xs[j]] = [xs[j]!, xs[i]!];
+    }
+    return xs;
+  };
+  const ordered = [
+    ...shuffle(ids.filter((id) => starred.has(id))),
+    ...shuffle(ids.filter((id) => !starred.has(id))),
+  ];
+  return new Map(ordered.map((id, pos) => [id, pos]));
+}
+```
+
+- [ ] **Step 4: Implement in `LinkPage.tsx`:**
+  1. Import `steamWishlistForLink` and `floatRanks`. Add `const WISH_HOLD_MS = 400;` and the `Wish` type at module scope.
+  2. State: `const [wish, setWish] = useState<Wish>({ kind: "none" });` and `const [holdOver, setHoldOver] = useState(false);`.
+  3. **Inside the steam effect** (the `useEffect` that declares `let cancelled = false;` at ~`:195`), right after that declaration, define the loader so it closes over `cancelled`:
+
+```ts
+    const loadWish = (steamid: string) => {
+      setWish({ kind: "pending" });
+      // Promise.resolve() first: a mock (or future caller) returning a non-promise degrades
+      // silently instead of throwing inside the effect.
+      Promise.resolve()
+        .then(() => steamWishlistForLink(token!, steamid))
+        .then((items) => {
+          if (!cancelled) setWish({ kind: "done", wished: new Map(items.map((i) => [i.appid, i.added])) });
+        })
+        .catch(() => {
+          if (!cancelled) setWish({ kind: "done", wished: new Map() });
+        });
+    };
+```
+
+  4. **Restore path:** replace the existing block
+
+```ts
+    if (fragment === null) {
+      // No return fragment — restore from localStorage
+      const stored = loadIdentity();
+      if (!cancelled) setSteamIdentity(stored);
+      return;
+    }
+```
+
+with (**the bare `return;` becomes a cleanup, so `cancelled` can actually flip on this path**):
+
+```ts
+    if (fragment === null) {
+      // No return fragment — restore from localStorage
+      const stored = loadIdentity();
+      if (!cancelled) setSteamIdentity(stored);
+      if (stored) loadWish(stored.steamid);
+      return () => {
+        cancelled = true;
+      };
+    }
+```
+
+**Return path:** call `loadWish(steamid);` on the line **before** `void fetchOwned();`, so the two run in parallel. **Accepted race (recorded, not fixed):** on this path, if the wishlist lands before owned, ranks may freeze with an owned-and-wishlisted game floated but unstarred. Steam removes a game from the wishlist on purchase, so this needs stale Steam data to happen.
+  5. **Placement matters (rules-of-hooks):** put the `holdOver` state, this effect and `holding` **immediately after the `ownedSet` memo (~`:284`) and before `shuffleRanksRef`**. Every hook must stay above the early return at ~`:317`.
+
+```ts
+  // Hold only an ACTIVE open shelf. Curated never floats, and dead or sealed links 409 on the proxy.
+  const openShelf =
+    view.kind === "loaded" && view.data.curated !== true && view.data.state === "active";
+  useEffect(() => {
+    if (!openShelf || wish.kind !== "pending") return;
+    const t = setTimeout(() => setHoldOver(true), WISH_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [openShelf, wish.kind]);
+  const holding = openShelf && wish.kind === "pending" && !holdOver;
+```
+  6. `const wishedMap = wish.kind === "done" ? wish.wished : undefined;`
+  7. In the `shelfGames` memo: `if (holding) return [];` before the rank block, and replace the inline Fisher–Yates with `shuffleRanksRef.current = floatRanks(games.map((g) => g.id), starredIds, Math.random)`, where `starredIds` is built from `games`, `wishedMap` and `ownedSet` (non-owned, `steam_app_id` in `wishedMap`). Add `holding`, `wishedMap` and `ownedSet` to the deps. Ranks are still assigned only while `shuffleRanksRef.current === null`, which is the freeze. **Do not reset the ref when the wishlist lands.**
+  8. The render gate: extend the existing `if (view.kind === "loading")` to `if (view.kind === "loading" || holding)`.
+  9. The count line counts **distinct appids**, because the open shelf renders one card per title (`dedupedByTitle`): `const starCount = new Set(shelfGames.filter((g) => g.gone !== true && g.steam_app_id !== null && !ownedSet.has(g.steam_app_id) && wishedMap?.has(g.steam_app_id)).map((g) => g.steam_app_id)).size;`. Render it directly above `<GameGrid …/>` when `starCount >= 1`: `<p className="px-6 pt-2 text-sm text-ink-soft">⭐ {starCount} of these {starCount === 1 ? "is" : "are"} on your wishlist</p>`. The text must be a **single text node** so `getByText` matches: build the string first, `const line = \`⭐ ${starCount} of these ${starCount === 1 ? "is" : "are"} on your wishlist\`;`, then render `{line}`.
+  10. Pass `wished={wishedMap}` to `<GameGrid>`. **Known, accepted (OMBB minor):** the typewriter's `viewLoaded` gate (`:67`) is true during the hold, so for ≤400 ms the gift-note typing and its Enter/Space skip run behind the loading view. It is harmless: nothing is lost, and the note is either still typing or complete when the grid appears. Do not re-order hooks to fix it.
+  11. In the disconnect handler next to `clearIdentity();`, add `setWish({ kind: "none" });`.
+
+- [ ] **Step 5: Run the whole web suite:** `cd web && npx vitest run && npm run typecheck && npm run lint` ⇒ green. The lint baseline is **3 warnings** (measured 2026-09-30), and this task must not add one.
+  12. **Amend `docs/spec-wishing-well.md` §5**, replacing the "When it lands, starred games move up in one reorder" bullet with the hold-then-freeze contract: the first open-shelf render waits ≤400 ms for the wishlist, and a later arrival adds stars and moves nothing. Commit it with this task. **Step 6: Commit** `⭐ web: the wishing well — float, hold ≤400ms, late stars never move, count line at ≥1`.
+
+---
+
+### Task 6: prove the "nothing at rest" boundary, then the full gate
+
+- [ ] **Step 1: The diff boundary.** Run `git diff --name-only origin/main...HEAD`. The printed list must contain **no** path under `crates/dynamo/`, `terraform/` or `crates/fulfillment/`, and no `iam-request-corpus.json`. Assert it rather than eyeballing it:
+
+```bash
+set -o pipefail
+files=$(git diff --name-only origin/main...HEAD) && [ -n "$files" ] || { echo "🔴 NOT MEASURED — empty or failed diff"; exit 2; }
+printf '%s\n' "$files" | tee /dev/stderr \
+  | grep -E '^(crates/dynamo/|crates/fulfillment/|terraform/|terraform-iam/)' \
+  && { echo "🔴 NOTHING-AT-REST BOUNDARY BROKEN"; exit 1; } || echo "✅ boundary holds"
+```
+
+Before trusting that, run the positive control: `printf 'terraform/x.tf\n' | grep -E '^(crates/dynamo/|crates/fulfillment/|terraform/|terraform-iam/)'` ⇒ rc 0. That proves the pattern can see a hit.
+- [ ] **Step 2: Full gate = CI.** The box has 3.7G RAM and cargo `jobs=1`, and CI runs this exact gate (fmt, clippy `--all-features`, dynamodb-local tests, Node 22 web typecheck/lint/test/build). So push the branch and gate on `ops/branch-green.sh yourcodekitten/bendobundles kitten/wishing-well` (from `~/code-kitten`) ⇒ rc 0. Locally, run at least `cargo fmt --all -- --check` and `cd web && npm run typecheck && npm run lint && npx vitest run`.
+- [ ] **Step 2b: Commit any fix-ups** from Steps 1–2 (`cargo fmt` reflow, lint) as `🧹 fmt/lint`, and push.
+- [ ] **Step 3: The IAM evidence, stated precisely.** `iam_capture` drives Store methods from its own caller map (`iam_capture.rs:22-29`), so it **cannot see** new call sites in public-api. A green run proves only that the dynamo crate is unchanged. The real evidence: `jq -r '.["public-api"] | keys[]' terraform/iam-request-corpus.json` lists `get_link`, `batch_get_games` and `list_listable_games`. Those three are the only Store calls the new proxy makes, so its reads are already inside the deployed policy.
+
+---
+
+## Deploy (pounce step 11, after merge)
+
+Full deploy per `terraform/README.md` → "Deploying as kitten". This changes lambda code **and** web, so it is not the web-only path. **Pre-register the plan shape from prod's last-deployed stamp, never from this diff** (a deploy ships prod→main, which may carry others' merges). The expected shape for this PR alone is **0 add / N change / 0 destroy**, where N is the lambda functions whose zip hash moved: `public-api`, `admin-api` and `fulfillment` all link `steam-client`, so **pre-register N = 3 lambda functions** (their `source_code_hash` moves), plus any change from others' merges since prod's last deploy. Name every resource from the plan's own list before applying. Then run `deploy-web.sh` from the CI `web-dist` artifact of the merge commit.
+
+## Post-deploy verification (pounce step 12)
+
+0a. **Baseline scan BEFORE step 1:** `AWS_PROFILE=kitten-debug aws dynamodb scan --region us-east-1 --table-name brd-prod-ue1-bendobundles-table --filter-expression 'contains(pk,:id) OR contains(sk,:id)' --expression-attribute-values '{":id":{"S":"<id64>"}}' --output json | jq -S '.Items' > scan-before.json`.
+0. **Pre-register the subject BEFORE deploy (non-vacuous overlap).** Pick a live open-shelf link token and an id64 from the 2026-09-30 probe (or any public profile) whose **raw** keyless wishlist ∩ that link's `games[].steam_app_id` is **non-empty**, and whose raw wishlist also carries appids **not** on the link. Compute both sets from the raw Steam call and the live `/api/l/<token>` payload, and write the id64, the token and the expected overlap into the checkpoint. If no public id64 overlaps, use a curated test link whose games are chosen from a known wishlist.
+1. `curl -sSi "https://<prod-host>/api/l/<token>/steam/wishlist/<id64>"` ⇒ `200`, `cache-control: private, max-age=3600`. Assert **both** halves mechanically with jq: returned ⊆ link appids (set-difference ⇒ empty) **and** returned == the pre-registered overlap (so returned ≠ the raw wishlist).
+2. **Logs:** a Logs Insights query over the public-api log group for the request window, filtered on (i) one returned overlap appid and (ii) one **wishlist-only** appid (≥7 digits, so `REPORT` numbers cannot collide) ⇒ 0 each. Positive control on the same query and window: filter on `REPORT RequestId` ⇒ ≥1. API Gateway execution logs run at INFO with `data_trace_enabled=false`, so they carry the path (which holds the id64, not appids) and no bodies. Check that in `terraform/aws-apigateway.tf`; don't assume it.
+3. Load the page in a browser (Playwright) with a stored identity for that id64 and screenshot the stars and the count line.
+4. **Nothing at rest, measured:** re-run the step 0a scan into `scan-after.json`, then `diff scan-before.json scan-after.json` ⇒ **identical** (rc 0). The proxy call and the browser load in between must have written nothing keyed to that id64. This is unconditional; there is no "only if" clause.

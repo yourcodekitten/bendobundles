@@ -4,6 +4,7 @@ import {
   fetchLink,
   fetchGameDetail,
   steamOwnedForLink,
+  steamWishlistForLink,
   NotFound,
   type GameView,
   type LinkView,
@@ -26,6 +27,15 @@ import { CursorCompanion } from "./CursorCompanion";
 import { prefersReducedMotion, motionOK } from "../motion";
 import { graphemes } from "../text";
 import { BootScreen } from "./BootScreen";
+import { floatRanks } from "../wishlist";
+
+/** ⭐ the first open-shelf render waits at most this long for the wishlist (spec §5). */
+const WISH_HOLD_MS = 400;
+const WISH_NONE = { kind: "none" } as const;
+type Wish =
+  | typeof WISH_NONE
+  | { kind: "pending" }
+  | { kind: "done"; wished: Map<number, number> };
 
 type ViewState =
   | { kind: "loading" }
@@ -187,6 +197,13 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   );
   const [steamPrivate, setSteamPrivate] = useState(false);
   const [steamError, setSteamError] = useState<string | null>(null);
+  // ⭐ the wishing well — never persisted (spec §4: nothing at rest, not even localStorage)
+  const [wish, setWish] = useState<Wish>(WISH_NONE);
+  const [holdOver, setHoldOver] = useState(false);
+  // whose wishlist to ask for — set by the steam effect, cleared by disconnect
+  const [wishSteamid, setWishSteamid] = useState<string | null>(null);
+  // OpenID return only: owned is in flight, so the float must not freeze yet (review #259)
+  const [ownedPending, setOwnedPending] = useState(false);
 
   const refresh = useCallback(() => setRefreshTick((t) => t + 1), []);
 
@@ -200,7 +217,11 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       // No return fragment — restore from localStorage
       const stored = loadIdentity();
       if (!cancelled) setSteamIdentity(stored);
-      return;
+      setWishSteamid(stored?.steamid ?? null);
+      setOwnedPending(false);
+      return () => {
+        cancelled = true;
+      };
     }
 
     if ("error" in fragment) {
@@ -230,11 +251,52 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       }
     }
 
-    void fetchOwned();
+    // ⭐ the wishlist starts NOW, in parallel with owned (its own effect below); the hold also
+    // waits for owned on this path, so an owned game can never freeze into the float.
+    setWishSteamid(steamid);
+    setOwnedPending(true);
+    void fetchOwned().finally(() => {
+      if (!cancelled) setOwnedPending(false);
+    });
     return () => {
       cancelled = true;
     };
   }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── ⭐ wishlist effect — keyed on (token, steamid, eligibility), not on mount ─────────
+  // Eligible while the link is loading (so it runs in parallel with fetchLink) or ACTIVE.
+  // A sealed/dead link therefore gets ONE request during the load that 409s (silently) —
+  // the price of the parallel start — and is not asked again while ineligible. A gift that
+  // unwraps in-session becomes eligible again and IS asked (review #259). The cleanup is
+  // the cancellation: disconnect (steamid → null) or a token change drops a late result.
+  const wishEligible =
+    view.kind === "loading" ||
+    (view.kind === "loaded" && view.data.state === "active");
+  useEffect(() => {
+    if (!token || wishSteamid === null || !wishEligible) {
+      setWish(WISH_NONE); // a stable object: an ineligible pass costs no extra render
+      return;
+    }
+    let cancelled = false;
+    setWish({ kind: "pending" });
+    // Promise.resolve() first: a mock (or future caller) returning a non-promise degrades
+    // silently instead of throwing inside the effect.
+    Promise.resolve()
+      .then(() => steamWishlistForLink(token, wishSteamid))
+      .then((items) => {
+        if (!cancelled)
+          setWish({
+            kind: "done",
+            wished: new Map(items.map((i) => [i.appid, i.added])),
+          });
+      })
+      .catch(() => {
+        if (!cancelled) setWish({ kind: "done", wished: new Map() });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, wishSteamid, wishEligible]);
 
   // ── link load effect ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -251,6 +313,10 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       // entrance after each claim, the exact churn playedKeyRef exists to prevent.)
       if (prevTokenRef.current !== token) {
         prevTokenRef.current = token;
+        // ⭐ a different link is a different visit: its ranks, and its hold, start fresh
+        shuffleRanksRef.current = null;
+        holdStartRef.current = null;
+        setHoldOver(false);
         setView({ kind: "loading" });
         // a different link is a different page: its entrance hasn't played
         playedKeyRef.current = null;
@@ -282,6 +348,31 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
     [steamIdentity],
   );
 
+  // "Pending" includes the render where the link has JUST become eligible (e.g. a gift that
+  // unwrapped) and the wishlist effect has not yet run — else ranks freeze one render early.
+  const wishPending =
+    wish.kind === "pending" ||
+    (wish.kind === "none" && wishSteamid !== null && wishEligible);
+  // Hold only an ACTIVE open shelf. Curated never floats, and dead or sealed links 409 on the proxy.
+  const openShelf =
+    view.kind === "loaded" && view.data.curated !== true && view.data.state === "active";
+  // The cap is measured from when the hold FIRST engaged: a dep change mid-hold (owned
+  // landing while the wishlist is still pending) re-runs this effect, and without the anchor
+  // it would start a fresh 400 — ~800ms worst case (OMBB, #259 PR review).
+  const holdStartRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!openShelf || (!wishPending && !ownedPending)) return;
+    if (holdStartRef.current === null) holdStartRef.current = Date.now();
+    const left = Math.max(0, WISH_HOLD_MS - (Date.now() - holdStartRef.current));
+    const t = setTimeout(() => setHoldOver(true), left);
+    return () => clearTimeout(t);
+  }, [openShelf, wishPending, ownedPending]);
+  const holding = openShelf && (wishPending || ownedPending) && !holdOver;
+  // Stars need an IDENTITY on the page: no identity ⇒ no disconnect button to clear them
+  // (owned failed on return), and disconnect itself nulls it (review #259 findings 4–5).
+  const wishedMap =
+    wish.kind === "done" && steamIdentity !== null ? wish.wished : undefined;
+
   // ── The shelf shuffle (ben, 2026-07-09) ─────────────────────────────────────
   // Games render in a random order so each visit rummages the trove afresh —
   // but the order is locked per visit (ranks assigned once, then reused), so
@@ -295,16 +386,30 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
       // the shuffle ranks: a mode flip must not inherit stale ranks.
       return view.data.games;
     }
+    // ⭐ held for the wishlist (≤ WISH_HOLD_MS): render nothing yet, and do NOT freeze ranks.
+    if (holding) return [];
     const games = view.data.games;
+    // Never freeze over an EMPTY payload (a sealed gift carries games: []): ranks frozen over
+    // nothing would pin every unwrapped game to MAX — server order, no shuffle, no float.
+    if (games.length === 0) return games;
     if (shuffleRanksRef.current === null) {
-      const ids = games.map((g) => g.id);
-      for (let i = ids.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const tmp = ids[i]!;
-        ids[i] = ids[j]!;
-        ids[j] = tmp;
-      }
-      shuffleRanksRef.current = new Map(ids.map((id, pos) => [id, pos]));
+      // Frozen ONCE per visit, float included (spec §2.2/§5): a wishlist that lands after this
+      // point adds stars and moves nothing. Owned wins, so an owned game never floats.
+      const starred = new Set(
+        games
+          .filter(
+            (g) =>
+              g.steam_app_id !== null &&
+              !ownedSet.has(g.steam_app_id) &&
+              wishedMap?.has(g.steam_app_id) === true,
+          )
+          .map((g) => g.id),
+      );
+      shuffleRanksRef.current = floatRanks(
+        games.map((g) => g.id),
+        starred,
+        Math.random,
+      );
     }
     const ranks = shuffleRanksRef.current;
     return [...games].sort(
@@ -312,7 +417,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
         (ranks.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
         (ranks.get(b.id) ?? Number.MAX_SAFE_INTEGER),
     );
-  }, [view]);
+  }, [view, holding, wishedMap, ownedSet]);
 
   if (view.kind === "loading") {
     return (
@@ -375,6 +480,23 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   // Explicit server state — never inferred from side signals like games.length
   const exhausted = data.state === "exhausted";
   const dead = data.state === "revoked" || data.state === "expired";
+  // ⭐ count line (spec §2.4): counts the starred CARDS the grid renders. Curated: one card per
+  // game (two copies are two gifts). Open: the grid dedupes by title, first occurrence wins.
+  const starredGame = (g: GameView) =>
+    g.gone !== true &&
+    g.steam_app_id !== null &&
+    !ownedSet.has(g.steam_app_id) &&
+    wishedMap?.has(g.steam_app_id) === true;
+  const starCount =
+    data.curated === true
+      ? shelfGames.filter(starredGame).length
+      : shelfGames
+          .filter((g, i) => shelfGames.findIndex((h) => h.title === g.title) === i)
+          .filter(starredGame).length;
+  const starLine =
+    starCount >= 1
+      ? `⭐ ${starCount} of these ${starCount === 1 ? "is" : "are"} on your wishlist`
+      : null;
 
   return (
     <div className="min-h-screen bg-room text-ink">
@@ -479,6 +601,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
                   onClick={() => {
                     clearIdentity();
                     setSteamIdentity(null);
+                    setWishSteamid(null);
                     setSteamPrivate(false);
                     setSteamError(null);
                   }}
@@ -567,11 +690,23 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
 
       {/* Grid: shown for exhausted or active (claiming lives in the detail modal,
           which respects link state); hidden for revoked/expired */}
+      {/* the slot is RESERVED whenever a wishlist is in play, so a late line fills in place
+          and moves no card (review #259 pass 2) */}
+      {!dead && steamIdentity !== null && (
+        <p
+          data-testid="wish-count-line"
+          aria-live="polite"
+          className="min-h-[1.75rem] px-6 pt-2 text-sm text-ink-soft"
+        >
+          {starLine ?? ""}
+        </p>
+      )}
       {!dead && (
         <GameGrid
           games={shelfGames}
           curated={data.curated === true}
           owned={ownedSet}
+          wished={wishedMap}
           onDetail={setDetailGame}
         />
       )}

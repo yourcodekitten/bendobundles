@@ -3725,3 +3725,263 @@ async fn shelf_500s_when_index_absent_never_renders_empty() {
         "a query error must never collapse into an empty shelf"
     );
 }
+
+// ── ⭐ wishing well: the token-scoped wishlist proxy ──────────────────────────
+
+fn wish_body(items: &[(u32, i64)]) -> String {
+    let xs: Vec<String> = items
+        .iter()
+        .map(|(a, d)| format!(r#"{{"appid":{a},"priority":0,"date_added":{d}}}"#))
+        .collect();
+    format!(r#"{{"response":{{"items":[{}]}}}}"#, xs.join(","))
+}
+
+async fn mount_wishlist(server: &wiremock::MockServer, status: u16, body: &str) {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/IWishlistService/GetWishlist/v1/",
+        ))
+        .respond_with(wiremock::ResponseTemplate::new(status).set_body_string(body.to_string()))
+        .mount(server)
+        .await;
+}
+
+/// Unknown token ⇒ the byte-identical unknown-link 404, even with a malformed id64
+/// (token beats id: no oracle upgrade).
+#[tokio::test]
+async fn wishlist_proxy_unknown_token_is_byte_identical_404_even_with_bad_id() {
+    let Some(store) = store_or_skip("wish-404").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let a = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/{CTX_TOKEN}/steam/wishlist/not-an-id"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let b = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/l/{CTX_TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(a.status(), StatusCode::NOT_FOUND);
+    let ab = axum::body::to_bytes(a.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let bb = axum::body::to_bytes(b.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(ab, bb);
+}
+
+/// Dead link ⇒ 409 before the id64 is looked at.
+#[tokio::test]
+async fn wishlist_proxy_revoked_link_is_409_even_with_bad_id() {
+    let Some(store) = store_or_skip("wish-409").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    let mut lnk = test_link("wish-409-tok");
+    lnk.revoked = true;
+    store.create_link(&lnk).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app
+        .oneshot(
+            Request::get("/api/l/wish-409-tok/steam/wishlist/not-an-id")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+}
+
+/// Live link + bad id64 ⇒ 400.
+#[tokio::test]
+async fn wishlist_proxy_bad_id_on_live_link_is_400() {
+    let Some(store) = store_or_skip("wish-400").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    store.create_link(&test_link("wish-400-tok")).await.unwrap();
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app
+        .oneshot(
+            Request::get("/api/l/wish-400-tok/steam/wishlist/7656119800000000x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Curated link: the response is the INTERSECTION with the link's LIVE games — a wishlisted
+/// appid that is not on the shelf is absent, and a ghost (not live_on_link) is absent.
+#[tokio::test]
+async fn wishlist_proxy_curated_returns_only_live_shelf_overlap() {
+    let Some(store) = store_or_skip("wish-curated").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    // A (appid 111) is live; B (appid 222) is hidden ⇒ a ghost on a curated link
+    // (`live_on_link` requires `!game.hidden`, lib.rs:651).
+    let mut a = test_game(9101);
+    a.steam_app_id = Some(111);
+    let mut b = test_game(9102);
+    b.steam_app_id = Some(222);
+    b.hidden = true;
+    store.put_game(&a).await.unwrap();
+    store.put_game(&b).await.unwrap();
+    let mut lnk = test_link("wish-cur-tok");
+    lnk.curated_game_ids = Some(vec![a.id.clone(), b.id.clone()]);
+    store.create_link(&lnk).await.unwrap();
+    // Wishlist carries A, B and 333 (not on the shelf at all).
+    mount_wishlist(
+        &server,
+        200,
+        &wish_body(&[(111, 1678000000), (222, 1678000001), (333, 1678000002)]),
+    )
+    .await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app
+        .oneshot(
+            Request::get(format!("/api/l/wish-cur-tok/steam/wishlist/{TEST_STEAMID}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        r.headers()[axum::http::header::CACHE_CONTROL],
+        "private, max-age=3600"
+    );
+    let j = body_json(r).await;
+    assert_eq!(
+        j,
+        serde_json::json!({"items":[{"appid":111,"added":1678000000}]})
+    );
+}
+
+/// Open shelf: intersection with the listable catalog.
+#[tokio::test]
+async fn wishlist_proxy_open_shelf_returns_catalog_overlap() {
+    let Some(store) = store_or_skip("wish-open").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    // test_game is Available + giftable + !hidden ⇒ listable. Unique n: the table is shared.
+    let mut g = test_game(9201);
+    g.steam_app_id = Some(444);
+    store.put_game(&g).await.unwrap();
+    store
+        .create_link(&test_link("wish-open-tok"))
+        .await
+        .unwrap();
+    mount_wishlist(
+        &server,
+        200,
+        &wish_body(&[(444, 1600000000), (555, 1600000001)]),
+    )
+    .await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app
+        .oneshot(
+            Request::get(format!(
+                "/api/l/wish-open-tok/steam/wishlist/{TEST_STEAMID}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let j = body_json(r).await;
+    let appids: Vec<u64> = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["appid"].as_u64().unwrap())
+        .collect();
+    assert!(appids.contains(&444));
+    assert!(!appids.contains(&555));
+}
+
+/// Private/empty ⇒ 200 {"items":[]}; there is NO "private" flag (unmeasurable).
+#[tokio::test]
+async fn wishlist_proxy_empty_is_empty_items_no_private_flag() {
+    let Some(store) = store_or_skip("wish-empty").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    store
+        .create_link(&test_link("wish-empty-tok"))
+        .await
+        .unwrap();
+    mount_wishlist(&server, 200, r#"{"response":{}}"#).await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app
+        .oneshot(
+            Request::get(format!(
+                "/api/l/wish-empty-tok/steam/wishlist/{TEST_STEAMID}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(body_json(r).await, serde_json::json!({"items":[]}));
+}
+
+/// Steam 429 (shared Lambda egress IPs get rate-limited too) ⇒ plain 503; the client
+/// renders that silent (Task 5 pins the client half).
+#[tokio::test]
+async fn wishlist_proxy_steam_429_is_503() {
+    let Some(store) = store_or_skip("wish-429").await else {
+        return;
+    };
+    let server = wiremock::MockServer::start().await;
+    store.create_link(&test_link("wish-429-tok")).await.unwrap();
+    mount_wishlist(&server, 429, "").await;
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let app = steam_router(Arc::clone(&store), mock, &server.uri());
+    let r = app
+        .oneshot(
+            Request::get(format!("/api/l/wish-429-tok/steam/wishlist/{TEST_STEAMID}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+}

@@ -202,4 +202,30 @@ describe('GameGrid', () => {
     render(<GameGrid games={games} onDetail={vi.fn()} />);
     expect(screen.queryByText(/from ben/)).not.toBeInTheDocument();
   });
+
+  // ── ⭐ wishing well ──
+  it("stars a wishlisted game with its since-date as the accessible name", () => {
+    render(<GameGrid games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420 })]}
+      wished={new Map([[420, 1678000000]])} onDetail={() => {}} />);
+    expect(screen.getByText("⭐ on your wishlist")).toHaveAttribute("title", "on your wishlist since mar 2023");
+    // spec §2.1: the CARD's accessible name carries it. The card is a button whose aria-label
+    // replaces its descendants' text (GameGrid.tsx:~203), so a label on the pill is never heard.
+    expect(screen.getByRole("button", { name: "Portal — details, on your wishlist since mar 2023" })).toBeInTheDocument();
+  });
+  it("owned wins: no star on an owned game", () => {
+    render(<GameGrid games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420 })]}
+      owned={new Set([420])} wished={new Map([[420, 1678000000]])} onDetail={() => {}} />);
+    expect(screen.getByText(/you own this/i)).toBeInTheDocument();
+    expect(screen.queryByText("⭐ on your wishlist")).not.toBeInTheDocument();
+  });
+  it("never stars a ghost", () => {
+    render(<GameGrid curated games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420, gone: true })]}
+      wished={new Map([[420, 1678000000]])} onDetail={() => {}} />);
+    expect(screen.queryByText("⭐ on your wishlist")).not.toBeInTheDocument();
+  });
+  it("a missing date still stars, without a since", () => {
+    render(<GameGrid games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420 })]}
+      wished={new Map([[420, 0]])} onDetail={() => {}} />);
+    expect(screen.getByText("⭐ on your wishlist")).toHaveAttribute("title", "on your wishlist");
+  });
 });

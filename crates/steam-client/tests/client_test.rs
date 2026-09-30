@@ -1031,3 +1031,93 @@ async fn store_items_rate_limited_maps_to_error() {
         .unwrap_err();
     assert!(matches!(err, steam_client::SteamError::RateLimited));
 }
+
+#[tokio::test]
+async fn wishlist_returns_items_and_sends_no_key() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/IWishlistService/GetWishlist/v1/"))
+        .and(wiremock::matchers::query_param("steamid", "76561198000000001"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            r#"{"response":{"items":[{"appid":413150,"priority":1,"date_added":1678000000},{"appid":1273400,"priority":0,"date_added":1700000000}]}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = test_client(&server)
+        .get_wishlist(&steam_client::SteamId64("76561198000000001".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            steam_client::WishItem {
+                appid: 413150,
+                date_added: 1678000000
+            },
+            steam_client::WishItem {
+                appid: 1273400,
+                date_added: 1700000000
+            },
+        ]
+    );
+    // Keyless by construction: the recorded request carries NO key param.
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    assert!(
+        !reqs[0].url.query_pairs().any(|(k, _)| k == "key"),
+        "wishlist must not send the api key: {}",
+        reqs[0].url
+    );
+}
+
+#[tokio::test]
+async fn wishlist_empty_response_object_is_empty_vec_not_error() {
+    // Measured 2026-09-30: private and empty are the SAME bytes. Not an error.
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path(
+        "/IWishlistService/GetWishlist/v1/",
+    ))
+    .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(r#"{"response":{}}"#))
+    .mount(&server)
+    .await;
+    let out = test_client(&server)
+        .get_wishlist(&steam_client::SteamId64("76561198000000001".into()))
+        .await
+        .unwrap();
+    assert!(out.is_empty());
+}
+
+#[tokio::test]
+async fn wishlist_429_is_rate_limited() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path(
+        "/IWishlistService/GetWishlist/v1/",
+    ))
+    .respond_with(wiremock::ResponseTemplate::new(429))
+    .mount(&server)
+    .await;
+    let err = test_client(&server)
+        .get_wishlist(&steam_client::SteamId64("76561198000000001".into()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, steam_client::SteamError::RateLimited),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn wishlist_malformed_body_is_parse_error() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path(
+        "/IWishlistService/GetWishlist/v1/",
+    ))
+    .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("<html>nope</html>"))
+    .mount(&server)
+    .await;
+    let err = test_client(&server)
+        .get_wishlist(&steam_client::SteamId64("76561198000000001".into()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, steam_client::SteamError::Parse(_)), "{err:?}");
+}

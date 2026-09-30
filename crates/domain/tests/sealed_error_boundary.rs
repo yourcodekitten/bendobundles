@@ -675,8 +675,9 @@ const REVIEWED_VERB_COUNTS: &[(&str, &str, usize, &str)] = &[
     (
         "crates/steam-client/src/lib.rs",
         ".send()",
-        10,
-        "UNFORCED — fn net exists and nothing requires it; pinned at today's debt, see #187",
+        11,
+        "UNFORCED — fn net exists and nothing requires it; pinned at today's debt, see #187. \
+         11th = get_wishlist (#259): keyless, and its .send() error DOES go through map_err(net)",
     ),
     (
         "crates/steam-client/src/lib.rs",
