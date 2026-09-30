@@ -45,7 +45,7 @@ Owned tells you what to skip. This tells you what to take.
    rearranges the shelf.
 3. **Curated links keep Ben's order.** A curated link's order is the order Ben picked (spec §5 of the
    curated work), so starred cards are marked but **never moved**.
-4. **The count line.** When at least one game matches, one line appears above the grid:
+4. **The count line (open AND curated links).** When at least one game matches, one line appears above the grid:
    `⭐ 3 of these are on your wishlist` (singular form: `1 of these is`). When nothing matches, no
    line appears. Silence is the correct output for "no match", and also for "can't see".
 5. **Precedence.** If a game is both owned and wishlisted (Steam normally removes a game from the
@@ -62,7 +62,7 @@ in the same order:
    ⇒ `500 try again`.
 3. Liveness via `link.can_claim(now)` ⇒ `409` with the same four messages.
 4. Validate id64 **after** 2–3 (no oracle upgrade) ⇒ `400`.
-5. Cache-or-fetch (§4).
+5. Fetch from Steam (§4). There is **no cache**: every call is live.
 
 **Response: `{"items":[{"appid":N,"added":EPOCH}, ...]}`, filtered to appids that appear among the
 link's own games.** The server intersects before it answers, for two reasons:
@@ -73,31 +73,41 @@ link's own games.** The server intersects before it answers, for two reasons:
 
 A hidden or empty wishlist ⇒ `{"items":[]}`. There is no `private` flag, because we cannot measure one
 (§1.1). Steam unavailable ⇒ `503`, which the client treats as "no stars" and never as an error banner.
-The response gets `Cache-Control: private, max-age=<fresh secs>`, as the owned proxy does.
+The response gets `Cache-Control: private, max-age=3600`, so it lives only in the friend's own browser (§4).
 
-## 4. Cache — `STEAMWISH#<steamid>`
+## 4. Nothing at rest — no server cache (revised 2026-09-30 after OMBB's review)
 
-- New item `pk=STEAMWISH#<id64>, sk=META`: `{items:[{appid,added}], fetched_at, ttl}`, with a 24h
-  freshness window and a 7d TTL. These are the owned cache's constants, **reused and not copied**:
-  one freshness rule for both.
-- Core: `Store::cached_wishlist_or_fetch`, the same shape as `cached_owned_or_fetch`. That includes
-  its rule that **a degraded read does not overwrite a good cache**. Because empty and hidden are
-  indistinguishable, an empty result **is** cached. Otherwise every visit by a private-wishlist friend
-  would call Steam again.
-- `steam-client`: `get_wishlist(&SteamId64) -> Result<Vec<WishItem>, SteamError>`, keyless, using the
-  existing `net()` URL-stripping and status mapping. A response without `items` returns `Ok(vec![])`.
-  A malformed body returns `Parse`.
+The first draft cached the **full** wishlist at `STEAMWISH#<id64>` for 7 days. OMBB objected: "public"
+is only true **at fetch time**. If a friend makes their wishlist private tomorrow, we would still be
+holding all of it, keyed to their Steam id. **That is right, and the fix goes further than either of
+his options: no server-side record at all.**
+
+- The endpoint is keyless and cheap, and each page load calls it once. The owned cache exists because
+  `GetOwnedGames` spends **our API key's** quota. The wishlist call spends nothing of ours.
+- **At-rest contents, stated so the plan can be checked against it: the server stores NOTHING about
+  a wishlist.** No dynamo item and no log line carrying appids. The browser holds only the
+  **overlap** (§3), in React state, for the life of the page. It is **not** written to localStorage.
+- Repeat loads are absorbed by `Cache-Control: private, max-age=3600` on the proxy response, which
+  lives in the friend's own browser.
+- **Consequences:** no `dynamo` change, no IAM-capture corpus change, no policy-template change, no
+  terraform. The deploy is lambda code plus web assets only.
+- `steam-client`: `get_wishlist(&SteamId64) -> Result<Vec<WishItem>, SteamError>`, **keyless** (no
+  `key` query param). It reuses the existing `net()` URL-stripping and status mapping. A response
+  without `items` returns `Ok(vec![])`. A malformed body returns `Parse`.
 
 ## 5. Client
 
 - `steamWishlistForLink(token, steamid) -> Promise<WishItem[]>`. It throws `FetchFailed` on
   404/409/!ok, the same as `steamOwnedForLink`.
-- `SteamIdentity` gains an optional `wishlist?: {appid:number, added:number}[]`. **Back-compat:**
-  identities already in localStorage lack the field. The restore path (no return fragment) must fetch
-  the wishlist when the field is **absent**, or every already-connected friend would never see a star.
-- The OpenID return path fetches owned and wishlist **in parallel**. **A wishlist failure never blocks
-  owned** and never sets `steamError`. It degrades to no stars.
-- **Disconnect** (`clearIdentity`) clears the wishlist along with everything else.
+- **Fetched whenever a Steam identity is present on the page**, whether from the OpenID return or
+  restored from localStorage. `SteamIdentity`'s stored shape is **unchanged**, so friends who connected
+  before this ships see stars too, with no migration.
+- **A wishlist failure never blocks owned** and never sets `steamError`. It degrades to no stars.
+- **The float is applied once.** The wishlist resolves after the first render. When it lands,
+  starred games move up in one reorder. After that the order is locked for the visit, like the shuffle
+  ranks, so a claim refresh never moves a card. A reload is a new visit and reshuffles, as the shelf
+  shuffle already does (Ben, 2026-07-09).
+- **Disconnect** clears the wishlist state along with the identity.
 
 ## 6. Non-goals
 
@@ -118,13 +128,13 @@ The response gets `Cache-Control: private, max-age=<fresh secs>`, as the owned p
 
 - A red-first test for each: the proxy preamble order (unknown token beats bad id64; dead link beats
   bad id64), the intersection (a wishlisted appid not on the shelf is **absent** from the response),
-  empty-caches-too, stale-refetch, and owned-wins precedence.
+  the keyless request (no `key` param reaches Steam), and owned-wins precedence.
 - Web: the float is a stable partition that keeps the shuffle rank inside each group; curated order is
   byte-identical with and without a wishlist; the count line is absent at 0; restore-without-field
   fetches the wishlist.
-- IAM capture corpus regenerated for the new store calls (census, not roster: the #210 lesson).
+- **No `dynamo`/`terraform` diff at all.** The PR's file list proves it.
 - **Deployed and verified live:** a real public-wishlist id64 against a real prod link returns the
-  intersection, and a `STEAMWISH#` item exists afterwards.
+  intersection, and a table scan afterwards finds **no** item keyed to that id.
 
 ## 8. Open questions (for the family)
 
@@ -132,6 +142,8 @@ The response gets `Cache-Control: private, max-age=<fresh secs>`, as the owned p
    of choices, and the shuffle stays intact within groups. Would the shelf feel less like
    rummaging?
 2. **The count line:** delight or noise? It is the one element with no per-card anchor.
-3. **Intersect server-side:** it is right for exposure, but it means the cache holds the full list
-   while the response holds the subset. Any objection to storing the full list at rest (public data,
-   7d TTL)?
+3. ~~Cache the full list at rest?~~ **Resolved: nothing at rest (§4)**, from OMBB's objection.
+   Settled by OMBB + Lilith: **float** (§2.2); the count line **only at ≥1, never "0 of these"**,
+   tested both ways, and shown on **curated links too** (Lilith: there the stars stay scattered in
+   Ben's order, so the line is what tells a friend to go looking) (§2.4). Lilith's
+   empty-must-overwrite arm is moot for the same reason: no server-side entry exists to go stale.
