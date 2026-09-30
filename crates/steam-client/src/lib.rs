@@ -131,6 +131,15 @@ pub enum OwnedGames {
     Games(Vec<u32>),
 }
 
+/// One entry on a friend's public Steam wishlist (docs/spec-wishing-well.md §1.1). `priority`
+/// is deliberately not carried — v1 does not order by it (spec §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WishItem {
+    pub appid: u32,
+    /// Epoch seconds the game was wishlisted; 0 if Steam omitted it.
+    pub date_added: i64,
+}
+
 #[derive(Debug)]
 pub struct Persona {
     pub name: String,
@@ -172,6 +181,24 @@ struct OwnedResp {
 #[derive(Deserialize)]
 struct OwnedGame {
     appid: u32,
+}
+
+#[derive(Deserialize)]
+struct WishWire {
+    response: WishResp,
+}
+/// `{"response":{}}` is BOTH a private and an empty wishlist (measured 2026-09-30) — so `items`
+/// defaults to empty and neither case is an error.
+#[derive(Deserialize)]
+struct WishResp {
+    #[serde(default)]
+    items: Vec<WishWireItem>,
+}
+#[derive(Deserialize)]
+struct WishWireItem {
+    appid: u32,
+    #[serde(default)]
+    date_added: i64,
 }
 
 #[derive(Deserialize)]
@@ -493,6 +520,32 @@ impl SteamClient {
                 wire.response.games.into_iter().map(|g| g.appid).collect(),
             )),
         }
+    }
+
+    /// Public wishlist for `steamid`. **Keyless** — the endpoint does not need the Web API
+    /// key (measured 2026-09-30), and a secret on a request that does not need it is only risk.
+    /// Private and empty wishlists are indistinguishable on the wire; both are `Ok(vec![])`.
+    /// Status mapping reuses `keyed_json` (a 401/403 surfaces as `KeyRejected`, a misnomer on a
+    /// keyless call — every caller maps all errors to one silent 503).
+    pub async fn get_wishlist(&self, steamid: &SteamId64) -> Result<Vec<WishItem>, SteamError> {
+        let url = format!("{}/IWishlistService/GetWishlist/v1/", self.base_web_api);
+        let resp = self
+            .http
+            .get(url)
+            .query(&[("steamid", &steamid.0)])
+            .send()
+            .await
+            .map_err(net)?;
+        let wire: WishWire = keyed_json(resp).await?;
+        Ok(wire
+            .response
+            .items
+            .into_iter()
+            .map(|i| WishItem {
+                appid: i.appid,
+                date_added: i.date_added,
+            })
+            .collect())
     }
 
     pub async fn get_player_summary(&self, steamid: &SteamId64) -> Result<Persona, SteamError> {
