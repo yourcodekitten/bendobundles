@@ -2,6 +2,7 @@ import { memo } from 'react';
 import { type GameView } from '../api';
 import { displayTags, fitTags } from '../tags';
 import { titleColorClass, titleHueVar } from '../titleColor';
+import { formatSince } from '../wishlist';
 
 interface GameGridProps {
   games: GameView[];
@@ -9,6 +10,8 @@ interface GameGridProps {
   curated?: boolean;
   /** Set of Steam appids the viewer already owns — shows "you own this" pill. */
   owned?: Set<number>;
+  /** ⭐ appid ⇒ added epoch secs, already intersected server-side. Owned wins; ghosts never star. */
+  wished?: Map<number, number>;
   /** Opens the detail modal — via the details button or the card body. Claiming
       happens inside the modal (the grid never claims directly; see DESIGN.md,
       The Button Burgundy Rule). */
@@ -30,7 +33,7 @@ function dedupedByTitle(games: GameView[]): { game: GameView; count: number }[] 
   return Array.from(seen.values());
 }
 
-function GameGridImpl({ games, curated, owned, onDetail }: GameGridProps) {
+function GameGridImpl({ games, curated, owned, wished, onDetail }: GameGridProps) {
   // Curated: ben picked ids, not titles — two copies of one title are two
   // gifts (spec §5). Dedupe is the open-shelf storefront affordance only.
   const entries = curated
@@ -46,6 +49,17 @@ function GameGridImpl({ games, curated, owned, onDetail }: GameGridProps) {
           game.steam_app_id !== null &&
           owned !== undefined &&
           owned.has(game.steam_app_id);
+        const wishedAt =
+          !youOwnThis && game.gone !== true && game.steam_app_id !== null
+            ? wished?.get(game.steam_app_id)
+            : undefined;
+        const wishLabel =
+          wishedAt === undefined
+            ? null
+            : (() => {
+                const since = formatSince(wishedAt);
+                return since ? `on your wishlist since ${since}` : "on your wishlist";
+              })();
         // the game's shell hue for the 'clear' variant — same shared hash
         const shellHue = titleHueVar(game.title);
 
@@ -122,6 +136,14 @@ function GameGridImpl({ games, curated, owned, onDetail }: GameGridProps) {
                 you own this
               </span>
             )}
+            {wishLabel !== null && (
+              <span
+                className="rounded bg-floor px-2 py-0.5 text-xs text-ink-soft"
+                title={wishLabel}
+              >
+                ⭐ on your wishlist
+              </span>
+            )}
             {/* ✍️ presence marker only — the tag's text lives in the detail modal
                 (carts stay compact; spec-gift-tags D4.1). floor chip, no burgundy:
                 the tag is not the act of claiming. */}
@@ -174,7 +196,7 @@ function GameGridImpl({ games, curated, owned, onDetail }: GameGridProps) {
           <button
             key={cardKey}
             type="button"
-            aria-label={`${game.title} — details`}
+            aria-label={`${game.title} — details${wishLabel ? `, ${wishLabel}` : ""}`}
             onClick={() => onDetail(game)}
             className="block w-full rounded-[6px_6px_20px_6px] overflow-hidden text-left cursor-pointer transition duration-200 ease-[cubic-bezier(0.25,1,0.5,1)] hover:brightness-[1.05] active:brightness-[0.98] motion-safe:hover:-translate-y-[3px] motion-safe:active:-translate-y-px focus-visible:outline-[3px] focus-visible:outline-pixel focus-visible:outline-offset-2"
             style={{ background: `color-mix(in oklch, ${shellHue}, var(--color-shelf) 80%)` }}
