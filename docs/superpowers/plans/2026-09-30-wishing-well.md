@@ -756,7 +756,7 @@ it("floatRanks with nothing starred is a plain shuffle of all ids", () => {
 });
 ```
 
-`LinkPage.test.tsx`: add `steamWishlistForLink: vi.fn()` to the `vi.mock("../api")` factory and to the import list. **Set the default in the TOP-LEVEL `describe("LinkPage")` `beforeEach`**, right after `loadIdentity` is set to null (~`:80`): `vi.mocked(steamWishlistForLink).mockResolvedValue([]);`. Nowhere else will do: the existing steam-identity tests (`:629`, `:658`, `:685`) restore an identity, and a bare `vi.fn()` returns `undefined`. **Nest `describe("wishing well")` INSIDE `describe("LinkPage")`** so it inherits that `beforeEach` and the `consumeReturnFragment` default. Add `afterEach(() => { vi.useRealTimers(); })` inside the wishing-well describe, so a failing fake-timer test cannot leak. Then:
+`LinkPage.test.tsx`: add `steamWishlistForLink: vi.fn()` to the `vi.mock("../api")` factory and to the import list. **Set the default in the TOP-LEVEL `describe("LinkPage")` `beforeEach`**, right after `loadIdentity` is set to null (~`:80`): `vi.mocked(steamWishlistForLink).mockResolvedValue([]);`. Nowhere else will do: the existing steam-identity tests (`:629`, `:658`, `:685`) restore an identity, and a bare `vi.fn()` returns `undefined`. **Nest `describe("wishing well")` INSIDE `describe("LinkPage")`** so it inherits that `beforeEach` and the `consumeReturnFragment` default. Add `afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); })` inside the wishing-well describe (the second call undoes the `Math.random` spies), so a failing fake-timer test cannot leak. Then:
 
 ```tsx
 describe("wishing well", () => {
@@ -794,6 +794,8 @@ describe("wishing well", () => {
   });
 
   it("open shelf: starred cards render first", async () => {
+    // Pin the shuffle: rand≈1 makes Fisher–Yates the identity, so G6 is first ONLY via the float.
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
     vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(8) });
     vi.mocked(loadIdentity).mockReturnValue(stored);
     vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 1006, added: 1678000000 }]);
@@ -814,8 +816,41 @@ describe("wishing well", () => {
     expect(titles).toEqual(["G0", "G1", "G2", "G3"]);
   });
 
+  it("the hold ENGAGES: a deferred wishlist keeps the loading view, then floats (OMBB M1)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.spyOn(Math, "random").mockReturnValue(0.999); // identity shuffle ⇒ G5 first only via the float
+    let resolveWish!: (v: { appid: number; added: number }[]) => void;
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(6) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockReturnValue(new Promise((r) => { resolveWish = r; }));
+    renderLinkPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+    expect(screen.getByText("loading...")).toBeInTheDocument();
+    expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0);
+    await act(async () => { resolveWish([{ appid: 1005, added: 1678000000 }]); });
+    await waitFor(() => expect(screen.getAllByRole("heading", { level: 3 })[0]).toHaveTextContent("G5"));
+  });
+
+  it("the hold is CAPPED at 400ms: held at 399, rendered (unfloated) at 401 (OMBB M1)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(4) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockReturnValue(new Promise(() => {})); // never lands
+    renderLinkPage();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(399); });
+    expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2); });
+    expect(screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent)).toEqual(["G0", "G1", "G2", "G3"]);
+  });
+
   it("a wishlist that lands AFTER the hold cap adds stars without moving any card", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Pinned (OMBB M2): identity order puts G7 LAST, so a wrong late re-rank (G7 → first)
+    // cannot pass on shuffle luck. Unpinned, it passed 1 run in 8 for free.
+    vi.spyOn(Math, "random").mockReturnValue(0.999);
     let resolveWish!: (v: { appid: number; added: number }[]) => void;
     vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(8) });
     vi.mocked(loadIdentity).mockReturnValue(stored);
