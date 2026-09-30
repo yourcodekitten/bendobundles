@@ -1031,6 +1031,77 @@ describe("typewriter (animations on)", () => {
       await waitFor(() => expect(screen.queryByText(/on your wishlist/)).not.toBeInTheDocument());
     });
 
+    // ── review pass 1 (#259): each of these reproduced a defect before its fix ──
+
+    it("OpenID return: an owned+wishlisted game never floats (the hold waits for owned too)", async () => {
+      vi.spyOn(Math, "random").mockReturnValue(0.999);
+      vi.mocked(consumeReturnFragment).mockReturnValue({ steamid: "76561198000000001", persona: "A" });
+      let resolveOwned!: (v: number[]) => void;
+      vi.mocked(steamOwnedForLink).mockReturnValue(new Promise((r) => { resolveOwned = r; }));
+      vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 1005, added: 1678000000 }]);
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(6) });
+      renderLinkPage();
+      // the grid must render (hold cap) BEFORE owned lands — that is the race
+      await waitFor(() => expect(screen.getAllByRole("heading", { level: 3 })).toHaveLength(6));
+      await act(async () => { resolveOwned([1005]); });
+      await waitFor(() => expect(screen.getByText(/you own this/i)).toBeInTheDocument());
+      const titles = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent);
+      expect(titles[0]).toBe("G0");
+      expect(screen.queryByText("⭐ on your wishlist")).not.toBeInTheDocument();
+    });
+
+    it("a wrapped gift that unwraps in-session gets its stars (and its shuffle)", async () => {
+      vi.spyOn(Math, "random").mockReturnValue(0); // rand=0 Fisher–Yates on 4 ⇒ G1 G2 G3 G0
+      vi.mocked(loadIdentity).mockReturnValue(stored);
+      vi.mocked(steamWishlistForLink)
+        .mockRejectedValueOnce(new FetchFailed()) // the proxy 409s while sealed
+        .mockResolvedValue([{ appid: 1002, added: 1678000000 }]);
+      vi.mocked(fetchLink)
+        .mockResolvedValueOnce({ ...baseLink, state: "sealed", unlocks_in_seconds: 1, unlocks_at: "2026-09-30T12:00:00Z" } as LinkView)
+        .mockResolvedValue({ ...baseLink, games: shelf(4) });
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText("⭐ 1 of these is on your wishlist")).toBeInTheDocument(), { timeout: 5000 });
+      const titles = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent);
+      expect(titles[0]).toBe("G2"); // floated; and the rest shuffled, not frozen over the sealed []
+      expect(titles).not.toEqual(["G2", "G0", "G1", "G3"]);
+    }, 10000);
+
+    it("owned fails, wishlist works ⇒ no stars (no identity, no disconnect to clear them)", async () => {
+      vi.mocked(consumeReturnFragment).mockReturnValue({ steamid: "76561198000000001", persona: "A" });
+      vi.mocked(steamOwnedForLink).mockRejectedValue(new FetchFailed());
+      vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 1002, added: 1678000000 }]);
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(4) });
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText(/Steam is currently unavailable/)).toBeInTheDocument());
+      await act(async () => { await new Promise((r) => setTimeout(r, 50)); });
+      expect(screen.queryByText(/on your wishlist/)).not.toBeInTheDocument();
+    });
+
+    it("disconnect while the wishlist is in flight ⇒ the late result never paints stars", async () => {
+      vi.mocked(loadIdentity).mockReturnValue(stored);
+      let res!: (v: { appid: number; added: number }[]) => void;
+      vi.mocked(steamWishlistForLink).mockReturnValue(new Promise((r) => { res = r; }));
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(3) });
+      renderLinkPage();
+      await waitFor(() => expect(screen.getAllByRole("heading", { level: 3 })).toHaveLength(3), { timeout: 3000 });
+      await userEvent.click(screen.getByRole("button", { name: /disconnect/i }));
+      await act(async () => { res([{ appid: 1001, added: 1678000000 }]); });
+      await act(async () => { await new Promise((r) => setTimeout(r, 50)); });
+      expect(screen.queryByText(/on your wishlist/)).not.toBeInTheDocument();
+    });
+
+    it("curated: two copies are two gifts, so the count line counts cards", async () => {
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, curated: true, games: [
+        makeGame({ id: "a", title: "Portal", steam_app_id: 420 }),
+        makeGame({ id: "b", title: "Portal", steam_app_id: 420 }),
+      ] });
+      vi.mocked(loadIdentity).mockReturnValue(stored);
+      vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 420, added: 1678000000 }]);
+      renderLinkPage();
+      await waitFor(() => expect(screen.getByText("⭐ 2 of these are on your wishlist")).toBeInTheDocument());
+      expect(screen.getAllByText("⭐ on your wishlist")).toHaveLength(2);
+    });
+
     it("wishlist failure never blocks owned", async () => {
       vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(2) });
       vi.mocked(consumeReturnFragment).mockReturnValue({ steamid: "76561198000000001", persona: "Alice" });
