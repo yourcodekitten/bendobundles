@@ -315,6 +315,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
         prevTokenRef.current = token;
         // ⭐ a different link is a different visit: its ranks, and its hold, start fresh
         shuffleRanksRef.current = null;
+        holdStartRef.current = null;
         setHoldOver(false);
         setView({ kind: "loading" });
         // a different link is a different page: its entrance hasn't played
@@ -355,9 +356,15 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
   // Hold only an ACTIVE open shelf. Curated never floats, and dead or sealed links 409 on the proxy.
   const openShelf =
     view.kind === "loaded" && view.data.curated !== true && view.data.state === "active";
+  // The cap is measured from when the hold FIRST engaged: a dep change mid-hold (owned
+  // landing while the wishlist is still pending) re-runs this effect, and without the anchor
+  // it would start a fresh 400 — ~800ms worst case (OMBB, #259 PR review).
+  const holdStartRef = useRef<number | null>(null);
   useEffect(() => {
     if (!openShelf || (!wishPending && !ownedPending)) return;
-    const t = setTimeout(() => setHoldOver(true), WISH_HOLD_MS);
+    if (holdStartRef.current === null) holdStartRef.current = Date.now();
+    const left = Math.max(0, WISH_HOLD_MS - (Date.now() - holdStartRef.current));
+    const t = setTimeout(() => setHoldOver(true), left);
     return () => clearTimeout(t);
   }, [openShelf, wishPending, ownedPending]);
   const holding = openShelf && (wishPending || ownedPending) && !holdOver;

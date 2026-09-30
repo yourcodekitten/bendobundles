@@ -1035,6 +1035,22 @@ describe("typewriter (animations on)", () => {
       await waitFor(() => expect(screen.queryByText(/on your wishlist/)).not.toBeInTheDocument());
     });
 
+    it("the 400ms cap does NOT stretch when owned lands mid-hold (OMBB PR review nit 1)", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: false });
+      vi.mocked(consumeReturnFragment).mockReturnValue({ steamid: "76561198000000001", persona: "A" });
+      let resolveOwned!: (v: number[]) => void;
+      vi.mocked(steamOwnedForLink).mockReturnValue(new Promise((r) => { resolveOwned = r; }));
+      vi.mocked(steamWishlistForLink).mockReturnValue(new Promise(() => {})); // never lands
+      vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(3) });
+      renderLinkPage();
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+      await act(async () => { resolveOwned([]); await vi.advanceTimersByTimeAsync(0); }); // owned lands at 300
+      expect(screen.queryAllByRole("heading", { level: 3 })).toHaveLength(0);
+      await act(async () => { await vi.advanceTimersByTimeAsync(101); }); // t = 401: the cap is from the START
+      expect(screen.getAllByRole("heading", { level: 3 })).toHaveLength(3);
+    });
+
     // ── review pass 2 (#259) ──
 
     it("an EMPTY wishlist ([] — private or empty, same bytes) shows no count line and no error", async () => {
