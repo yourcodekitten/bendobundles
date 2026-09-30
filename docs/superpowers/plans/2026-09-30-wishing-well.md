@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (axum, reqwest, serde, wiremock tests, DynamoDB-local via `store_or_skip`), React + TypeScript + vitest.
 
-**Spec:** `docs/spec-wishing-well.md` (at `fe74c92` or later). Read it first. §4 ("nothing at rest") and §2 (what the friend sees) are the contract.
+**Spec:** `docs/spec-wishing-well.md` (at `fe74c92` or later; §5's float wording is amended by this PR's Task 5, so it matches the hold-then-freeze contract below). Read it first. §4 ("nothing at rest") and §2 (what the friend sees) are the contract.
 
 ## Global Constraints
 
@@ -20,6 +20,7 @@
 - **Copy (verbatim):** pill `⭐ on your wishlist`. Pill `title` and accessible name `on your wishlist since <mon yyyy>`, lowercase, UTC month (e.g. `since mar 2023`). Count line `⭐ N of these are on your wishlist`, singular `⭐ 1 of these is on your wishlist`. The count line exists only for N ≥ 1.
 - **Precedence:** owned wins (no star on an owned game). A `gone` (ghost) card never gets a star, and the server already excludes ghosts from the intersection.
 - **Curated links never reorder.** Open shelves float starred games first, shuffled within each group. The order is frozen for the visit.
+- **Rust gates match CI** (`ci.yml`): run `cargo fmt --all` before every Rust commit; clippy is always `--all-targets --all-features -- -D warnings`. **Web gates match CI:** `npm run typecheck` and `npm run lint`. Root `npx tsc --noEmit` checks **0 files** here (`tsconfig.json` has `"files": []`), so never use it as a gate.
 - Commits GPG-signed as `code kitten <yourcodekitten@gmail.com>`; branch `kitten/wishing-well`.
 
 ---
@@ -192,7 +193,7 @@ and the method after `get_owned_games`:
     }
 ```
 
-- [ ] **Step 4: Run.** `cargo test -p steam-client` ⇒ all pass, including the 4 new tests. Then `cargo clippy -p steam-client --all-targets -- -D warnings`.
+- [ ] **Step 4: Run.** `cargo test -p steam-client` ⇒ all pass, including the 4 new tests. Then `cargo fmt --all && cargo clippy -p steam-client --all-targets --all-features -- -D warnings`.
 
 - [ ] **Step 5: Commit.** `git add crates/steam-client && git commit -S -m "⭐ steam-client: get_wishlist — keyless, private==empty is Ok(vec![])"`
 
@@ -207,7 +208,7 @@ and the method after `get_owned_games`:
 
 **Interfaces:**
 - Consumes: `SteamClient::get_wishlist`, `WishItem` (Task 1). Existing: `Store::get_link`, `Store::batch_get_games(&[String]) -> Result<HashMap<String, Game>, StoreError>`, `Store::list_listable_games() -> Result<Vec<Game>, StoreError>`, `live_on_link(&Link, &Game) -> bool`, `link_not_found_response()`, `steam_client::is_valid_steam_id64`, `steam_client::STEAM_ID64_ERROR_MSG`.
-- Produces: HTTP `GET /api/l/{token}/steam/wishlist/{steamid}` ⇒ `200 {"items":[{"appid":u32,"added":i64}]}` with `Cache-Control: private, max-age=3600` | `404` (byte-identical unknown-link) | `409 {"error":…}` | `400` | `500 {"error":"try again"}` | `503` (empty body).
+- Produces: HTTP `GET /api/l/{token}/steam/wishlist/{steamid}` ⇒ `200 {"items":[{"appid":u32,"added":i64}]}` with `Cache-Control: private, max-age=3600` | `404` (byte-identical unknown-link) | `409 {"error":…}` | `400` | `500 {"error":"try again"}` | `503` (empty body when Steam fails; `{"error":"steam not configured"}` when no client is configured).
 
 - [ ] **Step 1: Write the failing proxy tests** (append to `api_test.rs`). Seed games the way the existing tests do (`store.put_game(&game)` with a `Game` whose `steam_app_id` is set and status listable; copy the `Game` literal from the nearest existing test that seeds a listable game with a `steam_app_id`, and change only `id`/`title`/`steam_app_id`).
 
@@ -294,7 +295,7 @@ async fn wishlist_proxy_curated_returns_only_live_shelf_overlap() {
     let app = steam_router(Arc::clone(&store), mock, &server.uri());
     let r = app.oneshot(Request::get(format!("/api/l/wish-cur-tok/steam/wishlist/{TEST_STEAMID}")).body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    assert_eq!(r.headers()[header::CACHE_CONTROL], "private, max-age=3600");
+    assert_eq!(r.headers()[axum::http::header::CACHE_CONTROL], "private, max-age=3600");
     let j = body_json(r).await;
     assert_eq!(j, serde_json::json!({"items":[{"appid":111,"added":1678000000}]}));
 }
@@ -348,7 +349,7 @@ async fn wishlist_proxy_steam_429_is_503() {
 }
 ```
 
-Seeding uses the file's own `test_game(n)` (`api_test.rs:85`: `Available`, `giftable`, `!hidden`, `steam_app_id: None`). Every test sets `steam_app_id` and uses a **unique `n` ≥ 9100**, because DynamoDB-local is shared across tests and the open-shelf path scans the whole listable index.
+Seeding uses the file's own `test_game(n)` (`api_test.rs:85`: `Available`, `giftable`, `!hidden`, `steam_app_id: None`). Every test sets `steam_app_id` and uses a **unique `n` ≥ 9100**, which is harmless and keeps ids readable. (`store_or_skip` creates a fresh table per test, `t-pub-{test}` at `api_test.rs:46`, so there is no cross-test sharing.) **`api_test.rs` does not import `header`:** spell it `axum::http::header::CACHE_CONTROL`, as the existing test at `:1571` does.
 
 - [ ] **Step 2: Write the failing log-capture test** — new file `crates/public-api/tests/wishlist_logs_test.rs`. It is its own test binary, so it may own the **global** subscriber. (The fulfillment tests explain why a thread-local `set_default` is unsafe with tracing's callsite cache, `handler_test.rs:4327`.)
 
@@ -371,8 +372,14 @@ impl std::io::Write for Cap {
 
 fn install() {
     BUF.get_or_init(|| Arc::new(Mutex::new(Vec::new())));
+    // PRODUCTION PARITY: main.rs installs `fmt().with_ansi(false).without_time().init()`, which is
+    // INFO across all targets, and that is what reaches CloudWatch. Do NOT raise it to TRACE:
+    // aws-smithy-runtime logs full DynamoDB request/response bodies at TRACE
+    // (orchestrator.rs:486/:541, orchestrator/http.rs:42), and the seeded game's own
+    // `steam_app_id` would appear in them whatever the handler does. That would be a red
+    // against a correct handler.
     let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
         .with_writer(|| Cap)
         .try_init();
 }
@@ -382,7 +389,7 @@ fn captured() -> String {
 }
 ```
 
-Then **one** `#[tokio::test]` that: calls `install()`; emits `tracing::info!("canary-9913377")` and asserts `captured().contains("canary-9913377")` (**positive control**); runs the wishlist proxy against a seeded link whose shelf and wishlist both carry appid **`8675309`**, with a wishlist-only appid **`7340033`** (seed with `test_game(9301)`, `steam_app_id: Some(8675309)`; copy `test_game`, `test_link`, `MockInvoker`, `steam_router`; reuse the helper bodies from Step 1 by copying them. They live in another test binary and cannot be imported); asserts a 200 whose body contains `8675309`; and finally asserts `!captured().contains("8675309") && !captured().contains("7340033")`. Use `store_or_skip` copied from `api_test.rs:24` (the first ~50 lines are self-contained helpers).
+Then **one** `#[tokio::test] async fn wishlist_proxy_logs_no_appids()` that: calls `install()`; emits `tracing::info!("canary-9913377")` and asserts `captured().contains("canary-9913377")` (**positive control**); runs the wishlist proxy against a seeded link whose shelf and wishlist both carry appid **`8675309`**, with a wishlist-only appid **`7340033`** (seed with `test_game(9301)`, `steam_app_id: Some(8675309)`; copy `test_game`, `test_link`, `MockInvoker` **including its `bell` impl**, `steam_router` and the `TEST_BASE_URL` const it uses; reuse the helper bodies from Step 1 by copying them. They live in another test binary and cannot be imported); asserts a 200 whose body contains `8675309`; and finally asserts `!captured().contains("8675309") && !captured().contains("7340033")`. Use `store_or_skip` copied from `api_test.rs:24` (the first ~50 lines are self-contained helpers).
 
 - [ ] **Step 3: Run and confirm they fail.** `cargo test -p public-api --test api_test wishlist` and `cargo test -p public-api --test wishlist_logs_test` ⇒ all 404 (no route) or fail to compile.
 
@@ -405,7 +412,7 @@ fn dead_link_conflict(refusal: domain::ClaimRefusal) -> Response {
 }
 ```
 
-and replace the owned proxy's inline block with `if let Err(refusal) = link.can_claim(now) { return dead_link_conflict(refusal); }`. The existing owned-proxy tests must stay green unchanged.
+and replace the owned proxy's inline block with `if let Err(refusal) = link.can_claim(now) { return dead_link_conflict(refusal); }`. The existing owned-proxy tests must stay green unchanged. (The claim handler has a third copy of this match, at `lib.rs:903`. Leave it alone: its messages feed a different response shape, and this PR does not touch the claim path.)
 
 (b) **The live-appid set:**
 
@@ -481,7 +488,13 @@ async fn handle_steam_wishlist_proxy(
         )
             .into_response();
     }
-    let shelf = match link_live_app_ids(&s.store, &link).await {
+    // Both reads are needed before answering, and the client holds its first render ≤400ms
+    // for this response, so run them concurrently.
+    let (shelf, wish) = tokio::join!(
+        link_live_app_ids(&s.store, &link),
+        steam.get_wishlist(&steam_client::SteamId64(steamid)),
+    );
+    let shelf = match shelf {
         Ok(set) => set,
         Err(_) => {
             return (
@@ -491,10 +504,7 @@ async fn handle_steam_wishlist_proxy(
                 .into_response();
         }
     };
-    match steam
-        .get_wishlist(&steam_client::SteamId64(steamid))
-        .await
-    {
+    match wish {
         Ok(items) => {
             let items: Vec<serde_json::Value> = items
                 .into_iter()
@@ -526,7 +536,16 @@ async fn handle_steam_wishlist_proxy(
 
 (e) Update the module doc comment at `lib.rs:6` to list the new route.
 
-- [ ] **Step 5: Run.** Start DynamoDB-local the way the suite expects (`moto_server` on `:8000`; see `store_or_skip`'s doc comment for the env var). Then run `cargo test -p public-api` ⇒ all green, **and confirm the new tests actually RAN, not skipped:** each prints its skip reason when the store is absent, so check with `cargo test -p public-api wishlist -- --nocapture 2>&1 | grep -c skip` ⇒ `0`. Then run `cargo clippy -p public-api --all-targets -- -D warnings`.
+- [ ] **Step 5: Run.** DynamoDB-local must be up on `:8000` (`moto_server`); the env var is `DYNAMODB_LOCAL_URL`. Then prove the tests **ran**, not skipped (`store_or_skip` prints an upper-case `SKIP <test>: …`):
+
+```bash
+echo 'SKIP x' | grep -c SKIP                                   # positive control ⇒ 1
+DYNAMODB_LOCAL_URL=http://localhost:8000 cargo test -p public-api 2>&1 | tee /tmp/wish-pub.log
+grep -cE '^test wishlist_proxy_\S+ \.\.\. ok$' /tmp/wish-pub.log     # ⇒ 8 (7 in api_test + 1 logs test)
+grep -c SKIP /tmp/wish-pub.log                                  # ⇒ 0
+```
+
+Then `cargo fmt --all && cargo clippy -p public-api --all-targets --all-features -- -D warnings`.
 
 - [ ] **Step 6: Commit.** `git add crates/public-api && git commit -S -m "⭐ public-api: token-scoped wishlist proxy — live, intersected, nothing at rest"`
 
@@ -539,7 +558,7 @@ async fn handle_steam_wishlist_proxy(
 **Interfaces:**
 - Produces: `export type WishItem = { appid: number; added: number }` and `export async function steamWishlistForLink(token: string, steamid: string): Promise<WishItem[]>`. It throws `FetchFailed` on network error or any non-2xx.
 
-- [ ] **Step 1: Failing tests** (follow the file's existing `steamOwnedForLink` tests for the `fetch` stub pattern):
+- [ ] **Step 1: Failing tests** (`api.test.ts` has no owned-proxy tests. Its pattern is a module-level `mockFetch` stubbed in `beforeEach`, and the per-test `vi.stubGlobal` below also works. **Add `steamWishlistForLink` to the file's import from `./api`**, or the red is "not a function" rather than the real one):
 
 ```ts
 describe("steamWishlistForLink", () => {
@@ -601,7 +620,15 @@ it("formats UTC month + year, lowercase", () => {
   expect(formatSince(1678000000)).toBe("mar 2023"); // 2023-03-05T07:06:40Z
 });
 it("uses UTC, not local time, at a month boundary", () => {
-  expect(formatSince(1680307200)).toBe("apr 2023"); // 2023-04-01T00:00:00Z
+  // CI and the box run TZ=UTC, so without this override a local-time implementation also
+  // passes. In Los Angeles this instant is still Mar 31, so only a UTC formatter says apr.
+  const old = process.env.TZ;
+  process.env.TZ = "America/Los_Angeles";
+  try {
+    expect(formatSince(1680307200)).toBe("apr 2023"); // 2023-04-01T00:00:00Z
+  } finally {
+    process.env.TZ = old;
+  }
 });
 it("returns null for a missing date", () => {
   expect(formatSince(0)).toBeNull();
@@ -614,9 +641,10 @@ In `GameGrid.test.tsx` (reuse its `makeGame`):
 it("stars a wishlisted game with its since-date as the accessible name", () => {
   render(<GameGrid games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420 })]}
     wished={new Map([[420, 1678000000]])} onDetail={() => {}} />);
-  const pill = screen.getByText("⭐ on your wishlist");
-  expect(pill).toHaveAttribute("title", "on your wishlist since mar 2023");
-  expect(pill).toHaveAccessibleName("on your wishlist since mar 2023");
+  expect(screen.getByText("⭐ on your wishlist")).toHaveAttribute("title", "on your wishlist since mar 2023");
+  // spec §2.1: the CARD's accessible name carries it. The card is a button whose aria-label
+  // replaces its descendants' text (GameGrid.tsx:~203), so a label on the pill is never heard.
+  expect(screen.getByRole("button", { name: "Portal — details, on your wishlist since mar 2023" })).toBeInTheDocument();
 });
 it("owned wins: no star on an owned game", () => {
   render(<GameGrid games={[makeGame({ id: "1", title: "Portal", steam_app_id: 420 })]}
@@ -672,18 +700,25 @@ and render right after the `youOwnThis` pill:
 ```tsx
             {wishLabel !== null && (
               <span
-                className="rounded bg-amber-900 px-2 py-0.5 text-xs text-amber-200"
+                className="rounded bg-floor px-2 py-0.5 text-xs text-ink-soft"
                 title={wishLabel}
-                aria-label={wishLabel}
               >
                 ⭐ on your wishlist
               </span>
             )}
 ```
 
-(Colour: the owned pill is blue on dark, and amber is its warm sibling. If `DESIGN.md` names a chip palette that forbids raw Tailwind colours, follow `DESIGN.md` and note the choice in the commit.)
+**Colour, decided:** a **floor chip** (`bg-floor … text-ink-soft`) where the ⭐ glyph carries the meaning, which is the `✍ from ben` presence-marker precedent. **Not amber:** `DESIGN.md` §2 reserves amber for pending/caution, and it is already the page's "used all your claims" alert.
 
-- [ ] **Step 4: Run** ⇒ PASS, plus the whole `GameGrid.test.tsx`. **Step 5: Commit** `⭐ web: the wishlist star — owned wins, ghosts never star`.
+**Also add `import { formatSince } from "../wishlist";` to `GameGrid.tsx`**, and extend the card button's label (search `aria-label={\`${game.title} — details\`}`) to:
+
+```tsx
+aria-label={`${game.title} — details${wishLabel ? `, ${wishLabel}` : ""}`}
+```
+
+The existing exact-label assertion (`LinkPage.test.tsx:122`) has no wishlist, so it stays green. **Note:** the "owned wins" and "ghost" tests are **regression guards** and are already green at red (ghost cards return before the chip row). Only the star test and the missing-date test are true reds.
+
+- [ ] **Step 4: Run** ⇒ PASS, plus the whole `GameGrid.test.tsx` and `LinkPage.test.tsx` (the label change touches its `:122` assertion); then `npm run typecheck && npm run lint`. **Step 5: Commit** `⭐ web: the wishlist star — owned wins, ghosts never star`.
 
 ---
 
@@ -692,7 +727,7 @@ and render right after the `youOwnThis` pill:
 **Files:** Modify `web/src/friend/LinkPage.tsx`, `web/src/friend/LinkPage.test.tsx`; add `floatRanks` to `web/src/wishlist.ts` (+ test).
 
 **Interfaces:**
-- Consumes: `steamWishlistForLink`, `WishItem` (Task 3); `formatSince`, `GameGrid.wished` (Task 4).
+- Consumes: `steamWishlistForLink`, `WishItem` (Task 3); `GameGrid.wished` (Task 4).
 - Produces: `export function floatRanks(ids: string[], starred: Set<string>, rand: () => number): Map<string, number>`. Starred ids get ranks `0..k-1` in shuffled order, the rest get `k..n-1` in shuffled order. `rand` is injectable so the partition test is deterministic.
 
 **Behaviour contract (from spec §2, §5 and the family review):**
@@ -721,7 +756,7 @@ it("floatRanks with nothing starred is a plain shuffle of all ids", () => {
 });
 ```
 
-`LinkPage.test.tsx`: add `steamWishlistForLink: vi.fn()` to the `vi.mock("../api")` factory and to the import list. In the existing `beforeEach` (or a new one inside a `describe("wishing well")`), default it to `vi.mocked(steamWishlistForLink).mockResolvedValue([])` so older tests keep passing. Then:
+`LinkPage.test.tsx`: add `steamWishlistForLink: vi.fn()` to the `vi.mock("../api")` factory and to the import list. **Set the default in the TOP-LEVEL `describe("LinkPage")` `beforeEach`**, right after `loadIdentity` is set to null (~`:80`): `vi.mocked(steamWishlistForLink).mockResolvedValue([]);`. Nowhere else will do: the existing steam-identity tests (`:629`, `:658`, `:685`) restore an identity, and a bare `vi.fn()` returns `undefined`. **Nest `describe("wishing well")` INSIDE `describe("LinkPage")`** so it inherits that `beforeEach` and the `consumeReturnFragment` default. Add `afterEach(() => { vi.useRealTimers(); })` inside the wishing-well describe, so a failing fake-timer test cannot leak. Then:
 
 ```tsx
 describe("wishing well", () => {
@@ -786,14 +821,43 @@ describe("wishing well", () => {
     vi.mocked(loadIdentity).mockReturnValue(stored);
     vi.mocked(steamWishlistForLink).mockReturnValue(new Promise((r) => { resolveWish = r; }));
     renderLinkPage();
-    await act(async () => { vi.advanceTimersByTime(450); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });   // let fetchLink resolve ⇒ hold timer scheduled
+    await act(async () => { await vi.advanceTimersByTimeAsync(450); }); // past WISH_HOLD_MS
     await waitFor(() => expect(screen.getByText("G0")).toBeInTheDocument());
     const before = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent);
     await act(async () => { resolveWish([{ appid: 1007, added: 1678000000 }]); });
     await waitFor(() => expect(screen.getByText("⭐ on your wishlist")).toBeInTheDocument());
     const after = screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent);
     expect(after).toEqual(before);
-    vi.useRealTimers();
+  });
+
+  it("two copies of one wishlisted title count ONCE (the grid dedupes by title)", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: [
+      makeGame({ id: "a", title: "Portal", steam_app_id: 420 }),
+      makeGame({ id: "b", title: "Portal", steam_app_id: 420 }),
+      makeGame({ id: "c", title: "Other", steam_app_id: 999 }),
+    ] });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 420, added: 1678000000 }]);
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("⭐ 1 of these is on your wishlist")).toBeInTheDocument());
+  });
+
+  it("restore path fetches the wishlist with the stored steamid", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(2) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    renderLinkPage();
+    await waitFor(() => expect(steamWishlistForLink).toHaveBeenCalledWith("abc123", stored.steamid));
+  });
+
+  it("disconnect clears the stars and the count line", async () => {
+    vi.mocked(fetchLink).mockResolvedValue({ ...baseLink, games: shelf(3) });
+    vi.mocked(loadIdentity).mockReturnValue(stored);
+    vi.mocked(steamWishlistForLink).mockResolvedValue([{ appid: 1001, added: 1678000000 }]);
+    renderLinkPage();
+    await waitFor(() => expect(screen.getByText("⭐ 1 of these is on your wishlist")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: /disconnect/i }));
+    await waitFor(() => expect(screen.queryByText(/on your wishlist/)).not.toBeInTheDocument());
   });
 
   it("wishlist failure never blocks owned", async () => {
@@ -835,17 +899,72 @@ export function floatRanks(ids: string[], starred: Set<string>, rand: () => numb
 - [ ] **Step 4: Implement in `LinkPage.tsx`:**
   1. Import `steamWishlistForLink` and `floatRanks`. Add `const WISH_HOLD_MS = 400;` and the `Wish` type at module scope.
   2. State: `const [wish, setWish] = useState<Wish>({ kind: "none" });` and `const [holdOver, setHoldOver] = useState(false);`.
-  3. Add a helper inside the component: `const loadWish = (steamid: string) => { setWish({ kind: "pending" }); steamWishlistForLink(token!, steamid).then((items) => setWish({ kind: "done", wished: new Map(items.map((i) => [i.appid, i.added])) })).catch(() => setWish({ kind: "done", wished: new Map() })); };`. Guard it with the steam effect's `cancelled` flag: pass `cancelled` through a closure, or check a ref, so an unmounted page never calls `setWish`.
-  4. In the steam effect: restore path, after `setSteamIdentity(stored)`, add `if (stored) loadWish(stored.steamid);`. Return path: call `loadWish(steamid)` **before** `void fetchOwned();`, so the two run in parallel.
-  5. The hold timer: `useEffect(() => { if (view.kind !== "loaded" || view.data.curated === true || wish.kind !== "pending") return; const t = setTimeout(() => setHoldOver(true), WISH_HOLD_MS); return () => clearTimeout(t); }, [view.kind, wish.kind]);`. Compute `const holding = view.kind === "loaded" && view.data.curated !== true && wish.kind === "pending" && !holdOver;`.
+  3. **Inside the steam effect** (the `useEffect` that declares `let cancelled = false;` at ~`:195`), right after that declaration, define the loader so it closes over `cancelled`:
+
+```ts
+    const loadWish = (steamid: string) => {
+      setWish({ kind: "pending" });
+      // Promise.resolve() first: a mock (or future caller) returning a non-promise degrades
+      // silently instead of throwing inside the effect.
+      Promise.resolve()
+        .then(() => steamWishlistForLink(token!, steamid))
+        .then((items) => {
+          if (!cancelled) setWish({ kind: "done", wished: new Map(items.map((i) => [i.appid, i.added])) });
+        })
+        .catch(() => {
+          if (!cancelled) setWish({ kind: "done", wished: new Map() });
+        });
+    };
+```
+
+  4. **Restore path:** replace the existing block
+
+```ts
+    if (fragment === null) {
+      // No return fragment — restore from localStorage
+      const stored = loadIdentity();
+      if (!cancelled) setSteamIdentity(stored);
+      return;
+    }
+```
+
+with (**the bare `return;` becomes a cleanup, so `cancelled` can actually flip on this path**):
+
+```ts
+    if (fragment === null) {
+      // No return fragment — restore from localStorage
+      const stored = loadIdentity();
+      if (!cancelled) setSteamIdentity(stored);
+      if (stored) loadWish(stored.steamid);
+      return () => {
+        cancelled = true;
+      };
+    }
+```
+
+**Return path:** call `loadWish(steamid);` on the line **before** `void fetchOwned();`, so the two run in parallel. **Accepted race (recorded, not fixed):** on this path, if the wishlist lands before owned, ranks may freeze with an owned-and-wishlisted game floated but unstarred. Steam removes a game from the wishlist on purchase, so this needs stale Steam data to happen.
+  5. **Placement matters (rules-of-hooks):** put the `holdOver` state, this effect and `holding` **immediately after the `ownedSet` memo (~`:284`) and before `shuffleRanksRef`**. Every hook must stay above the early return at ~`:317`.
+
+```ts
+  // Hold only an ACTIVE open shelf. Curated never floats, and dead or sealed links 409 on the proxy.
+  const openShelf =
+    view.kind === "loaded" && view.data.curated !== true && view.data.state === "active";
+  useEffect(() => {
+    if (!openShelf || wish.kind !== "pending") return;
+    const t = setTimeout(() => setHoldOver(true), WISH_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [openShelf, wish.kind]);
+  const holding = openShelf && wish.kind === "pending" && !holdOver;
+```
   6. `const wishedMap = wish.kind === "done" ? wish.wished : undefined;`
   7. In the `shelfGames` memo: `if (holding) return [];` before the rank block, and replace the inline Fisher–Yates with `shuffleRanksRef.current = floatRanks(games.map((g) => g.id), starredIds, Math.random)`, where `starredIds` is built from `games`, `wishedMap` and `ownedSet` (non-owned, `steam_app_id` in `wishedMap`). Add `holding`, `wishedMap` and `ownedSet` to the deps. Ranks are still assigned only while `shuffleRanksRef.current === null`, which is the freeze. **Do not reset the ref when the wishlist lands.**
   8. The render gate: extend the existing `if (view.kind === "loading")` to `if (view.kind === "loading" || holding)`.
-  9. The count line: `const starCount = shelfGames.filter((g) => g.gone !== true && g.steam_app_id !== null && !ownedSet.has(g.steam_app_id) && wishedMap?.has(g.steam_app_id)).length;`. Render it directly above `<GameGrid …/>` when `starCount >= 1`: `<p className="px-6 pt-2 text-sm text-ink-soft">⭐ {starCount} of these {starCount === 1 ? "is" : "are"} on your wishlist</p>`. The text must be a **single text node** so `getByText` matches: build the string first, `const line = \`⭐ ${starCount} of these ${starCount === 1 ? "is" : "are"} on your wishlist\`;`, then render `{line}`.
+  9. The count line counts **distinct appids**, because the open shelf renders one card per title (`dedupedByTitle`): `const starCount = new Set(shelfGames.filter((g) => g.gone !== true && g.steam_app_id !== null && !ownedSet.has(g.steam_app_id) && wishedMap?.has(g.steam_app_id)).map((g) => g.steam_app_id)).size;`. Render it directly above `<GameGrid …/>` when `starCount >= 1`: `<p className="px-6 pt-2 text-sm text-ink-soft">⭐ {starCount} of these {starCount === 1 ? "is" : "are"} on your wishlist</p>`. The text must be a **single text node** so `getByText` matches: build the string first, `const line = \`⭐ ${starCount} of these ${starCount === 1 ? "is" : "are"} on your wishlist\`;`, then render `{line}`.
   10. Pass `wished={wishedMap}` to `<GameGrid>`.
   11. In the disconnect handler next to `clearIdentity();`, add `setWish({ kind: "none" });`.
 
-- [ ] **Step 5: Run the whole web suite:** `cd web && npx vitest run && npx tsc --noEmit && npx eslint src` ⇒ green. **Step 6: Commit** `⭐ web: the wishing well — float, hold ≤400ms, late stars never move, count line at ≥1`.
+- [ ] **Step 5: Run the whole web suite:** `cd web && npx vitest run && npm run typecheck && npm run lint` ⇒ green. The lint baseline is **3 warnings** (measured 2026-09-30), and this task must not add one.
+  12. **Amend `docs/spec-wishing-well.md` §5**, replacing the "When it lands, starred games move up in one reorder" bullet with the hold-then-freeze contract: the first open-shelf render waits ≤400 ms for the wishlist, and a later arrival adds stars and moves nothing. Commit it with this task. **Step 6: Commit** `⭐ web: the wishing well — float, hold ≤400ms, late stars never move, count line at ≥1`.
 
 ---
 
@@ -855,22 +974,24 @@ export function floatRanks(ids: string[], starred: Set<string>, rand: () => numb
 
 ```bash
 git diff --name-only origin/main...HEAD | tee /dev/stderr \
-  | grep -E '^(crates/dynamo/|crates/fulfillment/|terraform/)' \
+  | grep -E '^(crates/dynamo/|crates/fulfillment/|terraform/|terraform-iam/)' \
   && { echo "🔴 NOTHING-AT-REST BOUNDARY BROKEN"; exit 1; } || echo "✅ boundary holds"
 ```
 
-Before trusting that, run the positive control: `printf 'terraform/x.tf\n' | grep -E '^(crates/dynamo/|crates/fulfillment/|terraform/)'` ⇒ rc 0. That proves the pattern can see a hit.
-- [ ] **Step 2: Full workspace.** `cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` (with DynamoDB-local up) **and** `cd web && npx vitest run && npx tsc --noEmit && npx eslint src && npm run build`.
-- [ ] **Step 3: IAM capture stays byte-identical:** `cargo test -p dynamo --test iam_capture` ⇒ PASS in default (assert) mode with **no** regeneration. The new proxy only uses store reads the public lambda already makes (`get_link`, `batch_get_games`, `list_listable_games`). This step proves that.
+Before trusting that, run the positive control: `printf 'terraform/x.tf\n' | grep -E '^(crates/dynamo/|crates/fulfillment/|terraform/|terraform-iam/)'` ⇒ rc 0. That proves the pattern can see a hit.
+- [ ] **Step 2: Full gate = CI.** The box has 3.7G RAM and cargo `jobs=1`, and CI runs this exact gate (fmt, clippy `--all-features`, dynamodb-local tests, Node 22 web typecheck/lint/test/build). So push the branch and gate on `ops/branch-green.sh yourcodekitten/bendobundles kitten/wishing-well` (from `~/code-kitten`) ⇒ rc 0. Locally, run at least `cargo fmt --all -- --check` and `cd web && npm run typecheck && npm run lint && npx vitest run`.
+- [ ] **Step 2b: Commit any fix-ups** from Steps 1–2 (`cargo fmt` reflow, lint) as `🧹 fmt/lint`, and push.
+- [ ] **Step 3: The IAM evidence, stated precisely.** `iam_capture` drives Store methods from its own caller map (`iam_capture.rs:22-29`), so it **cannot see** new call sites in public-api. A green run proves only that the dynamo crate is unchanged. The real evidence: `jq -r '.["public-api"] | keys[]' terraform/iam-request-corpus.json` lists `get_link`, `batch_get_games` and `list_listable_games`. Those three are the only Store calls the new proxy makes, so its reads are already inside the deployed policy.
 
 ---
 
 ## Deploy (pounce step 11, after merge)
 
-Full deploy per `terraform/README.md` → "Deploying as kitten". This changes lambda code **and** web, so it is not the web-only path. **Pre-register the plan shape from prod's last-deployed stamp, never from this diff** (a deploy ships prod→main, which may carry others' merges). The expected shape for this PR alone is **0 add / N change / 0 destroy**, where N is the lambda functions whose zip hash moved: `public-api` for certain, and every lambda that links `steam-client` if the build embeds it. Name N from the plan's own resource list before applying. Then run `deploy-web.sh` from the CI `web-dist` artifact of the merge commit.
+Full deploy per `terraform/README.md` → "Deploying as kitten". This changes lambda code **and** web, so it is not the web-only path. **Pre-register the plan shape from prod's last-deployed stamp, never from this diff** (a deploy ships prod→main, which may carry others' merges). The expected shape for this PR alone is **0 add / N change / 0 destroy**, where N is the lambda functions whose zip hash moved: `public-api`, `admin-api` and `fulfillment` all link `steam-client`, so **pre-register N = 3 lambda functions** (their `source_code_hash` moves), plus any change from others' merges since prod's last deploy. Name every resource from the plan's own list before applying. Then run `deploy-web.sh` from the CI `web-dist` artifact of the merge commit.
 
 ## Post-deploy verification (pounce step 12)
 
-1. `curl -sS "https://<prod-host>/api/l/<a live open-shelf token>/steam/wishlist/<a public id64 from the 2026-09-30 probe with items>"` ⇒ `200`, `cache-control: private, max-age=3600`. Every returned appid must be present in that link's `/api/l/<token>` `games[].steam_app_id`. Check this mechanically with jq set-difference ⇒ empty.
-2. **Nothing at rest, measured:** `AWS_PROFILE=kitten-debug aws dynamodb get-item` for `pk=STEAMWISH#<id64>` **and** `pk=STEAMOWN#<id64>, sk=WISH` ⇒ no item. Also run a CloudWatch Logs Insights query over the public-api log group for the request window, filtering on one returned appid ⇒ 0 matches. Before that, run a positive control on the same query with a string known to be logged (the request path) ⇒ ≥1 match.
+0. **Pre-register the subject BEFORE deploy (non-vacuous overlap).** Pick a live open-shelf link token and an id64 from the 2026-09-30 probe (or any public profile) whose **raw** keyless wishlist ∩ that link's `games[].steam_app_id` is **non-empty**, and whose raw wishlist also carries appids **not** on the link. Compute both sets from the raw Steam call and the live `/api/l/<token>` payload, and write the id64, the token and the expected overlap into the checkpoint. If no public id64 overlaps, use a curated test link whose games are chosen from a known wishlist.
+1. `curl -sSi "https://<prod-host>/api/l/<token>/steam/wishlist/<id64>"` ⇒ `200`, `cache-control: private, max-age=3600`. Assert **both** halves mechanically with jq: returned ⊆ link appids (set-difference ⇒ empty) **and** returned == the pre-registered overlap (so returned ≠ the raw wishlist).
+2. **Nothing at rest, measured:** `AWS_PROFILE=kitten-debug aws dynamodb scan --filter-expression 'contains(pk,:id) OR contains(sk,:id)' --expression-attribute-values '{":id":{"S":"<id64>"}}'` over the table. Pre-registered expectation: **only** `STEAMOWN#<id64>`, and only if an owned call happened for that id. **Logs:** a Logs Insights query over the public-api log group for the request window, filtered on one returned appid ⇒ 0. Positive control on the same query and window: filter on `REPORT RequestId` (always logged by the Lambda runtime) ⇒ ≥1. API Gateway execution logs run at INFO with `data_trace_enabled=false`, so they carry the path (which holds the id64, not appids) and no bodies. That is stated, not assumed: check `terraform/aws-apigateway.tf`.
 3. Load the page in a browser (Playwright) with a stored identity for that id64 and screenshot the stars and the count line.
