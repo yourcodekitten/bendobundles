@@ -60,6 +60,11 @@ already picked the games. The matchmaker helps Ben pick them in the first place.
 - It is stored as a top-level attribute `steam_id64` on `FRIEND#<id>/META`, and `Friend` gains
   `#[serde(default)] steam_id64: Option<String>`. Older records read back as `None`.
 - The existing "exactly one field per request" rule stays and simply counts four fields instead of three.
+- **Lifetime:** the id64 lives on the friend's own `META` item. Measured at `38e1748`, **there is no
+  friend-delete route** (the friend routes are `POST`+`GET /admin/api/friends` and `POST /admin/api/friends/{id}`;
+  revoke keeps the record). The only way to remove the id64 is therefore `steam: null`. If a delete route
+  is ever added, deleting the item removes the id64 with it, because there is no second copy (Lilith's
+  condition, family review). Revoking a friend's shelf does **not** forget their Steam id. Ben forgets it explicitly.
 
 ### 3.2 Wishlist proxy
 `GET /admin/api/steam/wishlist/{steamid}`. It mirrors the admin owned proxy's preamble exactly:
@@ -104,19 +109,25 @@ It is pure, so every rule above gets a unit test.
 - Many friends ⇒ wishlist calls are made **lazily**: one per friend row once it scrolls into view, at
   most 4 at a time. They are not fanned out on page load.
 
-## 6. Open questions for the family
-- **Q1 (data at rest):** the wishing well stored nothing. Here, Ben's own address book gains an id64
-  per friend. That is Ben-entered, admin-only and forgettable. Is that the right line, or should the
-  profile be pasted into each session and never stored?
-- **Q2 (vanity):** adding a keyed verb only for convenience. Worth it, or ship id64 + `/profiles/` only?
-- **Q3 (v2 board):** is the cross-friend "who wants this" view worth a lazily-fetched page of its own later?
+## 6. Family decisions (2026-10-02, Lilith; OMBB pending)
+- **D1, store the id64 (was Q1).** The wishing well's nothing-at-rest rule was about the *wishlist*,
+  which is still never stored. An id64 is a public identifier Ben typed into his own address book. If he
+  had to paste it every session he would never use the feature.
+- **D2, resolve vanity URLs (was Q2).** `/id/<name>` is the form Ben will actually copy out of Steam.
+  It is resolved once at save time, so the cost is one keyed call per friend, ever. The verb count moving
+  11 → 12 is the detector working as intended.
+- **D3, the census decides any board (was Q3).** **No v2 commitment in this spec.** The baseline is the
+  2026-09-28 census (59 unclaimed slots, no claim since 2026-07-14). After v1 ships, check whether links
+  cut from wishlist matches get claimed at a better rate. If they do, a cross-friend board has earned its
+  N calls. If they don't, the bottleneck isn't picking.
 
 ## 7. Testing
 - `matchmaker.ts`: predicate, owned exclusion, `private` passthrough, title dedupe determinism, sort order.
 - steam-client: `priority` decoded; a malformed item drops only itself (#260); vanity resolve success,
   `success: 42`, network error.
-- admin-api: the PATCH four-way exclusivity, the `steam` set and forget round-trip, the wishlist proxy
+- admin-api: the `POST /admin/api/friends/{id}` four-way exclusivity (the route is `POST`; its handler is named `handle_patch_friend`), the `steam` set and forget round-trip, the wishlist proxy
   preamble (503 / 400 / 200), and a test that **no `STEAMWISH#`-style write ever happens** (asserted by
   the IAM capture, the same way the wishing well asserted it).
+- admin-api: `steam: null` REMOVEs `steam_id64` (asserted on the raw item, not only the read-back), and a revoke leaves it in place.
 - web: the Friends row hides the line when there are zero matches, the panel → Links handoff carries
   `picked` and `friendId`, and Links preselects curated mode with the friend attached after create.
