@@ -89,8 +89,9 @@ The admin page already has the full catalog. The match is a pure function in `we
 - candidates: catalog rows with `status === 'available' && giftable && !hidden && steam_app_id != null`
   (the same predicate as `Game::is_listable`, plus a mapped appid);
 - keep the rows whose appid is in the wishlist; drop them if the appid is in `owned`;
-- **dedupe by title** (a game can appear several times from different bundles; the friend wants one).
-  Keep the copy that has a bundle name, then the lowest id, so the result is deterministic;
+- **dedupe by `steam_app_id`**, not title (OMBB, family review): one appid can sit under two catalog
+  titles across bundles, and a title dedupe keeps both. Inside an appid group the tiebreak is the copy
+  with a bundle name, then the title, then the lowest id, so the result is deterministic;
 - sort: `priority` ascending, then `date_added` ascending, then title.
 It is pure, so every rule above gets a unit test.
 
@@ -120,6 +121,22 @@ It is pure, so every rule above gets a unit test.
   2026-09-28 census (59 unclaimed slots, no claim since 2026-07-14). After v1 ships, check whether links
   cut from wishlist matches get claimed at a better rate. If they do, a cross-friend board has earned its
   N calls. If they don't, the bottleneck isn't picking.
+
+## 6.1 Unresolved, must be decided before the plan (OMBB, 2026-10-02, verified at `38e1748`)
+**Q1 was wider than the id64.** The owned-games exclusion goes through the admin owned proxy, which calls
+`Store::cached_owned_or_fetch`. That **writes `STEAMOWN#<id64>`**, which holds the friend's **whole owned
+library**, with a 7-day TTL (`put_steam_owned` → `schema::steam_owned_item`). `steam: null` does not touch
+it. So "nothing left at rest" and a test asserting only "no `STEAMWISH#` write" are both too narrow: the IAM
+capture would show that put. Pick one and write it here:
+- **(a)** the TTL'd cache is acceptable, stated as such, with the 7-day bound named; or
+- **(b)** `steam: null` also deletes `STEAMOWN#<id64>`. This is a new delete path, and it has to be added to the IAM capture.
+
+## 6.2 The yardstick, pre-registered BEFORE any data (OMBB)
+D3 is only honest if the measure is fixed before anyone sees results. **Measure:** the claim rate of links
+cut through the matchmaker (claims / slots, over the 30 days after creation), against the 2026-09-28
+baseline (59 unclaimed slots across 11 live links, no claim since 2026-07-14). ⚠️ This needs a way to tell
+a matchmaker-cut link from any other link. Today nothing on `Link` records how it was made, so the plan
+must add a provenance marker or the measure cannot be taken.
 
 ## 7. Testing
 - `matchmaker.ts`: predicate, owned exclusion, `private` passthrough, title dedupe determinism, sort order.
