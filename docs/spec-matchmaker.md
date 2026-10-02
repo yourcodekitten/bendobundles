@@ -127,8 +127,9 @@ It is pure, so every rule above gets a unit test.
 `Store::cached_owned_or_fetch`. That **writes `STEAMOWN#<id64>`**, which holds the friend's **whole owned
 library**, with a 7-day TTL (`put_steam_owned` → `schema::steam_owned_item`). `steam: null` does not touch
 it. So "nothing left at rest" and a test asserting only "no `STEAMWISH#` write" are both too narrow: the IAM
-capture would show that put. Pick one and write it here:
-- **(a)** the TTL'd cache is acceptable, stated as such, with the 7-day bound named; or
+capture would show that put. Pick one, write it here, and write the IAM capture test to match it:
+- **(a)** the TTL'd cache is acceptable, stated as such, naming the bound honestly: the row lives **7 days**
+  (`ttl=now+7d`), even though the proxy only treats it as fresh for **24h** (Lilith: retention is the TTL, not the freshness window); or
 - **(b)** `steam: null` also deletes `STEAMOWN#<id64>`. This is a new delete path, and it has to be added to the IAM capture.
 
 ## 6.2 The yardstick, pre-registered BEFORE any data (OMBB)
