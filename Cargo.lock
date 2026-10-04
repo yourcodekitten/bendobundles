@@ -256,9 +256,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-dynamodb"
-version = "1.124.0"
+version = "1.126.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1f263cde3de25aade4a83ffceec29d962e185a8a52a421c84337589e672b15a"
+checksum = "84916ddc26951545be16e11fe45277e2d2561b9d0f2d0538274fb750c09b3eae"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -283,9 +283,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-lambda"
-version = "1.144.0"
+version = "1.146.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c2d1dafbd33057e5d3100bf650dcb7444ebe0eb83dbde961ca5dbce30e262f5"
+checksum = "dc2c82003738ade7224560f489e3aad67d7dc154c09136e6019cbdb366e96143"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -310,9 +310,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-s3"
-version = "1.146.1"
+version = "1.148.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cd651b4400d4011b8927b83a9552bf90ff11e6e5da0b9f0a7583247aceec971"
+checksum = "8a61c1db3987ab6c8740fb87f248864687d50549401115244a84f02c3047b2d5"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -347,9 +347,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-ssm"
-version = "1.122.0"
+version = "1.124.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "400e5cea358fbcf6f971babbca13bd992a7077e527ac4f961c728c6a5a19ab9f"
+checksum = "c1545dc5c4157bc9682e0f89df274f92c30a9c1e66d941310333dc4181d31d79"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
