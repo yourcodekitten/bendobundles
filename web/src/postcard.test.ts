@@ -61,17 +61,22 @@ describe("postcard model", () => {
     expect(t.postmark).toBe("in the attic since mar 2014 · unwrapped mar 1, 2015");
   });
 
-  it("D5: ≥1 whole year adds the waited clause, singular and plural", () => {
-    expect(postcardText(base).postmark).toBe(
-      "in the attic since mar 2014 · unwrapped oct 5, 2026 · waited 12 years for you",
-    );
-    expect(postcardText({ ...base, unwrappedAt: "2015-03-02T18:00:00Z" }).postmark).toContain(
+  it("D5: ≥1 whole year yields the WAITED headline, singular and plural — its own field, not buried in the postmark", () => {
+    const t = postcardText(base);
+    expect(t.waited).toBe("waited 12 years for you");
+    expect(t.postmark).toBe("in the attic since mar 2014 · unwrapped oct 5, 2026");
+    expect(postcardText({ ...base, unwrappedAt: "2015-03-02T18:00:00Z" }).waited).toBe(
       "waited 1 year for you",
     );
   });
 
+  it("under one year ⇒ no waited headline at all", () => {
+    expect(postcardText({ ...base, unwrappedAt: "2015-03-01T12:00:00Z" }).waited).toBeNull();
+  });
+
   it("unknown acquiredAt drops the attic clause and the waited clause", () => {
     expect(postcardText({ ...base, acquiredAt: null }).postmark).toBe("unwrapped oct 5, 2026");
+    expect(postcardText({ ...base, acquiredAt: null }).waited).toBeNull();
   });
 
   it("note passes through; from-line is fixed", () => {

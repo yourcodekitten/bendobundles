@@ -25,6 +25,7 @@ const F = {
   from: `36px "Chivo Variable", ${SERIF_FALLBACK}`,
   note: `italic 36px "Chivo Variable", ${SERIF_FALLBACK}`,
   post: `26px "Chivo Variable", ${SERIF_FALLBACK}`,
+  waited: `44px "Pixelify Sans Variable", ${SERIF_FALLBACK}`,
   mark: `28px "Silkscreen", ui-monospace, monospace`,
 };
 
@@ -65,7 +66,7 @@ export async function loadPostcardAssets(
 }
 
 const M = 72; // outer margin
-const ART = { x: M + 24, y: M + 24, w: POSTCARD_W - 2 * (M + 24), h: 620 };
+const ART = { x: M + 24, y: M + 24, w: POSTCARD_W - 2 * (M + 24), h: 580 };
 
 function drawPlaceholder(ctx: DrawCtx) {
   ctx.fillStyle = P.mat;
@@ -125,8 +126,17 @@ export function drawPostcard(ctx: DrawCtx, input: PostcardInput, assets: Postcar
   ctx.font = F.post;
   ctx.fillStyle = P.dust;
   const postY = POSTCARD_H - M - 70;
-  for (const [i, line] of wrapLines(t.postmark, maxW, 2, (s) => ctx.measureText(s).width).entries()) {
-    ctx.fillText(line, x, postY - (1 - i) * 34);
+  const postLines = wrapLines(t.postmark, maxW, 2, (s) => ctx.measureText(s).width);
+  for (const [i, line] of postLines.entries()) {
+    ctx.fillText(line, x, postY - (postLines.length - 1 - i) * 34);
+  }
+  if (t.waited !== null) {
+    // the headline: one line, give-pink, sitting on top of the small print.
+    // Layout bound (art h 580): worst-case note baseline 1052; this line's top at
+    // 2-line postmark ≈ 1208-34-56-44 = 1074 — keep that inequality if sizes change.
+    ctx.font = F.waited;
+    ctx.fillStyle = P.give;
+    ctx.fillText(t.waited, x, postY - (postLines.length - 1) * 34 - 56);
   }
   ctx.font = F.mark;
   ctx.textAlign = "right";

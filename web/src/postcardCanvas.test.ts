@@ -34,7 +34,7 @@ describe("drawPostcard", () => {
     expect(all).toContain("Stardew Valley");
     expect(all).toContain(t.from);
     expect(all).toContain("for you ♡");
-    expect(all).toContain("waited 12 years for you");
+    expect(texts).toContain("waited 12 years for you"); // drawn as ONE line — the headline never wraps mid-phrase
     expect(all).toContain("bendobundles");
     expect(all).not.toMatch(/https?:|www\.|\.com\//);
   });

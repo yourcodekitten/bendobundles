@@ -59,6 +59,10 @@ export type PostcardText = {
   title: string;
   from: string;
   note: string | null;
+  /** The card's headline — "waited 12 years for you" — or null under one whole year /
+   *  unknown acquisition. Its own field so it is drawn as ONE line, never wrapped into
+   *  the small print (the first real-browser render buried it and orphaned "for you"). */
+  waited: string | null;
   postmark: string;
 };
 
@@ -71,8 +75,8 @@ export function postcardText(i: PostcardInput): PostcardText {
   const unwrapT = Date.parse(i.unwrappedAt);
   // D5: inject the unwrap instant — never default-now.
   const years = Number.isNaN(unwrapT) ? null : waitedYears(i.acquiredAt ?? undefined, unwrapT);
-  if (years !== null) parts.push(`waited ${years} ${years === 1 ? "year" : "years"} for you`);
-  return { title: i.title, from: "from ben ♡", note: i.note, postmark: parts.join(" · ") };
+  const waited = years === null ? null : `waited ${years} ${years === 1 ? "year" : "years"} for you`;
+  return { title: i.title, from: "from ben ♡", note: i.note, waited, postmark: parts.join(" · ") };
 }
 
 /** Word wrap with a hard break for over-long words; the last allowed line is
