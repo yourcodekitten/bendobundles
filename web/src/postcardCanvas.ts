@@ -1,15 +1,31 @@
 // 🖼️ the postcard's canvas half (docs/spec-postcard.md D2/D3/D10). Assets load ONCE
 // per panel; drawPostcard is synchronous so a D8 toggle re-render never awaits.
 import {
-  POSTCARD_H, POSTCARD_PALETTE as P, POSTCARD_W, postcardText, wrapLines, type PostcardInput,
+  POSTCARD_H,
+  POSTCARD_PALETTE as P,
+  POSTCARD_W,
+  postcardText,
+  wrapLines,
+  type PostcardInput,
 } from "./postcard";
 
 export type PostcardAssets = { art: HTMLImageElement | null };
 
 export type DrawCtx = Pick<
   CanvasRenderingContext2D,
-  "fillStyle" | "strokeStyle" | "lineWidth" | "font" | "textAlign" | "textBaseline"
-  | "fillRect" | "strokeRect" | "fillText" | "measureText" | "drawImage" | "save" | "restore"
+  | "fillStyle"
+  | "strokeStyle"
+  | "lineWidth"
+  | "font"
+  | "textAlign"
+  | "textBaseline"
+  | "fillRect"
+  | "strokeRect"
+  | "fillText"
+  | "measureText"
+  | "drawImage"
+  | "save"
+  | "restore"
 >;
 
 export const POSTCARD_FONTS = [
@@ -30,14 +46,25 @@ const F = {
 };
 
 export function canMakePostcards(): boolean {
-  return typeof HTMLCanvasElement !== "undefined"
-    && typeof HTMLCanvasElement.prototype.toBlob === "function";
+  return (
+    typeof HTMLCanvasElement !== "undefined" &&
+    typeof HTMLCanvasElement.prototype.toBlob === "function"
+  );
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
   return new Promise((resolve) => {
     const t = setTimeout(() => resolve(fallback), ms);
-    p.then((v) => { clearTimeout(t); resolve(v); }, () => { clearTimeout(t); resolve(fallback); });
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(t);
+        resolve(fallback);
+      },
+    );
   });
 }
 
@@ -46,18 +73,22 @@ export async function loadPostcardAssets(
   artworkUrl: string | null,
   timeoutMs = 4000,
 ): Promise<PostcardAssets> {
-  const fonts = typeof document !== "undefined" && document.fonts
-    ? Promise.all(POSTCARD_FONTS.map((f) => document.fonts.load(f))).then(() => undefined)
-    : Promise.resolve(undefined);
-  const art: Promise<HTMLImageElement | null> = artworkUrl === null
-    ? Promise.resolve(null)
-    : new Promise((resolve) => {
-        const img = new Image();
-        img.crossOrigin = "anonymous";
-        img.onload = () => resolve(img);
-        img.onerror = () => resolve(null);
-        img.src = artworkUrl;
-      });
+  const fonts =
+    typeof document !== "undefined" && document.fonts
+      ? Promise.all(POSTCARD_FONTS.map((f) => document.fonts.load(f))).then(
+          () => undefined,
+        )
+      : Promise.resolve(undefined);
+  const art: Promise<HTMLImageElement | null> =
+    artworkUrl === null
+      ? Promise.resolve(null)
+      : new Promise((resolve) => {
+          const img = new Image();
+          img.crossOrigin = "anonymous";
+          img.onload = () => resolve(img);
+          img.onerror = () => resolve(null);
+          img.src = artworkUrl;
+        });
   const [, a] = await Promise.all([
     withTimeout(fonts, timeoutMs, undefined),
     withTimeout(art, timeoutMs, null),
@@ -72,7 +103,9 @@ function drawPlaceholder(ctx: DrawCtx) {
   ctx.fillStyle = P.mat;
   ctx.fillRect(ART.x, ART.y, ART.w, ART.h);
   // the house pixel-gift glyph, drawn in blocks (no asset, cannot fail)
-  const s = 24, cx = ART.x + ART.w / 2, cy = ART.y + ART.h / 2;
+  const s = 24,
+    cx = ART.x + ART.w / 2,
+    cy = ART.y + ART.h / 2;
   ctx.fillStyle = P.give;
   ctx.fillRect(cx - 4 * s, cy - 2 * s, 8 * s, 6 * s); // box
   ctx.fillStyle = P.paper;
@@ -86,13 +119,19 @@ function drawPlaceholder(ctx: DrawCtx) {
 function drawArt(ctx: DrawCtx, img: HTMLImageElement) {
   ctx.fillStyle = P.mat;
   ctx.fillRect(ART.x, ART.y, ART.w, ART.h);
-  const iw = img.naturalWidth || ART.w, ih = img.naturalHeight || ART.h;
+  const iw = img.naturalWidth || ART.w,
+    ih = img.naturalHeight || ART.h;
   const k = Math.min(ART.w / iw, ART.h / ih); // contain, never crop (spec: the card)
-  const w = iw * k, h = ih * k;
+  const w = iw * k,
+    h = ih * k;
   ctx.drawImage(img, ART.x + (ART.w - w) / 2, ART.y + (ART.h - h) / 2, w, h);
 }
 
-export function drawPostcard(ctx: DrawCtx, input: PostcardInput, assets: PostcardAssets): void {
+export function drawPostcard(
+  ctx: DrawCtx,
+  input: PostcardInput,
+  assets: PostcardAssets,
+): void {
   const t = postcardText(input);
   ctx.save();
   ctx.fillStyle = P.mat;
@@ -102,31 +141,51 @@ export function drawPostcard(ctx: DrawCtx, input: PostcardInput, assets: Postcar
   ctx.strokeStyle = P.frame;
   ctx.lineWidth = 6;
   ctx.strokeRect(M, M, POSTCARD_W - 2 * M, POSTCARD_H - 2 * M);
-  if (assets.art !== null) drawArt(ctx, assets.art); else drawPlaceholder(ctx);
+  if (assets.art !== null) drawArt(ctx, assets.art);
+  else drawPlaceholder(ctx);
 
-  const x = ART.x, maxW = ART.w;
+  const x = ART.x,
+    maxW = ART.w;
   let y = ART.y + ART.h + 80;
   ctx.textAlign = "left";
   ctx.textBaseline = "alphabetic";
   ctx.font = F.title;
   ctx.fillStyle = P.ink;
-  for (const line of wrapLines(t.title, maxW, 2, (s) => ctx.measureText(s).width)) {
-    ctx.fillText(line, x, y); y += 72;
+  for (const line of wrapLines(
+    t.title,
+    maxW,
+    2,
+    (s) => ctx.measureText(s).width,
+  )) {
+    ctx.fillText(line, x, y);
+    y += 72;
   }
   y += 8;
   ctx.font = F.from;
   ctx.fillStyle = P.give;
-  ctx.fillText(t.from, x, y); y += 52;
+  ctx.fillText(t.from, x, y);
+  y += 52;
   if (t.note !== null) {
     ctx.font = F.note;
-    for (const line of wrapLines(`“${t.note}”`, maxW, 3, (s) => ctx.measureText(s).width)) {
-      ctx.fillText(line, x, y); y += 46;
+    for (const line of wrapLines(
+      `“${t.note}”`,
+      maxW,
+      3,
+      (s) => ctx.measureText(s).width,
+    )) {
+      ctx.fillText(line, x, y);
+      y += 46;
     }
   }
   ctx.font = F.post;
   ctx.fillStyle = P.dust;
   const postY = POSTCARD_H - M - 70;
-  const postLines = wrapLines(t.postmark, maxW, 2, (s) => ctx.measureText(s).width);
+  const postLines = wrapLines(
+    t.postmark,
+    maxW,
+    2,
+    (s) => ctx.measureText(s).width,
+  );
   for (const [i, line] of postLines.entries()) {
     ctx.fillText(line, x, postY - (postLines.length - 1 - i) * 34);
   }
@@ -147,7 +206,11 @@ export function drawPostcard(ctx: DrawCtx, input: PostcardInput, assets: Postcar
 
 function toBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
   return new Promise((resolve) => {
-    try { canvas.toBlob((b) => resolve(b), "image/png"); } catch { resolve(null); }
+    try {
+      canvas.toBlob((b) => resolve(b), "image/png");
+    } catch {
+      resolve(null);
+    }
   });
 }
 
@@ -174,17 +237,36 @@ const freshCanvas = () => document.createElement("canvas");
  *  also fails. */
 export type PostcardRender = { blob: Blob | null; artUsed: boolean };
 
+/** One encode attempt on its own canvas. Never throws (a paint can — drawImage on an
+ *  undrawable image, a lost context: review-1 #1), and always releases the bitmap after:
+ *  iOS Safari caps TOTAL canvas memory and frees it lazily, so a 1080×1350 canvas left
+ *  sized after every toggle would eventually make getContext return null (review-1 #6). */
+async function encodeOnce(
+  c: HTMLCanvasElement,
+  input: PostcardInput,
+  assets: PostcardAssets,
+): Promise<Blob | null> {
+  try {
+    if (!paintPostcard(c, input, assets)) return null;
+    return await toBlob(c);
+  } catch {
+    return null;
+  } finally {
+    c.width = 0;
+    c.height = 0;
+  }
+}
+
 export async function renderPostcardBlob(
   input: PostcardInput,
   assets: PostcardAssets,
   makeCanvas: () => HTMLCanvasElement = freshCanvas,
 ): Promise<PostcardRender> {
-  const c1 = makeCanvas();
-  if (!paintPostcard(c1, input, assets)) return { blob: null, artUsed: false };
-  const b = await toBlob(c1);
+  const b = await encodeOnce(makeCanvas(), input, assets);
   if (b !== null) return { blob: b, artUsed: assets.art !== null };
   if (assets.art === null) return { blob: null, artUsed: false };
-  const c2 = makeCanvas();
-  if (!paintPostcard(c2, input, { art: null })) return { blob: null, artUsed: false };
-  return { blob: await toBlob(c2), artUsed: false };
+  return {
+    blob: await encodeOnce(makeCanvas(), input, { art: null }),
+    artUsed: false,
+  };
 }

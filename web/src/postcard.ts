@@ -23,7 +23,9 @@ const KEYS_EXACT: Record<keyof PostcardInput, true> = {
   acquiredAt: true,
   unwrappedAt: true,
 };
-export const POSTCARD_INPUT_KEYS = Object.keys(KEYS_EXACT) as (keyof PostcardInput)[];
+export const POSTCARD_INPUT_KEYS = Object.keys(
+  KEYS_EXACT,
+) as (keyof PostcardInput)[];
 
 /** D11: deterministic over every field, in a fixed order. */
 export function postcardKey(i: PostcardInput): string {
@@ -44,7 +46,20 @@ export const POSTCARD_PALETTE = {
   line: "#939761", // --color-line
 } as const;
 
-const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"] as const;
+const MONTHS = [
+  "jan",
+  "feb",
+  "mar",
+  "apr",
+  "may",
+  "jun",
+  "jul",
+  "aug",
+  "sep",
+  "oct",
+  "nov",
+  "dec",
+] as const;
 
 /** D5: the FRIEND'S local date (a 9pm-eastern unwrap is that day, not tomorrow's UTC).
  *  The acquisition month stays postmark()'s UTC — that is ben's order, not this moment. */
@@ -74,9 +89,20 @@ export function postcardText(i: PostcardInput): PostcardText {
   if (day !== null) parts.push(`unwrapped ${day}`);
   const unwrapT = Date.parse(i.unwrappedAt);
   // D5: inject the unwrap instant — never default-now.
-  const years = Number.isNaN(unwrapT) ? null : waitedYears(i.acquiredAt ?? undefined, unwrapT);
-  const waited = years === null ? null : `waited ${years} ${years === 1 ? "year" : "years"} for you`;
-  return { title: i.title, from: "from ben ♡", note: i.note, waited, postmark: parts.join(" · ") };
+  const years = Number.isNaN(unwrapT)
+    ? null
+    : waitedYears(i.acquiredAt ?? undefined, unwrapT);
+  const waited =
+    years === null
+      ? null
+      : `waited ${years} ${years === 1 ? "year" : "years"} for you`;
+  return {
+    title: i.title,
+    from: "from ben ♡",
+    note: i.note,
+    waited,
+    postmark: parts.join(" · "),
+  };
 }
 
 /** Word wrap with a hard break for over-long words; the last allowed line is
@@ -90,28 +116,33 @@ export function wrapLines(
   const words = text.split(/\s+/).filter((w) => w.length > 0);
   const lines: string[] = [];
   let cur = "";
+  // review-1 #3: cut by CODE POINT, never by UTF-16 unit — a `slice` can split an
+  // emoji's surrogate pair and the canvas draws a broken glyph.
   const pushHardBroken = (w: string) => {
-    let rest = w;
-    while (measure(rest) > maxWidth && rest.length > 1) {
+    let rest = [...w];
+    while (measure(rest.join("")) > maxWidth && rest.length > 1) {
       let n = rest.length;
-      while (n > 1 && measure(rest.slice(0, n)) > maxWidth) n--;
-      lines.push(rest.slice(0, n));
+      while (n > 1 && measure(rest.slice(0, n).join("")) > maxWidth) n--;
+      lines.push(rest.slice(0, n).join(""));
       rest = rest.slice(n);
     }
-    return rest;
+    return rest.join("");
   };
   for (const w of words) {
     const cand = cur === "" ? w : `${cur} ${w}`;
-    if (measure(cand) <= maxWidth) { cur = cand; continue; }
+    if (measure(cand) <= maxWidth) {
+      cur = cand;
+      continue;
+    }
     if (cur !== "") lines.push(cur);
     cur = measure(w) > maxWidth ? pushHardBroken(w) : w;
   }
   if (cur !== "") lines.push(cur);
   if (lines.length <= maxLines) return lines;
   const kept = lines.slice(0, maxLines);
-  let last = kept[maxLines - 1] ?? "";
-  while (last.length > 0 && measure(`${last}…`) > maxWidth) last = last.slice(0, -1);
-  kept[maxLines - 1] = `${last}…`;
+  const last = [...(kept[maxLines - 1] ?? "")];
+  while (last.length > 0 && measure(`${last.join("")}…`) > maxWidth) last.pop();
+  kept[maxLines - 1] = `${last.join("")}…`;
   return kept;
 }
 

@@ -7,7 +7,11 @@ vi.mock("../postcardCanvas", () => ({
   paintPostcard: vi.fn(() => true),
   renderPostcardBlob: vi.fn(),
 }));
-import { loadPostcardAssets, paintPostcard, renderPostcardBlob } from "../postcardCanvas";
+import {
+  loadPostcardAssets,
+  paintPostcard,
+  renderPostcardBlob,
+} from "../postcardCanvas";
 import { PostcardPanel } from "./PostcardPanel";
 import type { PostcardInput } from "../postcard";
 
@@ -31,7 +35,11 @@ beforeEach(() => {
 describe("PostcardPanel", () => {
   it("loads assets ONCE and renders a canvas preview, not an <img> (D7/D10)", async () => {
     render(<PostcardPanel base={base} note="for you ♡" />);
-    await waitFor(() => expect(screen.getByRole("button", { name: /send a postcard/ })).toBeEnabled());
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /send a postcard/ }),
+      ).toBeEnabled(),
+    );
     expect(loadPostcardAssets).toHaveBeenCalledTimes(1);
     expect(screen.getByLabelText("postcard preview").tagName).toBe("CANVAS");
     await userEvent.click(screen.getByLabelText(/include ben's note/));
@@ -53,13 +61,24 @@ describe("PostcardPanel", () => {
   it("D11: save is disabled while the blob is for an older input, and a stale completion is discarded", async () => {
     let releaseFirst!: (r: { blob: Blob | null; artUsed: boolean }) => void;
     vi.mocked(renderPostcardBlob)
-      .mockImplementationOnce(() => new Promise((r) => { releaseFirst = r; }))
-      .mockImplementation(async (input) => ({ blob: new Blob([String(input.note)], { type: "image/png" }), artUsed: false }));
+      .mockImplementationOnce(
+        () =>
+          new Promise((r) => {
+            releaseFirst = r;
+          }),
+      )
+      .mockImplementation(async (input) => ({
+        blob: new Blob([String(input.note)], { type: "image/png" }),
+        artUsed: false,
+      }));
     render(<PostcardPanel base={base} note="for you ♡" />);
     await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalledTimes(1));
     await userEvent.click(screen.getByLabelText(/include ben's note/)); // note ON while note-OFF render is pending
     await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalledTimes(2));
-    releaseFirst({ blob: new Blob(["STALE"], { type: "image/png" }), artUsed: false }); // the OFF render finishes LAST
+    releaseFirst({
+      blob: new Blob(["STALE"], { type: "image/png" }),
+      artUsed: false,
+    }); // the OFF render finishes LAST
     const share = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { canShare: () => true, share });
     const btn = await screen.findByRole("button", { name: /send a postcard/ });
@@ -70,7 +89,9 @@ describe("PostcardPanel", () => {
   });
 
   it("D10: AbortError is a cancel — no download fallback", async () => {
-    const share = vi.fn().mockRejectedValue(Object.assign(new Error("x"), { name: "AbortError" }));
+    const share = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error("x"), { name: "AbortError" }));
     Object.assign(navigator, { canShare: () => true, share });
     const create = vi.spyOn(URL, "createObjectURL");
     render(<PostcardPanel base={base} note={null} />);
@@ -85,23 +106,37 @@ describe("PostcardPanel", () => {
   it("no canShare ⇒ download with the slug filename", async () => {
     Object.assign(navigator, { canShare: undefined, share: undefined });
     const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:x");
-    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
     render(<PostcardPanel base={base} note={null} />);
     const btn = await screen.findByRole("button", { name: /send a postcard/ });
     await waitFor(() => expect(btn).toBeEnabled());
     await userEvent.click(btn);
     expect(create).toHaveBeenCalled();
-    expect((click.mock.contexts[0] as HTMLAnchorElement).download).toBe("postcard-stardew-valley.png");
+    expect((click.mock.contexts[0] as HTMLAnchorElement).download).toBe(
+      "postcard-stardew-valley.png",
+    );
   });
 
   it("Lilith: a taint ⇒ the preview is repainted WITHOUT art before save enables", async () => {
     const art = { naturalWidth: 10, naturalHeight: 10 } as HTMLImageElement;
     vi.mocked(loadPostcardAssets).mockResolvedValue({ art });
     vi.mocked(renderPostcardBlob).mockResolvedValue({
-      blob: new Blob(["artless"], { type: "image/png" }), artUsed: false,
+      blob: new Blob(["artless"], { type: "image/png" }),
+      artUsed: false,
     });
-    render(<PostcardPanel base={{ ...base, artworkUrl: "https://hb.imgix.net/x.png" }} note={null} />);
-    await waitFor(() => expect(screen.getByRole("button", { name: /send a postcard/ })).toBeEnabled());
+    render(
+      <PostcardPanel
+        base={{ ...base, artworkUrl: "https://hb.imgix.net/x.png" }}
+        note={null}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /send a postcard/ }),
+      ).toBeEnabled(),
+    );
     const calls = vi.mocked(paintPostcard).mock.calls;
     expect(calls[0]![2].art).toBe(art); // first paint showed the art
     expect(calls[calls.length - 1]![2].art).toBeNull(); // the preview now matches the artless blob
@@ -111,11 +146,23 @@ describe("PostcardPanel", () => {
     const art = { naturalWidth: 10, naturalHeight: 10 } as HTMLImageElement;
     vi.mocked(loadPostcardAssets).mockResolvedValue({ art });
     vi.mocked(renderPostcardBlob).mockResolvedValue({
-      blob: new Blob(["withart"], { type: "image/png" }), artUsed: true,
+      blob: new Blob(["withart"], { type: "image/png" }),
+      artUsed: true,
     });
-    render(<PostcardPanel base={{ ...base, artworkUrl: "https://hb.imgix.net/x.png" }} note={null} />);
-    await waitFor(() => expect(screen.getByRole("button", { name: /send a postcard/ })).toBeEnabled());
-    expect(vi.mocked(paintPostcard).mock.calls.every((c) => c[2].art === art)).toBe(true);
+    render(
+      <PostcardPanel
+        base={{ ...base, artworkUrl: "https://hb.imgix.net/x.png" }}
+        note={null}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /send a postcard/ }),
+      ).toBeEnabled(),
+    );
+    expect(
+      vi.mocked(paintPostcard).mock.calls.every((c) => c[2].art === art),
+    ).toBe(true);
   });
 
   it("D10 (OMBB): share is called SYNCHRONOUSLY inside the click — no await before it", async () => {
@@ -128,10 +175,89 @@ describe("PostcardPanel", () => {
     expect(share).toHaveBeenCalledTimes(1);
   });
 
-  it("render failure ⇒ soft message, save stays disabled", async () => {
-    vi.mocked(renderPostcardBlob).mockResolvedValue({ blob: null, artUsed: false });
+  it("review-1 #1a: a THROWING preview paint never takes the page down — soft failure copy instead", async () => {
+    vi.mocked(paintPostcard).mockImplementation(() => {
+      throw new DOMException("x", "InvalidStateError");
+    });
     render(<PostcardPanel base={base} note={null} />);
-    expect(await screen.findByText(/couldn't make the postcard this time/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /send a postcard/ })).toBeDisabled();
+    expect(
+      await screen.findByText(/couldn't make the postcard this time/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /send a postcard/ }),
+    ).toBeDisabled();
+  });
+
+  it("review-1 #1b: a REJECTED render shows the failure copy instead of a forever-disabled save", async () => {
+    vi.mocked(renderPostcardBlob).mockRejectedValue(
+      new DOMException("broken", "InvalidStateError"),
+    );
+    render(<PostcardPanel base={base} note={null} />);
+    expect(
+      await screen.findByText(/couldn't make the postcard this time/),
+    ).toBeInTheDocument();
+  });
+
+  it("review-1 #2: a second click while a share is still open neither re-shares nor downloads", async () => {
+    let n = 0;
+    const share = vi.fn(() =>
+      ++n === 1
+        ? new Promise<void>(() => {})
+        : Promise.reject(
+            Object.assign(new Error("earlier share pending"), {
+              name: "InvalidStateError",
+            }),
+          ),
+    );
+    Object.assign(navigator, { canShare: () => true, share });
+    const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:x");
+    render(<PostcardPanel base={base} note={null} />);
+    const btn = await screen.findByRole("button", { name: /send a postcard/ });
+    await waitFor(() => expect(btn).toBeEnabled());
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(share).toHaveBeenCalledTimes(1);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("review-1 #2b: InvalidStateError from share is NOT a reason to download", async () => {
+    const share = vi
+      .fn()
+      .mockRejectedValue(
+        Object.assign(new Error("x"), { name: "InvalidStateError" }),
+      );
+    Object.assign(navigator, { canShare: () => true, share });
+    const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:x");
+    render(<PostcardPanel base={base} note={null} />);
+    const btn = await screen.findByRole("button", { name: /send a postcard/ });
+    await waitFor(() => expect(btn).toBeEnabled());
+    fireEvent.click(btn);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("review-1 #4: the preview is an image to assistive tech, and loading/failure are announced", async () => {
+    render(<PostcardPanel base={base} note={null} />);
+    expect(screen.getByRole("img", { name: /postcard preview/ }).tagName).toBe(
+      "CANVAS",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /getting your postcard ready/,
+    );
+  });
+
+  it("render failure ⇒ soft message, save stays disabled", async () => {
+    vi.mocked(renderPostcardBlob).mockResolvedValue({
+      blob: null,
+      artUsed: false,
+    });
+    render(<PostcardPanel base={base} note={null} />);
+    expect(
+      await screen.findByText(/couldn't make the postcard this time/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /send a postcard/ }),
+    ).toBeDisabled();
   });
 });

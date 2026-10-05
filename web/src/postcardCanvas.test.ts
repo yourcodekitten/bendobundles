@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { drawPostcard, loadPostcardAssets, renderPostcardBlob, type DrawCtx } from "./postcardCanvas";
+import {
+  drawPostcard,
+  loadPostcardAssets,
+  renderPostcardBlob,
+  type DrawCtx,
+} from "./postcardCanvas";
 import { postcardText, type PostcardInput } from "./postcard";
 
 const input: PostcardInput = {
@@ -14,11 +19,25 @@ function recordingCtx() {
   const texts: string[] = [];
   const images: unknown[] = [];
   const ctx = {
-    fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left", textBaseline: "alphabetic",
-    fillRect: vi.fn(), strokeRect: vi.fn(), save: vi.fn(), restore: vi.fn(),
-    fillText: vi.fn((s: string) => { texts.push(s); }),
-    measureText: vi.fn((s: string) => ({ width: s.length * 20 }) as TextMetrics),
-    drawImage: vi.fn((img: unknown) => { images.push(img); }),
+    fillStyle: "",
+    strokeStyle: "",
+    lineWidth: 1,
+    font: "",
+    textAlign: "left",
+    textBaseline: "alphabetic",
+    fillRect: vi.fn(),
+    strokeRect: vi.fn(),
+    save: vi.fn(),
+    restore: vi.fn(),
+    fillText: vi.fn((s: string) => {
+      texts.push(s);
+    }),
+    measureText: vi.fn(
+      (s: string) => ({ width: s.length * 20 }) as TextMetrics,
+    ),
+    drawImage: vi.fn((img: unknown) => {
+      images.push(img);
+    }),
   } as unknown as DrawCtx;
   return { ctx, texts, images };
 }
@@ -84,13 +103,17 @@ describe("loadPostcardAssets", () => {
       queueMicrotask(() => el.onerror?.(new Event("error")));
       return el;
     });
-    await expect(loadPostcardAssets("https://x/y.png", 1000)).resolves.toEqual({ art: null });
+    await expect(loadPostcardAssets("https://x/y.png", 1000)).resolves.toEqual({
+      art: null,
+    });
     expect(errSpy).toHaveBeenCalledTimes(1); // a throwing constructor must not satisfy this arm
     errSpy.mockRestore();
     const hangSpy = vi.spyOn(window, "Image").mockImplementation(function () {
       return document.createElement("img"); // never settles ⇒ the 20ms cap must fire
     });
-    await expect(loadPostcardAssets("https://x/y.png", 20)).resolves.toEqual({ art: null });
+    await expect(loadPostcardAssets("https://x/y.png", 20)).resolves.toEqual({
+      art: null,
+    });
     expect(hangSpy).toHaveBeenCalledTimes(1);
   });
 });
@@ -99,7 +122,8 @@ describe("renderPostcardBlob (M1: taint ⇒ a FRESH canvas, never the same one)"
   function fakeCanvas(toBlobImpl: (cb: (b: Blob | null) => void) => void) {
     const { ctx } = recordingCtx();
     return {
-      width: 0, height: 0,
+      width: 0,
+      height: 0,
       getContext: () => ctx,
       toBlob: vi.fn((cb: (b: Blob | null) => void) => toBlobImpl(cb)),
     } as unknown as HTMLCanvasElement;
@@ -110,7 +134,8 @@ describe("renderPostcardBlob (M1: taint ⇒ a FRESH canvas, never the same one)"
     const made: HTMLCanvasElement[] = [];
     const b = await renderPostcardBlob(input, { art: img }, () => {
       const c = fakeCanvas((cb) => cb(new Blob(["ok"], { type: "image/png" })));
-      made.push(c); return c;
+      made.push(c);
+      return c;
     });
     expect(await b.blob!.text()).toBe("ok");
     expect(b.artUsed).toBe(true);
@@ -122,20 +147,57 @@ describe("renderPostcardBlob (M1: taint ⇒ a FRESH canvas, never the same one)"
     const b = await renderPostcardBlob(input, { art: img }, () => {
       const first = made.length === 0;
       const c = fakeCanvas((cb) => {
-        if (first) throw Object.assign(new Error("tainted"), { name: "SecurityError" });
+        if (first)
+          throw Object.assign(new Error("tainted"), { name: "SecurityError" });
         cb(new Blob(["artless"], { type: "image/png" }));
       });
-      made.push(c); return c;
+      made.push(c);
+      return c;
     });
     expect(made).toHaveLength(2);
     expect(await b.blob!.text()).toBe("artless");
     expect(b.artUsed).toBe(false); // the panel must repaint its preview without art
   });
 
+  it("review-1 #1: a THROWING paint resolves {blob: null} — renderPostcardBlob never rejects", async () => {
+    const throwing = {
+      width: 0,
+      height: 0,
+      getContext: () => ({
+        ...recordingCtx().ctx,
+        fillRect: () => {
+          throw new DOMException("x", "InvalidStateError");
+        },
+      }),
+      toBlob: vi.fn(),
+    } as unknown as HTMLCanvasElement;
+    await expect(
+      renderPostcardBlob(input, { art: null }, () => throwing),
+    ).resolves.toEqual({ blob: null, artUsed: false });
+  });
+
+  it("review-1 #6: every encode canvas is released (0×0) afterwards — iOS caps total canvas memory", async () => {
+    const made: HTMLCanvasElement[] = [];
+    await renderPostcardBlob(input, { art: img }, () => {
+      const first = made.length === 0;
+      const c = fakeCanvas((cb) => {
+        if (first)
+          throw Object.assign(new Error("tainted"), { name: "SecurityError" });
+        cb(new Blob(["ok"], { type: "image/png" }));
+      });
+      made.push(c);
+      return c;
+    });
+    expect(made).toHaveLength(2);
+    for (const c of made) expect([c.width, c.height]).toEqual([0, 0]);
+  });
+
   it("no art and encode fails ⇒ null, no pointless retry", async () => {
     const made: HTMLCanvasElement[] = [];
     const b = await renderPostcardBlob(input, { art: null }, () => {
-      const c = fakeCanvas((cb) => cb(null)); made.push(c); return c;
+      const c = fakeCanvas((cb) => cb(null));
+      made.push(c);
+      return c;
     });
     expect(b).toEqual({ blob: null, artUsed: false });
     expect(made).toHaveLength(1);
