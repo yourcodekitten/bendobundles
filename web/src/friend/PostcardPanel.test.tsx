@@ -37,11 +37,14 @@ describe("PostcardPanel", () => {
     render(<PostcardPanel base={base} note="for you ♡" />);
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: /send a postcard/ }),
+        screen.getByRole("button", { name: /save my postcard/ }),
       ).toBeEnabled(),
     );
     expect(loadPostcardAssets).toHaveBeenCalledTimes(1);
-    expect(screen.getByLabelText("postcard preview").tagName).toBe("CANVAS");
+    expect(
+      screen.getByRole("img", { name: /postcard of Stardew Valley, from ben/ })
+        .tagName,
+    ).toBe("CANVAS");
     await userEvent.click(screen.getByLabelText(/include ben's note/));
     await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalledTimes(2));
     expect(loadPostcardAssets).toHaveBeenCalledTimes(1);
@@ -81,7 +84,7 @@ describe("PostcardPanel", () => {
     }); // the OFF render finishes LAST
     const share = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { canShare: () => true, share });
-    const btn = await screen.findByRole("button", { name: /send a postcard/ });
+    const btn = await screen.findByRole("button", { name: /save my postcard/ });
     await waitFor(() => expect(btn).toBeEnabled());
     await userEvent.click(btn);
     const file = share.mock.calls[0]![0].files[0] as File;
@@ -95,7 +98,7 @@ describe("PostcardPanel", () => {
     Object.assign(navigator, { canShare: () => true, share });
     const create = vi.spyOn(URL, "createObjectURL");
     render(<PostcardPanel base={base} note={null} />);
-    const btn = await screen.findByRole("button", { name: /send a postcard/ });
+    const btn = await screen.findByRole("button", { name: /save my postcard/ });
     await waitFor(() => expect(btn).toBeEnabled());
     await userEvent.click(btn);
     await waitFor(() => expect(share).toHaveBeenCalled());
@@ -110,7 +113,7 @@ describe("PostcardPanel", () => {
       .spyOn(HTMLAnchorElement.prototype, "click")
       .mockImplementation(() => {});
     render(<PostcardPanel base={base} note={null} />);
-    const btn = await screen.findByRole("button", { name: /send a postcard/ });
+    const btn = await screen.findByRole("button", { name: /save my postcard/ });
     await waitFor(() => expect(btn).toBeEnabled());
     await userEvent.click(btn);
     expect(create).toHaveBeenCalled();
@@ -134,7 +137,7 @@ describe("PostcardPanel", () => {
     );
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: /send a postcard/ }),
+        screen.getByRole("button", { name: /save my postcard/ }),
       ).toBeEnabled(),
     );
     const calls = vi.mocked(paintPostcard).mock.calls;
@@ -157,7 +160,7 @@ describe("PostcardPanel", () => {
     );
     await waitFor(() =>
       expect(
-        screen.getByRole("button", { name: /send a postcard/ }),
+        screen.getByRole("button", { name: /save my postcard/ }),
       ).toBeEnabled(),
     );
     expect(
@@ -169,7 +172,7 @@ describe("PostcardPanel", () => {
     const share = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { canShare: () => true, share });
     render(<PostcardPanel base={base} note={null} />);
-    const btn = await screen.findByRole("button", { name: /send a postcard/ });
+    const btn = await screen.findByRole("button", { name: /save my postcard/ });
     await waitFor(() => expect(btn).toBeEnabled());
     fireEvent.click(btn); // sync dispatch: nothing between this line and the assertion may yield
     expect(share).toHaveBeenCalledTimes(1);
@@ -184,7 +187,7 @@ describe("PostcardPanel", () => {
       await screen.findByText(/couldn't make the postcard this time/),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /send a postcard/ }),
+      screen.getByRole("button", { name: /save my postcard/ }),
     ).toBeDisabled();
   });
 
@@ -212,7 +215,7 @@ describe("PostcardPanel", () => {
     Object.assign(navigator, { canShare: () => true, share });
     const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:x");
     render(<PostcardPanel base={base} note={null} />);
-    const btn = await screen.findByRole("button", { name: /send a postcard/ });
+    const btn = await screen.findByRole("button", { name: /save my postcard/ });
     await waitFor(() => expect(btn).toBeEnabled());
     fireEvent.click(btn);
     fireEvent.click(btn);
@@ -230,7 +233,7 @@ describe("PostcardPanel", () => {
     Object.assign(navigator, { canShare: () => true, share });
     const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:x");
     render(<PostcardPanel base={base} note={null} />);
-    const btn = await screen.findByRole("button", { name: /send a postcard/ });
+    const btn = await screen.findByRole("button", { name: /save my postcard/ });
     await waitFor(() => expect(btn).toBeEnabled());
     fireEvent.click(btn);
     await new Promise((r) => setTimeout(r, 0));
@@ -239,12 +242,19 @@ describe("PostcardPanel", () => {
 
   it("review-1 #4: the preview is an image to assistive tech, and loading/failure are announced", async () => {
     render(<PostcardPanel base={base} note={null} />);
-    expect(screen.getByRole("img", { name: /postcard preview/ }).tagName).toBe(
+    expect(screen.getByRole("img", { name: /postcard of/ }).tagName).toBe(
       "CANVAS",
     );
     expect(screen.getByRole("status")).toHaveTextContent(
       /getting your postcard ready/,
     );
+  });
+
+  it("D9 (review 2): the panel's save is an OUTLINE button — the filled buttons belong to the key", async () => {
+    render(<PostcardPanel base={base} note={null} />);
+    const save = screen.getByRole("button", { name: /save my postcard/ });
+    expect(save.className).not.toMatch(/(^|\s)bg-give(\s|$)/);
+    expect(save.className).toMatch(/border-give/);
   });
 
   it("render failure ⇒ soft message, save stays disabled", async () => {
@@ -257,7 +267,7 @@ describe("PostcardPanel", () => {
       await screen.findByText(/couldn't make the postcard this time/),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /send a postcard/ }),
+      screen.getByRole("button", { name: /save my postcard/ }),
     ).toBeDisabled();
   });
 });

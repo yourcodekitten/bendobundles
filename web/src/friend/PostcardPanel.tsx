@@ -139,7 +139,7 @@ export function PostcardPanel({
       <canvas
         ref={canvasRef}
         role="img"
-        aria-label="postcard preview"
+        aria-label={`postcard of ${base.title}, from ben`}
         className="h-auto w-full max-w-[270px] rounded shadow"
       />
       {/* review-1 #4: ONE persistent live region — a status node mounted at the moment
@@ -165,9 +165,9 @@ export function PostcardPanel({
         type="button"
         disabled={!ready}
         onClick={onSave}
-        className="rounded bg-give px-4 py-2 text-sm text-give-ink transition-colors hover:bg-give-bright disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pixel focus-visible:ring-offset-2 focus-visible:ring-offset-floor"
+        className="rounded border-2 border-give bg-transparent px-4 py-2 text-sm text-give-soft transition-colors hover:bg-give hover:text-give-ink disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pixel focus-visible:ring-offset-2 focus-visible:ring-offset-floor"
       >
-        send a postcard ♡
+        save my postcard ♡
       </button>
     </div>
   );

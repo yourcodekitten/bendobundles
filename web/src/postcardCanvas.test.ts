@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
+  canMakePostcards,
   drawPostcard,
   loadPostcardAssets,
+  POSTCARD_FONTS,
   renderPostcardBlob,
   type DrawCtx,
 } from "./postcardCanvas";
@@ -201,5 +203,66 @@ describe("renderPostcardBlob (M1: taint ⇒ a FRESH canvas, never the same one)"
     });
     expect(b).toEqual({ blob: null, artUsed: false });
     expect(made).toHaveLength(1);
+  });
+});
+
+describe("review 2: D3 fonts, contain-not-crop, D6", () => {
+  it("D3: every postcard face is requested from document.fonts", async () => {
+    const load = vi.fn((_font: string) => Promise.resolve([] as FontFace[]));
+    const saved = Object.getOwnPropertyDescriptor(document, "fonts");
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: { load },
+    });
+    try {
+      await loadPostcardAssets(null, 1000);
+      expect(load.mock.calls.map((c) => c[0])).toEqual([...POSTCARD_FONTS]);
+    } finally {
+      if (saved) Object.defineProperty(document, "fonts", saved);
+      else delete (document as { fonts?: unknown }).fonts;
+    }
+  });
+
+  it("D3: fonts that never settle cannot hold the postcard past the cap", async () => {
+    const saved = Object.getOwnPropertyDescriptor(document, "fonts");
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: { load: () => new Promise(() => {}) },
+    });
+    try {
+      await expect(loadPostcardAssets(null, 20)).resolves.toEqual({
+        art: null,
+      });
+    } finally {
+      if (saved) Object.defineProperty(document, "fonts", saved);
+      else delete (document as { fonts?: unknown }).fonts;
+    }
+  });
+
+  it("art is CONTAINED, never cropped: a 460×215 steam header fills the width and not the height", () => {
+    const calls: number[][] = [];
+    const { ctx } = recordingCtx();
+    (ctx as unknown as { drawImage: unknown }).drawImage = (
+      _i: unknown,
+      ...a: number[]
+    ) => calls.push(a);
+    drawPostcard(ctx, input, {
+      art: { naturalWidth: 460, naturalHeight: 215 } as HTMLImageElement,
+    });
+    const [, , w, h] = calls[0]!;
+    expect(w).toBeCloseTo(888, 0);
+    expect(h).toBeLessThan(580);
+  });
+
+  it("D6: no HTMLCanvasElement.prototype.toBlob ⇒ canMakePostcards() is false", () => {
+    const saved = HTMLCanvasElement.prototype.toBlob;
+    try {
+      // @ts-expect-error deliberately removing a DOM method for the D6 arm
+      delete HTMLCanvasElement.prototype.toBlob;
+      expect(canMakePostcards()).toBe(false);
+    } finally {
+      HTMLCanvasElement.prototype.toBlob = saved;
+    }
+    expect(canMakePostcards()).toBe(true);
   });
 });

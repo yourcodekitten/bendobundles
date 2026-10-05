@@ -35,13 +35,13 @@ export const POSTCARD_FONTS = [
   '28px "Silkscreen"',
 ] as const;
 
-const SERIF_FALLBACK = "ui-sans-serif, system-ui, sans-serif";
+const SANS_FALLBACK = "ui-sans-serif, system-ui, sans-serif";
 const F = {
-  title: `64px "Pixelify Sans Variable", ${SERIF_FALLBACK}`,
-  from: `36px "Chivo Variable", ${SERIF_FALLBACK}`,
-  note: `italic 36px "Chivo Variable", ${SERIF_FALLBACK}`,
-  post: `26px "Chivo Variable", ${SERIF_FALLBACK}`,
-  waited: `44px "Pixelify Sans Variable", ${SERIF_FALLBACK}`,
+  title: `64px "Pixelify Sans Variable", ${SANS_FALLBACK}`,
+  from: `36px "Chivo Variable", ${SANS_FALLBACK}`,
+  note: `italic 36px "Chivo Variable", ${SANS_FALLBACK}`,
+  post: `26px "Chivo Variable", ${SANS_FALLBACK}`,
+  waited: `44px "Pixelify Sans Variable", ${SANS_FALLBACK}`,
   mark: `28px "Silkscreen", ui-monospace, monospace`,
 };
 
@@ -231,10 +231,6 @@ export function paintPostcard(
 
 const freshCanvas = () => document.createElement("canvas");
 
-/** Encode on a FRESH canvas. A taint (SecurityError / null with art) redraws WITHOUT
- *  art on ANOTHER fresh canvas — origin-clean is never restored on an element, so the
- *  same canvas would fail forever (plan review M1). Null only when the art-less encode
- *  also fails. */
 export type PostcardRender = { blob: Blob | null; artUsed: boolean };
 
 /** One encode attempt on its own canvas. Never throws (a paint can — drawImage on an
@@ -257,6 +253,10 @@ async function encodeOnce(
   }
 }
 
+/** Encode on a FRESH canvas. A taint (SecurityError / null with art) redraws WITHOUT
+ *  art on ANOTHER fresh canvas — origin-clean is never restored on an element, so the
+ *  same canvas would fail forever (plan review M1). Null only when the art-less encode
+ *  also fails. */
 export async function renderPostcardBlob(
   input: PostcardInput,
   assets: PostcardAssets,
