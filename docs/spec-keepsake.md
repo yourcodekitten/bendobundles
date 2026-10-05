@@ -1,6 +1,6 @@
 # the keepsake 📸 — spec
 
-*2026-10-05, kitten. Status: v1 draft — pounce arc, awaiting family questions. Where narrative and
+*2026-10-05, kitten. Status: v2 — Lilith's Q1/Q2 answers + D1 limit integrated; Q3 (OMBB) open. Where narrative and
 **decisions** disagree, the decisions win.*
 
 ## why this exists
@@ -38,7 +38,7 @@ A small preview of the card shows in-dialog before saving, so the friend sees wh
 - warm paper frame in the house palette (dark-theme-safe, not white-on-white), polaroid proportions
 - **cover art**, fitted (contain, not crop — humble subproduct icons are square, steam headers 460×215)
 - **title** (wrapped, ≤3 lines, ellipsised)
-- **"from ben ♡"**, and ben's note in quotes when present (per-game note on curated links, else the
+- **"from ben ♡"**, and — only when the friend ticks D8's toggle — ben's note in quotes (per-game note on curated links, else the
   link's `gift_note`; ≤5 lines, ellipsised)
 - the **postmark line**: `in the attic since 2014 · unwrapped oct 5, 2026` — first clause
   presence-gated on `acquired_at`; when the gap is ≥1 year, `· waited 12 years for you`
@@ -52,11 +52,16 @@ have those fields** — it takes a `KeepsakeInput { title, artworkUrl, note?, ac
 built at the call site, so a capability cannot reach the canvas by accident. A test asserts the
 type's keys exhaustively. *(A keepsake is designed to be forwarded; the gift URL is a one-time
 bearer capability. That is the whole security model of this feature.)*
+⚠️ **WHAT D1 GUARANTEES, AND WHAT IT DOES NOT (Lilith, 2026-10-05):** it rules out capability
+**FIELDS**. It cannot rule out capability **CONTENT**: `note` is free text ben types, and the day he
+writes *"here's the DLC code: XXXX"* or pastes a link, the exhaustive-keys test stays green and the
+key leaves in a PNG. ⇒ **the note is UNVETTED content**, and D8 (default OFF) is the mitigation, not
+a proof. The claim is *"no capability field"*, never *"no capability"*.
 
 **D2 — art failure degrades, never blocks.** The image loads with `crossOrigin = "anonymous"`.
 Measured 2026-10-05: `shared.akamai.steamstatic.com` → 200 + `access-control-allow-origin: *`;
-`hb.imgix.net` → `access-control-allow-origin: *` (on a 403 probe — **re-measure on a real
-`artwork_url` before building the art path**). If the image errors, times out (4s), or the canvas
+`hb.imgix.net` → `access-control-allow-origin: *` — first on a 403 probe, then **re-measured on a
+REAL prod `artwork_url`: 200 `image/png` + `ACAO: *`** (2026-10-05T07:0x-04:00). If the image errors, times out (4s), or the canvas
 would be tainted (`toBlob` throws `SecurityError`), the card renders with a **drawn placeholder**
 (the house pixel-gift glyph) instead — the keepsake still saves. Principle 5.
 
@@ -88,6 +93,18 @@ https://*.steamstatic.com https://hb.imgix.net` — **no `blob:`, no `data:`**. 
 `<canvas>` element itself**, scaled by CSS; never an `<img src=blob:…>` (it would be blocked). Still no
 CSP change. The download/share path hands a `Blob`/`File` to the browser, which `img-src` does not govern.
 
+**D8 — ben's note is OFF by default, behind a toggle (Lilith, Q2).** He wrote it to ONE person; a
+keepsake is built to be forwarded, so the default is the private state and putting the note on the
+card is **the friend's** choice. The preview has an *"include ben's note"* checkbox (absent entirely
+when there is no note), and **the preview redraws live from the same render call the save uses** — so
+what they see is exactly what leaves their hands. One render function, one input; never a preview
+path and a save path that could disagree.
+
+**D9 — placement on the unwrap (Lilith, Q1): both surfaces.** On the gifted step it sits **below the
+key block, only once the key is revealed** (never during `celebrating`), with a **link's visual weight,
+not a button's** — the key's two buttons stay the only buttons. Saving at the peak of the moment is
+the point; the shelf is the October backup.
+
 ## out of scope
 
 - admin-side keepsakes (the scrapbook is ben's; this is the friend's)
@@ -96,10 +113,7 @@ CSP change. The download/share path hands a `Blob`/`File` to the browser, which 
 
 ## open questions (for the family)
 
-- **Q1 (taste):** keepsake on the unwrap dialog as well as the shelf, or **shelf only** — is a second
-  button on the gifted step clutter at the one moment that must be about the key?
-- **Q2 (privacy):** ben's note is written to ONE friend. A keepsake makes it forwardable. Include it by
-  default, include behind a toggle on the preview ("include ben's note"), or never?
+- ~~Q1~~ → **D9** (Lilith). ~~Q2~~ → **D8** + D1's limit (Lilith).
 - **Q3 (infra, OMBB):** anything in the CloudFront/CSP layer that would make `blob:` object-URL downloads
   or `navigator.share` with files misbehave that I would not see from the config alone?
 
