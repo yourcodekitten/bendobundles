@@ -1,6 +1,6 @@
-# the keepsake 📸 — spec
+# the postcard 🖼️ — spec
 
-*2026-10-05, kitten. Status: v2 — Lilith's Q1/Q2 answers + D1 limit integrated; Q3 (OMBB) open. Where narrative and
+*2026-10-05, kitten. Status: v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
 **decisions** disagree, the decisions win.*
 
 ## why this exists
@@ -10,7 +10,7 @@ heart rate is."* We spent it on the moment — the chain, the fanfare, the confe
 moment **leaves nothing in the friend's hands** except a one-time humble URL they redeem and
 forget. The shelf remembers for them, behind a link. Nothing travels.
 
-Friends *"visit rarely and remember the feeling, not the UI"* (PRODUCT.md, Users). A keepsake is
+Friends *"visit rarely and remember the feeling, not the UI"* (PRODUCT.md, Users). A postcard is
 the feeling made portable: a small polaroid-style card — the cover art, the title, ben's note,
 **"in the attic since 2014"**, the day they unwrapped it — that they can save to their camera roll
 or send to the group chat. A gift you can show someone is a gift twice.
@@ -19,17 +19,17 @@ Composition, not construction — every input is already on the friend's wire ex
 
 ## what it is
 
-A **"save a keepsake ♡"** action in two places:
+A **"send a postcard ♡"** action in two places:
 
 1. **the unwrap** — `ClaimDialog`'s `gifted` step, beneath the humble link (never above it: the key
-   is the job, the keepsake is the charm — principle 5, *delight never gates*).
+   is the job, the postcard is the charm — principle 5, *delight never gates*).
 2. **the shelf** — each gift card on `/s/{token}`, so a gift unwrapped in July can be kept in October.
 
 Pressing it renders a **1080×1350 PNG** (4:5, the phone-and-chat-friendly portrait) client-side on a
 `<canvas>`, then:
 - where `navigator.canShare({ files: [png] })` is true (phones) → `navigator.share` (camera roll,
   messages — the native sheet);
-- otherwise → `<a download="keepsake-<slug>.png">` from an object URL, revoked after click.
+- otherwise → `<a download="postcard-<slug>.png">` from an object URL, revoked after click.
 
 A small preview of the card shows in-dialog before saving, so the friend sees what they keep.
 
@@ -46,11 +46,11 @@ A small preview of the card shows in-dialog before saving, so the friend sees wh
 
 ## decisions
 
-**D1 — the card NEVER carries a capability.** No `gift_url`, no revealed key, no link token, no
+**D1 — the card carries no capability FIELD** (and its free-text note is unvetted — see the limit below). No `gift_url`, no revealed key, no link token, no
 shelf token, no QR, no domain path beyond the bare wordmark. The renderer's input type **does not
-have those fields** — it takes a `KeepsakeInput { title, artworkUrl, note?, acquiredAt?, unwrappedAt }`
+have those fields** — it takes a `PostcardInput { title, artworkUrl, note?, acquiredAt?, unwrappedAt }`
 built at the call site, so a capability cannot reach the canvas by accident. A test asserts the
-type's keys exhaustively. *(A keepsake is designed to be forwarded; the gift URL is a one-time
+type's keys exhaustively. *(A postcard is designed to be forwarded; the gift URL is a one-time
 bearer capability. That is the whole security model of this feature.)*
 ⚠️ **WHAT D1 GUARANTEES, AND WHAT IT DOES NOT (Lilith, 2026-10-05):** it rules out capability
 **FIELDS**. It cannot rule out capability **CONTENT**: `note` is free text ben types, and the day he
@@ -63,7 +63,7 @@ Measured 2026-10-05: `shared.akamai.steamstatic.com` → 200 + `access-control-a
 `hb.imgix.net` → `access-control-allow-origin: *` — first on a 403 probe, then **re-measured on a
 REAL prod `artwork_url`: 200 `image/png` + `ACAO: *`** (2026-10-05T07:0x-04:00). If the image errors, times out (4s), or the canvas
 would be tainted (`toBlob` throws `SecurityError`), the card renders with a **drawn placeholder**
-(the house pixel-gift glyph) instead — the keepsake still saves. Principle 5.
+(the house pixel-gift glyph) instead — the postcard still saves. Principle 5.
 
 **D3 — fonts are awaited.** Canvas text in an unloaded webfont silently falls back. Render after
 `document.fonts.load()` for the faces used (Silkscreen for the wordmark/postmark, the body face for
@@ -94,7 +94,7 @@ https://*.steamstatic.com https://hb.imgix.net` — **no `blob:`, no `data:`**. 
 CSP change. The download/share path hands a `Blob`/`File` to the browser, which `img-src` does not govern.
 
 **D8 — ben's note is OFF by default, behind a toggle (Lilith, Q2).** He wrote it to ONE person; a
-keepsake is built to be forwarded, so the default is the private state and putting the note on the
+postcard is built to be forwarded, so the default is the private state and putting the note on the
 card is **the friend's** choice. The preview has an *"include ben's note"* checkbox (absent entirely
 when there is no note), and **the preview redraws live from the same render call the save uses** — so
 what they see is exactly what leaves their hands. One render function, one input; never a preview
@@ -107,8 +107,8 @@ the point; the shelf is the October backup.
 
 ## out of scope
 
-- admin-side keepsakes (the scrapbook is ben's; this is the friend's)
-- animated/video keepsakes, stickers, multiple layouts, friend-chosen themes
+- admin-side postcards (the scrapbook is ben's; this is the friend's)
+- animated/video postcards, stickers, multiple layouts, friend-chosen themes
 - sharing to a URL (would need hosting + a capability — explicitly D7/D1's opposite)
 
 ## open questions (for the family)
@@ -119,6 +119,14 @@ the point; the shelf is the October backup.
 
 ## success
 
-A friend on a phone unwraps, taps "save a keepsake ♡", and the native share sheet offers a card that
+A friend on a phone unwraps, taps "send a postcard ♡", and the native share sheet offers a card that
 looks like a polaroid of the gift — art, title, ben's words, *waited 12 years for you* — and nothing
 on it that could be used to claim anything.
+
+## naming note
+
+Called *the keepsake* through v2. **Renamed** because `docs/spec-scrapbook.md:37` already defines a
+**keepsake card** (ben's admin-side opened-gift card) and `web/src/postmark.ts`'s `waitedYears` doc names
+it as a caller. One word for two features in one repo makes every grep ambiguous. **Inherited from that
+neighbour, deliberately:** `waitedYears(acquired_at, unwrappedAt)` MUST inject the unwrap instant as
+`now` — a default-now call drifts +1 every january (postmark.ts's own comment).
