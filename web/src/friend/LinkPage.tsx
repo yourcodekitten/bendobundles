@@ -732,6 +732,7 @@ function LinkPageBody({ bootDone }: { bootDone: boolean }) {
           game={claimingGame}
           onClose={() => setClaimingGame(null)}
           onRefresh={refresh}
+          linkNote={data.gift_note}
         />
       )}
 

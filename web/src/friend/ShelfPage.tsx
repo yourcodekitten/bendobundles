@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { fetchShelf, NotFound, type ShelfView } from "../api";
 import { titleColorClass } from "../titleColor";
+import { canMakePostcards } from "../postcardCanvas";
+import { PostcardPanel } from "./PostcardPanel";
 
 type ViewState =
   | { kind: "loading" }
@@ -40,6 +42,7 @@ export function ShelfPage() {
   const { token } = useParams<{ token: string }>();
   const [view, setView] = useState<ViewState>({ kind: "loading" });
   const [refreshTick, setRefreshTick] = useState(0);
+  const [openPostcard, setOpenPostcard] = useState<string | null>(null);
   const retry = () => setRefreshTick((t) => t + 1);
 
   useEffect(() => {
@@ -178,6 +181,33 @@ export function ShelfPage() {
                         &mdash; you, delivered to ben ♡
                       </span>
                     </p>
+                  )}
+                  {canMakePostcards() && (
+                    <div className="mt-2">
+                      <button
+                        type="button"
+                        aria-expanded={openPostcard === gift.game_id}
+                        onClick={() =>
+                          setOpenPostcard((g) =>
+                            g === gift.game_id ? null : gift.game_id,
+                          )
+                        }
+                        className="text-sm text-give-soft underline hover:text-give focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pixel"
+                      >
+                        send a postcard ♡
+                      </button>
+                      {openPostcard === gift.game_id && (
+                        <PostcardPanel
+                          base={{
+                            title: gift.title,
+                            artworkUrl: gift.artwork_url,
+                            acquiredAt: gift.acquired_at ?? null,
+                            unwrappedAt: gift.unwrapped_at,
+                          }}
+                          note={gift.gift_note}
+                        />
+                      )}
+                    </div>
                   )}
                 </div>
               </li>

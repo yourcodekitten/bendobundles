@@ -17,6 +17,15 @@ vi.mock("../api", async (importOriginal) => {
 
 import { fetchShelf, NotFound, FetchFailed } from "../api";
 
+vi.mock("../postcardCanvas", async (orig) => ({
+  ...(await orig<typeof import("../postcardCanvas")>()),
+  canMakePostcards: () => true,
+  loadPostcardAssets: vi.fn().mockResolvedValue({ art: null }),
+  paintPostcard: vi.fn(() => true),
+  renderPostcardBlob: vi.fn().mockResolvedValue({ blob: new Blob(["x"], { type: "image/png" }), artUsed: false }),
+}));
+
+
 function renderShelfPage(token = "abc123") {
   return render(
     <MemoryRouter initialEntries={[`/s/${token}`]}>
@@ -33,6 +42,25 @@ const baseShelf: ShelfView = {
 };
 
 describe("ShelfPage", () => {
+  it("each gift offers a postcard carrying its acquired_at and unwrap instant", async () => {
+    vi.mocked(fetchShelf).mockResolvedValue({
+      name: "sarah",
+      gifts: [{
+        game_id: "g1", title: "Stardew Valley", artwork_url: null,
+        unwrapped_at: "2026-10-05T16:00:00Z", gift_note: "for you ♡", thank_note: null,
+        acquired_at: "2014-03-02T17:00:00Z",
+      }],
+    });
+    renderShelfPage();
+    await userEvent.click(await screen.findByRole("button", { name: /send a postcard/ }));
+    const { renderPostcardBlob } = await import("../postcardCanvas");
+    await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalled());
+    expect(vi.mocked(renderPostcardBlob).mock.calls[0]![0]).toEqual({
+      title: "Stardew Valley", artworkUrl: null, note: null,
+      acquiredAt: "2014-03-02T17:00:00Z", unwrappedAt: "2026-10-05T16:00:00Z",
+    });
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -241,7 +269,7 @@ describe("ShelfPage", () => {
     expect(screen.queryByText(/unwrapped/)).not.toBeInTheDocument();
   });
 
-  it("never renders a claim/action affordance — it's a read-only keepsake page", async () => {
+  it("never renders a claim affordance — the postcard entry is its only button", async () => {
     vi.mocked(fetchShelf).mockResolvedValue({
       name: "sarah",
       gifts: [
@@ -257,7 +285,9 @@ describe("ShelfPage", () => {
     });
     renderShelfPage();
     await waitFor(() => screen.getByText("Celeste"));
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    const buttons = screen.queryAllByRole("button");
+    expect(buttons).toHaveLength(1); // OMBB: an empty list would pass .every() vacuously
+    expect(buttons.every((b) => /send a postcard/.test(b.textContent ?? ""))).toBe(true); // only the postcard entry
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
 });
