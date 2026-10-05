@@ -110,14 +110,18 @@ In `struct ShelfGift` add after `thank_note`:
 ```rust
     /// 📮 when ben's bundle purchase created this game's order (docs/spec-postcard.md D4);
     /// read from the Game record assemble_shelf already holds. Absent when unknown.
-    #[serde(
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    acquired_at: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acquired_at: Option<String>,
 ```
 
-In `assemble_shelf`'s `gifts.push(ShelfGift { … })` add `acquired_at: game.acquired_at,` after `thank_note,`.
+In `assemble_shelf`'s `gifts.push(ShelfGift { … })` add, after `thank_note,` — **the same formatting the link wire's `GameView` uses (`lib.rs` ~L163), so the two wires agree on out-of-range dates (absent, never an error):**
+
+```rust
+            acquired_at: game.acquired_at.and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            }),
+```
 
 In `web/src/api.ts` `ShelfGiftView`, after `thank_note`:
 
@@ -157,7 +161,7 @@ git commit -S -m "📮 shelf gifts carry acquired_at (postcard D4)"
 - Consumes: `postmark`, `waitedYears` from `web/src/postmark.ts`.
 - Produces:
   - `type PostcardInput = { title: string; artworkUrl: string | null; note: string | null; acquiredAt: string | null; unwrappedAt: string }`
-  - `const POSTCARD_INPUT_KEYS: readonly (keyof PostcardInput)[]`
+  - `const POSTCARD_INPUT_KEYS: (keyof PostcardInput)[]` (derived from an exhaustive `Record<keyof PostcardInput, true>`)
   - `function postcardKey(i: PostcardInput): string`
   - `type PostcardText = { title: string; from: string; note: string | null; postmark: string }`
   - `function postcardText(i: PostcardInput): PostcardText`
@@ -277,13 +281,17 @@ export type PostcardInput = {
   unwrappedAt: string;
 };
 
-export const POSTCARD_INPUT_KEYS = [
-  "title",
-  "artworkUrl",
-  "note",
-  "acquiredAt",
-  "unwrappedAt",
-] as const satisfies readonly (keyof PostcardInput)[];
+// M4 (plan review): a `satisfies (keyof T)[]` list only proves SUBSET. A Record over
+// keyof PostcardInput fails to compile when a key is ADDED to the type without being
+// listed here — so a `giftUrl` field cannot slip in with the D1 test still green.
+const KEYS_EXACT: Record<keyof PostcardInput, true> = {
+  title: true,
+  artworkUrl: true,
+  note: true,
+  acquiredAt: true,
+  unwrappedAt: true,
+};
+export const POSTCARD_INPUT_KEYS = Object.keys(KEYS_EXACT) as (keyof PostcardInput)[];
 
 /** D11: deterministic over every field, in a fixed order. */
 export function postcardKey(i: PostcardInput): string {
@@ -306,11 +314,13 @@ export const POSTCARD_PALETTE = {
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"] as const;
 
+/** D5: the FRIEND'S local date (a 9pm-eastern unwrap is that day, not tomorrow's UTC).
+ *  The acquisition month stays postmark()'s UTC — that is ben's order, not this moment. */
 function dayLabel(iso: string): string | null {
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return null;
   const d = new Date(t);
-  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`;
+  return `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
 }
 
 export type PostcardText = {
@@ -363,7 +373,7 @@ export function wrapLines(
   if (cur !== "") lines.push(cur);
   if (lines.length <= maxLines) return lines;
   const kept = lines.slice(0, maxLines);
-  let last = kept[maxLines - 1];
+  let last = kept[maxLines - 1] ?? "";
   while (last.length > 0 && measure(`${last}…`) > maxWidth) last = last.slice(0, -1);
   kept[maxLines - 1] = `${last}…`;
   return kept;
@@ -404,7 +414,8 @@ git commit -S -m "🖼️ postcard model: D1 input type, D11 key, D5 postmark li
   - `function loadPostcardAssets(artworkUrl: string | null, timeoutMs?: number): Promise<PostcardAssets>` — never rejects
   - `type DrawCtx = Pick<CanvasRenderingContext2D, "fillStyle" | "strokeStyle" | "lineWidth" | "font" | "textAlign" | "textBaseline" | "fillRect" | "strokeRect" | "fillText" | "measureText" | "drawImage" | "save" | "restore">`
   - `function drawPostcard(ctx: DrawCtx, input: PostcardInput, assets: PostcardAssets): void` — synchronous
-  - `function renderPostcardBlob(canvas: HTMLCanvasElement, input: PostcardInput, assets: PostcardAssets): Promise<Blob | null>` — draws then `toBlob("image/png")`; resolves `null` on taint (`SecurityError`) after redrawing WITHOUT art and retrying once
+  - `function paintPostcard(canvas: HTMLCanvasElement, input: PostcardInput, assets: PostcardAssets): void` — sizes + draws the PREVIEW canvas (display only; may be tainted, that is fine for display)
+  - `function renderPostcardBlob(input: PostcardInput, assets: PostcardAssets, makeCanvas?: () => HTMLCanvasElement): Promise<Blob | null>` — draws onto a **FRESH** canvas from `makeCanvas` (default `document.createElement("canvas")`) and encodes; on a taint (`toBlob` throws or yields null with art present) it draws again WITHOUT art on **ANOTHER fresh canvas** and encodes once more. ⚠️ **A tainted canvas stays tainted after a `width` reset (HTML spec: origin-clean is never restored)** — retrying on the same element would fail forever.
   - `const POSTCARD_FONTS: readonly string[]`
   - `function canMakePostcards(): boolean` — D6
 
@@ -412,7 +423,7 @@ git commit -S -m "🖼️ postcard model: D1 input type, D11 key, D5 postmark li
 
 ```ts
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { drawPostcard, loadPostcardAssets, type DrawCtx } from "./postcardCanvas";
+import { drawPostcard, loadPostcardAssets, renderPostcardBlob, type DrawCtx } from "./postcardCanvas";
 import { postcardText, type PostcardInput } from "./postcard";
 
 const input: PostcardInput = {
@@ -476,9 +487,11 @@ describe("loadPostcardAssets", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
+  // ⚠️ B2 (plan review): vitest 4 cannot `new` an ARROW mock implementation — it throws, and an
+  // error-path test then passes for the wrong reason. Every Image mock is a `function`.
   it("sets crossOrigin=anonymous and resolves art on load (D2)", async () => {
     let made: HTMLImageElement | null = null;
-    vi.spyOn(window, "Image").mockImplementation(() => {
+    vi.spyOn(window, "Image").mockImplementation(function () {
       const el = document.createElement("img");
       made = el;
       queueMicrotask(() => el.onload?.(new Event("load")));
@@ -489,15 +502,65 @@ describe("loadPostcardAssets", () => {
     expect(a.art).toBe(made);
   });
 
-  it("error OR timeout ⇒ { art: null }, never rejects (D2)", async () => {
-    vi.spyOn(window, "Image").mockImplementation(() => {
+  it("error OR timeout ⇒ { art: null }, never rejects (D2) — and the Image WAS constructed", async () => {
+    const errSpy = vi.spyOn(window, "Image").mockImplementation(function () {
       const el = document.createElement("img");
       queueMicrotask(() => el.onerror?.(new Event("error")));
       return el;
     });
     await expect(loadPostcardAssets("https://x/y.png", 1000)).resolves.toEqual({ art: null });
-    vi.spyOn(window, "Image").mockImplementation(() => document.createElement("img")); // never settles
+    expect(errSpy).toHaveBeenCalledTimes(1); // a throwing constructor must not satisfy this arm
+    errSpy.mockRestore();
+    const hangSpy = vi.spyOn(window, "Image").mockImplementation(function () {
+      return document.createElement("img"); // never settles ⇒ the 20ms cap must fire
+    });
     await expect(loadPostcardAssets("https://x/y.png", 20)).resolves.toEqual({ art: null });
+    expect(hangSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("renderPostcardBlob (M1: taint ⇒ a FRESH canvas, never the same one)", () => {
+  function fakeCanvas(toBlobImpl: (cb: (b: Blob | null) => void) => void) {
+    const { ctx } = recordingCtx();
+    return {
+      width: 0, height: 0,
+      getContext: () => ctx,
+      toBlob: vi.fn((cb: (b: Blob | null) => void) => toBlobImpl(cb)),
+    } as unknown as HTMLCanvasElement;
+  }
+  const img = { naturalWidth: 10, naturalHeight: 10 } as HTMLImageElement;
+
+  it("clean canvas ⇒ one canvas, one blob", async () => {
+    const made: HTMLCanvasElement[] = [];
+    const b = await renderPostcardBlob(input, { art: img }, () => {
+      const c = fakeCanvas((cb) => cb(new Blob(["ok"], { type: "image/png" })));
+      made.push(c); return c;
+    });
+    expect(await b!.text()).toBe("ok");
+    expect(made).toHaveLength(1);
+  });
+
+  it("tainted ⇒ retries WITHOUT art on a SECOND canvas and still saves (D2)", async () => {
+    const made: HTMLCanvasElement[] = [];
+    const b = await renderPostcardBlob(input, { art: img }, () => {
+      const first = made.length === 0;
+      const c = fakeCanvas((cb) => {
+        if (first) throw Object.assign(new Error("tainted"), { name: "SecurityError" });
+        cb(new Blob(["artless"], { type: "image/png" }));
+      });
+      made.push(c); return c;
+    });
+    expect(made).toHaveLength(2);
+    expect(await b!.text()).toBe("artless");
+  });
+
+  it("no art and encode fails ⇒ null, no pointless retry", async () => {
+    const made: HTMLCanvasElement[] = [];
+    const b = await renderPostcardBlob(input, { art: null }, () => {
+      const c = fakeCanvas((cb) => cb(null)); made.push(c); return c;
+    });
+    expect(b).toBeNull();
+    expect(made).toHaveLength(1);
   });
 });
 ```
@@ -650,22 +713,39 @@ function toBlob(canvas: HTMLCanvasElement): Promise<Blob | null> {
   });
 }
 
-/** Draw + encode. A tainted canvas (SecurityError) redraws WITHOUT art and retries once
- *  — the postcard still saves (D2). Null only when encoding fails twice. */
-export async function renderPostcardBlob(
+/** Size + draw a canvas. Used for the PREVIEW (display may be tainted — fine) and,
+ *  on fresh elements, for encoding. */
+export function paintPostcard(
   canvas: HTMLCanvasElement,
   input: PostcardInput,
   assets: PostcardAssets,
-): Promise<Blob | null> {
+): boolean {
   canvas.width = POSTCARD_W;
   canvas.height = POSTCARD_H;
   const ctx = canvas.getContext("2d");
-  if (ctx === null) return null;
+  if (ctx === null) return false;
   drawPostcard(ctx, input, assets);
-  const b = await toBlob(canvas);
+  return true;
+}
+
+const freshCanvas = () => document.createElement("canvas");
+
+/** Encode on a FRESH canvas. A taint (SecurityError / null with art) redraws WITHOUT
+ *  art on ANOTHER fresh canvas — origin-clean is never restored on an element, so the
+ *  same canvas would fail forever (plan review M1). Null only when the art-less encode
+ *  also fails. */
+export async function renderPostcardBlob(
+  input: PostcardInput,
+  assets: PostcardAssets,
+  makeCanvas: () => HTMLCanvasElement = freshCanvas,
+): Promise<Blob | null> {
+  const c1 = makeCanvas();
+  if (!paintPostcard(c1, input, assets)) return null;
+  const b = await toBlob(c1);
   if (b !== null || assets.art === null) return b;
-  drawPostcard(ctx, input, { art: null });
-  return toBlob(canvas);
+  const c2 = makeCanvas();
+  if (!paintPostcard(c2, input, { art: null })) return null;
+  return toBlob(c2);
 }
 ```
 
@@ -688,14 +768,14 @@ git commit -S -m "🖼️ postcard canvas: assets once (D2/D3), synchronous draw
 - Create: `web/src/friend/PostcardPanel.tsx`, `web/src/friend/PostcardPanel.test.tsx`
 
 **Interfaces:**
-- Consumes: Task 2 (`PostcardInput`, `postcardKey`, `postcardFilename`), Task 3 (`loadPostcardAssets`, `renderPostcardBlob`, `PostcardAssets`).
-- Produces: `export function PostcardPanel(props: { base: Omit<PostcardInput, "note">; note: string | null }): JSX.Element` — `note` is ben's note if any; the panel decides (D8) whether it enters the input.
+- Consumes: Task 2 (`PostcardInput`, `postcardKey`, `postcardFilename`), Task 3 (`loadPostcardAssets`, `paintPostcard(canvas, input, assets): boolean`, `renderPostcardBlob(input, assets, makeCanvas?): Promise<Blob | null>`, `PostcardAssets`).
+- Produces: `export function PostcardPanel(props: { base: Omit<PostcardInput, "note">; note: string | null }): React.JSX.Element` — `note` is ben's note if any; the panel decides (D8) whether it enters the input.
 
 Behaviour contract:
 1. On mount: `loadPostcardAssets(base.artworkUrl)` once (state `assets: PostcardAssets | null`). While null: text `getting your postcard ready…`, save disabled.
 2. Toggle: `<input type="checkbox">` labelled `include ben's note`, rendered only when `note !== null`, default unchecked.
 3. `current: PostcardInput = { ...base, note: include ? note : null }`, `curKey = postcardKey(current)`.
-4. Effect on `[assets, curKey]`: call `renderPostcardBlob(canvasRef.current, current, assets)`; on completion, store `{ key, blob }` ONLY if `key === latestKeyRef.current` (D11 discard).
+4. Effect on `[assets, curKey]`: `paintPostcard(canvasRef.current, current, assets)` for the preview (synchronous), then `renderPostcardBlob(current, assets)` for the artifact (its OWN fresh canvas — Task 3); on completion, store `{ key, blob }` ONLY if `key === latestKeyRef.current` (D11 discard). **One draw function (`drawPostcard`), one input** — D8 holds.
 5. Save button `send a postcard ♡` (inside the panel this IS a button — D9 governs only the entry link) — `disabled` unless `artifact !== null && artifact.blob !== null && artifact.key === curKey`.
 6. onClick (synchronous until share): re-check key; build `new File([blob], postcardFilename(base.title), { type: "image/png" })`; if `navigator.canShare?.({ files: [file] })` ⇒ `navigator.share({ files: [file] })`, `.catch(e => { if (e?.name !== "AbortError") download(blob) })`; else `download(blob)`.
 7. `download(blob)`: `URL.createObjectURL` → temporary `<a download=filename>` → `.click()` → `URL.revokeObjectURL` in a `setTimeout(…, 0)`.
@@ -711,9 +791,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../postcardCanvas", () => ({
   loadPostcardAssets: vi.fn(),
+  paintPostcard: vi.fn(() => true),
   renderPostcardBlob: vi.fn(),
 }));
-import { loadPostcardAssets, renderPostcardBlob } from "../postcardCanvas";
+import { loadPostcardAssets, paintPostcard, renderPostcardBlob } from "../postcardCanvas";
 import { PostcardPanel } from "./PostcardPanel";
 import type { PostcardInput } from "../postcard";
 
@@ -727,7 +808,8 @@ const base: Omit<PostcardInput, "note"> = {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(loadPostcardAssets).mockResolvedValue({ art: null });
-  vi.mocked(renderPostcardBlob).mockImplementation(async (_c, input) =>
+  vi.mocked(paintPostcard).mockReturnValue(true);
+  vi.mocked(renderPostcardBlob).mockImplementation(async (input) =>
     new Blob([JSON.stringify(input)], { type: "image/png" }),
   );
 });
@@ -747,7 +829,8 @@ describe("PostcardPanel", () => {
     const { unmount } = render(<PostcardPanel base={base} note="for you ♡" />);
     expect(screen.getByLabelText(/include ben's note/)).not.toBeChecked();
     await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalled());
-    expect(vi.mocked(renderPostcardBlob).mock.calls[0][1].note).toBeNull();
+    expect(vi.mocked(renderPostcardBlob).mock.calls[0]![0].note).toBeNull();
+    expect(vi.mocked(paintPostcard).mock.calls[0]![1].note).toBeNull(); // preview == artifact input
     unmount();
     render(<PostcardPanel base={base} note={null} />);
     expect(screen.queryByLabelText(/include ben's note/)).toBeNull();
@@ -757,7 +840,7 @@ describe("PostcardPanel", () => {
     let releaseFirst!: (b: Blob) => void;
     vi.mocked(renderPostcardBlob)
       .mockImplementationOnce(() => new Promise((r) => { releaseFirst = r; }))
-      .mockImplementation(async (_c, input) => new Blob([String(input.note)], { type: "image/png" }));
+      .mockImplementation(async (input) => new Blob([String(input.note)], { type: "image/png" }));
     render(<PostcardPanel base={base} note="for you ♡" />);
     await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalledTimes(1));
     await userEvent.click(screen.getByLabelText(/include ben's note/)); // note ON while note-OFF render is pending
@@ -768,7 +851,7 @@ describe("PostcardPanel", () => {
     const btn = await screen.findByRole("button", { name: /send a postcard/ });
     await waitFor(() => expect(btn).toBeEnabled());
     await userEvent.click(btn);
-    const file = share.mock.calls[0][0].files[0] as File;
+    const file = share.mock.calls[0]![0].files[0] as File;
     expect(await file.text()).toBe("for you ♡"); // the CURRENT input's blob, never "STALE"
   });
 
@@ -781,6 +864,7 @@ describe("PostcardPanel", () => {
     await waitFor(() => expect(btn).toBeEnabled());
     await userEvent.click(btn);
     await waitFor(() => expect(share).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 0)); // let the .catch microtask run BEFORE asserting absence
     expect(create).not.toHaveBeenCalled();
   });
 
@@ -812,7 +896,7 @@ describe("PostcardPanel", () => {
 ```tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import { postcardFilename, postcardKey, type PostcardInput } from "../postcard";
-import { loadPostcardAssets, renderPostcardBlob, type PostcardAssets } from "../postcardCanvas";
+import { loadPostcardAssets, paintPostcard, renderPostcardBlob, type PostcardAssets } from "../postcardCanvas";
 
 // 🖼️ the postcard panel (docs/spec-postcard.md D7/D8/D10/D11). Assets load once on
 // mount; every input change re-renders synchronously-then-encodes; the stored artifact
@@ -860,7 +944,8 @@ export function PostcardPanel({
   useEffect(() => {
     if (assets === null || canvasRef.current === null) return;
     const key = curKey;
-    void renderPostcardBlob(canvasRef.current, current, assets).then((blob) => {
+    paintPostcard(canvasRef.current, current, assets); // the preview — same draw, same input
+    void renderPostcardBlob(current, assets).then((blob) => {
       if (key === latestKey.current) setArtifact({ key, blob }); // D11: stale ⇒ discarded
     });
     // `current` is fully determined by curKey
@@ -952,6 +1037,7 @@ vi.mock("../postcardCanvas", async (orig) => ({
   ...(await orig<typeof import("../postcardCanvas")>()),
   canMakePostcards: () => true,
   loadPostcardAssets: vi.fn().mockResolvedValue({ art: null }),
+  paintPostcard: vi.fn(() => true),
   renderPostcardBlob: vi.fn().mockResolvedValue(new Blob(["x"], { type: "image/png" })),
 }));
 
@@ -976,7 +1062,7 @@ it("D9: a postcard link appears only after the key, as a link not a button, and 
   await user.click(entry);
   const { renderPostcardBlob } = await import("../postcardCanvas");
   await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalled());
-  const input = vi.mocked(renderPostcardBlob).mock.calls[0][1];
+  const input = vi.mocked(renderPostcardBlob).mock.calls[0]![0];
   expect(JSON.stringify(input)).not.toContain("abc123xyz"); // D1 end-to-end: GIFT_URL's key
   expect(input.title).toBe("Hollow Knight");
   expect(input.acquiredAt).toBe("2014-03-02T17:00:00Z");
@@ -994,6 +1080,7 @@ vi.mock("../postcardCanvas", async (orig) => ({
   ...(await orig<typeof import("../postcardCanvas")>()),
   canMakePostcards: () => true,
   loadPostcardAssets: vi.fn().mockResolvedValue({ art: null }),
+  paintPostcard: vi.fn(() => true),
   renderPostcardBlob: vi.fn().mockResolvedValue(new Blob(["x"], { type: "image/png" })),
 }));
 
@@ -1010,7 +1097,7 @@ it("each gift offers a postcard carrying its acquired_at and unwrap instant", as
   await userEvent.click(await screen.findByRole("button", { name: /send a postcard/ }));
   const { renderPostcardBlob } = await import("../postcardCanvas");
   await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalled());
-  expect(vi.mocked(renderPostcardBlob).mock.calls[0][1]).toEqual({
+  expect(vi.mocked(renderPostcardBlob).mock.calls[0]![0]).toEqual({
     title: "Stardew Valley", artworkUrl: null, note: null,
     acquiredAt: "2014-03-02T17:00:00Z", unwrappedAt: "2026-10-05T11:00:00Z",
   });
@@ -1028,7 +1115,16 @@ const [postcardOpen, setPostcardOpen] = useState(false);
 const [unwrappedAt, setUnwrappedAt] = useState<string | null>(null);
 ```
 
-Wherever the code calls `setStep("gifted")` (both the `celebrating` `onDone` and the reduced-motion direct path), also call `setUnwrappedAt((u) => u ?? new Date().toISOString())` (D5: the client's now at success; set once). Then inside the gifted fragment, after the `keys may be region-locked` paragraph:
+In `handleConfirm` (~L99-110), the gifted branch is ONE line: `if (r.kind === "gifted") setStep(motionOK() ? "celebrating" : "gifted");`. Change it to:
+
+```tsx
+    if (r.kind === "gifted") {
+      setUnwrappedAt(new Date().toISOString()); // D5: the client's now at success — one site covers both motion paths
+      setStep(motionOK() ? "celebrating" : "gifted");
+    }
+```
+
+Do NOT add a second `setUnwrappedAt` in the celebration `onDone` — one site, set once. Then inside the gifted fragment, after the `keys may be region-locked` paragraph:
 
 ```tsx
 {canMakePostcards() && unwrappedAt !== null && (
@@ -1058,9 +1154,11 @@ Wherever the code calls `setStep("gifted")` (both the `celebrating` `onDone` and
 
 ⚠️ `base` is a new object each render; `PostcardPanel`'s asset effect depends only on `base.artworkUrl` and its render effect on `curKey`, so this does not re-load or loop. Do not "fix" it with `useMemo` unless a test shows a loop.
 
-LinkPage L730: add `linkNote={data.gift_note}` to `<ClaimDialog …>` (use whatever the loaded `LinkView` variable is named there; `gift_note` is `string | undefined`).
+LinkPage L730: add `linkNote={data.gift_note}` to `<ClaimDialog …>` (`data` is the destructured `LinkView` at ~L461; `gift_note` is `string | undefined`).
 
-ShelfPage: add `const [openPostcard, setOpenPostcard] = useState<string | null>(null);` and after the thank-note block inside each gift:
+M6 (phone height): the gifted step plus a ~340px preview overflows a 375×667 screen, and the centred flex clips both the close and save buttons. On the inner panel at ClaimDialog ~L152 change `className="dialog-bezel w-full max-w-md rounded-xl bg-floor p-6"` to `className="dialog-bezel w-full max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-floor p-6"`.
+
+ShelfPage: add `const [openPostcard, setOpenPostcard] = useState<string | null>(null);` **directly after `const [refreshTick, setRefreshTick] = useState(0);` (~L43), before any early return** (rules of hooks; `useState` is already imported). Then after the thank-note block inside each gift:
 
 ```tsx
 {canMakePostcards() && (
@@ -1090,7 +1188,17 @@ ShelfPage: add `const [openPostcard, setOpenPostcard] = useState<string | null>(
 
 Imports: `import { PostcardPanel } from "./PostcardPanel"; import { canMakePostcards } from "../postcardCanvas";` in both files; `useState` in ShelfPage if not already imported.
 
-- [ ] **Step 4: Run the full web suite** — `cd web && npm test -- --run && npm run typecheck && npm run lint && npm run build` ⇒ all PASS. Existing ClaimDialog/ShelfPage/LinkPage tests must stay green untouched (the prop is optional; the entry only appears in the gifted step / when canvas exists — happy-dom: if `canMakePostcards()` is true there, existing snapshot-free tests are unaffected because they query by role/text that does not overlap `send a postcard`).
+- [ ] **Step 3b: Update ONE existing test, deliberately (B3).** `ShelfPage.test.tsx` ~L244 `"never renders a claim/action affordance — it's a read-only keepsake page"` asserts `queryByRole("button")` is absent. happy-dom implements `toBlob`, so `canMakePostcards()` is true and the postcard entry is a button. The invariant the test protects is *no CLAIM/ACTION on the shelf*; the spec (D9, family-ruled) adds exactly one non-claim affordance. Replace its last two assertions with:
+
+```tsx
+    const buttons = screen.queryAllByRole("button");
+    expect(buttons.every((b) => /send a postcard/.test(b.textContent ?? ""))).toBe(true); // only the postcard entry
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+```
+
+and rename it `"never renders a claim affordance — the postcard entry is its only button"`. Say so in the commit message.
+
+- [ ] **Step 4: Run the full web suite** — `cd web && npm test -- --run && npm run typecheck && npm run lint && npm run build` ⇒ all PASS. **Measured by the plan review: the ONLY existing test this task reddens is the one Step 3b updates.** Any other red is a finding — stop and report it.
 
 - [ ] **Step 5: Commit**
 
@@ -1105,15 +1213,24 @@ git commit -S -m "🖼️ postcard doorways: after the key on the unwrap (D9), a
 
 **Files:** none (verification only; findings that need code go back to the owning task).
 
-- [ ] **Step 1:** `cd web && npm run build && npx vite preview --port 4173 &` then, with the playwright tools, open the ShelfPage route against a stubbed API is NOT available — instead verify the **pure render** in a real Chromium: open `about:blank`, inject the built `postcardCanvas` via `npx vite` dev server route `/src/postcardCanvas.ts` (dev server on 5173: `npx vite --port 5173 &`), and run in the page:
+- [ ] **Step 1:** Start the dev server with the Bash tool's `run_in_background: true`: `cd web && npx vite --port 5173 --strictPort`. Wait until `curl -sf http://localhost:5173/ >/dev/null` succeeds (poll ≤30s).
+- [ ] **Step 2:** `mcp__playwright__browser_resize` to **375×667**, then `mcp__playwright__browser_navigate` to `http://localhost:5173/` (a real origin — `import('/src/…')` from `about:blank` cannot resolve).
+- [ ] **Step 3:** `mcp__playwright__browser_evaluate` with:
 
 ```js
-const m = await import('/src/postcardCanvas.ts');
-const c = document.createElement('canvas');
-const a = await m.loadPostcardAssets('https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/413150/header.jpg');
-const b = await m.renderPostcardBlob(c, { title: 'Stardew Valley', artworkUrl: 'x', note: 'for you ♡', acquiredAt: '2014-03-02T17:00:00Z', unwrappedAt: '2026-10-05T11:00:00Z' }, a);
-[a.art !== null, b && b.size, b && b.type]
+async () => {
+  const m = await import('/src/postcardCanvas.ts');
+  const input = { title: 'Stardew Valley', artworkUrl: 'x', note: 'for you ♡',
+    acquiredAt: '2014-03-02T17:00:00Z', unwrappedAt: '2026-10-05T11:00:00Z' };
+  const a = await m.loadPostcardAssets('https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/413150/header.jpg');
+  const b = await m.renderPostcardBlob(input, a);
+  const c = document.createElement('canvas');
+  m.paintPostcard(c, input, a);
+  c.id = 'pc'; c.style.width = '270px'; document.body.prepend(c);
+  return [a.art !== null, b && b.size, b && b.type];
+}
 ```
 
-Expected: `[true, <non-zero>, "image/png"]` — art loaded cross-origin and the canvas was NOT tainted (a taint would have forced the art-less retry; assert `a.art !== null` AND inspect the screenshot). Screenshot the canvas (append it to the body, `browser_take_screenshot`) and look at it: art contained, title, from-line, note in quotes, postmark line, `bendobundles` mark, nothing overlapping.
-- [ ] **Step 2:** Kill the servers. Record the screenshot path + the tuple in the PR description.
+Expected: `[true, <non-zero>, "image/png"]`. `true` proves the art loaded cross-origin; a non-null blob from a run WITH art proves the encode canvas was not tainted (to tell art-less retry apart, also confirm the screenshot shows the art).
+- [ ] **Step 4:** `mcp__playwright__browser_take_screenshot` (full page). Look at it: art contained (not cropped), title, `from ben ♡`, note in quotes, postmark line, `bendobundles` mark, nothing overlapping. Save the path.
+- [ ] **Step 5:** ⚠️ The dev server does NOT apply the prod CSP — this step proves rendering and CORS, never CSP. CSP is re-verified on the deployed site at pounce step 12. Stop the background server (TaskStop / kill its PID). Record the screenshot path + tuple in the PR description.

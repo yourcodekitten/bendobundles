@@ -1,6 +1,6 @@
 # the postcard 🖼️ — spec
 
-*2026-10-05, kitten. Status: v4 — OMBB's Q3 (infra clear; user activation, D10) + Lilith's staleness catch (D11) integrated. v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
+*2026-10-05, kitten. Status: v5 — plan-review amendments (line caps, fonts, postmark example, shelf invariant). v4 — OMBB's Q3 (infra clear; user activation, D10) + Lilith's staleness catch (D11) integrated. v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
 **decisions** disagree, the decisions win.*
 
 ## why this exists
@@ -37,10 +37,10 @@ A small preview of the card shows in-dialog before saving, so the friend sees wh
 
 - warm paper frame in the house palette (dark-theme-safe, not white-on-white), polaroid proportions
 - **cover art**, fitted (contain, not crop — humble subproduct icons are square, steam headers 460×215)
-- **title** (wrapped, ≤3 lines, ellipsised)
+- **title** (wrapped, ≤2 lines at 64px, ellipsised)
 - **"from ben ♡"**, and — only when the friend ticks D8's toggle — ben's note in quotes (per-game note on curated links, else the
-  link's `gift_note`; ≤5 lines, ellipsised)
-- the **postmark line**: `in the attic since 2014 · unwrapped oct 5, 2026` — first clause
+  link's `gift_note`; ≤3 lines at 36px italic, ellipsised)
+- the **postmark line**: `in the attic since mar 2014 · unwrapped oct 5, 2026` (month+year via the shared `postmark()` helper, so it reads exactly like the site's own postmark) — first clause
   presence-gated on `acquired_at`; when the gap is ≥1 year, `· waited 12 years for you`
 - a tiny `bendobundles` mark, bottom corner. **No URL of any kind.**
 
@@ -70,8 +70,8 @@ would be tainted (`toBlob` throws `SecurityError`), the card renders with a **dr
 (the house pixel-gift glyph) instead — the postcard still saves. Principle 5.
 
 **D3 — fonts are awaited.** Canvas text in an unloaded webfont silently falls back. Render after
-`document.fonts.load()` for the faces used (Silkscreen for the wordmark/postmark, the body face for
-note/title), with the same 4s cap; on timeout, render anyway in the fallback stack. ⚠️ **#261 is adjacent:** vite inlines Silkscreen's
+`document.fonts.load()` for the faces used (Silkscreen for the **wordmark only** — a pixel face is illegible across a long postmark line, so the
+postmark uses Chivo; Pixelify for the title; Chivo for from-line and note), with the same 4s cap; on timeout, render anyway in the fallback stack. ⚠️ **#261 is adjacent:** vite inlines Silkscreen's
 latin-ext subset as a `data:` font and `font-src 'self'` blocks it — so a title with latin-ext glyphs
 falls back for *those glyphs* on the card exactly as it already does on the page. Not this feature's
 to fix; the card must not be worse than the page, and it isn't.
@@ -127,6 +127,11 @@ input, an older render"* ships the note the friend just removed. ⇒ the rendere
 `artifact.key === keyOf(currentInput)`**; every input change re-renders, and a completion whose key no
 longer matches the current input is **discarded**, never stored. The tap sends `artifact.blob` only
 after re-checking the key in the same synchronous handler.
+
+**D12 — the shelf gains exactly one affordance, and it is not a claim.** `ShelfPage.test.tsx` pinned
+the shelf as having no buttons at all (*"a read-only keepsake page"*). The invariant that matters is
+**no claim/action on the shelf**; the postcard entry is the one deliberate exception (D9, family-ruled),
+and the test is narrowed to say exactly that rather than deleted.
 
 ## out of scope
 
