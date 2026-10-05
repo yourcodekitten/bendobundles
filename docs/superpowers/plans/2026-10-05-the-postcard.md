@@ -1157,7 +1157,7 @@ it("each gift offers a postcard carrying its acquired_at and unwrap instant", as
     name: "sarah",
     gifts: [{
       game_id: "g1", title: "Stardew Valley", artwork_url: null,
-      unwrapped_at: "2026-10-05T11:00:00Z", gift_note: "for you ♡", thank_note: null,
+      unwrapped_at: "2026-10-05T16:00:00Z", gift_note: "for you ♡", thank_note: null,
       acquired_at: "2014-03-02T17:00:00Z",
     }],
   });
@@ -1290,7 +1290,7 @@ git commit -S -m "🖼️ postcard doorways: after the key on the unwrap (D9), a
 async () => {
   const m = await import('/src/postcardCanvas.ts');
   const input = { title: 'Stardew Valley', artworkUrl: 'x', note: 'for you ♡',
-    acquiredAt: '2014-03-02T17:00:00Z', unwrappedAt: '2026-10-05T11:00:00Z' };
+    acquiredAt: '2014-03-02T17:00:00Z', unwrappedAt: '2026-10-05T16:00:00Z' };
   const a = await m.loadPostcardAssets('https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/413150/header.jpg');
   const b = await m.renderPostcardBlob(input, a);
   const c = document.createElement('canvas');
