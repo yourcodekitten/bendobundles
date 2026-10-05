@@ -1,6 +1,6 @@
 # the postcard 🖼️ — spec
 
-*2026-10-05, kitten. Status: v6 — OMBB step-5 verdict (APPROVE WITH CHANGES) + Lilith's {blob, artUsed} integrated; D13. v5 — plan-review amendments (line caps, fonts, postmark example, shelf invariant). v4 — OMBB's Q3 (infra clear; user activation, D10) + Lilith's staleness catch (D11) integrated. v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
+*2026-10-05, kitten. Status: **v7 — AMENDED AFTER OMBB's step-5 SIGN-OFF**, to match what ships after execution + review passes 1 and 2 (headline, desktop share, InvalidStateError + re-tap guard, failure state, D9 save weight, real italic). Every amendment below is marked *(v7)*. v6 — OMBB step-5 verdict (APPROVE WITH CHANGES) + Lilith's {blob, artUsed} integrated; D13. v5 — plan-review amendments (line caps, fonts, postmark example, shelf invariant). v4 — OMBB's Q3 (infra clear; user activation, D10) + Lilith's staleness catch (D11) integrated. v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
 **decisions** disagree, the decisions win.*
 
 ## why this exists
@@ -27,8 +27,8 @@ A **"send a postcard ♡"** action in two places:
 
 Pressing it renders a **1080×1350 PNG** (4:5, the phone-and-chat-friendly portrait) client-side on a
 `<canvas>`, then:
-- where `navigator.canShare({ files: [png] })` is true (phones) → `navigator.share` (camera roll,
-  messages — the native sheet);
+- where `navigator.canShare({ files: [png] })` is true → `navigator.share` (the native sheet). *(v7: that is
+  phones AND desktop Chrome/Edge and macOS Safari — not phones only, as v1–v6 said);*
 - otherwise → `<a download="postcard-<slug>.png">` from an object URL, revoked after click.
 
 A small preview of the card shows in-dialog before saving, so the friend sees what they keep.
@@ -40,8 +40,12 @@ A small preview of the card shows in-dialog before saving, so the friend sees wh
 - **title** (wrapped, ≤2 lines at 64px, ellipsised)
 - **"from ben ♡"**, and — only when the friend ticks D8's toggle — ben's note in quotes (per-game note on curated links, else the
   link's `gift_note`; ≤3 lines at 36px italic, ellipsised)
+- *(v7)* the **headline**: `waited 12 years for you` — its own single line, 44px Pixelify in give-pink,
+  above the postmark; absent under one whole year or when `acquired_at` is unknown. *(v1–v6 put it at the
+  end of the postmark; the first real-browser render buried the card's best line in small print and
+  orphaned "for you", so it was promoted.)*
 - the **postmark line**: `in the attic since mar 2014 · unwrapped oct 5, 2026` (month+year via the shared `postmark()` helper, so it reads exactly like the site's own postmark) — first clause
-  presence-gated on `acquired_at`; when the gap is ≥1 year, `· waited 12 years for you`
+  presence-gated on `acquired_at`
 - a tiny `bendobundles` mark, bottom corner. **No URL of any kind.**
 
 ## decisions
@@ -69,7 +73,7 @@ measured by OMBB. ⚠️ **Art loads ONLY via `<img crossOrigin="anonymous">`, n
 would be tainted (`toBlob` throws `SecurityError`), the card renders with a **drawn placeholder**
 (the house pixel-gift glyph) instead — the postcard still saves. Principle 5.
 
-**D3 — fonts are awaited.** Canvas text in an unloaded webfont silently falls back. Render after
+**D3 — fonts are awaited.** *(v7: the note's italic is now a REAL face — `@fontsource-variable/chivo/wght-italic.css` is imported in `main.tsx`; before, both the page and the card synthesised it.)* Canvas text in an unloaded webfont silently falls back. Render after
 `document.fonts.load()` for the faces used (Silkscreen for the **wordmark only** — a pixel face is illegible across a long postmark line, so the
 postmark uses Chivo; Pixelify for the title; Chivo for from-line and note), with the same 4s cap; on timeout, render anyway in the fallback stack. ⚠️ **#261 is adjacent:** vite inlines Silkscreen's
 latin-ext subset as a `data:` font and `font-src 'self'` blocks it — so a title with latin-ext glyphs
@@ -104,7 +108,11 @@ when there is no note), and **the preview redraws live from the same render call
 what they see is exactly what leaves their hands. One render function, one input; never a preview
 path and a save path that could disagree.
 
-**D9 — placement on the unwrap (Lilith, Q1): both surfaces.** On the gifted step it sits **below the
+**D9 — placement on the unwrap (Lilith, Q1): both surfaces.** *(v7, review 2: D9 governs the ENTRY. Once
+the friend opens the panel, its save is a real button — but an **outline** one, never a fill; the filled
+buttons on that screen stay the key's.)* *(v7: "never during `celebrating`" holds by construction — the
+entry renders only in the `gifted` step — and is not separately tested, since the test env forces reduced
+motion and skips `celebrating`.)* On the gifted step it sits **below the
 key block, only once the key is revealed** (never during `celebrating`), with a **link's visual weight,
 not a button's** — the key's two buttons stay the only buttons. Saving at the peak of the moment is
 the point; the shelf is the October backup.
@@ -115,7 +123,9 @@ activation**; a tap handler that first awaits fonts + art (D2/D3's 4s caps) spen
 D8's toggle — is a **synchronous canvas draw + `toBlob`**, cheap. The tap handler's only await-free work
 is `navigator.share({ files: [file] })` / the anchor click.
 - **`AbortError` = the friend cancelled the sheet. It is NOT a failure: no download fallback, no error
-  copy.** Any OTHER share rejection → fall back to the download path, quietly.
+  copy.** *(v7)* **`InvalidStateError` = a sheet is already open — also no download** (review 1: a double tap
+  shared AND downloaded). A synchronous re-tap guard ignores a second tap while a share is pending. Any
+  OTHER share rejection → fall back to the download path, quietly.
 - No `Permissions-Policy` header is set today, so `web-share` defaults to `self`. **If one is ever
   added it must carry `web-share=(self)`** — recorded in the CSP comment block in `aws-cloudfront.tf`.
 
@@ -142,6 +152,14 @@ curated notes on the shelf is a shelf feature, not a postcard one; out of scope 
 
 **D2 addendum (Lilith):** when a taint forces the art-less retry, the preview is **repainted without
 the art before save enables** — the art obeys "what you see is what you keep" exactly like the note.
+
+**D14 *(v7)* — failure is soft, and never takes the key with it (review 1).** A preview paint that throws,
+or a render that rejects, shows *"couldn't make the postcard this time"* in a persistent `role="status"`
+region and leaves save disabled; it never escapes the panel (there is no error boundary above it, and in the
+unwrap dialog an escaped throw would unmount the one-time gift url). Encode canvases are released to 0×0
+after every attempt (iOS caps total canvas memory). Wrapping cuts by code point, never through an emoji.
+The preview is `role="img"` named `postcard of <title>, from ben`; the panel's save is `save my postcard ♡`
+(distinct from the entry's `send a postcard ♡`).
 
 ## out of scope
 

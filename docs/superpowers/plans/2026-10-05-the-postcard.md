@@ -1,5 +1,10 @@
 # the postcard 🖼️ Implementation Plan
 
+> ⚠️ **SUPERSEDED IN PART — HISTORY, NOT INSTRUCTIONS.** This is the plan OMBB signed off at `8c7ef954` and it was
+> executed as written. Execution and two review passes then changed the card (art box 620→580, the *waited*
+> headline as its own line, `InvalidStateError` + re-tap guard, failure state, outline save, real italic).
+> **`docs/spec-postcard.md` v7 is the law; where this plan disagrees with it, the spec wins.**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A friend can save a 1080×1350 postcard PNG of a gift (cover art, title, "from ben ♡", optionally ben's note, the postmark line) from the unwrap dialog and from their shelf, via the phone share sheet or a download — and the card carries no capability field.
