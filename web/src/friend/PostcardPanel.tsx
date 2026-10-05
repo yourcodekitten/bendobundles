@@ -52,15 +52,34 @@ export function PostcardPanel({
 
   // D10: load ONCE. base.artworkUrl is fixed for the panel's life.
   const artworkUrl = base.artworkUrl;
+  const sampleText = `${base.title} ${note ?? ""}`; // OMBB m6: latin-ext faces for THIS card
   useEffect(() => {
     let live = true;
-    void loadPostcardAssets(artworkUrl).then((a) => {
-      if (live) setAssets(a);
-    });
+    loadPostcardAssets(artworkUrl, undefined, sampleText)
+      .then((a) => {
+        if (live) setAssets(a);
+      })
+      // OMBB m7: "never rejects" is the contract, not a guarantee — a throw must not
+      // strand the panel on "getting ready" forever. Fall back to the art-less card.
+      .catch(() => {
+        if (live) setAssets({ art: null });
+      });
     return () => {
       live = false;
     };
-  }, [artworkUrl]);
+  }, [artworkUrl, sampleText]);
+
+  // OMBB m4: release the 1080×1350 preview bitmap on unmount — D14 frees the encode
+  // canvases for iOS's total-canvas-memory cap, and the preview is the biggest one left.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    return () => {
+      if (canvas !== null) {
+        canvas.width = 0;
+        canvas.height = 0;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (assets === null || canvasRef.current === null) return;
@@ -117,8 +136,18 @@ export function PostcardPanel({
       navigator.canShare({ files: [file] })
     ) {
       sharing.current = true;
-      navigator
-        .share({ files: [file] })
+      let pending: Promise<void>;
+      try {
+        pending = navigator.share({ files: [file] });
+      } catch {
+        // OMBB m3: older WebKit can throw SYNCHRONOUSLY. Release the guard (or the button is
+        // dead until remount) and save as a download NOW, inside the same click — an anchor
+        // download can need the same transient activation share does (D10's reasoning).
+        sharing.current = false;
+        download(blob, filename);
+        return;
+      }
+      pending
         .catch((e: unknown) => {
           const name = (e as { name?: string } | null)?.name;
           // AbortError = the friend cancelled; InvalidStateError = a sheet is already open.

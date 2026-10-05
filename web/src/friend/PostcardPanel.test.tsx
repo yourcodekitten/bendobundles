@@ -257,6 +257,69 @@ describe("PostcardPanel", () => {
     expect(save.className).toMatch(/border-give/);
   });
 
+  it("OMBB m3: after a share SETTLES, the next tap shares again (the guard releases)", async () => {
+    const share = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { canShare: () => true, share });
+    render(<PostcardPanel base={base} note={null} />);
+    const btn = await screen.findByRole("button", { name: /save my postcard/ });
+    await waitFor(() => expect(btn).toBeEnabled());
+    fireEvent.click(btn);
+    await new Promise((r) => setTimeout(r, 0));
+    fireEvent.click(btn);
+    expect(share).toHaveBeenCalledTimes(2);
+  });
+
+  it("OMBB m3: a SYNCHRONOUS throw from share (older WebKit) neither kills the button nor eats the save", async () => {
+    let n = 0;
+    const share = vi.fn(() => {
+      if (++n === 1) throw new TypeError("share threw synchronously");
+      return Promise.resolve();
+    });
+    Object.assign(navigator, { canShare: () => true, share });
+    const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:x");
+    render(<PostcardPanel base={base} note={null} />);
+    const btn = await screen.findByRole("button", { name: /save my postcard/ });
+    await waitFor(() => expect(btn).toBeEnabled());
+    fireEvent.click(btn);
+    expect(create).toHaveBeenCalledTimes(1); // the save still happens, as a download
+    fireEvent.click(btn);
+    expect(share).toHaveBeenCalledTimes(2); // and the guard did not stay latched
+  });
+
+  it("OMBB m4: the 1080×1350 preview canvas is released when the panel unmounts", async () => {
+    const { unmount } = render(<PostcardPanel base={base} note={null} />);
+    const canvas = screen.getByRole("img", {
+      name: /postcard of/,
+    }) as HTMLCanvasElement;
+    canvas.width = 1080;
+    canvas.height = 1350;
+    unmount();
+    expect([canvas.width, canvas.height]).toEqual([0, 0]);
+  });
+
+  it("OMBB m7: an asset loader that REJECTS cannot strand the panel on 'getting ready'", async () => {
+    vi.mocked(loadPostcardAssets).mockRejectedValue(new Error("boom"));
+    render(<PostcardPanel base={base} note={null} />);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /save my postcard/ }),
+      ).toBeEnabled(),
+    );
+    expect(screen.getByRole("status")).not.toHaveTextContent(
+      /getting your postcard ready/,
+    );
+  });
+
+  it("OMBB m6: the asset loader is handed the card's own text (title + note) for latin-ext faces", async () => {
+    render(
+      <PostcardPanel base={{ ...base, title: "Ōkami HD" }} note="für dich" />,
+    );
+    await waitFor(() => expect(loadPostcardAssets).toHaveBeenCalled());
+    const text = vi.mocked(loadPostcardAssets).mock.calls[0]![2];
+    expect(text).toContain("Ōkami HD");
+    expect(text).toContain("für dich");
+  });
+
   it("render failure ⇒ soft message, save stays disabled", async () => {
     vi.mocked(renderPostcardBlob).mockResolvedValue({
       blob: null,

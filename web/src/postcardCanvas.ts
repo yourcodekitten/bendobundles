@@ -72,12 +72,19 @@ function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
 export async function loadPostcardAssets(
   artworkUrl: string | null,
   timeoutMs = 4000,
+  /** OMBB m6: the card's own text. `load(font)` alone fetches only faces whose
+   *  unicode-range covers a space (latin); the text pulls the subsets it really needs. */
+  sampleText = "",
 ): Promise<PostcardAssets> {
   const fonts =
     typeof document !== "undefined" && document.fonts
-      ? Promise.all(POSTCARD_FONTS.map((f) => document.fonts.load(f))).then(
-          () => undefined,
-        )
+      ? Promise.all(
+          POSTCARD_FONTS.map((f) =>
+            sampleText === ""
+              ? document.fonts.load(f)
+              : document.fonts.load(f, sampleText),
+          ),
+        ).then(() => undefined)
       : Promise.resolve(undefined);
   const art: Promise<HTMLImageElement | null> =
     artworkUrl === null

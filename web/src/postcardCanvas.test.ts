@@ -208,15 +208,21 @@ describe("renderPostcardBlob (M1: taint ⇒ a FRESH canvas, never the same one)"
 
 describe("review 2: D3 fonts, contain-not-crop, D6", () => {
   it("D3: every postcard face is requested from document.fonts", async () => {
-    const load = vi.fn((_font: string) => Promise.resolve([] as FontFace[]));
+    const load = vi.fn<(font: string, text?: string) => Promise<FontFace[]>>(
+      () => Promise.resolve([]),
+    );
     const saved = Object.getOwnPropertyDescriptor(document, "fonts");
     Object.defineProperty(document, "fonts", {
       configurable: true,
       value: { load },
     });
     try {
-      await loadPostcardAssets(null, 1000);
+      await loadPostcardAssets(null, 1000, "Ōkami — für dich");
       expect(load.mock.calls.map((c) => c[0])).toEqual([...POSTCARD_FONTS]);
+      // OMBB m6: load(font) with no text only fetches faces whose unicode-range covers a SPACE
+      // (latin). Passing the card's own text pulls the latin-ext subsets the title/note need.
+      for (const c of load.mock.calls)
+        expect(c[1]).toContain("Ōkami — für dich");
     } finally {
       if (saved) Object.defineProperty(document, "fonts", saved);
       else delete (document as { fonts?: unknown }).fonts;

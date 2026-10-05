@@ -130,6 +130,28 @@ describe("postcard model", () => {
     expect(hard.join("")).toMatch(/^(😘)+(…)?$/u);
   });
 
+  it("OMBB m5: wrapping never splits a GRAPHEME — ZWJ families, flags, skin tones stay whole", () => {
+    const m = (s: string) => s.length * 10; // code units: half a cluster must be able to "fit"
+    const family = "👨‍👩‍👧"; // 8 code units, one grapheme
+    const flag = "🇺🇸"; // 4 code units, one grapheme
+    const wave = "👋🏽"; // 4 code units, one grapheme
+    for (const g of [family, flag, wave]) {
+      // 115 = 11 code units: one family (8) + 👨+ZWJ (3) fits; two flags (8) + one regional
+      // indicator (2) fits; two waves (8) + 👋 (2) fits — every cut lands MID-cluster unless graphemes are respected
+      const lines = [
+        ...wrapLines(g.repeat(6), 115, 6, m),
+        ...wrapLines(`ab ${g.repeat(4)} cd ef`, 115, 1, m),
+      ];
+      for (const l of lines) {
+        const body = l.endsWith("…") ? l.slice(0, -1) : l;
+        expect(
+          body.split(g).join(""),
+          `split inside ${g}: ${JSON.stringify(l)}`,
+        ).toMatch(/^[a-z ]*$/);
+      }
+    }
+  });
+
   it("filename is a safe slug", () => {
     expect(postcardFilename("Stardew Valley: Deluxe!")).toBe(
       "postcard-stardew-valley-deluxe.png",

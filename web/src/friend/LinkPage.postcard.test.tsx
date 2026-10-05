@@ -86,15 +86,25 @@ it("passes the link's gift_note to the claim dialog as linkNote (D13 fallback)",
     ).toBeInTheDocument(),
   );
   await user.click(screen.getByRole("button", { name: /^claim$/i }));
-  const masher = screen.getByRole("button", { name: /mash to claim/i });
-  for (let i = 0; i < 4; i++) await user.click(masher);
-  // 5s, not the 2s the sibling LinkPage test uses: this wait spans the REAL claim-burst
-  // animation (~1s wall), and under load it overran 2s once (observed during mutation runs).
+  // ROOT CAUSE of OMBB's blocker 2 (measured under load, not guessed): the chest's charge is
+  // "drained in the parent, filled by mashing" (ClaimChest.tsx). "4 mashes crest 100" holds
+  // only if the clicks outrun the drain — under CPU load they don't, the dialog NEVER opens,
+  // and no timeout can fix that (10s waited, 2 of 3 loaded runs red). So: mash until it opens,
+  // bounded. The sibling LinkPage.test.tsx round-trip carries the same latent assumption.
+  for (
+    let i = 0;
+    i < 60 && screen.queryByText("claim dialog stub") === null;
+    i++
+  ) {
+    const masher = screen.queryByRole("button", { name: /mash to claim/i });
+    if (masher === null) break; // burst in progress — let the wait below catch the dialog
+    await user.click(masher);
+  }
   await waitFor(
     () => expect(screen.getByText("claim dialog stub")).toBeInTheDocument(),
-    { timeout: 5000 },
+    { timeout: 10_000 },
   );
   expect(captured[captured.length - 1]!.linkNote).toBe(
     "picked these with you in mind",
   );
-});
+}, 20_000);

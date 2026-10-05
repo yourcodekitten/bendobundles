@@ -105,6 +105,27 @@ export function postcardText(i: PostcardInput): PostcardText {
   };
 }
 
+// OMBB m5: a code point is not a character either — a ZWJ family, a flag or a skin tone is
+// several code points that draw as ONE glyph. Cut on grapheme clusters where the runtime can
+// segment them (every browser this ships to); fall back to code points elsewhere.
+type GraphemeSegmenter = { segment(s: string): Iterable<{ segment: string }> };
+const SegmenterCtor = (
+  Intl as unknown as {
+    Segmenter?: new (
+      l?: string,
+      o?: { granularity: "grapheme" },
+    ) => GraphemeSegmenter;
+  }
+).Segmenter;
+const segmenter = SegmenterCtor
+  ? new SegmenterCtor(undefined, { granularity: "grapheme" })
+  : null;
+export function graphemes(s: string): string[] {
+  return segmenter
+    ? Array.from(segmenter.segment(s), (x) => x.segment)
+    : [...s];
+}
+
 /** Word wrap with a hard break for over-long words; the last allowed line is
  *  ellipsised when text remains. `measure` is injected (canvas measureText in prod). */
 export function wrapLines(
@@ -116,10 +137,10 @@ export function wrapLines(
   const words = text.split(/\s+/).filter((w) => w.length > 0);
   const lines: string[] = [];
   let cur = "";
-  // review-1 #3: cut by CODE POINT, never by UTF-16 unit — a `slice` can split an
+  // review-1 #3 / OMBB m5: cut by GRAPHEME, never by UTF-16 unit or code point — a `slice` can split an
   // emoji's surrogate pair and the canvas draws a broken glyph.
   const pushHardBroken = (w: string) => {
-    let rest = [...w];
+    let rest = graphemes(w);
     while (measure(rest.join("")) > maxWidth && rest.length > 1) {
       let n = rest.length;
       while (n > 1 && measure(rest.slice(0, n).join("")) > maxWidth) n--;
@@ -140,7 +161,7 @@ export function wrapLines(
   if (cur !== "") lines.push(cur);
   if (lines.length <= maxLines) return lines;
   const kept = lines.slice(0, maxLines);
-  const last = [...(kept[maxLines - 1] ?? "")];
+  const last = graphemes(kept[maxLines - 1] ?? "");
   while (last.length > 0 && measure(`${last.join("")}…`) > maxWidth) last.pop();
   kept[maxLines - 1] = `${last.join("")}…`;
   return kept;
