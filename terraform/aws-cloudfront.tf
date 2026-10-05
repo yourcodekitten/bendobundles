@@ -54,6 +54,9 @@ module "label_site_headers" {
 #                                  attrs — those go through CSSOM, which CSP never
 #                                  gates. Retire if CursorCompanion's CSS moves to the
 #                                  stylesheet
+# No Permissions-Policy header is set, so `web-share` defaults to self — the postcard's
+# navigator.share depends on that (docs/spec-postcard.md D10). If one is ever added it
+# MUST carry `web-share=(self)`.
 # No inline scripts (vite module bundle only), no data:/blob: images, no frames,
 # no external fonts; both <form>s are onSubmit-handled (no action navigation).
 locals {

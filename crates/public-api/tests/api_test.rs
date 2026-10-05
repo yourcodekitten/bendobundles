@@ -3698,6 +3698,47 @@ async fn shelf_happy_fulfilled_only_no_cross_friend_bleed() {
 }
 
 #[tokio::test]
+async fn shelf_gift_carries_acquired_at_and_omits_it_when_unknown() {
+    let Some(store) = store_or_skip("shelf-acquired").await else {
+        return;
+    };
+    let mock = MockInvoker::new(FulfillResponse::GiftUrl {
+        url: "https://x.com/g".into(),
+    });
+    let mut g1 = test_game(1);
+    g1.acquired_at = Some(datetime!(2014-03-02 17:00 UTC));
+    store.put_game(&g1).await.unwrap();
+    store.put_game(&test_game(2)).await.unwrap(); // acquired_at: None
+    let f = test_friend("f1", "sarah", "aa");
+    store.create_friend(&f).await.unwrap();
+    store.create_link(&test_link("t1")).await.unwrap();
+    store.set_link_friend("t1", Some("f1")).await.unwrap();
+    store
+        .put_claim(&claim("c1", "t1", 1, ClaimState::Fulfilled, 2024))
+        .await
+        .unwrap();
+    store
+        .put_claim(&claim("c2", "t1", 2, ClaimState::Fulfilled, 2025))
+        .await
+        .unwrap();
+
+    let req = Request::get(format!("/api/s/{}", f.shelf_token))
+        .body(Body::empty())
+        .unwrap();
+    let resp = plain_router(store, mock).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    let gifts = j["gifts"].as_array().unwrap();
+    assert_eq!(gifts.len(), 2);
+    assert_eq!(gifts[0]["acquired_at"], "2014-03-02T17:00:00Z");
+    assert!(
+        gifts[1].get("acquired_at").is_none(),
+        "unknown acquired_at is ABSENT, never null: {}",
+        gifts[1]
+    );
+}
+
+#[tokio::test]
 async fn shelf_500s_when_index_absent_never_renders_empty() {
     // The deploy window as a fixture: a store whose table has NO gsi3. A query against the
     // absent index ERRORS; the handler must surface 500, never Ok(vec![]) (fail distinct).

@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { claimGame, type ClaimResult, type GameView } from "../api";
 import { makeTrapKeyDown } from "../focusTrap";
 import { motionOK } from "../motion";
+import { canMakePostcards } from "../postcardCanvas";
+import { PostcardPanel } from "./PostcardPanel";
 
 // ── The claim celebration — THE CHAIN (ben's pick, 2026-07-09) ───────────────
 // The unwrap is the product (PRODUCT.md #1), so a successful claim plays the
@@ -20,6 +22,8 @@ interface ClaimDialogProps {
   game: GameView;
   onClose: () => void;
   onRefresh: () => void;
+  /** ✍️ the link's gift_note — the postcard's note when this game has no curated note (D8: off by default). */
+  linkNote?: string;
 }
 
 type Step =
@@ -51,11 +55,14 @@ export function ClaimDialog({
   game,
   onClose,
   onRefresh,
+  linkNote,
 }: ClaimDialogProps) {
   const [step, setStep] = useState<Step>("confirm");
   const [result, setResult] = useState<ClaimResult | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
+  const [postcardOpen, setPostcardOpen] = useState(false);
+  const [unwrappedAt, setUnwrappedAt] = useState<string | null>(null);
   // Hard re-entry guard for the one-shot claim POST. Unmounting the confirm
   // button on setStep('loading') is an implementation detail, and checking
   // `step` in the handler doesn't help either — a double-click / Enter-repeat /
@@ -102,8 +109,10 @@ export function ClaimDialog({
     setStep("loading");
     const r = await claimGame(token, game.id);
     setResult(r);
-    if (r.kind === "gifted") setStep(motionOK() ? "celebrating" : "gifted");
-    else if (r.kind === "processing") setStep("processing");
+    if (r.kind === "gifted") {
+      setUnwrappedAt(new Date().toISOString()); // D5: the client's now at success — one site covers both motion paths
+      setStep(motionOK() ? "celebrating" : "gifted");
+    } else if (r.kind === "processing") setStep("processing");
     else if (r.kind === "refused") setStep("refused");
     else setStep("error");
   };
@@ -149,7 +158,7 @@ export function ClaimDialog({
           onClose();
         }}
       >
-        <div className="dialog-bezel w-full max-w-md rounded-xl bg-floor p-6">
+        <div className="dialog-bezel w-full max-w-md max-h-[calc(100dvh-2rem)] overflow-y-auto rounded-xl bg-floor p-6">
           {step === "confirm" && (
             <>
               <h2 className="text-lg font-semibold">
@@ -232,6 +241,29 @@ export function ClaimDialog({
               <p className="mt-4 text-xs text-dust-faint">
                 keys may be region-locked
               </p>
+              {canMakePostcards() && unwrappedAt !== null && (
+                <div className="mt-4 text-center">
+                  <button
+                    type="button"
+                    aria-expanded={postcardOpen}
+                    onClick={() => setPostcardOpen((o) => !o)}
+                    className="text-sm text-give-soft underline hover:text-give focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pixel"
+                  >
+                    send a postcard ♡
+                  </button>
+                  {postcardOpen && (
+                    <PostcardPanel
+                      base={{
+                        title: game.title,
+                        artworkUrl: game.artwork_url,
+                        acquiredAt: game.acquired_at ?? null,
+                        unwrappedAt,
+                      }}
+                      note={game.note ?? linkNote ?? null}
+                    />
+                  )}
+                </div>
+              )}
               <div className="mt-4 flex justify-end">
                 <button
                   type="button"

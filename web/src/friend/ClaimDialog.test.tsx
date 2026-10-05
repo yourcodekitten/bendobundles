@@ -5,6 +5,14 @@ import { ClaimDialog } from './ClaimDialog';
 import type { GameView } from '../api';
 
 vi.mock('../api');
+vi.mock("../postcardCanvas", async (orig) => ({
+  ...(await orig<typeof import("../postcardCanvas")>()),
+  canMakePostcards: vi.fn(() => true),
+  loadPostcardAssets: vi.fn().mockResolvedValue({ art: null }),
+  paintPostcard: vi.fn(() => true),
+  renderPostcardBlob: vi.fn().mockResolvedValue({ blob: new Blob(["x"], { type: "image/png" }), artUsed: false }),
+}));
+
 import { claimGame } from '../api';
 
 const mockGame: GameView = {
@@ -42,6 +50,93 @@ describe('ClaimDialog', () => {
   });
 
   describe('gifted path', () => {
+    async function openPostcard(game: GameView, linkNote?: string) {
+      const user = userEvent.setup();
+      vi.mocked(claimGame).mockResolvedValue({ kind: "gifted", gift_url: GIFT_URL });
+      render(<ClaimDialog token="tok" game={game} linkNote={linkNote} onClose={onClose} onRefresh={onRefresh} />);
+      await user.click(screen.getByRole("button", { name: /confirm/i }));
+      await waitFor(() => expect(screen.getByText(GIFT_URL)).toBeInTheDocument());
+      await user.click(screen.getByRole("button", { name: /send a postcard/ }));
+      await user.click(await screen.findByLabelText(/include ben's note/));
+      const { renderPostcardBlob } = await import("../postcardCanvas");
+      await waitFor(() =>
+        expect(vi.mocked(renderPostcardBlob).mock.calls.some((c) => c[0].note !== null)).toBe(true),
+      );
+      const ticked = vi.mocked(renderPostcardBlob).mock.calls.filter((c) => c[0].note !== null);
+      return ticked[ticked.length - 1]![0];
+    }
+
+    it("D13: with the note ticked, the curated game.note wins over the link's note", async () => {
+      const input = await openPostcard({ ...mockGame, note: "this one is for the train" }, "a link-wide note");
+      expect(input.note).toBe("this one is for the train");
+    });
+
+    it("D13: with no curated note, the ticked note is the link's gift_note", async () => {
+      const input = await openPostcard(mockGame, "a link-wide note");
+      expect(input.note).toBe("a link-wide note");
+    });
+
+    it("D6: no canvas toBlob ⇒ no postcard entry at all, the key flow is untouched", async () => {
+      const { canMakePostcards } = await import("../postcardCanvas");
+      vi.mocked(canMakePostcards).mockReturnValue(false);
+      try {
+        const user = userEvent.setup();
+        vi.mocked(claimGame).mockResolvedValue({ kind: "gifted", gift_url: GIFT_URL });
+        render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+        await user.click(screen.getByRole("button", { name: /confirm/i }));
+        await waitFor(() => expect(screen.getByText(GIFT_URL)).toBeInTheDocument());
+        expect(screen.queryByRole("button", { name: /send a postcard/ })).toBeNull();
+      } finally {
+        vi.mocked(canMakePostcards).mockReturnValue(true);
+      }
+    });
+
+    it("D5: the unwrap instant is the client's now at the moment of success", async () => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-10-05T16:30:00Z"));
+      try {
+        const user = userEvent.setup();
+        vi.mocked(claimGame).mockResolvedValue({ kind: "gifted", gift_url: GIFT_URL });
+        render(<ClaimDialog token="tok" game={mockGame} onClose={onClose} onRefresh={onRefresh} />);
+        await user.click(screen.getByRole("button", { name: /confirm/i }));
+        await waitFor(() => expect(screen.getByText(GIFT_URL)).toBeInTheDocument());
+        await user.click(screen.getByRole("button", { name: /send a postcard/ }));
+        const { renderPostcardBlob } = await import("../postcardCanvas");
+        await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalled());
+        expect(vi.mocked(renderPostcardBlob).mock.calls[0]![0].unwrappedAt).toBe("2026-10-05T16:30:00.000Z");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("D9: a postcard link appears only after the key, as a link not a button, and its input never sees the gift url", async () => {
+      const user = userEvent.setup();
+      vi.mocked(claimGame).mockResolvedValue({ kind: "gifted", gift_url: GIFT_URL });
+      render(
+        <ClaimDialog
+          token="tok"
+          game={{ ...mockGame, acquired_at: "2014-03-02T17:00:00Z" }}
+          linkNote="for you ♡"
+          onClose={onClose}
+          onRefresh={onRefresh}
+        />,
+      );
+      expect(screen.queryByText(/send a postcard/)).toBeNull(); // confirm step
+      await user.click(screen.getByRole("button", { name: /confirm/i }));
+      await waitFor(() => expect(screen.getByText(GIFT_URL)).toBeInTheDocument());
+      const entry = screen.getByRole("button", { name: /send a postcard/ });
+      expect(entry.className).toContain("underline");
+      expect(entry.className).not.toContain("bg-give");
+      await user.click(entry);
+      const { renderPostcardBlob } = await import("../postcardCanvas");
+      await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalled());
+      const input = vi.mocked(renderPostcardBlob).mock.calls[0]![0];
+      expect(JSON.stringify(input)).not.toContain("abc123xyz"); // D1 end-to-end: GIFT_URL's key
+      expect(input.title).toBe("Hollow Knight");
+      expect(input.acquiredAt).toBe("2014-03-02T17:00:00Z");
+      expect(input.note).toBeNull(); // D8: off by default even with a linkNote
+    });
+
     it('shows exact gift URL after confirm', async () => {
       const user = userEvent.setup();
       vi.mocked(claimGame).mockResolvedValue({ kind: 'gifted', gift_url: GIFT_URL });

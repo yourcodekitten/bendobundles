@@ -17,6 +17,15 @@ vi.mock("../api", async (importOriginal) => {
 
 import { fetchShelf, NotFound, FetchFailed } from "../api";
 
+vi.mock("../postcardCanvas", async (orig) => ({
+  ...(await orig<typeof import("../postcardCanvas")>()),
+  canMakePostcards: vi.fn(() => true),
+  loadPostcardAssets: vi.fn().mockResolvedValue({ art: null }),
+  paintPostcard: vi.fn(() => true),
+  renderPostcardBlob: vi.fn().mockResolvedValue({ blob: new Blob(["x"], { type: "image/png" }), artUsed: false }),
+}));
+
+
 function renderShelfPage(token = "abc123") {
   return render(
     <MemoryRouter initialEntries={[`/s/${token}`]}>
@@ -33,6 +42,68 @@ const baseShelf: ShelfView = {
 };
 
 describe("ShelfPage", () => {
+  const gift = (id: string, title: string) => ({
+    game_id: id, title, artwork_url: null, unwrapped_at: "2026-10-05T16:00:00Z",
+    gift_note: `note for ${title}`, thank_note: null, acquired_at: "2014-03-02T17:00:00Z",
+  });
+
+  it("D13: ticking the note on a shelf postcard carries that gift's gift_note", async () => {
+    vi.mocked(fetchShelf).mockResolvedValue({ name: "sarah", gifts: [gift("g1", "Celeste")] });
+    renderShelfPage();
+    await userEvent.click(await screen.findByRole("button", { name: /send a postcard/ }));
+    await userEvent.click(await screen.findByLabelText(/include ben's note/));
+    const { renderPostcardBlob } = await import("../postcardCanvas");
+    await waitFor(() =>
+      expect(vi.mocked(renderPostcardBlob).mock.calls.some((c) => c[0].note === "note for Celeste")).toBe(true),
+    );
+  });
+
+  it("one postcard open at a time: opening B closes A, and B's entry toggles it shut", async () => {
+    vi.mocked(fetchShelf).mockResolvedValue({ name: "sarah", gifts: [gift("a", "Celeste"), gift("b", "Hades")] });
+    renderShelfPage();
+    const [a, b] = await screen.findAllByRole("button", { name: /send a postcard/ });
+    await userEvent.click(a!);
+    expect(screen.getAllByRole("img", { name: /postcard of/ })).toHaveLength(1);
+    await userEvent.click(b!);
+    const open = screen.getAllByRole("img", { name: /postcard of/ });
+    expect(open).toHaveLength(1);
+    expect(open[0]).toHaveAccessibleName(/Hades/);
+    await userEvent.click(b!);
+    expect(screen.queryAllByRole("img", { name: /postcard of/ })).toHaveLength(0);
+  });
+
+  it("D6: no canvas toBlob ⇒ the shelf offers no postcard at all", async () => {
+    const { canMakePostcards } = await import("../postcardCanvas");
+    vi.mocked(canMakePostcards).mockReturnValue(false);
+    try {
+      vi.mocked(fetchShelf).mockResolvedValue({ name: "sarah", gifts: [gift("a", "Celeste")] });
+      renderShelfPage();
+      await waitFor(() => screen.getByText("Celeste"));
+      expect(screen.queryByRole("button", { name: /send a postcard/ })).toBeNull();
+    } finally {
+      vi.mocked(canMakePostcards).mockReturnValue(true);
+    }
+  });
+
+  it("each gift offers a postcard carrying its acquired_at and unwrap instant", async () => {
+    vi.mocked(fetchShelf).mockResolvedValue({
+      name: "sarah",
+      gifts: [{
+        game_id: "g1", title: "Stardew Valley", artwork_url: null,
+        unwrapped_at: "2026-10-05T16:00:00Z", gift_note: "for you ♡", thank_note: null,
+        acquired_at: "2014-03-02T17:00:00Z",
+      }],
+    });
+    renderShelfPage();
+    await userEvent.click(await screen.findByRole("button", { name: /send a postcard/ }));
+    const { renderPostcardBlob } = await import("../postcardCanvas");
+    await waitFor(() => expect(renderPostcardBlob).toHaveBeenCalled());
+    expect(vi.mocked(renderPostcardBlob).mock.calls[0]![0]).toEqual({
+      title: "Stardew Valley", artworkUrl: null, note: null,
+      acquiredAt: "2014-03-02T17:00:00Z", unwrappedAt: "2026-10-05T16:00:00Z",
+    });
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -241,7 +312,7 @@ describe("ShelfPage", () => {
     expect(screen.queryByText(/unwrapped/)).not.toBeInTheDocument();
   });
 
-  it("never renders a claim/action affordance — it's a read-only keepsake page", async () => {
+  it("never renders a claim affordance — the postcard entry is its only button", async () => {
     vi.mocked(fetchShelf).mockResolvedValue({
       name: "sarah",
       gifts: [
@@ -257,7 +328,9 @@ describe("ShelfPage", () => {
     });
     renderShelfPage();
     await waitFor(() => screen.getByText("Celeste"));
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    const buttons = screen.queryAllByRole("button");
+    expect(buttons).toHaveLength(1); // OMBB: an empty list would pass .every() vacuously
+    expect(buttons.every((b) => /send a postcard/.test(b.textContent ?? ""))).toBe(true); // only the postcard entry
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
   });
 });
