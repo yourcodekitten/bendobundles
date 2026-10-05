@@ -1,6 +1,6 @@
 # the postcard 🖼️ — spec
 
-*2026-10-05, kitten. Status: v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
+*2026-10-05, kitten. Status: v4 — OMBB's Q3 (infra clear; user activation, D10) + Lilith's staleness catch (D11) integrated. v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
 **decisions** disagree, the decisions win.*
 
 ## why this exists
@@ -61,7 +61,11 @@ a proof. The claim is *"no capability field"*, never *"no capability"*.
 **D2 — art failure degrades, never blocks.** The image loads with `crossOrigin = "anonymous"`.
 Measured 2026-10-05: `shared.akamai.steamstatic.com` → 200 + `access-control-allow-origin: *`;
 `hb.imgix.net` → `access-control-allow-origin: *` — first on a 403 probe, then **re-measured on a
-REAL prod `artwork_url`: 200 `image/png` + `ACAO: *`** (2026-10-05T07:0x-04:00). If the image errors, times out (4s), or the canvas
+REAL prod `artwork_url`: 200 `image/png` + `ACAO: *`** (2026-10-05T07:0x-04:00), **and again WITHOUT an
+`Origin` header: 200 + `ACAO: *`** (OMBB's cached-copy-taint question — the page's plain `<img>` may
+seed the cache our `crossOrigin` load reuses; an unconditional `*` makes that safe). Steamstatic: same,
+measured by OMBB. ⚠️ **Art loads ONLY via `<img crossOrigin="anonymous">`, never `fetch()`** —
+`connect-src` does not list `hb.imgix.net`. If the image errors, times out (4s), or the canvas
 would be tainted (`toBlob` throws `SecurityError`), the card renders with a **drawn placeholder**
 (the house pixel-gift glyph) instead — the postcard still saves. Principle 5.
 
@@ -105,6 +109,25 @@ key block, only once the key is revealed** (never during `celebrating`), with a 
 not a button's** — the key's two buttons stay the only buttons. Saving at the peak of the moment is
 the point; the shelf is the October backup.
 
+**D10 — the tap does nothing but `share` (OMBB, Q3).** `navigator.share` needs **transient user
+activation**; a tap handler that first awaits fonts + art (D2/D3's 4s caps) spends it, and Safari throws
+`NotAllowedError`. ⇒ **fonts and art load ONCE, when the preview opens.** Every later render — including
+D8's toggle — is a **synchronous canvas draw + `toBlob`**, cheap. The tap handler's only await-free work
+is `navigator.share({ files: [file] })` / the anchor click.
+- **`AbortError` = the friend cancelled the sheet. It is NOT a failure: no download fallback, no error
+  copy.** Any OTHER share rejection → fall back to the download path, quietly.
+- No `Permissions-Policy` header is set today, so `web-share` defaults to `self`. **If one is ever
+  added it must carry `web-share=(self)`** — recorded in the CSP comment block in `aws-cloudfront.tf`.
+
+**D11 — a blob is valid only for the input it was rendered from (Lilith, catching D10 against D8).**
+Pre-rendering makes the blob a CACHE, and a cache can be stale: toggle the note off, tap fast, and *"one
+input, an older render"* ships the note the friend just removed. ⇒ the rendered artifact is stored
+**as a pair `{ key, blob }`**, where `key` is a deterministic serialization of the full `PostcardInput`
+(**including** the toggle's effect, i.e. whether `note` is present). Save is **enabled only when
+`artifact.key === keyOf(currentInput)`**; every input change re-renders, and a completion whose key no
+longer matches the current input is **discarded**, never stored. The tap sends `artifact.blob` only
+after re-checking the key in the same synchronous handler.
+
 ## out of scope
 
 - admin-side postcards (the scrapbook is ben's; this is the friend's)
@@ -114,7 +137,7 @@ the point; the shelf is the October backup.
 ## open questions (for the family)
 
 - ~~Q1~~ → **D9** (Lilith). ~~Q2~~ → **D8** + D1's limit (Lilith).
-- **Q3 (infra, OMBB):** anything in the CloudFront/CSP layer that would make `blob:` object-URL downloads
+- ~~Q3~~ → **infra blocks nothing** (OMBB) + D10. Original question: **(infra, OMBB):** anything in the CloudFront/CSP layer that would make `blob:` object-URL downloads
   or `navigator.share` with files misbehave that I would not see from the config alone?
 
 ## success
