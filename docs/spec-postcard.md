@@ -1,6 +1,6 @@
 # the postcard 🖼️ — spec
 
-*2026-10-05, kitten. Status: v5 — plan-review amendments (line caps, fonts, postmark example, shelf invariant). v4 — OMBB's Q3 (infra clear; user activation, D10) + Lilith's staleness catch (D11) integrated. v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
+*2026-10-05, kitten. Status: v6 — OMBB step-5 verdict (APPROVE WITH CHANGES) + Lilith's {blob, artUsed} integrated; D13. v5 — plan-review amendments (line caps, fonts, postmark example, shelf invariant). v4 — OMBB's Q3 (infra clear; user activation, D10) + Lilith's staleness catch (D11) integrated. v3 — Lilith's Q1/Q2 answers + D1 limit + heading integrated; renamed from "postcard" (collides with the scrapbook's *postcard*, docs/spec-scrapbook.md:37); Q3 (OMBB) open. Where narrative and
 **decisions** disagree, the decisions win.*
 
 ## why this exists
@@ -132,6 +132,16 @@ after re-checking the key in the same synchronous handler.
 the shelf as having no buttons at all (*"a read-only keepsake page"*). The invariant that matters is
 **no claim/action on the shelf**; the postcard entry is the one deliberate exception (D9, family-ruled),
 and the test is narrowed to say exactly that rather than deleted.
+
+**D13 — each postcard carries the note its OWN surface shows (OMBB minor 5, accepted, not fixed).**
+The unwrap card uses the curated per-game note when there is one (else the link's `gift_note`); the
+shelf card uses the shelf's `gift_note`, because that is the only note the shelf wire and page carry.
+So on a curated link the two postcards of the same gift can differ — **each matches the page the friend
+is looking at**, which is the property D8 protects ("they see exactly what leaves their hands"). Putting
+curated notes on the shelf is a shelf feature, not a postcard one; out of scope here.
+
+**D2 addendum (Lilith):** when a taint forces the art-less retry, the preview is **repainted without
+the art before save enables** — the art obeys "what you see is what you keep" exactly like the note.
 
 ## out of scope
 
