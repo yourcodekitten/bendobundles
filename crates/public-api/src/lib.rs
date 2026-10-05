@@ -235,6 +235,11 @@ struct ShelfGift {
     unwrapped_at: OffsetDateTime,
     gift_note: Option<String>,
     thank_note: Option<String>,
+    /// 📮 when ben's bundle purchase created this game's order (docs/spec-postcard.md D4);
+    /// read from the Game record assemble_shelf already holds. Absent when unknown —
+    /// formatted exactly like the link wire's GameView.acquired_at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    acquired_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1621,6 +1626,10 @@ async fn assemble_shelf(
             unwrapped_at: c.created_at,
             gift_note,
             thank_note,
+            acquired_at: game.acquired_at.and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            }),
         });
     }
     gifts.sort_by_key(|g| g.unwrapped_at);

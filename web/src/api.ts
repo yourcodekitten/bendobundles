@@ -56,6 +56,8 @@ export type ShelfGiftView = {
   unwrapped_at: string;
   gift_note: string | null;
   thank_note: string | null;
+  /** 📮 rfc3339 instant ben's bundle order was created; absent when unknown (postcard D4). */
+  acquired_at?: string;
 };
 
 export type ShelfView = {
