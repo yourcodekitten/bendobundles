@@ -71,6 +71,9 @@ export function AdminApp() {
         <NavLink to="/admin/scrapbook" className={navLinkClass}>
           scrapbook
         </NavLink>
+        <NavLink to="/admin/almanac" className={navLinkClass}>
+          almanac
+        </NavLink>
         <NavLink to="/admin/ops" className={navLinkClass}>
           ops
         </NavLink>

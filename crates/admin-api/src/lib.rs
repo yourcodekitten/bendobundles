@@ -337,6 +337,14 @@ struct CatalogGameView {
     owned_by_ben: bool,
     /// Provenance of `hidden` — "sync" rows get the "auto-hidden: adult content" label (#71).
     hidden_source: Option<domain::HiddenSource>,
+    /// 📮 the postmark (spec-almanac D3): when ben's order was created. Same serde shape as
+    /// the domain field — rfc3339, and ABSENT (not null) when unknown, so the almanac reads
+    /// absence as "no postmark" (falls through to name-month/undated).
+    #[serde(
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    acquired_at: Option<time::OffsetDateTime>,
     steam: Option<SteamSummaryView>,
 }
 
@@ -397,6 +405,28 @@ fn steam_summary(cache: &dynamo::SteamAppCache) -> Option<SteamSummaryView> {
     })
 }
 
+/// One projection for every admin game row (catalog list AND detail) — so a field added
+/// here reaches both endpoints, and a third call site cannot drift (almanac review B1).
+fn catalog_view(g: domain::Game, steam: Option<SteamSummaryView>) -> CatalogGameView {
+    CatalogGameView {
+        steam,
+        id: g.id,
+        title: g.title,
+        bundle: g.bundle,
+        key_type: g.key_type,
+        giftable: g.giftable,
+        hidden: g.hidden,
+        status: g.status,
+        claim_id: g.claim_id,
+        artwork_url: g.artwork_url,
+        requires_choice: g.requires_choice,
+        steam_app_id: g.steam_app_id,
+        owned_by_ben: g.owned_by_ben,
+        hidden_source: g.hidden_source,
+        acquired_at: g.acquired_at,
+    }
+}
+
 async fn handle_catalog(State(s): State<AppState>) -> Response {
     match s.store.list_all_games().await {
         Ok(games) => {
@@ -414,24 +444,12 @@ async fn handle_catalog(State(s): State<AppState>) -> Response {
                 .unwrap_or_default();
             let views: Vec<CatalogGameView> = games
                 .into_iter()
-                .map(|g| CatalogGameView {
-                    steam: g
+                .map(|g| {
+                    let steam = g
                         .steam_app_id
                         .and_then(|id| caches.get(&id))
-                        .and_then(steam_summary),
-                    id: g.id,
-                    title: g.title,
-                    bundle: g.bundle,
-                    key_type: g.key_type,
-                    giftable: g.giftable,
-                    hidden: g.hidden,
-                    status: g.status,
-                    claim_id: g.claim_id,
-                    artwork_url: g.artwork_url,
-                    requires_choice: g.requires_choice,
-                    steam_app_id: g.steam_app_id,
-                    owned_by_ben: g.owned_by_ben,
-                    hidden_source: g.hidden_source,
+                        .and_then(steam_summary);
+                    catalog_view(g, steam)
                 })
                 .collect();
             (StatusCode::OK, Json(views)).into_response()
@@ -540,22 +558,7 @@ async fn handle_game_detail(State(s): State<AppState>, Path(id): Path<String>) -
         None => serde_json::Value::Null,
     };
 
-    let game_view = CatalogGameView {
-        steam: cache.as_ref().and_then(steam_summary),
-        id: game.id,
-        title: game.title,
-        bundle: game.bundle,
-        key_type: game.key_type,
-        giftable: game.giftable,
-        hidden: game.hidden,
-        status: game.status,
-        claim_id: game.claim_id,
-        artwork_url: game.artwork_url,
-        requires_choice: game.requires_choice,
-        steam_app_id: game.steam_app_id,
-        owned_by_ben: game.owned_by_ben,
-        hidden_source: game.hidden_source,
-    };
+    let game_view = catalog_view(game, cache.as_ref().and_then(steam_summary));
 
     (
         StatusCode::OK,
@@ -1701,5 +1704,47 @@ mod friend_name_sanitize_tests {
         // mirrors sanitize_note's ordering: sanitize runs BEFORE the emptiness check
         // in the handlers, so an all-invisible name is refused as empty, not stored.
         assert_eq!(sanitize_line("\u{202E}\u{200B}").trim(), "");
+    }
+}
+
+#[cfg(test)]
+mod catalog_view_tests {
+    use super::*;
+
+    fn game() -> domain::Game {
+        domain::Game {
+            id: "gk:mn".into(),
+            title: "t".into(),
+            bundle: "b".into(),
+            gamekey: "gk".into(),
+            machine_name: "mn".into(),
+            key_type: "steam".into(),
+            giftable: true,
+            hidden: false,
+            status: domain::GameStatus::Available,
+            claim_id: None,
+            artwork_url: None,
+            keyindex: 0,
+            requires_choice: false,
+            steam_app_id: None,
+            appid_source: None,
+            owned_by_ben: false,
+            hidden_source: None,
+            acquired_at: None,
+        }
+    }
+
+    /// 📜 almanac D3: present when known; an ABSENT key (never null) when unknown.
+    #[test]
+    fn catalog_view_carries_acquired_at_and_omits_it_when_unknown() {
+        let mut g = game();
+        g.acquired_at = Some(time::macros::datetime!(2013-03-27 18:22:58 UTC));
+        let v = serde_json::to_value(catalog_view(g.clone(), None)).unwrap();
+        assert_eq!(v["acquired_at"], "2013-03-27T18:22:58Z");
+        let v = serde_json::to_value(catalog_view(game(), None)).unwrap();
+        assert!(
+            v.as_object().unwrap().get("acquired_at").is_none(),
+            "unknown must be an ABSENT key, not null: {v}"
+        );
     }
 }

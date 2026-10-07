@@ -358,6 +358,29 @@ describe("GameDetailModal", () => {
     });
   });
 
+  it("admin mount shows the 📮 postmark once the catalog sends acquired_at (almanac D3 side effect)", async () => {
+    // spec-almanac D3: the admin catalog now SENDS acquired_at, which lights this
+    // pre-existing render on the admin mount. Pinned so a refactor cannot drop it.
+    const dated: AdminGame = { ...adminGame, acquired_at: "2013-03-27T18:22:58Z" };
+    vi.mocked(adminGameDetail).mockResolvedValue({ game: dated, steam: null });
+
+    render(
+      <GameDetailModal
+        mount="admin"
+        game={dated}
+        onClose={vi.fn()}
+        armedId={null}
+        claiming={null}
+        onSelfClaim={vi.fn()}
+        adminSteamId={null}
+        selfClaimResult={null}
+        loadDetail={adminLoadDetail}
+      />,
+    );
+
+    expect(await screen.findByText(/📮.*mar 2013/)).toBeInTheDocument();
+  });
+
   it("admin mount shows status badge", async () => {
     vi.mocked(adminGameDetail).mockResolvedValue({
       game: adminGame,

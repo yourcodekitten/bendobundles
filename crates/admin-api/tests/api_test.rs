@@ -1880,6 +1880,39 @@ async fn catalog_exposes_requires_choice() {
     assert_eq!(game["requires_choice"], true);
 }
 
+/// 📜 almanac D3 end-to-end through the real route + dynamo round-trip (CI: dynamodb-local).
+#[tokio::test]
+async fn catalog_carries_acquired_at_when_known_and_omits_it_when_unknown() {
+    let (app, store, _) = test_app_with_call_invoker(
+        "catalog_carries_acquired_at_when_known_and_omits_it_when_unknown",
+        FulfillResponse::RevealedKey {
+            key: "unused".into(),
+        },
+    )
+    .await;
+    let mut dated = sample_game("gkA:mnA");
+    dated.acquired_at = Some(time::macros::datetime!(2013-03-27 18:22:58 UTC));
+    store.put_game(&dated).await.unwrap();
+    store.put_game(&sample_game("gkU:mnU")).await.unwrap();
+
+    let resp = authed_get(&app, "/admin/api/catalog").await;
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = body_json(resp).await;
+    let rows = body.as_array().unwrap();
+    let find = |id: &str| {
+        rows.iter()
+            .find(|g| g["id"] == id)
+            .unwrap_or_else(|| panic!("{id} must be in catalog"))
+            .clone()
+    };
+    assert_eq!(find("gkA:mnA")["acquired_at"], "2013-03-27T18:22:58Z");
+    let undated = find("gkU:mnU");
+    assert!(
+        undated.as_object().unwrap().get("acquired_at").is_none(),
+        "unknown must be an ABSENT key, not null: {undated}"
+    );
+}
+
 /// The gift-claims surface (GET /admin/api/links/:token/claims → AdminClaimView) must NEVER
 /// expose gift_url or revealed_key — raw-JSON substring check, not a typed parse.
 /// Regression guard: a new SelfClaimView with revealed_key must not bleed into this endpoint.
