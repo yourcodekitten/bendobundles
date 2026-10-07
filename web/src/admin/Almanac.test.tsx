@@ -121,11 +121,59 @@ describe('Almanac', () => {
     expect(within(e).getByTitle('gone').querySelector('div[aria-hidden="true"]')).not.toBeNull();
   });
 
-  it('shows a retry on load failure', async () => {
-    vi.mocked(adminCatalog).mockRejectedValue(new Error('boom'));
+  it('retry actually reloads (review 2: T12 survived an existence-only check)', async () => {
+    vi.mocked(adminCatalog).mockRejectedValueOnce(new Error('boom')).mockResolvedValueOnce(fixture);
     renderPage();
     expect(await screen.findByText("couldn't open the almanac — try again")).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'retry' })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'retry' }));
+    expect(await screen.findByText('14 years of the attic, month by month.')).toBeInTheDocument();
+    expect(vi.mocked(adminCatalog)).toHaveBeenCalledTimes(2);
+  });
+
+  it('lit entries are raised, quiet ones flat (review 2: T1 survived)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue(fixture);
+    renderPage();
+    expect(await screen.findByRole('article', { name: /september 2026/ })).toHaveClass('bg-shelf');
+    const quiet = screen.getByRole('article', { name: /Humble Indie Bundle 8/ });
+    expect(quiet).toHaveClass('bg-floor');
+    expect(quiet).not.toHaveClass('bg-shelf');
+  });
+
+  it('an undated entry says so: 📦 and "no date known" (review 2: T2/T3 survived)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue(fixture);
+    renderPage();
+    const undated = await screen.findByRole('article', { name: /Mystery Box/ });
+    expect(within(undated).getByText('📦')).toBeInTheDocument();
+    expect(within(undated).getByText('no date known')).toHaveClass('sr-only');
+  });
+
+  it('renders months newest-first inside a year (review 2: T8 survived)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([
+      game({ id: 'a:1', bundle: 'March 2020' }),
+      game({ id: 'b:1', bundle: 'July 2020' }),
+    ]);
+    renderPage();
+    await screen.findByRole('heading', { level: 3, name: 'july' });
+    expect(screen.getAllByRole('heading', { level: 3 }).map((h) => h.textContent)).toEqual(['july', 'march']);
+  });
+
+  it('heading levels never skip: undated entries are h3 under the undated h2 (review 2, MINOR-1)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue(fixture);
+    renderPage();
+    const undated = await screen.findByRole('article', { name: /Mystery Box/ });
+    expect(within(undated).getByRole('heading', { level: 3 })).toHaveTextContent('Mystery Box');
+    const dated = screen.getByRole('article', { name: /september 2026/ });
+    expect(within(dated).getByRole('heading', { level: 4 })).toHaveTextContent('september 2026');
+  });
+
+  it('the unparsed-picks line sits in the header beside N, never as the undated shelf preface (review 2, MINOR-2)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([
+      ...fixture,
+      game({ id: 'r:1', bundle: 'Choice: Renamed', requires_choice: true }),
+    ]);
+    renderPage();
+    const line = await screen.findByText("⚠️ 1 choice pick whose month we couldn't read");
+    expect(line.closest('header')).not.toBeNull();
   });
 
   it('dims a hidden thumb but keeps it in the strip (D6)', async () => {

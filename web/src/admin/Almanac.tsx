@@ -49,7 +49,10 @@ function Thumb({ g }: { g: AdminGame }) {
   );
 }
 
-function Entry({ e, onWrap }: { e: AlmanacEntry; onWrap: (e: AlmanacEntry) => void }) {
+// heading level follows where the entry sits — h4 under a month's h3, h3 directly on the
+// undated shelf's h2 — so the outline never skips a level (review 2)
+function Entry({ e, onWrap, level }: { e: AlmanacEntry; onWrap: (e: AlmanacEntry) => void; level: 3 | 4 }) {
+  const Heading = level === 3 ? 'h3' : 'h4';
   const lit = e.waiting.length > 0;
   const shown = e.games.slice(0, STRIP_MAX);
   const more = e.games.length - shown.length;
@@ -62,7 +65,7 @@ function Entry({ e, onWrap }: { e: AlmanacEntry; onWrap: (e: AlmanacEntry) => vo
       <div className="flex flex-wrap items-baseline gap-2">
         <span aria-hidden="true">{GLYPH[e.source]}</span>
         <span className="sr-only">{SOURCE_SR[e.source]}</span>
-        <h4 className="font-medium text-ink">{e.label}</h4>
+        <Heading className="font-medium text-ink">{e.label}</Heading>
         <span className="text-sm text-dust">{countLine(e)}</span>
         {lit && (
           <button
@@ -79,7 +82,8 @@ function Entry({ e, onWrap }: { e: AlmanacEntry; onWrap: (e: AlmanacEntry) => vo
       <div className="flex flex-wrap items-center gap-2">
         {shown.map((g) => (
           <span key={g.id} title={g.title} className={g.hidden ? 'opacity-40' : undefined}>
-            <Thumb g={g} />
+            {/* keyed on the ladder itself: a changed source list restarts at rung 0 */}
+            <Thumb key={thumbSrcs(g).join('|')} g={g} />
           </span>
         ))}
         {more > 0 && <span className="text-sm text-dust">+{more}</span>}
@@ -134,6 +138,13 @@ export function Almanac({ currentYear = new Date().getUTCFullYear() }: { current
         <h1 className="text-xl font-medium text-ink">📜 the almanac</h1>
         <p className="text-ink-soft">{subtitle(almanac)}</p>
         {line && <p className="font-medium text-ink">{line}</p>}
+        {/* beside N, which counts these picks — an unparsed pick may still be DATED by a
+            postmark, so it is never the undated shelf's preface (reviews 1 + 2) */}
+        {unparsed > 0 && (
+          <p className="text-sm text-ink">
+            {`⚠️ ${unparsed} choice ${unparsed === 1 ? 'pick' : 'picks'} whose month we couldn't read`}
+          </p>
+        )}
       </header>
 
       {almanac.years.map((y) => (
@@ -144,7 +155,7 @@ export function Almanac({ currentYear = new Date().getUTCFullYear() }: { current
               <h3 className="w-24 flex-shrink-0 text-sm font-normal text-dust">{MONTH_NAMES[m.month]}</h3>
               <div className="flex min-w-0 flex-1 flex-col gap-2">
                 {m.entries.map((e) => (
-                  <Entry key={e.key} e={e} onWrap={wrap} />
+                  <Entry key={e.key} e={e} onWrap={wrap} level={4} />
                 ))}
               </div>
             </div>
@@ -152,19 +163,12 @@ export function Almanac({ currentYear = new Date().getUTCFullYear() }: { current
         </section>
       ))}
 
-      {/* an unparsed pick may still be DATED by a postmark, so its line never sits under
-          "the attic doesn't know when these arrived" (review 1) — it lives on its own */}
-      {unparsed > 0 && (
-        <p className="text-sm text-ink">
-          {`⚠️ ${unparsed} choice ${unparsed === 1 ? 'pick' : 'picks'} whose month we couldn't read`}
-        </p>
-      )}
       {almanac.undated.length > 0 && (
         <section className="flex flex-col gap-3">
           <h2 className="border-b border-line pb-1 text-lg text-ink">undated</h2>
           <p className="text-sm text-dust">the attic doesn't know when these arrived.</p>
           {almanac.undated.map((e) => (
-            <Entry key={e.key} e={e} onWrap={wrap} />
+            <Entry key={e.key} e={e} onWrap={wrap} level={3} />
           ))}
         </section>
       )}

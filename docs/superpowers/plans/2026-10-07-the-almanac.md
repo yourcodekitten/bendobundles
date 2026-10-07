@@ -8,6 +8,12 @@
 
 **Tech Stack:** Rust (axum, serde, `time` 0.3 with the `serde`/`macros` features), React 19 + react-router, Tailwind v4 theme tokens, vitest + Testing Library.
 
+> ⚠️ **ERRATA (post-execution, review 2): this plan is the AS-PLANNED record, not the as-built one.** It still names
+> `capsule_616x353` (built: `capsule_231x87`), entry `<h3>` (built: h4 under a month, h3 on the undated shelf), a single
+> `thumbSrc` (built: a `thumbSrcs` ladder), and a test asserting the undated shelf renders for an unparsed dated pick (built: the
+> opposite; the ⚠️ line lives in the header). Also built, not planned: the same-label-within-a-month merge (spec D1 ②a). Where they
+> differ, **the code and `docs/spec-almanac.md` are the truth.**
+
 **Spec:** `docs/spec-almanac.md` (v2, `d362c58`). **Plan v2:** a cold plan review (fresh subagent, real repo, every web test block run in a scratch copy: T2 12/12, T3 17/17, T4 7/7 + 14/14 green) found 3 blockers and 4 majors. All are integrated below and marked *(review B1…)*. Read it before any task; where this plan and the spec disagree, the spec's **decisions** win.
 
 ## Global Constraints

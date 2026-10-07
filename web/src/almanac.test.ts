@@ -149,10 +149,11 @@ describe('buildAlmanac', () => {
   it('dates an order by its EARLIEST valid acquired_at and keeps its undated siblings with it', () => {
     const a = buildAlmanac(
       [
+        // junk FIRST: it must never become the anchor (review 2, mutant A4 survived with junk last)
+        game({ id: 'k1:d', bundle: 'B', acquired_at: 'junk' }),
         game({ id: 'k1:a', bundle: 'B', acquired_at: '2015-06-02T00:00:00Z' }),
         game({ id: 'k1:b', bundle: 'B', acquired_at: '2015-04-02T00:00:00Z' }),
         game({ id: 'k1:c', bundle: 'B' }),
-        game({ id: 'k1:d', bundle: 'B', acquired_at: 'junk' }),
       ],
       Y,
     );
@@ -168,6 +169,25 @@ describe('buildAlmanac', () => {
     );
     expect(a.years[0]!.year).toBe(2017);
     expect(a.years[0]!.months[0]!.entries[0]!.source).toBe('postmark');
+  });
+
+  it('undated stays grouped by ORDER, never merged by name, and sorted by label (review 2: A11, A7 survived)', () => {
+    const a = buildAlmanac(
+      [
+        game({ id: 'k2:b', bundle: 'A very special gift just for you' }),
+        game({ id: 'z:1', bundle: 'Zeta' }),
+        game({ id: 'k1:a', bundle: 'A very special gift just for you' }),
+        game({ id: 'm:1', bundle: 'alpha' }),
+      ],
+      Y,
+    );
+    expect(a.undated.map((e) => e.key)).toEqual(['order:k1', 'order:k2', 'order:m', 'order:z']);
+    expect(a.undated.map((e) => e.label)).toEqual([
+      'A very special gift just for you',
+      'A very special gift just for you',
+      'alpha',
+      'Zeta',
+    ]);
   });
 
   it('never invents a date: no name-month and no postmark ⇒ the undated shelf', () => {

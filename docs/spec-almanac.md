@@ -71,16 +71,17 @@ that reads like a year-by-year almanac:
 ── 2013 ──────────────────────────────────────────────
    march      📮 Humble Indie Bundle 8 · 7 treasures · all given or kept ♡   ← postmark label = the bundle name, verbatim
    ...
-── undated ───────────────────────────────────────────
-   the attic doesn't know when these arrived.
-   ⚠️ 3 choice picks whose month we couldn't read    ← only when a Choice pick's name didn't parse
+── undated ───────────────────────────────────────────   ← only when an entry has no date at all
+   the attic doesn't know when these arrived.            (prod 2026-10-07: none — all 1134 dated)
+   (the ⚠️ unparsed-picks line is NOT here: it sits in the header beside N, see D5)
 ```
 
 - **Years are dividers, months are rows, bundles are entries.** Newest year first: Ben opens it to
   remember *recent* forgetting, then scrolls back through time. (Q2.)
 - Each entry: provenance glyph + label, a count line in the attic voice, and an art strip of its
   games (≤ 8 thumbs, the rest as `+N`). Thumb source order: `artwork_url` → the steam capsule by
-  `steam_app_id` (the exact URL shape `GameGrid.tsx:77` already ships) → the catalog's
+  `steam_app_id` (GameGrid's URL shape, but the **`capsule_231x87`** variant: same availability and
+  ~7.8x fewer bytes over a measured sample; each load error steps down this ladder) → the catalog's
   `titleColorClass` block. CSP is unchanged (`*.steamstatic.com` and `hb.imgix.net` are already in
   `img-src`). Thumbs are **static**: `GameDetailModal`'s admin mount carries the whole self-claim
   apparatus (`Catalog.tsx:336-345`), and re-plumbing that into a second page is out of scope (v1 said
@@ -154,12 +155,12 @@ no ICU (`postmark.ts`'s twelve-strings rule). The page component only renders.
 **D5 — the headline is a sentence, and it is conditional.** *"N choice picks still waiting, across M
 months — never spent."* **N = every game with `requires_choice && is_listable`, WHATEVER its date
 source** (OMBB: counting only name-dated picks means a Humble rename silently *shrinks* N with no
-error). M = distinct name-months among those N. If some of the N didn't date by name, the undated
-shelf names them: *"⚠️ K choice picks whose month we couldn't read"* (a pick that fails the name-month but carries a
+error). M = distinct name-months among those N. If some of the N didn't date by name, **the header
+names them, directly under the headline**: *"⚠️ K choice picks whose month we couldn't read"* (a pick that fails the name-month but carries a
 postmark IS dated, so "couldn't date" would be false for it; plan-review wording, back-ported). A regex miss then becomes a **visible
-line**, not a smaller number. That line stands **on its own**, never under the undated shelf's
-*"the attic doesn't know when these arrived"*, because an unparsed pick with a postmark IS dated
-(review 1). N = 0 ⇒ the line is omitted (no *"0 picks waiting"*). The subtitle's
+line**, not a smaller number. It sits beside N (which counts these picks), **never** as the undated
+shelf's preface under *"the attic doesn't know when these arrived"*, because an unparsed pick with a
+postmark IS dated (reviews 1 + 2). N = 0 ⇒ the line is omitted (no *"0 picks waiting"*). The subtitle's
 *"N years"* = `newestDatedYear − oldestDatedYear + 1`, derived and never typed (OMBB: typed, it
 rots the first January after shipping); no dated years ⇒ the subtitle drops the count. No metric
 cards anywhere (PRODUCT.md anti-reference: SaaS dashboard chrome).
