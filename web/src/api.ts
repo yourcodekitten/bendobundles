@@ -104,10 +104,9 @@ export type AdminGame = {
   id: string;
   title: string;
   bundle: string;
-  /** 📮 rfc3339 acquisition instant. The admin payload does NOT currently send
-   *  this (spec docs/spec-postmark.md non-goal: no admin surface change) — typed
-   *  optional so the shared modal's postmark rendering typechecks across the
-   *  union; absent ⇒ exactly the today-state, on admin as everywhere. */
+  /** 📮 rfc3339 acquisition instant — sent by the admin catalog AND game-detail
+   *  endpoints when known (spec-almanac D3); ABSENT when unknown, and absent from an
+   *  old lambda during a deploy window. Absent ⇒ exactly the today-state. */
   acquired_at?: string;
   key_type: string;
   giftable: boolean;

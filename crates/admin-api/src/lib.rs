@@ -337,6 +337,14 @@ struct CatalogGameView {
     owned_by_ben: bool,
     /// Provenance of `hidden` — "sync" rows get the "auto-hidden: adult content" label (#71).
     hidden_source: Option<domain::HiddenSource>,
+    /// 📮 the postmark (spec-almanac D3): when ben's order was created. Same serde shape as
+    /// the domain field — rfc3339, and ABSENT (not null) when unknown, so the almanac reads
+    /// absence as "no postmark" (falls through to name-month/undated).
+    #[serde(
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    acquired_at: Option<time::OffsetDateTime>,
     steam: Option<SteamSummaryView>,
 }
 
@@ -415,6 +423,7 @@ fn catalog_view(g: domain::Game, steam: Option<SteamSummaryView>) -> CatalogGame
         steam_app_id: g.steam_app_id,
         owned_by_ben: g.owned_by_ben,
         hidden_source: g.hidden_source,
+        acquired_at: g.acquired_at,
     }
 }
 
