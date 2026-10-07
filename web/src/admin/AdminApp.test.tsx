@@ -67,12 +67,13 @@ describe('AdminApp layout', () => {
     vi.mocked(adminStatus).mockResolvedValue(noSyncStatus);
   });
 
-  it('renders nav links for catalog, links, friends, scrapbook, and ops', () => {
+  it('renders nav links for catalog, links, friends, scrapbook, almanac, and ops', () => {
     renderAdminWithChild(<div>catalog content</div>);
     expect(screen.getByRole('link', { name: /catalog/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /^links$/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /friends/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /scrapbook/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: /almanac/i })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /ops/i })).toBeInTheDocument();
   });
 

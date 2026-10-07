@@ -9,6 +9,7 @@ import { Catalog } from './admin/Catalog';
 import { Links } from './admin/Links';
 import { Friends } from './admin/Friends';
 import { Scrapbook } from './admin/Scrapbook';
+import { Almanac } from './admin/Almanac';
 import { Ops } from './admin/Ops';
 
 function App() {
@@ -28,6 +29,7 @@ function App() {
           <Route path="links" element={<Links />} />
           <Route path="friends" element={<Friends />} />
           <Route path="scrapbook" element={<Scrapbook />} />
+          <Route path="almanac" element={<Almanac />} />
           <Route path="ops" element={<Ops />} />
         </Route>
 
