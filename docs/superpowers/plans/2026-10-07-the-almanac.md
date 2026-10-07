@@ -21,7 +21,7 @@
 - Thumb URL for a steam app: `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${id}/capsule_616x353.jpg` (already shipped in `GameGrid.tsx:77`, already allowed by CSP `img-src *.steamstatic.com`).
 - No `Date.now()` or locale calls inside `almanac.ts`; `currentYear` is a parameter. No `toLocaleString`/`Intl` (postmark.ts's no-ICU rule).
 - Tests never depend on the real clock.
-- CI's exact web chain, run from `web/`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`. Rust: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace` (the admin-api tests need dynamodb-local, so locally they print `SKIP` and CI is the real run).
+- CI's exact web chain, run from `web/`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`. Rust: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace`. **NO LOCAL CARGO, by anyone (OMBB's step-5 condition, `1557353989245239363`):** a `cargo test` link on this box (concurrent `ld`) parked three tenants on 09-30, and `nice` does not bound memory. The admin-api integration tests also **panic** locally without `DYNAMODB_LOCAL_URL`; they don't skip. ⇒ **every Rust red and green is read from the CI log on the draft PR.**
 - Commits are GPG-signed (`git commit -S`) as `code kitten <yourcodekitten@gmail.com>`.
 - **The Button Burgundy Rule** (`DESIGN.md:153`): burgundy (`*-give*`) only where giving/claiming happens, never as ambient decoration, never above 10% of a screen. ⇒ the almanac uses **no** `give` tokens. Its "wrap these →" uses `bg-control`, exactly like the catalog's own "wrap these into a link" (`Catalog.tsx:296-303`). *(review minor)*
 - **Shared box:** 2 cores, seven tenants. Run local test/lint/build commands under `nice -n 15`, one at a time, never in parallel. CI is the authority.
@@ -97,7 +97,7 @@ and the one in `handle_game_detail` with:
     let game_view = catalog_view(game, cache.as_ref().and_then(steam_summary));
 ```
 
-(If `cache` or `game` is used after that line in `handle_game_detail`, keep the borrow order as it is: `game` is moved here exactly as the old literal moved its fields. `cargo check -p admin-api` will say so.)
+(If `cache` or `game` is used after that line in `handle_game_detail`, keep the borrow order as it is: `game` is moved here exactly as the old literal moved its fields. CI's build on the draft PR will say so. Do not run cargo locally.)
 
 Then append the test module to the end of `lib.rs`:
 
@@ -145,7 +145,17 @@ mod catalog_view_tests {
 }
 ```
 
-- [ ] **Step 2: Run, expect FAIL for the RIGHT reason.** `nice -n 15 cargo test -p admin-api --lib catalog_view_tests`. Expected: it compiles (the refactor is behaviour-identical) and **fails the first `assert_eq!`** with left `Null`, right `"2013-03-27T18:22:58Z"`. A compile error is **not** this red. Fix it and re-run until the failure is that assertion.
+- [ ] **Step 2: Commit the red, open the DRAFT PR, read the red FROM CI** (no local cargo, see Global Constraints).
+
+```bash
+git add crates/admin-api/src/lib.rs
+git commit -S -m "📜 red: catalog_view constructor + acquired_at test (almanac D3)"
+git push
+gh pr create -R yourcodekitten/bendobundles --draft --head kitten/almanac --base main \
+  --title "📜 the almanac" --body "draft — the almanac (docs/spec-almanac.md). body filled at PR-up."
+```
+
+Wait for the Rust job (`~/code-kitten/ops/branch-green.sh yourcodekitten/bendobundles kitten/almanac`, which reads the runs endpoint). Expected: `fmt`/`clippy` pass (the refactor is behaviour-identical), and `catalog_view_tests::catalog_view_carries_acquired_at_and_omits_it_when_unknown` **FAILS on the first `assert_eq!`** (left `Null`) in the test log. A compile error or a clippy failure is **not** this red: fix it, push, and read again.
 
 - [ ] **Step 3: Implement.** In `CatalogGameView`, after `hidden_source`:
 
@@ -219,19 +229,17 @@ Add the declared-side-effect test to `web/src/GameDetailModal.test.tsx`. Use **i
 
 (This one is green on arrival: the modal already handles the field. It pins the side effect so a future refactor can't silently drop it.)
 
-- [ ] **Step 4: Verify.** `nice -n 15 cargo test -p admin-api --lib catalog_view_tests` gives PASS. Then `cargo fmt --check` (if `rustfmt` isn't on PATH locally, rely on CI's `cargo fmt --check` and say so; don't skip silently), `nice -n 15 cargo clippy -p admin-api --all-targets -- -D warnings`, and `nice -n 15 npx vitest run src/GameDetailModal.test.tsx` from `web/`.
+- [ ] **Step 4: Verify the web half locally.** `nice -n 15 npx vitest run src/GameDetailModal.test.tsx` from `web/`. PASS.
 
-- [ ] **Step 5: Commit, push, open the DRAFT PR** *(review M2: CI runs only on `pull_request`)*
+- [ ] **Step 5: Commit, push, read GREEN from CI**
 
 ```bash
 git add crates/admin-api/src/lib.rs crates/admin-api/tests/api_test.rs web/src/api.ts web/src/GameDetailModal.test.tsx
-git commit -S -m "📜 admin catalog + detail carry acquired_at when known (almanac D3), one catalog_view constructor"
+git commit -S -m "📜 admin catalog + detail carry acquired_at when known (almanac D3)"
 git push
-gh pr create -R yourcodekitten/bendobundles --draft --head kitten/almanac --base main \
-  --title "📜 the almanac" --body "draft — the almanac (docs/spec-almanac.md). body filled at PR-up."
 ```
 
-Then watch CI for the head with `~/code-kitten/ops/branch-green.sh yourcodekitten/bendobundles kitten/almanac` (it reads the runs endpoint, never the rollup). The integration test must show `catalog_carries_acquired_at_when_known_and_omits_it_when_unknown ... ok` in the Rust job log.
+Expected in the CI Rust job log: `catalog_view_carries_acquired_at_and_omits_it_when_unknown ... ok` **and** `catalog_carries_acquired_at_when_known_and_omits_it_when_unknown ... ok`, with fmt and clippy green.
 
 ---
 
