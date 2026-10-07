@@ -75,7 +75,8 @@ describe('Almanac', () => {
     ]);
     renderPage();
     const named = await screen.findByRole('article', { name: /september 2026/ });
-    await userEvent.click(within(named).getByRole('button', { name: /wrap the 2 waiting/ }));
+    // label-in-name (WCAG 2.5.3, review 1 MINOR-2): the accessible name STARTS with the visible text
+    await userEvent.click(within(named).getByRole('button', { name: /^wrap these: 2 waiting from september 2026/ }));
     expect(JSON.parse(screen.getByTestId('picked').textContent ?? 'null')).toEqual({
       picked: [
         { id: 'p:1', title: 'pick one', requiresChoice: true },
@@ -138,12 +139,36 @@ describe('Almanac', () => {
     expect(within(e).getByTitle('tucked').className).toContain('opacity-40');
   });
 
-  it('renders the undated shelf when ONLY an unparsed dated pick exists', async () => {
+  it('names an unparsed-but-DATED pick without claiming the attic does not know when it arrived (review 1, MINOR-6)', async () => {
     vi.mocked(adminCatalog).mockResolvedValue([
       game({ id: 'r:1', bundle: 'Choice: Renamed', requires_choice: true, acquired_at: '2024-02-02T00:00:00Z' }),
     ]);
     renderPage();
-    expect(await screen.findByRole('heading', { level: 2, name: 'undated' })).toBeInTheDocument();
-    expect(screen.getByText("⚠️ 1 choice pick whose month we couldn't read")).toBeInTheDocument();
+    expect(await screen.findByText("⚠️ 1 choice pick whose month we couldn't read")).toBeInTheDocument();
+    expect(screen.queryByText(/the attic doesn't know when these arrived/)).toBeNull();
+    expect(screen.queryByRole('heading', { level: 2, name: 'undated' })).toBeNull();
+  });
+
+  it('a failed humble artwork still tries the steam capsule before the colour block (review 1, MINOR-3)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([
+      game({ id: 'p:1', bundle: 'May 2022', title: 'ladder', artwork_url: 'https://hb.imgix.net/a.png', steam_app_id: 5 }),
+    ]);
+    renderPage();
+    const e = await screen.findByRole('article', { name: /may 2022/ });
+    fireEvent.error(e.querySelector('img')!);
+    expect(e.querySelector('img')!.getAttribute('src')).toContain('/apps/5/capsule_231x87.jpg');
+    fireEvent.error(e.querySelector('img')!);
+    expect(e.querySelector('img')).toBeNull();
+  });
+
+  it('months are headings and each entry says its date source to a screen reader (review 1, NIT-2/NIT-3)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue(fixture);
+    renderPage();
+    expect(await screen.findByRole('heading', { level: 3, name: 'september' })).toBeInTheDocument();
+    const named = screen.getByRole('article', { name: /september 2026/ });
+    expect(within(named).getByRole('heading', { level: 4 })).toHaveTextContent('september 2026');
+    expect(within(named).getByText('dated by its name')).toHaveClass('sr-only');
+    const posted = screen.getByRole('article', { name: /Humble Indie Bundle 8/ });
+    expect(within(posted).getByText('dated by its postmark')).toHaveClass('sr-only');
   });
 });

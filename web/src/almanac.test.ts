@@ -9,6 +9,7 @@ import {
   orderKey,
   subtitle,
   thumbSrc,
+  thumbSrcs,
   type AlmanacEntry,
 } from './almanac';
 
@@ -67,14 +68,21 @@ describe('orderKey / thumbSrc', () => {
     expect(orderKey(game({ id: 'zApDsS:wingspan_steam' }))).toBe('zApDsS');
     expect(orderKey(game({ id: 'no-colon' }))).toBe('no-colon');
   });
-  it('thumbSrc prefers artwork, then the steam capsule, else null', () => {
+  it('thumbSrc prefers artwork, then the SMALL steam capsule (231x87: ~7.8x fewer bytes, measured), else null', () => {
     expect(thumbSrc(game({ artwork_url: 'https://hb.imgix.net/x.png', steam_app_id: 1 }))).toBe(
       'https://hb.imgix.net/x.png',
     );
     expect(thumbSrc(game({ steam_app_id: 413150 }))).toBe(
-      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/413150/capsule_616x353.jpg',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/413150/capsule_231x87.jpg',
     );
     expect(thumbSrc(game({}))).toBeNull();
+  });
+  it('thumbSrcs is the whole fallback ladder, in order (review 1: artwork failing must still try steam)', () => {
+    expect(thumbSrcs(game({ artwork_url: 'https://hb.imgix.net/x.png', steam_app_id: 7 }))).toEqual([
+      'https://hb.imgix.net/x.png',
+      'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/7/capsule_231x87.jpg',
+    ]);
+    expect(thumbSrcs(game({}))).toEqual([]);
   });
 });
 
@@ -111,8 +119,9 @@ describe('buildAlmanac', () => {
   it('merges same-label orders inside ONE month (4 identical gift cards in jul 2026, real render), never across months', () => {
     const a = buildAlmanac(
       [
-        game({ id: 'k1:a', bundle: 'A very special gift just for you', acquired_at: '2026-07-02T12:00:00Z' }),
+        // k2 BEFORE k1: the merged key must not depend on payload order (review 1, MINOR-5)
         game({ id: 'k2:b', bundle: 'A very special gift just for you', acquired_at: '2026-07-20T12:00:00Z' }),
+        game({ id: 'k1:a', bundle: 'A very special gift just for you', acquired_at: '2026-07-02T12:00:00Z' }),
         game({ id: 'k3:c', bundle: 'A very special gift just for you', acquired_at: '2026-06-20T12:00:00Z' }),
         game({ id: 'k4:d', bundle: 'Other', acquired_at: '2026-07-05T12:00:00Z' }),
       ],
@@ -123,6 +132,17 @@ describe('buildAlmanac', () => {
       ['A very special gift just for you', 2],
       ['Other', 1],
     ]);
+    expect(jul[0]!.key).toBe('order:k1'); // smallest member key …
+    // … under BOTH arrival orders: with one order, "smallest" and "last" can coincide and a
+    // last-member-key mutant survives (it did, on the first version of this test)
+    const flipped = buildAlmanac(
+      [
+        game({ id: 'k1:a', bundle: 'A very special gift just for you', acquired_at: '2026-07-02T12:00:00Z' }),
+        game({ id: 'k2:b', bundle: 'A very special gift just for you', acquired_at: '2026-07-20T12:00:00Z' }),
+      ],
+      Y,
+    );
+    expect(flipped.years[0]!.months[0]!.entries[0]!.key).toBe('order:k1');
     expect(a.years[0]!.months.find((m) => m.month === 5)!.entries).toHaveLength(1); // june stays its own
   });
 
@@ -171,6 +191,24 @@ describe('buildAlmanac', () => {
     expect(a.years[1]!.months.map((m) => m.month)).toEqual([6, 2]);
     expect(a.years[1]!.months[0]!.entries.map((e) => e.label)).toEqual(['Alpha', 'Zeta']);
     expect(a.span).toBe(4); // 2023 − 2020 + 1, derived
+  });
+
+  it("the month's own name entry leads, then labels case-insensitively (review 1, MINOR-1: raw code units put every Capitalised bundle above 'november 2021')", () => {
+    const a = buildAlmanac(
+      [
+        game({ id: 'n:1', bundle: 'November 2021', requires_choice: true }),
+        game({ id: 'h:1', bundle: 'Humble Book Bundle', acquired_at: '2021-11-05T00:00:00Z' }),
+        game({ id: 'i:1', bundle: 'indie gala', acquired_at: '2021-11-06T00:00:00Z' }),
+        game({ id: 'z:1', bundle: 'Zeta', acquired_at: '2021-11-07T00:00:00Z' }),
+      ],
+      Y,
+    );
+    expect(a.years[0]!.months[0]!.entries.map((e) => e.label)).toEqual([
+      'november 2021',
+      'Humble Book Bundle',
+      'indie gala',
+      'Zeta',
+    ]);
   });
 
   it('counts waiting and tucked per entry', () => {

@@ -9,7 +9,7 @@ import {
   countLine,
   headline,
   subtitle,
-  thumbSrc,
+  thumbSrcs,
   type AlmanacEntry,
 } from '../almanac';
 
@@ -23,18 +23,25 @@ type PageState =
 
 const STRIP_MAX = 8;
 const GLYPH: Record<AlmanacEntry['source'], string> = { name: '🗓️', postmark: '📮', undated: '📦' };
+// the glyph is the ONLY signal of where a date came from — say it to a screen reader too
+const SOURCE_SR: Record<AlmanacEntry['source'], string> = {
+  name: 'dated by its name',
+  postmark: 'dated by its postmark',
+  undated: 'no date known',
+};
 
 function Thumb({ g }: { g: AdminGame }) {
-  // a steam capsule can 404 (11 of 858 in the real render) — fall back to the colour
-  // block rather than show the browser's broken-image icon
-  const [failed, setFailed] = useState(false);
-  const src = failed ? null : thumbSrc(g);
+  // walk the ladder on each load error (a steam capsule can 404: 11 of 858 in the real
+  // render), then the colour block — never the browser's broken-image icon
+  const srcs = thumbSrcs(g);
+  const [rung, setRung] = useState(0);
+  const src = srcs[rung] ?? null;
   return src !== null ? (
     <img
       src={src}
       alt=""
       loading="lazy"
-      onError={() => setFailed(true)}
+      onError={() => setRung((r) => r + 1)}
       className="h-10 w-16 flex-shrink-0 rounded object-cover"
     />
   ) : (
@@ -54,13 +61,15 @@ function Entry({ e, onWrap }: { e: AlmanacEntry; onWrap: (e: AlmanacEntry) => vo
     >
       <div className="flex flex-wrap items-baseline gap-2">
         <span aria-hidden="true">{GLYPH[e.source]}</span>
-        <h3 className="font-medium text-ink">{e.label}</h3>
+        <span className="sr-only">{SOURCE_SR[e.source]}</span>
+        <h4 className="font-medium text-ink">{e.label}</h4>
         <span className="text-sm text-dust">{countLine(e)}</span>
         {lit && (
           <button
             type="button"
             onClick={() => onWrap(e)}
-            aria-label={`wrap the ${e.waiting.length} waiting from ${e.label} into a link`}
+            // label-in-name (WCAG 2.5.3): the accessible name starts with the visible text
+            aria-label={`wrap these: ${e.waiting.length} waiting from ${e.label}`}
             className="ml-auto rounded bg-control px-3 py-1 text-sm hover:bg-control-bright"
           >
             wrap these →
@@ -132,7 +141,7 @@ export function Almanac({ currentYear = new Date().getUTCFullYear() }: { current
           <h2 className="border-b border-line pb-1 text-lg text-ink">{y.year}</h2>
           {y.months.map((m) => (
             <div key={m.month} className="flex flex-col gap-2 sm:flex-row sm:gap-4">
-              <p className="w-24 flex-shrink-0 text-sm text-dust">{MONTH_NAMES[m.month]}</p>
+              <h3 className="w-24 flex-shrink-0 text-sm font-normal text-dust">{MONTH_NAMES[m.month]}</h3>
               <div className="flex min-w-0 flex-1 flex-col gap-2">
                 {m.entries.map((e) => (
                   <Entry key={e.key} e={e} onWrap={wrap} />
@@ -143,15 +152,17 @@ export function Almanac({ currentYear = new Date().getUTCFullYear() }: { current
         </section>
       ))}
 
-      {(almanac.undated.length > 0 || unparsed > 0) && (
+      {/* an unparsed pick may still be DATED by a postmark, so its line never sits under
+          "the attic doesn't know when these arrived" (review 1) — it lives on its own */}
+      {unparsed > 0 && (
+        <p className="text-sm text-ink">
+          {`⚠️ ${unparsed} choice ${unparsed === 1 ? 'pick' : 'picks'} whose month we couldn't read`}
+        </p>
+      )}
+      {almanac.undated.length > 0 && (
         <section className="flex flex-col gap-3">
           <h2 className="border-b border-line pb-1 text-lg text-ink">undated</h2>
           <p className="text-sm text-dust">the attic doesn't know when these arrived.</p>
-          {unparsed > 0 && (
-            <p className="text-sm text-ink">
-              {`⚠️ ${unparsed} choice ${unparsed === 1 ? 'pick' : 'picks'} whose month we couldn't read`}
-            </p>
-          )}
           {almanac.undated.map((e) => (
             <Entry key={e.key} e={e} onWrap={wrap} />
           ))}

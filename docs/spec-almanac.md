@@ -112,6 +112,13 @@ one month. Each game resolves in this order:
    prefix of `id` (`"{gamekey}:{machine_name}"`, a documented-accepted exposure per
    `admin-api/src/lib.rs` CatalogGameView's doc). They never group by name (the 9-orders measurement
    above). The entry's date is its earliest valid `acquired_at`. Glyph 📮, label = the bundle name.
+   **②a: same-label orders merge within ONE month only** (v2.2, found in the real render: four
+   identical one-treasure *"A very special gift just for you"* cards under jul 2026). The date is
+   identical at month grain, so nothing ② protects is lost, and ACROSS months they stay split (the
+   9-orders case). The merged key is the **smallest member key**, independent of payload order and
+   tested under both arrival orders. "wrap these" on a merged entry spans its orders' waiting games.
+   Within a month, the **name entry leads**, then labels case-insensitively (review 1: raw code
+   units sorted capitalised bundles above `november 2021`).
 3. **undated**: neither answered. The honest shelf at the bottom, grouped by order like (2).
    **Never invent a date.**
 A pre-Choice name that doesn't match the regex (e.g. a Humble Monthly era string) falls through to
@@ -150,7 +157,9 @@ source** (OMBB: counting only name-dated picks means a Humble rename silently *s
 error). M = distinct name-months among those N. If some of the N didn't date by name, the undated
 shelf names them: *"⚠️ K choice picks whose month we couldn't read"* (a pick that fails the name-month but carries a
 postmark IS dated, so "couldn't date" would be false for it; plan-review wording, back-ported). A regex miss then becomes a **visible
-line**, not a smaller number. N = 0 ⇒ the line is omitted (no *"0 picks waiting"*). The subtitle's
+line**, not a smaller number. That line stands **on its own**, never under the undated shelf's
+*"the attic doesn't know when these arrived"*, because an unparsed pick with a postmark IS dated
+(review 1). N = 0 ⇒ the line is omitted (no *"0 picks waiting"*). The subtitle's
 *"N years"* = `newestDatedYear − oldestDatedYear + 1`, derived and never typed (OMBB: typed, it
 rots the first January after shipping); no dated years ⇒ the subtitle drops the count. No metric
 cards anywhere (PRODUCT.md anti-reference: SaaS dashboard chrome).

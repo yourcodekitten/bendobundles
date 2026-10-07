@@ -11,8 +11,8 @@ export const MONTH_NAMES = [
 ] as const;
 const CAPITALISED = MONTH_NAMES.map((m) => m.charAt(0).toUpperCase() + m.slice(1));
 // D1: strict on purpose — a miss falls through to the postmark/undated, never to a
-// wrong month. Measured over prod 2026-10-07: 590/590 discovery picks and 21/21
-// order-key stragglers match.
+// wrong month. Measured over prod 2026-10-07: 590/590 discovery picks and 22/22
+// order-key stragglers match (21 steam + Diablo IV, blizzard_keyless).
 const NAME_MONTH_RE = new RegExp(`^(${CAPITALISED.join('|')}) (\\d{4})( Humble Choice)?$`);
 const MIN_YEAR = 2010;
 
@@ -38,13 +38,22 @@ export function orderKey(g: AdminGame): string {
   return i === -1 ? g.id : g.id.slice(0, i);
 }
 
-/** Thumb source order: humble artwork → steam capsule (GameGrid.tsx's shipped URL) → null. */
-export function thumbSrc(g: AdminGame): string | null {
-  if (g.artwork_url !== null) return g.artwork_url;
+/** The thumb fallback LADDER, in order: humble artwork → the SMALL steam capsule. The page
+ *  walks it on each load error, then falls to the colour block (review 1: one boolean skipped
+ *  the capsule whenever the artwork failed). 231x87 not GameGrid's 616x353: same availability
+ *  and ~7.8x fewer bytes over a 12-app sample (measured 2026-10-07), drawn at 64x40 anyway. */
+export function thumbSrcs(g: AdminGame): string[] {
+  const out: string[] = [];
+  if (g.artwork_url !== null) out.push(g.artwork_url);
   if (g.steam_app_id !== null) {
-    return `https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${g.steam_app_id}/capsule_616x353.jpg`;
+    out.push(`https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/${g.steam_app_id}/capsule_231x87.jpg`);
   }
-  return null;
+  return out;
+}
+
+/** The first rung of the ladder, or null. */
+export function thumbSrc(g: AdminGame): string | null {
+  return thumbSrcs(g)[0] ?? null;
 }
 
 export type EntrySource = 'name' | 'postmark' | 'undated';
@@ -74,8 +83,12 @@ function makeEntry(key: string, source: EntrySource, label: string, games: Admin
 function cmp(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
+/** The month's own name entry (its Choice shelf) leads; then labels case-insensitively;
+ *  key breaks ties. Raw code units sorted every Capitalised bundle above 'november 2021'
+ *  and buried the lit picks (review 1). toLowerCase is locale-free (toLocaleLowerCase is not). */
 function byLabelThenKey(a: AlmanacEntry, b: AlmanacEntry): number {
-  return cmp(a.label, b.label) || cmp(a.key, b.key);
+  const nameFirst = Number(b.source === 'name') - Number(a.source === 'name');
+  return nameFirst || cmp(a.label.toLowerCase(), b.label.toLowerCase()) || cmp(a.key, b.key);
 }
 
 /** Inside ONE month, postmark entries that share a label read as one shelf: the date is
