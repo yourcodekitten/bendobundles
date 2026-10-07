@@ -21,14 +21,25 @@ const MONTHS = [
   "dec",
 ] as const;
 
-/** 📮 "aug 2012" — lowercase month, UTC, attic voice. Null when unknown/junk (absence
- *  must render as exactly the today-state — spec D6). */
-export function postmark(iso: string | undefined): string | null {
+/** A calendar month; `month` is 0-based (jan = 0). */
+export type YearMonth = { year: number; month: number };
+
+/** 📮 the ONE place an acquisition instant becomes a month (UTC). The chip and the
+ *  almanac (docs/spec-almanac.md D2) both call this, so fixing #267 here moves BOTH —
+ *  never add a second bucketing. Null when unknown/junk. */
+export function postmarkMonth(iso: string | undefined): YearMonth | null {
   if (iso === undefined) return null;
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return null;
   const d = new Date(t);
-  return `${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() };
+}
+
+/** 📮 "aug 2012" — lowercase month, UTC, attic voice. Null when unknown/junk (absence
+ *  must render as exactly the today-state — spec D6). */
+export function postmark(iso: string | undefined): string | null {
+  const ym = postmarkMonth(iso);
+  return ym === null ? null : `${MONTHS[ym.month]} ${ym.year}`;
 }
 
 /** Whole CALENDAR years a treasure waited; null under one year (never "waited 0

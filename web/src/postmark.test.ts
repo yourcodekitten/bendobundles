@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { postmark, waitedYears } from "./postmark";
+import { postmark, postmarkMonth, waitedYears } from "./postmark";
 
 describe("postmark", () => {
   it("renders lowercase month + year, UTC", () => {
@@ -48,5 +48,25 @@ describe('waitedYears — the two scrapbook call shapes (frozen clock)', () => {
 
   it('anniversary not reached rounds down (mar 2023 → 8, not 9)', () => {
     expect(waitedYears(acquired, Date.parse('2023-03-10T00:00:00Z'))).toBe(8);
+  });
+});
+
+describe("postmarkMonth — the ONE UTC bucketing (spec-almanac D2, #267)", () => {
+  it("is the UTC year and 0-based month", () => {
+    expect(postmarkMonth("2013-03-27T18:22:58Z")).toEqual({ year: 2013, month: 2 });
+  });
+  it("puts an evening-of-the-31st order in the NEXT month — #267's known bug, pinned so a fix is visible", () => {
+    // 2023-10-31 21:34 EDT, measured from prod
+    expect(postmarkMonth("2023-11-01T01:34:23.072355Z")).toEqual({ year: 2023, month: 10 });
+  });
+  it("is null on absent or junk", () => {
+    expect(postmarkMonth(undefined)).toBeNull();
+    expect(postmarkMonth("not a date")).toBeNull();
+  });
+  it("agrees with postmark() by construction", () => {
+    const iso = "2012-08-15T19:41:25.76507Z";
+    const ym = postmarkMonth(iso);
+    expect(ym).toEqual({ year: 2012, month: 7 });
+    expect(postmark(iso)).toBe("aug 2012");
   });
 });
