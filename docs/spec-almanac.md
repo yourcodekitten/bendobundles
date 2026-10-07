@@ -24,8 +24,8 @@ is the argument.
 | carry `acquired_at` (postmark) | 522 |
 | **no `acquired_at`** | **612 (54%)** |
 | ↳ Humble Choice picks (`requires_choice = true`), bundle named `Month YYYY` | **590** — 75 distinct months, **589 `available`** |
-| ↳ `Month YYYY Humble Choice` order keys, `ben_redeemed` | 21 |
-| ↳ other | 1 |
+| ↳ `Month YYYY Humble Choice` order keys (21 steam + 1 `blizzard_keyless`, *Diablo IV*) | 22 |
+| ↳ other | **0** *(v1–v2 said 1. That was Diablo IV, mis-bucketed by a `key_type` split. Its name is `May 2026 Humble Choice`, so it is name-dated. OMBB asked for it to be named.)* |
 
 Two facts fall out of that table, and they shape every decision below:
 
@@ -36,7 +36,7 @@ Two facts fall out of that table, and they shape every decision below:
    to be given are among the undated** (589 of 688 `is_listable`). A timeline built on `acquired_at` alone would leave out
    most of what it exists to surface.
 2. **For most of those, the date is in the name.** All 590 Choice-pick bundle names match
-   `^(January|…|December) \d{4}$`, and all 21 order-key stragglers match `… \d{4} Humble Choice$`.
+   `^(January|…|December) \d{4}$`, and all 22 order-key stragglers match `… \d{4} Humble Choice$`.
    Where both sources exist (178 games), they **agree on 174 and disagree on 4**. The 4 are
    **2 orders × 2 games**, with `acquired_at` `2021-12-01T01:45Z` and `2023-11-01T01:34Z`, which is
    the **evening of Nov 30 / Oct 31 in Ben's zone**. A Choice order is created when Ben makes his
