@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (axum, serde, `time` 0.3 with the `serde`/`macros` features), React 19 + react-router, Tailwind v4 theme tokens, vitest + Testing Library.
 
-**Spec:** `docs/spec-almanac.md` (v2, `d362c58`). Read it before any task; where this plan and the spec disagree, the spec's **decisions** win.
+**Spec:** `docs/spec-almanac.md` (v2, `d362c58`). **Plan v2:** a cold plan review (fresh subagent, real repo, every web test block run in a scratch copy: T2 12/12, T3 17/17, T4 7/7 + 14/14 green) found 3 blockers and 4 majors. All are integrated below and marked *(review B1…)*. Read it before any task; where this plan and the spec disagree, the spec's **decisions** win.
 
 ## Global Constraints
 
@@ -23,6 +23,9 @@
 - Tests never depend on the real clock.
 - CI's exact web chain, run from `web/`: `npm run lint && npm run typecheck && npm test -- --run && npm run build`. Rust: `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace` (the admin-api tests need dynamodb-local, so locally they print `SKIP` and CI is the real run).
 - Commits are GPG-signed (`git commit -S`) as `code kitten <yourcodekitten@gmail.com>`.
+- **The Button Burgundy Rule** (`DESIGN.md:153`): burgundy (`*-give*`) only where giving/claiming happens, never as ambient decoration, never above 10% of a screen. ⇒ the almanac uses **no** `give` tokens. Its "wrap these →" uses `bg-control`, exactly like the catalog's own "wrap these into a link" (`Catalog.tsx:296-303`). *(review minor)*
+- **Shared box:** 2 cores, seven tenants. Run local test/lint/build commands under `nice -n 15`, one at a time, never in parallel. CI is the authority.
+- CI runs on **`pull_request` only** for branches (`.github/workflows/ci.yml`). Nothing "in CI" is observable until the draft PR exists (Task 1 Step 5 opens it). *(review M2)*
 
 ## File Structure
 
@@ -38,21 +41,139 @@
 
 ---
 
-### Task 1: admin catalog sends `acquired_at`
+### Task 1: admin catalog sends `acquired_at` (one constructor, both sites)
 
 **Files:**
-- Modify: `crates/admin-api/src/lib.rs` (`CatalogGameView`, `handle_catalog`)
-- Modify: `web/src/api.ts` (comment on `AdminGame.acquired_at`)
-- Test: `crates/admin-api/tests/api_test.rs` (append after `catalog_exposes_requires_choice`)
+- Modify: `crates/admin-api/src/lib.rs`: `CatalogGameView` (~:325), the literal in `handle_catalog` (~:417), **and the second literal in `handle_game_detail` (~:543)** *(review B1: a field added to only one site is E0063)*
+- Modify: `web/src/api.ts`: the `AdminGame.acquired_at` doc comment (~:107)
+- Test: a new `#[cfg(test)] mod catalog_view_tests` at the end of `crates/admin-api/src/lib.rs`, after `mod friend_name_sanitize_tests` (~:1670): **local, dynamo-free**
+- Test: `crates/admin-api/tests/api_test.rs`, appended after `catalog_exposes_requires_choice`: integration test, **CI only**
+- Test: `web/src/GameDetailModal.test.tsx`: one admin-mount test (the declared side effect, *review M1*)
 
 **Interfaces:**
-- Produces: `GET /admin/api/catalog` rows carry `"acquired_at": "<rfc3339>"` when the game has one, and **no `acquired_at` key** when it doesn't. The web type `AdminGame.acquired_at?: string` is unchanged.
+- Produces: `fn catalog_view(g: domain::Game, steam: Option<SteamSummaryView>) -> CatalogGameView`, private to `lib.rs` and used by **both** handlers. `GET /admin/api/catalog` **and** `GET /admin/api/games/{id}` rows carry `"acquired_at": "<rfc3339>"` when known and **no key** when unknown. The web type `AdminGame.acquired_at?: string` is unchanged.
+- ⚠️ **Declared side effect (review M1, deliberate):** the admin catalog modal (`GameDetailModal`, admin mount) already renders `postmark(game.acquired_at)` at `GameDetailModal.tsx:349` and `:511`, and has rendered nothing there only because the admin payload never sent the field. Shipping this lights the 📮 chip and the "tucked into the attic" line in the **admin** modal. That reverses spec-postmark's "no admin surface change" non-goal, on purpose: it's the same fact, on the giver's own workbench, and the almanac is the reason to send it.
 
-- [ ] **Step 1: Write the failing test** (append to `crates/admin-api/tests/api_test.rs`)
+- [ ] **Step 1: Write the failing LOCAL test.** Extract the constructor first, so the test has something to call. In `lib.rs`, add directly after `fn steam_summary(…)`:
 
 ```rust
-/// 📜 almanac D3: the catalog row carries the postmark when known and OMITS the key when
-/// unknown (skip_serializing_if — the web reads absence as unknown, never as null-vs-absent).
+/// One projection for every admin game row (catalog list AND detail) — so a field added
+/// here reaches both endpoints, and a third call site cannot drift (almanac review B1).
+fn catalog_view(g: domain::Game, steam: Option<SteamSummaryView>) -> CatalogGameView {
+    CatalogGameView {
+        steam,
+        id: g.id,
+        title: g.title,
+        bundle: g.bundle,
+        key_type: g.key_type,
+        giftable: g.giftable,
+        hidden: g.hidden,
+        status: g.status,
+        claim_id: g.claim_id,
+        artwork_url: g.artwork_url,
+        requires_choice: g.requires_choice,
+        steam_app_id: g.steam_app_id,
+        owned_by_ben: g.owned_by_ben,
+        hidden_source: g.hidden_source,
+    }
+}
+```
+
+Replace the struct literal in `handle_catalog` with:
+
+```rust
+                .map(|g| {
+                    let steam = g
+                        .steam_app_id
+                        .and_then(|id| caches.get(&id))
+                        .and_then(steam_summary);
+                    catalog_view(g, steam)
+                })
+```
+
+and the one in `handle_game_detail` with:
+
+```rust
+    let game_view = catalog_view(game, cache.as_ref().and_then(steam_summary));
+```
+
+(If `cache` or `game` is used after that line in `handle_game_detail`, keep the borrow order as it is: `game` is moved here exactly as the old literal moved its fields. `cargo check -p admin-api` will say so.)
+
+Then append the test module to the end of `lib.rs`:
+
+```rust
+#[cfg(test)]
+mod catalog_view_tests {
+    use super::*;
+
+    fn game() -> domain::Game {
+        domain::Game {
+            id: "gk:mn".into(),
+            title: "t".into(),
+            bundle: "b".into(),
+            gamekey: "gk".into(),
+            machine_name: "mn".into(),
+            key_type: "steam".into(),
+            giftable: true,
+            hidden: false,
+            status: domain::GameStatus::Available,
+            claim_id: None,
+            artwork_url: None,
+            keyindex: 0,
+            requires_choice: false,
+            steam_app_id: None,
+            appid_source: None,
+            owned_by_ben: false,
+            hidden_source: None,
+            acquired_at: None,
+        }
+    }
+
+    /// 📜 almanac D3: present when known; an ABSENT key (never null) when unknown.
+    #[test]
+    fn catalog_view_carries_acquired_at_and_omits_it_when_unknown() {
+        let mut g = game();
+        g.acquired_at = Some(time::macros::datetime!(2013-03-27 18:22:58 UTC));
+        let v = serde_json::to_value(catalog_view(g.clone(), None)).unwrap();
+        assert_eq!(v["acquired_at"], "2013-03-27T18:22:58Z");
+        let v = serde_json::to_value(catalog_view(game(), None)).unwrap();
+        assert!(
+            v.as_object().unwrap().get("acquired_at").is_none(),
+            "unknown must be an ABSENT key, not null: {v}"
+        );
+    }
+}
+```
+
+- [ ] **Step 2: Run, expect FAIL for the RIGHT reason.** `nice -n 15 cargo test -p admin-api --lib catalog_view_tests`. Expected: it compiles (the refactor is behaviour-identical) and **fails the first `assert_eq!`** with left `Null`, right `"2013-03-27T18:22:58Z"`. A compile error is **not** this red. Fix it and re-run until the failure is that assertion.
+
+- [ ] **Step 3: Implement.** In `CatalogGameView`, after `hidden_source`:
+
+```rust
+    /// 📮 the postmark (spec-almanac D3): when ben's order was created. Same serde shape as
+    /// the domain field — rfc3339, and ABSENT (not null) when unknown, so the almanac reads
+    /// absence as "no postmark" (falls through to name-month/undated).
+    #[serde(
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    acquired_at: Option<time::OffsetDateTime>,
+```
+
+and in `catalog_view`, after `hidden_source: g.hidden_source,` add `acquired_at: g.acquired_at,`.
+
+In `web/src/api.ts`, replace the `AdminGame.acquired_at` doc comment with:
+
+```ts
+  /** 📮 rfc3339 acquisition instant — sent by the admin catalog AND game-detail
+   *  endpoints when known (spec-almanac D3); ABSENT when unknown, and absent from an
+   *  old lambda during a deploy window. Absent ⇒ exactly the today-state. */
+```
+
+Add the CI-only integration test to `crates/admin-api/tests/api_test.rs`, after `catalog_exposes_requires_choice`. It **panics locally** (`test_app_with_call_invoker` `.expect`s `DYNAMODB_LOCAL_URL`); it does NOT skip. Run it only in CI.
+
+```rust
+/// 📜 almanac D3 end-to-end through the real route + dynamo round-trip (CI: dynamodb-local).
 #[tokio::test]
 async fn catalog_carries_acquired_at_when_known_and_omits_it_when_unknown() {
     let (app, store, _) = test_app_with_call_invoker(
@@ -86,43 +207,31 @@ async fn catalog_carries_acquired_at_when_known_and_omits_it_when_unknown() {
 }
 ```
 
-- [ ] **Step 2: Confirm it fails.** Locally it prints `SKIP` (no dynamodb-local). That's expected and **not** a red. Prove the red by compiling: `cargo test -p admin-api --no-run` must still compile (the test only reads JSON, so it compiles). The real red is observed in CI on the first push of this task, *before* Step 3. Push the test alone on the branch and read the failing assertion in the CI log (`assertion `left == right` failed` on `acquired_at`, left `Null`).
+Add the declared-side-effect test to `web/src/GameDetailModal.test.tsx`. Use **its existing admin-mount render helper and fixture** (find the existing test that renders `mount="admin"` and copy its setup exactly). The assertion:
 
-- [ ] **Step 3: Implement.** In `CatalogGameView`, after `hidden_source`:
-
-```rust
-    /// 📮 the postmark (spec-almanac D3): when ben's order was created. Same serde shape as
-    /// the domain field — rfc3339, and ABSENT (not null) when unknown, so an old SPA ignores
-    /// it and the almanac reads absence as "no postmark" (falls through to name-month/undated).
-    #[serde(
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    acquired_at: Option<time::OffsetDateTime>,
+```tsx
+  it('admin mount shows the 📮 postmark once the catalog sends acquired_at (almanac D3 side effect)', async () => {
+    // render the admin mount exactly as the neighbouring admin tests do, with the
+    // fixture game extended by: acquired_at: '2013-03-27T18:22:58Z'
+    expect(await screen.findByText('📮 mar 2013')).toBeInTheDocument();
+  });
 ```
 
-and in `handle_catalog`'s `.map(|g| CatalogGameView { … })`, after `hidden_source: g.hidden_source,`:
+(This one is green on arrival: the modal already handles the field. It pins the side effect so a future refactor can't silently drop it.)
 
-```rust
-                    acquired_at: g.acquired_at,
-```
+- [ ] **Step 4: Verify.** `nice -n 15 cargo test -p admin-api --lib catalog_view_tests` gives PASS. Then `cargo fmt --check` (if `rustfmt` isn't on PATH locally, rely on CI's `cargo fmt --check` and say so; don't skip silently), `nice -n 15 cargo clippy -p admin-api --all-targets -- -D warnings`, and `nice -n 15 npx vitest run src/GameDetailModal.test.tsx` from `web/`.
 
-In `web/src/api.ts`, replace the `AdminGame.acquired_at` doc comment with:
-
-```ts
-  /** 📮 rfc3339 acquisition instant — sent by the admin catalog when known
-   *  (spec-almanac D3); ABSENT when unknown, and absent from an old lambda during a
-   *  deploy window. Absent ⇒ exactly the today-state, on admin as everywhere. */
-```
-
-- [ ] **Step 4: Verify.** `cargo fmt --check && cargo clippy -p admin-api --all-targets -- -D warnings && cargo test -p admin-api --no-run`. Push, and confirm in the CI log that `catalog_carries_acquired_at_when_known_and_omits_it_when_unknown ... ok`.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit, push, open the DRAFT PR** *(review M2: CI runs only on `pull_request`)*
 
 ```bash
-git add crates/admin-api/src/lib.rs crates/admin-api/tests/api_test.rs web/src/api.ts
-git commit -S -m "📜 admin catalog carries acquired_at when known (almanac D3)"
+git add crates/admin-api/src/lib.rs crates/admin-api/tests/api_test.rs web/src/api.ts web/src/GameDetailModal.test.tsx
+git commit -S -m "📜 admin catalog + detail carry acquired_at when known (almanac D3), one catalog_view constructor"
+git push
+gh pr create -R yourcodekitten/bendobundles --draft --head kitten/almanac --base main \
+  --title "📜 the almanac" --body "draft — the almanac (docs/spec-almanac.md). body filled at PR-up."
 ```
+
+Then watch CI for the head with `~/code-kitten/ops/branch-green.sh yourcodekitten/bendobundles kitten/almanac` (it reads the runs endpoint, never the rollup). The integration test must show `catalog_carries_acquired_at_when_known_and_omits_it_when_unknown ... ok` in the Rust job log.
 
 ---
 
@@ -164,10 +273,12 @@ describe("postmarkMonth — the ONE UTC bucketing (spec-almanac D2, #267)", () =
 - [ ] **Step 3: Implement.** In `postmark.ts`, add above `postmark()`:
 
 ```ts
+/** A calendar month; `month` is 0-based (jan = 0). */
+export type YearMonth = { year: number; month: number };
+
 /** 📮 the ONE place an acquisition instant becomes a month (UTC). The chip and the
  *  almanac (docs/spec-almanac.md D2) both call this, so fixing #267 here moves BOTH —
- *  never add a second bucketing. month is 0-based. Null when unknown/junk. */
-export type YearMonth = { year: number; month: number };
+ *  never add a second bucketing. Null when unknown/junk. */
 export function postmarkMonth(iso: string | undefined): YearMonth | null {
   if (iso === undefined) return null;
   const t = Date.parse(iso);
@@ -426,6 +537,7 @@ describe('copy', () => {
     expect(countLine(entry({ games: [g], waiting: [g] }))).toBe('1 treasure · still waiting');
     expect(countLine(entry({ games: [g, g], waiting: [g], tucked: 1 }))).toBe('2 treasures · 1 still waiting · 1 tucked away');
     expect(countLine(entry({ games: [g, g], tucked: 2 }))).toBe('2 treasures · all tucked away');
+    expect(countLine(entry({ games: [g, g, g], tucked: 1 }))).toBe('3 treasures · the rest given or kept ♡ · 1 tucked away');
   });
 
   it('headline: conditional, pluralised, never "0 picks"', () => {
@@ -609,7 +721,8 @@ export function countLine(e: AlmanacEntry): string {
   const noun = n === 1 ? 'treasure' : 'treasures';
   if (w === 0 && e.tucked === n && n > 0) return `${n} ${noun} · all tucked away`;
   let s: string;
-  if (w === 0) s = `${n} ${noun} · all given or kept ♡`;
+  // with some tucked away, "all given or kept" would be false — say "the rest" (plan review)
+  if (w === 0) s = e.tucked > 0 ? `${n} ${noun} · the rest given or kept ♡` : `${n} ${noun} · all given or kept ♡`;
   else if (w === n) s = n === 1 ? '1 treasure · still waiting' : `${n} ${noun} · all ${n} still waiting`;
   else s = `${n} ${noun} · ${w} still waiting`;
   if (e.tucked > 0) s += ` · ${e.tucked} tucked away`;
@@ -649,7 +762,8 @@ git commit -S -m "📜 almanac.ts: pure grouping — name-month by (year,month),
 - Modify: `web/src/App.tsx` (route after `scrapbook`), `web/src/admin/AdminApp.tsx` (nav link after scrapbook), `web/src/admin/AdminApp.test.tsx` (nav assertion)
 
 **Interfaces:**
-- Consumes: `adminCatalog(): Promise<AdminGame[]>` (`api.ts:385`), `withAuth` (`./withAuth`), everything from Task 3, `titleColorClass` (`../titleColor`).
+- Consumes (existing): `adminCatalog(): Promise<AdminGame[]>` (`api.ts:385`); `withAuth<T>(fn: () => Promise<T>, navigate): Promise<T>` (`./withAuth`); `titleColorClass(title: string): string` (`../titleColor`).
+- Consumes (Task 3, `../almanac`, exact): `MONTH_NAMES: readonly string[]` ('january'…'december'); `buildAlmanac(games: AdminGame[], currentYear: number): Almanac`; `countLine(e: AlmanacEntry): string`; `headline(a: Almanac): string | null`; `subtitle(a: Almanac): string`; `thumbSrc(g: AdminGame): string | null`; `type AlmanacEntry = { key: string; source: 'name' | 'postmark' | 'undated'; label: string; games: AdminGame[]; waiting: AdminGame[]; tucked: number }`; `type Almanac = { years: { year: number; months: { month: number; entries: AlmanacEntry[] }[] }[]; undated: AlmanacEntry[]; span: number | null; picks: { waiting: number; months: number; unparsed: number } }`.
 - Produces: `export function Almanac({ currentYear }: { currentYear?: number })`. `currentYear` defaults to `new Date().getUTCFullYear()` and is injectable for tests.
 
 - [ ] **Step 1: Write the failing tests** (`web/src/admin/Almanac.test.tsx`)
@@ -776,7 +890,31 @@ describe('Almanac', () => {
 });
 ```
 
-- [ ] **Step 2: Run, expect FAIL.** `npx vitest run src/admin/Almanac.test.tsx`. Expected: cannot resolve `./Almanac`.
+Also in Step 1 (so they go red first): in `AdminApp.test.tsx`, rename the nav test to `'renders nav links for catalog, links, friends, scrapbook, almanac, and ops'` and add `expect(screen.getByRole('link', { name: /almanac/i })).toBeInTheDocument();`. And add these two to `Almanac.test.tsx`:
+
+```tsx
+  it('dims a hidden thumb but keeps it in the strip (D6)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([
+      game({ id: 'p:1', bundle: 'May 2022', steam_app_id: 1 }),
+      game({ id: 'p:2', bundle: 'May 2022', steam_app_id: 2, hidden: true, title: 'tucked' }),
+    ]);
+    renderPage();
+    const e = await screen.findByRole('article', { name: /may 2022/ });
+    expect(e.querySelectorAll('img')).toHaveLength(2);
+    expect(within(e).getByTitle('tucked').className).toContain('opacity-40');
+  });
+
+  it('renders the undated shelf when ONLY an unparsed dated pick exists', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([
+      game({ id: 'r:1', bundle: 'Choice: Renamed', requires_choice: true, acquired_at: '2024-02-02T00:00:00Z' }),
+    ]);
+    renderPage();
+    expect(await screen.findByRole('heading', { level: 2, name: 'undated' })).toBeInTheDocument();
+    expect(screen.getByText("⚠️ 1 choice pick whose month we couldn't read")).toBeInTheDocument();
+  });
+```
+
+- [ ] **Step 2: Run, expect FAIL.** `nice -n 15 npx vitest run src/admin/Almanac.test.tsx src/admin/AdminApp.test.tsx`. Expected: `Almanac.test.tsx` cannot resolve `./Almanac`; `AdminApp.test.tsx` fails **one** assertion (no `almanac` link).
 
 - [ ] **Step 3: Implement** (`web/src/admin/Almanac.tsx`)
 
@@ -823,7 +961,8 @@ function Entry({ e, onWrap }: { e: AlmanacEntry; onWrap: (e: AlmanacEntry) => vo
   return (
     <article
       aria-label={e.label}
-      className={`flex flex-col gap-2 rounded bg-floor p-4 ${lit ? 'border-l-4 border-give' : 'opacity-80'}`}
+      // lit = raised shelf; quiet = flat + faded. No burgundy: DESIGN.md's Button Burgundy Rule
+      className={`flex flex-col gap-2 rounded p-4 ${lit ? 'bg-shelf' : 'bg-floor opacity-80'}`}
     >
       <div className="flex flex-wrap items-baseline gap-2">
         <span aria-hidden="true">{GLYPH[e.source]}</span>
@@ -834,7 +973,7 @@ function Entry({ e, onWrap }: { e: AlmanacEntry; onWrap: (e: AlmanacEntry) => vo
             type="button"
             onClick={() => onWrap(e)}
             aria-label={`wrap the ${e.waiting.length} waiting from ${e.label} into a link`}
-            className="ml-auto rounded bg-give px-3 py-1 text-sm text-give-ink hover:bg-give-bright"
+            className="ml-auto rounded bg-control px-3 py-1 text-sm hover:bg-control-bright"
           >
             wrap these →
           </button>
@@ -897,7 +1036,7 @@ export function Almanac({ currentYear = new Date().getUTCFullYear() }: { current
       <header className="flex flex-col gap-1">
         <h1 className="text-xl font-medium text-ink">📜 the almanac</h1>
         <p className="text-ink-soft">{subtitle(almanac)}</p>
-        {line && <p className="text-give-soft">{line}</p>}
+        {line && <p className="font-medium text-ink">{line}</p>}
       </header>
 
       {almanac.years.map((y) => (
@@ -921,7 +1060,7 @@ export function Almanac({ currentYear = new Date().getUTCFullYear() }: { current
           <h2 className="border-b border-line pb-1 text-lg text-ink">undated</h2>
           <p className="text-sm text-dust">the attic doesn't know when these arrived.</p>
           {unparsed > 0 && (
-            <p className="text-sm text-give-soft">
+            <p className="text-sm text-ink">
               {`⚠️ ${unparsed} choice ${unparsed === 1 ? 'pick' : 'picks'} whose month we couldn't read`}
             </p>
           )}
@@ -949,9 +1088,8 @@ Nav, in `web/src/admin/AdminApp.tsx`, after the scrapbook `NavLink`:
         </NavLink>
 ```
 
-Nav test, in `AdminApp.test.tsx`: rename the test to `'renders nav links for catalog, links, friends, scrapbook, almanac, and ops'` and add `expect(screen.getByRole('link', { name: /almanac/i })).toBeInTheDocument();`.
 
-- [ ] **Step 4: Run.** `npx vitest run src/admin/Almanac.test.tsx src/admin/AdminApp.test.tsx`. Expected: PASS. Then run the **full CI web chain**, last, on the final tree: `npm run lint && npm run typecheck && npm test -- --run && npm run build`. Every step must pass. This is the step-9 lesson from the 10-05 pounce: no "clean" claim from a run that preceded an edit.
+- [ ] **Step 4: Run.** `nice -n 15 npx vitest run src/admin/Almanac.test.tsx src/admin/AdminApp.test.tsx`. Expected: PASS. Then run the **full CI web chain**, serially and niced, last, on the final tree: `nice -n 15 npm run lint && nice -n 15 npm run typecheck && nice -n 15 npm test -- --run && nice -n 15 npm run build`. Every step must pass. This is the step-9 lesson from the 10-05 pounce: no "clean" claim from a run that preceded an edit.
 
 - [ ] **Step 5: Commit**
 
@@ -964,9 +1102,57 @@ git commit -S -m "📜 the almanac page: /admin/almanac, newest-first months, wr
 
 ### Task 5: real-data proof (no deploy)
 
-**Files:** none committed. This is a verification task.
+**Files:** none committed. Throwaway files live **only** under the scratchpad
+`/tmp/claude-1003/-home-code-kitten-code-kitten/4231eac3-a00d-46c2-b578-4314a998b6e6/scratchpad/`.
 
-- [ ] **Step 1:** Run `buildAlmanac` over the **real prod payload shape**: the read-only scan in the pounce's scratchpad (`games.json`), projected to `AdminGame` (id/title/bundle/key_type/giftable/hidden/status/claim_id/artwork_url/requires_choice/steam_app_id/owned_by_ben/acquired_at, `steam: null`). Use a throwaway vitest file under the scratchpad, or `npx tsx`, **never committed**.
-- [ ] **Step 2:** Assert and record: `picks.waiting === 589`, `picks.months === 75`, `picks.unparsed === 0`, `span === 15`; the four `#267` rows sit under nov 2021 / oct 2023 (name wins); `A very special gift just for you` renders as **9** entries; every Choice month is one entry (no split spellings).
-- [ ] **Step 3:** Render the page in a real browser (vite dev + a mocked `/admin/api/catalog` returning that projection), take one screenshot at desktop width and one at 390px, and check: no horizontal scroll, the headline reads as a sentence, and the dimmed entries are still legible.
-- [ ] **Step 4:** Record the numbers in the PR body. The response size stays labelled a **reconstruction** until it's measured live after deploy (Lilith/OMBB).
+**Input** *(review B3)*: `…/scratchpad/games.json` is the raw output of `aws dynamodb scan` (read-only, `kitten-debug`, 2026-10-07T07:1x-04:00) over `pk begins_with GAME#`. The shape is `{ "Items": [ { "pk": {"S"}, "sk": {"S"}, "body": {"S": "<JSON of domain::Game>"}, … } ], "Count": 1134 }`. **The game is `JSON.parse(item.body.S)`.** If the file is missing, re-run the same scan rather than inventing data.
+
+- [ ] **Step 1: Project and assert** with a throwaway vitest file at `web/src/__almanac_proof.test.ts`. **Delete it before committing anything**, and `git status` must not show it.
+
+```ts
+import { readFileSync } from 'node:fs';
+import { expect, it } from 'vitest';
+import { buildAlmanac } from './almanac';
+import type { AdminGame } from './api';
+
+it('prod proof', () => {
+  const raw = JSON.parse(readFileSync('/tmp/claude-1003/-home-code-kitten-code-kitten/4231eac3-a00d-46c2-b578-4314a998b6e6/scratchpad/games.json', 'utf8'));
+  const games: AdminGame[] = raw.Items.map((it: { body: { S: string } }) => {
+    const g = JSON.parse(it.body.S);
+    return {
+      id: g.id, title: g.title, bundle: g.bundle, key_type: g.key_type, giftable: g.giftable,
+      hidden: g.hidden, status: g.status, claim_id: g.claim_id ?? null, artwork_url: g.artwork_url ?? null,
+      requires_choice: g.requires_choice ?? false, steam_app_id: g.steam_app_id ?? null,
+      owned_by_ben: g.owned_by_ben ?? false, ...(g.acquired_at ? { acquired_at: g.acquired_at } : {}), steam: null,
+    };
+  });
+  expect(games).toHaveLength(1134);
+  const a = buildAlmanac(games, 2026);
+  console.log(JSON.stringify({ picks: a.picks, span: a.span, years: a.years.map((y) => y.year), undated: a.undated.length }));
+  expect(a.picks).toEqual({ waiting: 589, months: 75, unparsed: 0 }); // 75 = distinct months among the 589 LISTABLE picks, measured 07:1x
+  expect(a.span).toBe(15);
+  const all = a.years.flatMap((y) => y.months.flatMap((m) => m.entries));
+  expect(all.filter((e) => e.label === 'A very special gift just for you')).toHaveLength(9);
+  const nov21 = a.years.find((y) => y.year === 2021)!.months.find((m) => m.month === 10)!.entries;
+  expect(nov21.filter((e) => e.source === 'name')).toHaveLength(1); // both spellings, one entry
+  expect(nov21[0]!.games.some((g) => g.title === 'Wingspan')).toBe(true); // the #267 row filed by name
+});
+```
+
+Run: `nice -n 15 npx vitest run src/__almanac_proof.test.ts` from `web/`. Record the printed JSON line verbatim. If an assertion fails, the **data** is the authority: read which number moved and why before touching code. A pre-registered number is a prediction, not a requirement.
+
+- [ ] **Step 2: Real-browser render** *(review M3)*. With `nice -n 15 npm run dev` running in `web/`, drive the Playwright MCP. Before navigating, register mocks with `browser_run_code_unsafe`:
+
+```js
+async (page) => {
+  const fs = require('fs');
+  const raw = JSON.parse(fs.readFileSync('/tmp/claude-1003/-home-code-kitten-code-kitten/4231eac3-a00d-46c2-b578-4314a998b6e6/scratchpad/games.json', 'utf8'));
+  const games = raw.Items.map((it) => { const g = JSON.parse(it.body.S); return { ...g, steam: null }; });
+  await page.route('**/admin/api/catalog', (r) => r.fulfill({ json: games }));
+  await page.route('**/admin/api/status', (r) => r.fulfill({ json: { sync: null, sync_run: null, game_counts: {} } }));
+}
+```
+
+(If `require` isn't available in that sandbox, write the projection to `…/scratchpad/catalog.json` with node first and fulfill with `path:`.) Navigate to `http://localhost:5173/admin/almanac`. Screenshot at 1280px and at 390px into the scratchpad. Check, at 390px: `document.querySelector('main, .flex.flex-col.gap-8').scrollWidth <= window.innerWidth` **for the almanac content**. The admin **nav** may already overflow at 390px without this change (7 items, `flex gap-6 px-6`, no wrap). **Measure it on `main` first.** If it overflows there too, record it as pre-existing and do **not** fix the nav in this PR. Stop the dev server after.
+
+- [ ] **Step 3: Record** the Step 1 JSON line and both screenshot paths for the PR body. The response size stays labelled a **reconstruction** (778,799 → 801,551 B) until it's measured live after deploy.

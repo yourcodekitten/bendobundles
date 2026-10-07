@@ -69,11 +69,11 @@ that reads like a year-by-year almanac:
    july       🗓️ the july 2026 choice · 10 picks · all 10 still waiting       [wrap these →]
    ...
 ── 2013 ──────────────────────────────────────────────
-   march      📮 humble indie bundle 8 · 7 treasures · all given or kept ♡
+   march      📮 Humble Indie Bundle 8 · 7 treasures · all given or kept ♡   ← postmark label = the bundle name, verbatim
    ...
 ── undated ───────────────────────────────────────────
    the attic doesn't know when these arrived.
-   ⚠️ 3 choice picks we couldn't date                ← only when a Choice pick's name didn't parse
+   ⚠️ 3 choice picks whose month we couldn't read    ← only when a Choice pick's name didn't parse
 ```
 
 - **Years are dividers, months are rows, bundles are entries.** Newest year first: Ben opens it to
@@ -85,7 +85,10 @@ that reads like a year-by-year almanac:
   `img-src`). Thumbs are **static**: `GameDetailModal`'s admin mount carries the whole self-claim
   apparatus (`Catalog.tsx:336-345`), and re-plumbing that into a second page is out of scope (v1 said
   "click opens the modal", and that was cut while planning).
-- **Waiting is lit.** An entry with waiting treasures gets the warm accent. An entry with none
+- **Waiting is lit.** An entry with waiting treasures sits raised (`bg-shelf`), and a quiet entry is
+  flat and faded. **No burgundy anywhere on this page** (DESIGN.md's Button Burgundy Rule: giving
+  and claiming only, never ambient, never above 10% of a screen; recent years are nearly all lit
+  Choice months). "wrap these →" is `bg-control`, the catalog's own precedent. An entry with none
   reads quieter: *"all given or kept ♡"*. Waiting = `Game::is_listable` exactly (`available &&
   giftable && !hidden`), mirrored in the web. No new definition of "waiting" (the lantern's #252
   already shows what two definitions of one word cost).
@@ -127,7 +130,14 @@ it's written into #267). Name-month entries are immune (no instant involved).
 The web `AdminGame.acquired_at?` already exists, typed optional; its comment changes from "not
 sent" to "sent when known". **Deploy skew is safe in both directions:** an old lambda omits the
 field ⇒ the web falls through to name-month / undated (correct, just less precise); a new lambda
-with an old SPA ⇒ an extra field nobody reads.
+with an old SPA ⇒ the existing admin modal starts showing the postmark (below). *(v2 said "an extra
+field nobody reads". That was false, and the cold plan review caught it.)* **The field goes on both
+admin game endpoints** (catalog list + game detail) through one `catalog_view` constructor.
+⚠️ **Declared side effect:** `GameDetailModal` already renders `postmark(game.acquired_at)` on every
+mount (`GameDetailModal.tsx:349,511`) and has been blank on admin only because the admin payload
+never carried the field. Shipping D3 **lights the 📮 chip in the admin catalog modal**. That
+reverses spec-postmark's "no admin surface change" non-goal, deliberately: it's the same fact on the
+giver's own workbench. It's pinned by a test.
 
 **D4 — grouping is pure and lives in `web/src/almanac.ts`** with a twin test file (web convention:
 `postmark.ts`, `tags.ts`). `buildAlmanac(games) → { headline, years: [{ year, months: [{ month,
@@ -138,7 +148,8 @@ no ICU (`postmark.ts`'s twelve-strings rule). The page component only renders.
 months — never spent."* **N = every game with `requires_choice && is_listable`, WHATEVER its date
 source** (OMBB: counting only name-dated picks means a Humble rename silently *shrinks* N with no
 error). M = distinct name-months among those N. If some of the N didn't date by name, the undated
-shelf names them: *"⚠️ K choice picks we couldn't date"*. A regex miss then becomes a **visible
+shelf names them: *"⚠️ K choice picks whose month we couldn't read"* (a pick that fails the name-month but carries a
+postmark IS dated, so "couldn't date" would be false for it; plan-review wording, back-ported). A regex miss then becomes a **visible
 line**, not a smaller number. N = 0 ⇒ the line is omitted (no *"0 picks waiting"*). The subtitle's
 *"N years"* = `newestDatedYear − oldestDatedYear + 1`, derived and never typed (OMBB: typed, it
 rots the first January after shipping); no dated years ⇒ the subtitle drops the count. No metric
