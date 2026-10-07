@@ -25,9 +25,18 @@ const STRIP_MAX = 8;
 const GLYPH: Record<AlmanacEntry['source'], string> = { name: '🗓️', postmark: '📮', undated: '📦' };
 
 function Thumb({ g }: { g: AdminGame }) {
-  const src = thumbSrc(g);
+  // a steam capsule can 404 (11 of 858 in the real render) — fall back to the colour
+  // block rather than show the browser's broken-image icon
+  const [failed, setFailed] = useState(false);
+  const src = failed ? null : thumbSrc(g);
   return src !== null ? (
-    <img src={src} alt="" loading="lazy" className="h-10 w-16 flex-shrink-0 rounded object-cover" />
+    <img
+      src={src}
+      alt=""
+      loading="lazy"
+      onError={() => setFailed(true)}
+      className="h-10 w-16 flex-shrink-0 rounded object-cover"
+    />
   ) : (
     <div aria-hidden="true" className={`h-10 w-16 flex-shrink-0 rounded ${titleColorClass(g.title)}`} />
   );

@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { vi, describe, it, expect, beforeEach } from 'vitest';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
@@ -108,6 +108,16 @@ describe('Almanac', () => {
     // thumbs are decorative (alt="" ⇒ role presentation), so count the DOM, not roles
     expect(e.querySelectorAll('img')).toHaveLength(8);
     expect(within(e).getByText('+3')).toBeInTheDocument();
+  });
+
+  it('a thumb whose image fails to load falls back to the colour block, never a broken icon (real render: 11/858)', async () => {
+    vi.mocked(adminCatalog).mockResolvedValue([game({ id: 'p:1', bundle: 'May 2022', steam_app_id: 999, title: 'gone' })]);
+    renderPage();
+    const e = await screen.findByRole('article', { name: /may 2022/ });
+    const img = e.querySelector('img')!;
+    fireEvent.error(img);
+    expect(e.querySelector('img')).toBeNull();
+    expect(within(e).getByTitle('gone').querySelector('div[aria-hidden="true"]')).not.toBeNull();
   });
 
   it('shows a retry on load failure', async () => {

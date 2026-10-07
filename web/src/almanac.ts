@@ -78,6 +78,30 @@ function byLabelThenKey(a: AlmanacEntry, b: AlmanacEntry): number {
   return cmp(a.label, b.label) || cmp(a.key, b.key);
 }
 
+/** Inside ONE month, postmark entries that share a label read as one shelf: the date is
+ *  identical at month grain, so nothing D1 protects is lost (the 9-orders case was ACROSS
+ *  years and stays split). Found in the real render: 4 identical one-treasure gift cards
+ *  under jul 2026. The merged key is the smallest member key — deterministic. */
+function mergeSameLabelOrders(entries: AlmanacEntry[]): AlmanacEntry[] {
+  const out: AlmanacEntry[] = [];
+  const byLabel = new Map<string, number>();
+  for (const e of entries) {
+    if (e.source !== 'postmark') {
+      out.push(e);
+      continue;
+    }
+    const at = byLabel.get(e.label);
+    if (at === undefined) {
+      byLabel.set(e.label, out.length);
+      out.push(e);
+      continue;
+    }
+    const prev = out[at]!;
+    out[at] = makeEntry(prev.key < e.key ? prev.key : e.key, 'postmark', e.label, [...prev.games, ...e.games]);
+  }
+  return out;
+}
+
 export function buildAlmanac(games: AdminGame[], currentYear: number): Almanac {
   const named = new Map<string, { ym: YearMonth; games: AdminGame[] }>();
   const orders = new Map<string, { label: string; games: AdminGame[] }>();
@@ -127,7 +151,7 @@ export function buildAlmanac(games: AdminGame[], currentYear: number): Almanac {
       year,
       months: [...months.entries()]
         .sort(([a], [b]) => b - a)
-        .map(([month, entries]) => ({ month, entries: entries.sort(byLabelThenKey) })),
+        .map(([month, entries]) => ({ month, entries: mergeSameLabelOrders(entries).sort(byLabelThenKey) })),
     }));
   undated.sort(byLabelThenKey);
 

@@ -108,6 +108,24 @@ describe('buildAlmanac', () => {
     expect(a.years.every((y) => y.months[0]!.entries[0]!.source === 'postmark')).toBe(true);
   });
 
+  it('merges same-label orders inside ONE month (4 identical gift cards in jul 2026, real render), never across months', () => {
+    const a = buildAlmanac(
+      [
+        game({ id: 'k1:a', bundle: 'A very special gift just for you', acquired_at: '2026-07-02T12:00:00Z' }),
+        game({ id: 'k2:b', bundle: 'A very special gift just for you', acquired_at: '2026-07-20T12:00:00Z' }),
+        game({ id: 'k3:c', bundle: 'A very special gift just for you', acquired_at: '2026-06-20T12:00:00Z' }),
+        game({ id: 'k4:d', bundle: 'Other', acquired_at: '2026-07-05T12:00:00Z' }),
+      ],
+      Y,
+    );
+    const jul = a.years[0]!.months.find((m) => m.month === 6)!.entries;
+    expect(jul.map((e) => [e.label, e.games.length])).toEqual([
+      ['A very special gift just for you', 2],
+      ['Other', 1],
+    ]);
+    expect(a.years[0]!.months.find((m) => m.month === 5)!.entries).toHaveLength(1); // june stays its own
+  });
+
   it('dates an order by its EARLIEST valid acquired_at and keeps its undated siblings with it', () => {
     const a = buildAlmanac(
       [
